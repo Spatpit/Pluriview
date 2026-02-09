@@ -1,76 +1,118 @@
-# Pluriview
+<p align="center">
+  <h1 align="center">Pluriview</h1>
+  <p align="center">
+    Live window previews on an infinite canvas for Windows
+    <br />
+    <em>Like PureRef, but for live windows</em>
+  </p>
+</p>
 
-A Windows application for creating live window previews on an infinite canvas. Similar to PureRef but for live windows instead of static images.
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-blue" alt="Platform">
+  <img src="https://img.shields.io/badge/rust-1.70%2B-orange" alt="Rust">
+  <img src="https://img.shields.io/github/license/Spatpit/Pluriview" alt="License">
+  <img src="https://img.shields.io/github/v/release/Spatpit/Pluriview?include_prereleases" alt="Release">
+</p>
+
+---
+
+<!--
+## Screenshot
+![Pluriview Screenshot](assets/screenshot.png)
+-->
 
 ## Features
 
-- **Live Window Capture** - Real-time previews of any window using Windows Graphics Capture API
-- **Infinite Canvas** - Pan and zoom freely to organize your previews
-- **Crop Regions** - Alt+drag corners to crop previews to specific areas
-- **Adjustable FPS** - Choose from 5, 15, 30, or 60 FPS per preview
-- **Persistent Layouts** - Automatically saves and restores your layout on restart
-- **System Tray** - Minimize to tray for background operation
-- **Double-Click Focus** - Double-click a preview to bring the source window to front
-- **Minimal Dark Theme** - Clean, borderless design with hover-reveal controls
+| Feature | Description |
+|---------|-------------|
+| **Live Capture** | Real-time window previews using Windows Graphics Capture API |
+| **Infinite Canvas** | Pan and zoom freely to organize your workspace |
+| **Crop Regions** | Focus on specific parts of windows with Alt+drag |
+| **Adjustable FPS** | Choose 5, 15, 30, or 60 FPS per preview |
+| **Auto-Save** | Layouts persist automatically between sessions |
+| **System Tray** | Minimize to tray for background operation |
+| **Quick Focus** | Double-click any preview to bring its window to front |
 
 ## Requirements
 
-- Windows 10 (1903+) or Windows 11
-- Graphics card with DirectX 11 support
+- **OS:** Windows 10 (version 1903+) or Windows 11
+- **GPU:** DirectX 11 compatible graphics card
 
-## Building
+## Installation
 
+### Download Release
+Download the latest `pluriview.exe` from [Releases](https://github.com/Spatpit/Pluriview/releases).
+
+### Build from Source
 ```bash
-# Debug build
-cargo build
-
-# Release build (optimized, ~6MB)
+git clone https://github.com/Spatpit/Pluriview.git
+cd Pluriview
 cargo build --release
 ```
-
-The executable will be at `target/release/pluriview.exe`.
+The executable will be at `target/release/pluriview.exe` (~6MB).
 
 ## Usage
 
-1. Run `pluriview.exe`
-2. Use the Window Picker (left panel) to add windows to the canvas
-3. Drag previews to arrange them
-4. Resize by dragging corners/edges
-5. Crop by Alt+dragging corners
-6. Right-click for context menu options
+1. **Launch** `pluriview.exe`
+2. **Add windows** from the Window Picker panel (left side)
+3. **Arrange** by dragging previews on the canvas
+4. **Resize** by dragging corners or edges
+5. **Crop** by holding Alt and dragging corners
+6. **Right-click** for context menu options
 
-### Keyboard Shortcuts
+## Keyboard Shortcuts
 
 | Action | Shortcut |
 |--------|----------|
-| Pan canvas | Middle Mouse / Alt+Drag |
-| Zoom | Scroll Wheel |
-| Toggle grid | G |
-| Select all | Ctrl+A |
-| Multi-select | Ctrl+Click |
-| Delete selected | Delete |
-| Crop preview | Alt+Drag corners |
-| Focus source window | Double-click preview |
-| Show shortcuts | F1 |
+| Pan canvas | `Middle Mouse` or `Alt + Drag` |
+| Zoom | `Scroll Wheel` |
+| Toggle grid | `G` |
+| Select all | `Ctrl + A` |
+| Multi-select | `Ctrl + Click` |
+| Delete selected | `Delete` |
+| Crop preview | `Alt + Drag corners` |
+| Focus window | `Double-click preview` |
+| Show shortcuts | `F1` |
 
 ## Project Structure
 
 ```
-src/
-  app.rs           # Main application state and UI
-  main.rs          # Entry point
-  canvas/          # Infinite canvas (pan, zoom, selection)
-  capture/         # Window capture coordinator
-  persistence/     # Layout save/load
-  preview/         # Preview window management
-  tray/            # System tray integration
-  window_picker/   # Window enumeration and picker UI
+Pluriview/
+├── src/
+│   ├── app.rs              # Main application state and UI
+│   ├── main.rs             # Entry point
+│   ├── canvas/             # Infinite canvas (pan, zoom, selection)
+│   ├── capture/            # Window capture coordinator
+│   ├── persistence/        # Layout save/load
+│   ├── preview/            # Preview window management
+│   ├── tray/               # System tray integration
+│   └── window_picker/      # Window enumeration and picker UI
+├── assets/
+│   └── icon.ico            # Application icon
+├── Cargo.toml              # Dependencies and metadata
+├── build.rs                # Windows resource compilation
+├── LICENSE                 # MIT License
+└── README.md
 ```
+
+## Contributing
+
+Contributions are welcome! Feel free to:
+- Report bugs via [Issues](https://github.com/Spatpit/Pluriview/issues)
+- Submit feature requests
+- Open pull requests
 
 ## License
 
-MIT
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Author
+## Acknowledgments
 
-Javier
+- Built with [egui](https://github.com/emilk/egui) - Immediate mode GUI library for Rust
+- Window capture via [windows-rs](https://github.com/microsoft/windows-rs)
+
+---
+
+<p align="center">
+  Made with Rust
+</p>
