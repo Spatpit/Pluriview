@@ -1,0 +1,33 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock (optional for applications, usually included)
+# Cargo.lock
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Debug files
+*.pdb
+
+# User-specific files
+*.log
+
+# Temporary files
+nul
+
+# Claude Code settings (local)
+.claude/
+
+# Design mockups (development only)
+design_mockups.html

@@ -1,0 +1,59 @@
+[package]
+name = "pluriview"
+version = "0.1.0"
+edition = "2021"
+description = "Live window preview application with infinite canvas"
+authors = ["Javier"]
+build = "build.rs"
+
+[dependencies]
+# UI Framework
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "persistence"
+] }
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["image"] }
+
+# Window Capture
+windows-capture = "1.4"
+
+# System Tray
+tray-icon = "0.19"
+
+# Async Runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+parking_lot = "0.12"
+directories = "5.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+env_logger = "0.11"
+
+# Windows-specific dependencies
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus"
+] }
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
