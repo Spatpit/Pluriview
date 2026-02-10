@@ -95,13 +95,6 @@ Pluriview/
 └── README.md
 ```
 
-## Contributing
-
-Contributions are welcome! Feel free to:
-- Report bugs via [Issues](https://github.com/Spatpit/Pluriview/issues)
-- Submit feature requests
-- Open pull requests
-
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
