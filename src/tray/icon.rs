@@ -97,65 +97,97 @@ impl TrayManager {
     }
 }
 
-/// Create a simple default icon (32x32 blue square with P)
+/// Create the leaf icon (32x32 green leaf)
 fn create_default_icon() -> Option<Icon> {
-    let size = 32;
+    Some(create_leaf_icon(32))
+}
+
+/// Create leaf icon at specified size - used for both tray and window icon
+pub fn create_leaf_icon(size: u32) -> Icon {
+    let size = size as usize;
     let mut rgba = vec![0u8; size * size * 4];
 
-    // Fill with a nice blue color
+    let cx = size as f64 / 2.0;
+    let cy = size as f64 / 2.0;
+    let margin = size as f64 / 10.0;
+    let leaf_length = size as f64 - 2.0 * margin;
+    let leaf_width = leaf_length * 0.55;
+
+    // Rotation angle (35 degrees)
+    let angle = 35.0_f64.to_radians();
+    let cos_a = angle.cos();
+    let sin_a = angle.sin();
+
+    // Colors
+    let base_color = (107u8, 170u8, 75u8);  // Main green
+    let dark_color = (70u8, 125u8, 50u8);   // Vein color
+
+    // Draw each pixel
     for y in 0..size {
         for x in 0..size {
             let idx = (y * size + x) * 4;
 
-            // Create a rounded square appearance
-            let margin = 2;
-            let is_border = x < margin || x >= size - margin || y < margin || y >= size - margin;
+            // Transform point back to unrotated space
+            let px = x as f64;
+            let py = y as f64;
 
-            if is_border {
-                // Transparent border
-                rgba[idx] = 0;     // R
-                rgba[idx + 1] = 0; // G
-                rgba[idx + 2] = 0; // B
-                rgba[idx + 3] = 0; // A
-            } else {
-                // Blue fill with slight gradient
-                let brightness = 180 + ((x + y) % 40) as u8;
-                rgba[idx] = 70;           // R
-                rgba[idx + 1] = 130;      // G
-                rgba[idx + 2] = brightness; // B
-                rgba[idx + 3] = 255;      // A (opaque)
+            // Inverse rotation
+            let ux = cos_a * (px - cx) + sin_a * (py - cy) + cx;
+            let uy = -sin_a * (px - cx) + cos_a * (py - cy) + cy;
+
+            // Check if point is inside leaf shape
+            let t = (uy - margin) / leaf_length;
+
+            if t >= 0.0 && t <= 1.0 {
+                // Leaf width at this height
+                let width_factor = (t * std::f64::consts::PI).sin().powf(0.8);
+                let half_width = (leaf_width / 2.0) * width_factor;
+
+                let dist_from_center = (ux - cx).abs();
+
+                if dist_from_center <= half_width {
+                    // Inside leaf - check if on vein
+                    let on_main_vein = dist_from_center < size as f64 / 18.0 && t > 0.08 && t < 0.92;
+
+                    // Check side veins
+                    let mut on_side_vein = false;
+                    for i in 1..=5 {
+                        let vein_t = 0.15 + (i as f64 / 6.0) * 0.7;
+                        let vein_y = margin + vein_t * leaf_length;
+                        let y_dist = (uy - vein_y).abs();
+
+                        if y_dist < size as f64 / 20.0 {
+                            let vein_width_factor = (vein_t * std::f64::consts::PI).sin().powf(0.8);
+                            let vein_len = (leaf_width / 2.0) * vein_width_factor * 0.75;
+
+                            // Side veins go diagonally upward
+                            let expected_x_offset = (ux - cx).abs();
+                            let expected_y_offset = expected_x_offset * 0.35;
+                            let actual_y = vein_y - expected_y_offset;
+
+                            if (uy - actual_y).abs() < size as f64 / 25.0 && expected_x_offset < vein_len {
+                                on_side_vein = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    let color = if on_main_vein || on_side_vein {
+                        dark_color
+                    } else {
+                        base_color
+                    };
+
+                    rgba[idx] = color.0;     // R
+                    rgba[idx + 1] = color.1; // G
+                    rgba[idx + 2] = color.2; // B
+                    rgba[idx + 3] = 255;     // A
+                }
             }
         }
     }
 
-    // Draw a "P" in white
-    let p_points = [
-        // Vertical line of P
-        (10, 8), (10, 9), (10, 10), (10, 11), (10, 12), (10, 13), (10, 14), (10, 15),
-        (10, 16), (10, 17), (10, 18), (10, 19), (10, 20), (10, 21), (10, 22), (10, 23),
-        (11, 8), (11, 22), (11, 23),
-        // Top of P
-        (12, 8), (13, 8), (14, 8), (15, 8), (16, 8), (17, 8), (18, 8),
-        (12, 9), (13, 9), (14, 9), (15, 9), (16, 9), (17, 9), (18, 9), (19, 9),
-        // Curve of P
-        (19, 10), (20, 10), (20, 11), (21, 11), (21, 12), (21, 13), (21, 14),
-        (20, 15), (20, 14), (19, 15), (19, 16),
-        // Middle bar of P
-        (12, 15), (13, 15), (14, 15), (15, 15), (16, 15), (17, 15), (18, 15),
-        (12, 16), (13, 16), (14, 16), (15, 16), (16, 16), (17, 16), (18, 16),
-    ];
-
-    for (x, y) in p_points {
-        if x < size && y < size {
-            let idx = (y * size + x) * 4;
-            rgba[idx] = 255;     // R
-            rgba[idx + 1] = 255; // G
-            rgba[idx + 2] = 255; // B
-            rgba[idx + 3] = 255; // A
-        }
-    }
-
-    Icon::from_rgba(rgba, size as u32, size as u32).ok()
+    Icon::from_rgba(rgba, size as u32, size as u32).unwrap()
 }
 
 impl Default for TrayManager {

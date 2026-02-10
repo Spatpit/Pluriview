@@ -314,7 +314,7 @@ impl eframe::App for PluriviewApp {
                     ui.vertical_centered(|ui| {
                         ui.add_space(10.0);
                         ui.heading("Pluriview");
-                        ui.label("Version 0.1.0");
+                        ui.label("Version 0.1");
                         ui.add_space(10.0);
                         ui.label("Live window preview application");
                         ui.label("with infinite canvas");
