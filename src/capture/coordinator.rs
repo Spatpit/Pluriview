@@ -1,3 +1,4 @@
+use crate::privacy;
 use crate::preview::{PreviewManager, PreviewId};
 use eframe::egui;
 use std::collections::HashMap;
@@ -295,14 +296,14 @@ fn capture_window_loop(
         // First try exact title match
         match Window::from_name(&window_title) {
             Ok(w) => {
-                log::info!("Found window by exact title: {}", window_title);
+                log::info!("Found window by exact title: {}", privacy::redact_title(&window_title));
                 w
             }
             Err(_) => {
                 // Try partial title match (contains)
                 match Window::from_contains_name(&window_title) {
                     Ok(w) => {
-                        log::info!("Found window by partial title: {}", window_title);
+                        log::info!("Found window by partial title: {}", privacy::redact_title(&window_title));
                         w
                     }
                     Err(_) => {
@@ -317,7 +318,9 @@ fn capture_window_loop(
                                         if title.to_lowercase().contains(&window_title.to_lowercase())
                                             || window_title.to_lowercase().contains(&title.to_lowercase())
                                         {
-                                            log::info!("Found window by enumeration: {} (looking for {})", title, window_title);
+                                            log::info!("Found window by enumeration: {} (looking for {})", 
+                                                privacy::redact_title(&title), 
+                                                privacy::redact_title(&window_title));
                                             found_window = Some(win);
                                             break;
                                         }
@@ -329,7 +332,7 @@ fn capture_window_loop(
                         match found_window {
                             Some(w) => w,
                             None => {
-                                log::error!("Could not find window with title: {}", window_title);
+                                log::error!("Could not find window with title: {}", privacy::redact_title(&window_title));
                                 return;
                             }
                         }

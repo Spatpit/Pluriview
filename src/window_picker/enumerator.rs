@@ -1,3 +1,4 @@
+use crate::privacy;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
@@ -139,6 +140,11 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
 
     // Skip our own window
     if title.contains("Pluriview") {
+        return BOOL(1);
+    }
+
+    // Skip sensitive windows (Password managers, browsers with "private" in title, etc.)
+    if privacy::is_sensitive_window(&exe_name, &title) {
         return BOOL(1);
     }
 
