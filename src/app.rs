@@ -470,8 +470,16 @@ impl eframe::App for PluriviewApp {
                 });
         }
 
-        // Request continuous repaint for live previews and tray event processing
-        // We always request repaint to ensure tray events are processed even when hidden
-        ctx.request_repaint();
+        // Schedule the next repaint instead of spinning at uncapped frame rate.
+        // When a capture is live we refresh at ~60 FPS so previews stay smooth;
+        // otherwise we tick slowly, which is still frequent enough to process
+        // tray events while keeping the app near-idle on the CPU.
+        // (egui repaints immediately on input regardless of this hint.)
+        let repaint_after = if self.capture_coordinator.has_live_capture() {
+            std::time::Duration::from_millis(16)
+        } else {
+            std::time::Duration::from_millis(250)
+        };
+        ctx.request_repaint_after(repaint_after);
     }
 }

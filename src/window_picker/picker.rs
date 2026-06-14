@@ -89,15 +89,10 @@ impl WindowPicker {
 
         // Window count and refresh indicator
         ui.horizontal(|ui| {
-            let count = self.windows.iter().filter(|w| {
-                if self.search_filter.is_empty() {
-                    true
-                } else {
-                    let filter_lower = self.search_filter.to_lowercase();
-                    w.title.to_lowercase().contains(&filter_lower) ||
-                    w.exe_name.to_lowercase().contains(&filter_lower)
-                }
-            }).count();
+            let filter_lower = self.search_filter.to_lowercase();
+            let count = self.windows.iter()
+                .filter(|w| Self::window_matches(w, &filter_lower))
+                .count();
 
             ui.label(
                 RichText::new(format!("{} windows", count))
@@ -124,9 +119,14 @@ impl WindowPicker {
 
         ui.add_space(6.0);
 
-        // Clone windows to avoid borrow issues
-        let windows: Vec<WindowInfo> = self.windows.clone();
+        // Precompute the filtered set once (avoids cloning the whole window
+        // list and re-filtering it several times every frame)
         let filter_lower = self.search_filter.to_lowercase();
+        let filtered: Vec<usize> = self.windows.iter()
+            .enumerate()
+            .filter(|(_, w)| Self::window_matches(w, &filter_lower))
+            .map(|(i, _)| i)
+            .collect();
 
         // Window list with card-style items
         egui::ScrollArea::vertical()
@@ -134,15 +134,8 @@ impl WindowPicker {
             .show(ui, |ui| {
                 let available_width = ui.available_width();
 
-                for window in &windows {
-                    // Apply filter
-                    if !filter_lower.is_empty() {
-                        let title_lower = window.title.to_lowercase();
-                        let exe_lower = window.exe_name.to_lowercase();
-                        if !title_lower.contains(&filter_lower) && !exe_lower.contains(&filter_lower) {
-                            continue;
-                        }
-                    }
+                for &idx in &filtered {
+                    let window = &self.windows[idx];
 
                     // Card frame
                     let (rect, response) = ui.allocate_exact_size(
@@ -248,13 +241,7 @@ impl WindowPicker {
                 }
 
                 // Empty state
-                if windows.iter().all(|w| {
-                    if filter_lower.is_empty() { false }
-                    else {
-                        !w.title.to_lowercase().contains(&filter_lower) &&
-                        !w.exe_name.to_lowercase().contains(&filter_lower)
-                    }
-                }) && !filter_lower.is_empty() {
+                if filtered.is_empty() && !filter_lower.is_empty() {
                     ui.add_space(20.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
@@ -265,6 +252,14 @@ impl WindowPicker {
                     });
                 }
             });
+    }
+
+    /// Returns true if a window matches the (already lowercased) search filter.
+    /// An empty filter matches everything.
+    fn window_matches(w: &WindowInfo, filter_lower: &str) -> bool {
+        filter_lower.is_empty()
+            || w.title.to_lowercase().contains(filter_lower)
+            || w.exe_name.to_lowercase().contains(filter_lower)
     }
 
     /// Add a window to the canvas
