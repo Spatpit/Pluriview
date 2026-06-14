@@ -7,6 +7,8 @@ mod capture;
 mod window_picker;
 mod persistence;
 mod tray;
+mod overlay;
+mod privacy;
 
 use app::PluriviewApp;
 use eframe::egui;
