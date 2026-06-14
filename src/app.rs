@@ -1,10 +1,12 @@
 use eframe::egui::{self, Vec2, Pos2};
+use crate::privacy;
 use crate::canvas::CanvasState;
-use crate::preview::{PreviewManager, PreviewLayout};
+use crate::preview::{PreviewManager, PreviewLayout, PreviewId};
 use crate::window_picker::{WindowPicker, enumerate_windows};
 use crate::capture::CaptureCoordinator;
 use crate::persistence::{Storage, SavedLayout, CanvasLayout};
 use crate::tray::TrayManager;
+use crate::overlay::RegionSelector;
 use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 use windows::core::w;
 
@@ -39,6 +41,12 @@ pub struct PluriviewApp {
 
     /// Show Keyboard Shortcuts dialog
     show_shortcuts: bool,
+
+    /// Active region selector overlay (if any)
+    region_selector: Option<RegionSelector>,
+
+    /// Preview ID that the region selector is for
+    region_select_preview_id: Option<PreviewId>,
 }
 
 impl PluriviewApp {
@@ -64,6 +72,8 @@ impl PluriviewApp {
             hwnd_set: false,
             show_about: false,
             show_shortcuts: false,
+            region_selector: None,
+            region_select_preview_id: None,
         };
 
         // Try to load autosave
@@ -179,10 +189,10 @@ impl PluriviewApp {
                 }
 
                 #[cfg(debug_assertions)]
-                println!("Restored preview: {}", window_info.title);
+                println!("Restored preview: {}", privacy::redact_title(&window_info.title));
             } else {
                 #[cfg(debug_assertions)]
-                println!("Window not found: {}", preview_layout.window_title);
+                println!("Window not found: {}", privacy::redact_title(&preview_layout.window_title));
             }
         }
     }
@@ -200,6 +210,46 @@ impl eframe::App for PluriviewApp {
 
         // Process any pending captured frames
         self.capture_coordinator.process_frames(&mut self.preview_manager, ctx);
+
+        // Handle pending region selection request (from context menu in canvas)
+        if let Some(preview_id) = self.canvas.pending_region_select.take() {
+            if let Some(preview) = self.preview_manager.get(preview_id) {
+                if let Some(ref handle) = preview.window_handle {
+                    // Start the region selector overlay
+                    if let Some(selector) = RegionSelector::show_for_window(handle.hwnd) {
+                        self.region_selector = Some(selector);
+                        self.region_select_preview_id = Some(preview_id);
+                    }
+                }
+            }
+        }
+
+        // Poll for region selection result
+        if let Some(ref mut selector) = self.region_selector {
+            if let Some(result) = selector.poll_result() {
+                if let Some(selection) = result {
+                    // Apply the crop to the preview
+                    if let Some(preview_id) = self.region_select_preview_id {
+                        if let Some(preview) = self.preview_manager.get_mut(preview_id) {
+                            // Get source dimensions from frame if available
+                            if let Some((w, h)) = preview.frame_size {
+                                let crop_uv = selection.to_uv(w, h);
+                                preview.crop_uv = Some(crop_uv);
+                                // Update aspect ratio for the cropped region
+                                let crop_w = (crop_uv.2 - crop_uv.0) * w as f32;
+                                let crop_h = (crop_uv.3 - crop_uv.1) * h as f32;
+                                if crop_h > 0.0 {
+                                    preview.source_aspect_ratio = crop_w / crop_h;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Clear the selector (whether successful or cancelled)
+                self.region_selector = None;
+                self.region_select_preview_id = None;
+            }
+        }
 
         // Minimal Void: Very dark, minimal menu bar
         egui::TopBottomPanel::top("top_panel")
