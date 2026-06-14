@@ -169,6 +169,12 @@ impl CaptureCoordinator {
             .map(|s| *s.paused.read())
             .unwrap_or(false)
     }
+
+    /// True if at least one capture session is active and not paused.
+    /// Used to decide how aggressively the UI should repaint.
+    pub fn has_live_capture(&self) -> bool {
+        self.sessions.values().any(|s| *s.active.read() && !*s.paused.read())
+    }
 }
 
 impl Default for CaptureCoordinator {
