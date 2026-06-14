@@ -1,4 +1,5 @@
 use eframe::egui::{self, Pos2, Vec2, Rect, Color32, Stroke, Sense, CursorIcon};
+use crate::privacy;
 use crate::preview::{PreviewManager, PreviewId, FpsPreset};
 use crate::capture::CaptureCoordinator;
 use super::animation::{AnimationState, DragTracker};
@@ -96,6 +97,9 @@ pub struct CanvasState {
 
     /// Drag tracker for canvas pan momentum
     pan_drag_tracker: DragTracker,
+
+    /// Preview ID pending region selection (set from context menu, consumed by app)
+    pub pending_region_select: Option<PreviewId>,
 }
 
 impl Default for CanvasState {
@@ -114,6 +118,7 @@ impl Default for CanvasState {
             preview_dragging: false,
             canvas_panning: false,
             pan_drag_tracker: DragTracker::new(),
+            pending_region_select: None,
         }
     }
 }
@@ -293,13 +298,13 @@ impl CanvasState {
                     capture_coordinator.resume_capture(id);
                     preview.capture_paused = false;
                     #[cfg(debug_assertions)]
-                    println!("Viewport culling: Resumed capture for '{}'", preview.title);
+                    println!("Viewport culling: Resumed capture for '{}'", privacy::redact_title(&preview.title));
                 } else if !is_visible && !preview.capture_paused {
                     // Pause capture - preview is now off-screen
                     capture_coordinator.pause_capture(id);
                     preview.capture_paused = true;
                     #[cfg(debug_assertions)]
-                    println!("Viewport culling: Paused capture for '{}'", preview.title);
+                    println!("Viewport culling: Paused capture for '{}'", privacy::redact_title(&preview.title));
                 }
             }
         }
@@ -751,17 +756,25 @@ impl CanvasState {
                 ui.separator();
 
                 // Crop section
-                ui.label("Crop:");
-                if has_crop {
-                    if ui.button("  Clear Crop (Show Full)").clicked() {
-                        if let Some(preview) = preview_manager.get_mut(id) {
-                            preview.clear_crop();
-                        }
+                ui.menu_button("Crop", |ui| {
+                    // Select Region button (ShareX-style)
+                    if ui.button("Select Region...").clicked() {
+                        self.pending_region_select = Some(id);
                         ui.close_menu();
                     }
-                } else {
-                    ui.label(egui::RichText::new("  Alt+drag handles to crop").weak().small());
-                }
+
+                    if has_crop {
+                        if ui.button("Clear Crop").clicked() {
+                            if let Some(preview) = preview_manager.get_mut(id) {
+                                preview.clear_crop();
+                            }
+                            ui.close_menu();
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Tip: Alt+drag corners to fine-tune").weak().small());
+                });
 
                 ui.separator();
 
