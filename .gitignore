@@ -32,5 +32,8 @@ nul
 # Design mockups (development only)
 design_mockups.html
 
+# Icon exploration / candidates (only assets/icon.ico is used by the build)
+assets/icon_options/
+
 # Personal dev notes (not part of the project)
 Journal/
