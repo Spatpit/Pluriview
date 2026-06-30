@@ -1,8 +1,13 @@
 use eframe::egui::{self, Pos2, Vec2, Rect, Color32, Stroke, Sense, CursorIcon};
+use std::time::Instant;
+#[cfg(debug_assertions)]
 use crate::privacy;
-use crate::preview::{PreviewManager, PreviewId, FpsPreset};
+use crate::preview::{PreviewManager, PreviewId, FpsPreset, RemovedPreviewInfo};
 use crate::capture::CaptureCoordinator;
 use super::animation::{AnimationState, DragTracker};
+
+/// How long the "Removed '...' · Undo" toast stays on screen.
+const UNDO_TOAST_SECS: f32 = 4.0;
 
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SetForegroundWindow, SW_RESTORE};
@@ -100,6 +105,18 @@ pub struct CanvasState {
 
     /// Preview ID pending region selection (set from context menu, consumed by app)
     pub pending_region_select: Option<PreviewId>,
+
+    /// Most recently removed preview, kept briefly to power the "Undo" toast.
+    last_removed: Option<(Instant, RemovedPreviewInfo)>,
+
+    /// Screen position of the last right-click on the canvas background,
+    /// used to anchor the "Add Window..." quick-add popup.
+    last_secondary_click: Option<Pos2>,
+
+    /// Set by the "Add Window..." context menu item: (canvas position to
+    /// place the new preview, screen position to anchor the popup). The app
+    /// consumes this to open the quick-add popup.
+    pub pending_quick_add: Option<(Pos2, Pos2)>,
 }
 
 impl Default for CanvasState {
@@ -119,6 +136,9 @@ impl Default for CanvasState {
             canvas_panning: false,
             pan_drag_tracker: DragTracker::new(),
             pending_region_select: None,
+            last_removed: None,
+            last_secondary_click: None,
+            pending_quick_add: None,
         }
     }
 }
@@ -220,6 +240,13 @@ impl CanvasState {
         // Update preview positions from their spring animations
         self.update_preview_animations(preview_manager);
 
+        // Reap any previews whose fade/shrink-out animation has finished,
+        // keeping the most recent one around briefly for the undo toast.
+        let finished_removals = preview_manager.finalize_removals();
+        if let Some(info) = finished_removals.into_iter().last() {
+            self.last_removed = Some((Instant::now(), info));
+        }
+
         // CRITICAL: Allocate background interaction FIRST
         // In egui, later interactions take priority over earlier ones.
         // By allocating the canvas background first, preview interactions
@@ -241,6 +268,11 @@ impl CanvasState {
             self.draw_grid(&painter, canvas_rect);
         }
 
+        // Empty-canvas hint (only relevant before anything has been added)
+        if preview_manager.count() == 0 {
+            self.draw_empty_state(&painter, canvas_rect);
+        }
+
         // Draw previews and handle their interactions (AFTER bg allocation)
         self.draw_and_interact_previews(ui, canvas_rect, preview_manager, ctx, capture_coordinator);
 
@@ -250,6 +282,9 @@ impl CanvasState {
 
         // Minimal Void: Floating status indicator (bottom-right corner)
         self.draw_floating_status(&painter, canvas_rect, preview_manager.count());
+
+        // Undo toast for the most recently removed preview
+        self.draw_and_interact_undo_toast(ui, canvas_rect, preview_manager, capture_coordinator);
 
         // Handle canvas-level input using the pre-allocated bg_response
         self.handle_canvas_input_with_response(ui, canvas_rect, preview_manager, capture_coordinator, bg_response);
@@ -426,7 +461,19 @@ impl CanvasState {
         }
 
         // Canvas context menu (right-click on empty space)
+        if bg_response.secondary_clicked() {
+            self.last_secondary_click = input.pointer.interact_pos();
+        }
+
         bg_response.context_menu(|ui| {
+            if ui.button("Add Window...").clicked() {
+                if let Some(screen_pos) = self.last_secondary_click {
+                    let canvas_pos = self.screen_to_canvas(screen_pos, canvas_rect);
+                    self.pending_quick_add = Some((canvas_pos, screen_pos));
+                }
+                ui.close_menu();
+            }
+            ui.separator();
             if ui.button("Reset View").clicked() {
                 self.reset();
                 ui.close_menu();
@@ -438,7 +485,7 @@ impl CanvasState {
                 if ui.button("Remove Selected").clicked() {
                     for id in self.selection.clone() {
                         capture_coordinator.stop_capture(id);
-                        preview_manager.remove(id);
+                        preview_manager.start_removal(id);
                     }
                     self.selection.clear();
                     ui.close_menu();
@@ -451,7 +498,7 @@ impl CanvasState {
             if input.key_pressed(egui::Key::Delete) {
                 for id in self.selection.clone() {
                     capture_coordinator.stop_capture(id);
-                    preview_manager.remove(id);
+                    preview_manager.start_removal(id);
                 }
                 self.selection.clear();
             }
@@ -477,16 +524,48 @@ impl CanvasState {
         let preview_info: Vec<_> = {
             let previews = preview_manager.get_visible_previews(&viewport);
             previews.iter().map(|p| {
-                (p.id, p.rect(), p.title.clone(), p.target_fps, p.fps_preset, p.crop_uv.is_some())
+                (p.id, p.rect(), p.title.clone(), p.target_fps, p.fps_preset, p.crop_uv.is_some(),
+                 p.removing.is_some(), p.spawn_progress(), p.removal_progress())
             }).collect()
         };
 
         let input = ui.input(|i| i.clone());
+        let mut any_spawn_or_remove_animating = false;
 
-        for (id, rect, title, target_fps, current_preset, has_crop) in preview_info {
+        for (id, rect, title, target_fps, current_preset, has_crop, is_removing, spawn_t, remove_t) in preview_info {
             let screen_rect = self.canvas_rect_to_screen(rect, canvas_rect);
 
             if !canvas_rect.intersects(screen_rect) {
+                continue;
+            }
+
+            // Spawn-in / fade-out: ease alpha and a subtle scale toward center.
+            let (alpha, scale) = if is_removing {
+                any_spawn_or_remove_animating |= remove_t < 1.0;
+                (1.0 - remove_t, 1.0 - remove_t * 0.12)
+            } else if spawn_t < 1.0 {
+                any_spawn_or_remove_animating = true;
+                (spawn_t, 0.85 + spawn_t * 0.15)
+            } else {
+                (1.0, 1.0)
+            };
+            let anim_rect = if (scale - 1.0).abs() > f32::EPSILON {
+                Rect::from_center_size(screen_rect.center(), screen_rect.size() * scale)
+            } else {
+                screen_rect
+            };
+            let alpha_u8 = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
+
+            let painter = ui.painter_at(canvas_rect);
+
+            if is_removing {
+                // Fading out: paint the last frame only, no interaction.
+                if let Some(preview) = preview_manager.get_mut(id) {
+                    let uv_rect = preview.get_uv_rect();
+                    if let Some(texture) = preview.get_texture(ctx) {
+                        painter.image(texture.id(), anim_rect, uv_rect, Color32::from_white_alpha(alpha_u8));
+                    }
+                }
                 continue;
             }
 
@@ -497,8 +576,16 @@ impl CanvasState {
                 Sense::click_and_drag(),
             );
 
-            // Get the painter
-            let painter = ui.painter_at(canvas_rect);
+            let is_active = self.selection.contains(&id) || preview_response.dragged();
+
+            // Soft drop shadow underneath the preview, stronger when selected/dragged.
+            let shadow_alpha = ((if is_active { 90.0 } else { 40.0 }) * alpha) as u8;
+            let shadow_offset = if is_active { Vec2::new(0.0, 6.0) } else { Vec2::new(0.0, 3.0) };
+            painter.rect_filled(
+                anim_rect.translate(shadow_offset),
+                8.0,
+                Color32::from_rgba_unmultiplied(0, 0, 0, shadow_alpha),
+            );
 
             // Minimal Void: No background fill - content fills entire area
             // Draw preview content (full rect, no title bar offset)
@@ -509,9 +596,9 @@ impl CanvasState {
                     // Minimal Void: content fills entire rect
                     painter.image(
                         texture.id(),
-                        screen_rect,
+                        anim_rect,
                         uv_rect,
-                        Color32::WHITE,
+                        Color32::from_white_alpha(alpha_u8),
                     );
                     true
                 } else {
@@ -522,15 +609,19 @@ impl CanvasState {
             };
 
             if !has_texture {
-                // Minimal Void: subtle placeholder
-                painter.rect_filled(screen_rect, 8.0, Color32::from_rgb(25, 25, 25));
+                // Shimmering placeholder while the capture connects
+                let t = ui.input(|i| i.time) as f32;
+                let pulse = (t * 1.8).sin() * 0.5 + 0.5;
+                let v = (18.0 + pulse * 14.0) as u8;
+                painter.rect_filled(anim_rect, 8.0, Color32::from_rgb(v, v, v + 2));
                 painter.text(
-                    screen_rect.center(),
+                    anim_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "Loading...",
+                    "Connecting...",
                     egui::FontId::proportional(12.0),
-                    Color32::from_rgb(80, 80, 80),
+                    Color32::from_rgb(95, 95, 95),
                 );
+                any_spawn_or_remove_animating = true;
             }
 
             // Minimal Void: Hover-reveal controls (no permanent title bar)
@@ -551,14 +642,29 @@ impl CanvasState {
                     screen_rect.right_top() + Vec2::new(-32.0, 8.0),
                     Vec2::new(24.0, 24.0),
                 );
-                painter.rect_filled(close_btn_rect, 4.0, Color32::from_rgba_unmultiplied(255, 80, 80, 200));
+                let close_response = ui.interact(
+                    close_btn_rect,
+                    ui.id().with(("preview_close", id.0)),
+                    Sense::click(),
+                );
+                let close_bg = if close_response.hovered() {
+                    Color32::from_rgba_unmultiplied(255, 100, 100, 230)
+                } else {
+                    Color32::from_rgba_unmultiplied(255, 80, 80, 200)
+                };
+                painter.rect_filled(close_btn_rect, 4.0, close_bg);
                 painter.text(
                     close_btn_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "×",
-                    egui::FontId::proportional(16.0),
+                    egui_phosphor::regular::X,
+                    egui::FontId::proportional(13.0),
                     Color32::WHITE,
                 );
+                if close_response.clicked() {
+                    capture_coordinator.stop_capture(id);
+                    preview_manager.start_removal(id);
+                    self.selection.retain(|&x| x != id);
+                }
 
                 // FPS badge (left of close button)
                 let fps_text = format!("{}", target_fps);
@@ -792,11 +898,17 @@ impl CanvasState {
 
                 if ui.button("Remove").clicked() {
                     capture_coordinator.stop_capture(id);
-                    preview_manager.remove(id);
+                    preview_manager.start_removal(id);
                     self.selection.retain(|&x| x != id);
                     ui.close_menu();
                 }
             });
+        }
+
+        // Keep repainting while any preview is spawning in, fading out, or
+        // still waiting on its first frame so the animations stay smooth.
+        if any_spawn_or_remove_animating {
+            ctx.request_repaint();
         }
     }
 
@@ -886,6 +998,127 @@ impl CanvasState {
             egui::FontId::proportional(11.0),
             Color32::from_rgb(120, 120, 120),
         );
+    }
+
+    /// Empty-canvas hint shown before any preview has been added.
+    fn draw_empty_state(&self, painter: &egui::Painter, canvas_rect: Rect) {
+        let center = canvas_rect.center();
+
+        painter.text(
+            center + Vec2::new(0.0, -18.0),
+            egui::Align2::CENTER_CENTER,
+            egui_phosphor::regular::APP_WINDOW,
+            egui::FontId::proportional(40.0),
+            Color32::from_rgb(55, 55, 60),
+        );
+        painter.text(
+            center + Vec2::new(0.0, 22.0),
+            egui::Align2::CENTER_CENTER,
+            "No windows yet",
+            egui::FontId::proportional(15.0),
+            Color32::from_rgb(110, 110, 118),
+        );
+        painter.text(
+            center + Vec2::new(0.0, 44.0),
+            egui::Align2::CENTER_CENTER,
+            "Search and add a window from the left panel to get started",
+            egui::FontId::proportional(12.0),
+            Color32::from_rgb(75, 75, 82),
+        );
+    }
+
+    /// Floating "Removed '...' · Undo" toast for the most recently removed preview.
+    fn draw_and_interact_undo_toast(
+        &mut self,
+        ui: &mut egui::Ui,
+        canvas_rect: Rect,
+        preview_manager: &mut PreviewManager,
+        capture_coordinator: &mut CaptureCoordinator,
+    ) {
+        let Some((removed_at, info)) = self.last_removed.clone() else { return; };
+
+        let age = removed_at.elapsed().as_secs_f32();
+        if age >= UNDO_TOAST_SECS {
+            self.last_removed = None;
+            return;
+        }
+
+        // Fade in quickly, fade out over the last half-second.
+        let fade_in = (age / 0.15).clamp(0.0, 1.0);
+        let fade_out = ((UNDO_TOAST_SECS - age) / 0.5).clamp(0.0, 1.0);
+        let fade = fade_in.min(fade_out);
+        let bg_alpha = (fade * 220.0) as u8;
+        let text_alpha = (fade * 255.0) as u8;
+
+        let title = if info.title.chars().count() > 28 {
+            let truncated: String = info.title.chars().take(25).collect();
+            format!("{}...", truncated)
+        } else {
+            info.title.clone()
+        };
+        let label = format!("Removed \"{}\"", title);
+
+        let padding = 16.0;
+        let toast_height = 32.0;
+        let toast_width = 230.0;
+        let toast_rect = Rect::from_min_size(
+            Pos2::new(canvas_rect.min.x + padding, canvas_rect.max.y - toast_height - padding),
+            Vec2::new(toast_width, toast_height),
+        );
+
+        let painter = ui.painter_at(canvas_rect);
+        painter.rect_filled(
+            toast_rect,
+            10.0,
+            Color32::from_rgba_unmultiplied(24, 24, 28, bg_alpha),
+        );
+        painter.text(
+            Pos2::new(toast_rect.min.x + 12.0, toast_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &label,
+            egui::FontId::proportional(11.5),
+            Color32::from_rgba_unmultiplied(210, 210, 215, text_alpha),
+        );
+
+        let undo_rect = Rect::from_min_size(
+            Pos2::new(toast_rect.max.x - 56.0, toast_rect.min.y + 6.0),
+            Vec2::new(48.0, toast_height - 12.0),
+        );
+        let undo_response = ui.interact(undo_rect, ui.id().with("undo_toast_btn"), Sense::click());
+        let undo_color = if undo_response.hovered() {
+            Color32::from_rgba_unmultiplied(140, 200, 255, text_alpha)
+        } else {
+            Color32::from_rgba_unmultiplied(74, 158, 255, text_alpha)
+        };
+        painter.text(
+            undo_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Undo",
+            egui::FontId::proportional(12.0),
+            undo_color,
+        );
+
+        if undo_response.clicked() {
+            if let Some(handle) = info.window_handle {
+                let id = preview_manager.add_for_window(
+                    handle.hwnd,
+                    handle.process_id,
+                    info.title.clone(),
+                    info.position,
+                    info.size,
+                );
+                if let Some(preview) = preview_manager.get_mut(id) {
+                    preview.capture_active = true;
+                    preview.set_fps_preset(info.fps_preset);
+                    preview.crop_uv = info.crop_uv;
+                }
+                capture_coordinator.start_capture(id, handle.hwnd, info.title.clone(), info.fps_preset.as_u32());
+            }
+            self.last_removed = None;
+        }
+
+        // Keep repainting while the toast is visible so it can fade out.
+        ui.ctx().request_repaint();
     }
 
     /// Draw selection indicators and interactive resize handles

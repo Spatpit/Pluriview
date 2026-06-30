@@ -1,7 +1,18 @@
 use eframe::egui::{self, Pos2, Vec2, Rect, TextureHandle};
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
+use std::time::Instant;
 use parking_lot::RwLock;
+
+/// How long the spawn-in / fade-out animations take.
+const SPAWN_DURATION_SECS: f32 = 0.22;
+const REMOVE_DURATION_SECS: f32 = 0.2;
+
+/// Cubic ease-out: starts fast, settles smoothly.
+fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
 
 /// Unique identifier for a preview
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -93,6 +104,14 @@ pub struct Preview {
 
     /// Frame data buffer (BGRA)
     frame_buffer: Arc<RwLock<Option<FrameData>>>,
+
+    /// When this preview was created (drives the spawn-in animation)
+    pub created_at: Instant,
+
+    /// Set when removal has been requested; drives the fade/shrink-out
+    /// animation. The preview is only actually dropped from the manager
+    /// once `removal_progress()` reaches 1.0.
+    pub removing: Option<Instant>,
 }
 
 /// Raw frame data from capture
@@ -124,6 +143,8 @@ impl Preview {
             frame_size: None,
             texture: None,
             frame_buffer: Arc::new(RwLock::new(None)),
+            created_at: Instant::now(),
+            removing: None,
         }
     }
 
@@ -274,6 +295,35 @@ impl Preview {
     /// Check if this preview contains the given canvas point
     pub fn contains(&self, point: Pos2) -> bool {
         self.rect().contains(point)
+    }
+
+    /// 0.0 (just created) .. 1.0 (fully spawned in), eased.
+    pub fn spawn_progress(&self) -> f32 {
+        let t = self.created_at.elapsed().as_secs_f32() / SPAWN_DURATION_SECS;
+        ease_out_cubic(t)
+    }
+
+    /// Mark this preview as pending removal (idempotent). The actual
+    /// removal from the manager happens once the fade-out completes.
+    pub fn start_removal(&mut self) {
+        if self.removing.is_none() {
+            self.removing = Some(Instant::now());
+        }
+    }
+
+    /// 0.0 (not removing / just started) .. 1.0 (fade-out complete), eased.
+    pub fn removal_progress(&self) -> f32 {
+        match self.removing {
+            Some(started) => ease_out_cubic(started.elapsed().as_secs_f32() / REMOVE_DURATION_SECS),
+            None => 0.0,
+        }
+    }
+
+    /// True once a removal has been requested and its animation has finished.
+    pub fn is_removal_complete(&self) -> bool {
+        self.removing
+            .map(|started| started.elapsed().as_secs_f32() >= REMOVE_DURATION_SECS)
+            .unwrap_or(false)
     }
 }
 
