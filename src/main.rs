@@ -24,7 +24,10 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([800.0, 600.0])
             .with_title("Pluriview")
-            .with_icon(icon),
+            .with_icon(icon)
+            // We draw our own title bar (see app.rs) so it can match the
+            // app's dark theme instead of the OS chrome.
+            .with_decorations(false),
         ..Default::default()
     };
 

@@ -66,7 +66,11 @@ impl WindowPicker {
         search_frame.show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Search icon (magnifying glass)
-                ui.label(RichText::new("🔍").size(14.0).color(text_secondary));
+                ui.label(
+                    RichText::new(egui_phosphor::regular::MAGNIFYING_GLASS)
+                        .size(14.0)
+                        .color(text_secondary)
+                );
                 ui.add_space(6.0);
 
                 // Search input with placeholder
@@ -103,8 +107,9 @@ impl WindowPicker {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Refresh button (subtle, icon-based)
                 let refresh_btn = ui.add(
-                    egui::Button::new(RichText::new("↻").size(14.0))
-                        .frame(false)
+                    egui::Button::new(
+                        RichText::new(egui_phosphor::regular::ARROW_CLOCKWISE).size(14.0)
+                    ).frame(false)
                 );
                 if refresh_btn.clicked() {
                     self.refresh();
@@ -222,8 +227,8 @@ impl WindowPicker {
                     ui.painter().text(
                         btn_center,
                         egui::Align2::CENTER_CENTER,
-                        "+",
-                        egui::FontId::proportional(18.0),
+                        egui_phosphor::regular::PLUS,
+                        egui::FontId::proportional(14.0),
                         plus_color
                     );
 
@@ -282,26 +287,33 @@ impl WindowPicker {
             -canvas.pan.y + 50.0 + offset.y,
         );
 
-        // Default preview size
-        let size = Vec2::new(320.0, 240.0);
-
-        // Add preview
-        let id = preview_manager.add_for_window(
-            window.hwnd,
-            window.process_id,
-            window.title.clone(),
-            position,
-            size,
-        );
-
-        // Mark as capturing
-        if let Some(preview) = preview_manager.get_mut(id) {
-            preview.capture_active = true;
-        }
-
-        // Start capture with window title for matching
-        capture_coordinator.start_capture(id, window.hwnd, window.title.clone(), 30);
+        spawn_preview(window, preview_manager, capture_coordinator, position, Vec2::new(320.0, 240.0));
     }
+}
+
+/// Create a preview for `window` at `position`/`size` and start capturing it.
+/// Shared by the sidebar picker's "+" button and the canvas right-click
+/// quick-add popup so both add windows the same way.
+pub fn spawn_preview(
+    window: &WindowInfo,
+    preview_manager: &mut PreviewManager,
+    capture_coordinator: &mut CaptureCoordinator,
+    position: Pos2,
+    size: Vec2,
+) {
+    let id = preview_manager.add_for_window(
+        window.hwnd,
+        window.process_id,
+        window.title.clone(),
+        position,
+        size,
+    );
+
+    if let Some(preview) = preview_manager.get_mut(id) {
+        preview.capture_active = true;
+    }
+
+    capture_coordinator.start_capture(id, window.hwnd, window.title.clone(), 30);
 }
 
 impl Default for WindowPicker {

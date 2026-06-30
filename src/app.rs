@@ -1,14 +1,27 @@
 use eframe::egui::{self, Vec2, Pos2};
+#[cfg(debug_assertions)]
 use crate::privacy;
 use crate::canvas::CanvasState;
 use crate::preview::{PreviewManager, PreviewLayout, PreviewId};
-use crate::window_picker::{WindowPicker, enumerate_windows};
+use crate::window_picker::{WindowPicker, WindowInfo, enumerate_windows, spawn_preview};
 use crate::capture::CaptureCoordinator;
 use crate::persistence::{Storage, SavedLayout, CanvasLayout};
 use crate::tray::TrayManager;
 use crate::overlay::RegionSelector;
 use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 use windows::core::w;
+
+/// Canvas right-click "Add Window..." popup: a small searchable list shown
+/// at the click position so windows can be added without the sidebar.
+struct QuickAddPopup {
+    /// Where to place the new preview (canvas coordinates).
+    canvas_pos: Pos2,
+    /// Where to anchor the popup (screen coordinates).
+    screen_pos: Pos2,
+    /// Snapshot of open windows, taken when the popup was opened.
+    windows: Vec<WindowInfo>,
+    search: String,
+}
 
 /// Main application state
 pub struct PluriviewApp {
@@ -47,10 +60,19 @@ pub struct PluriviewApp {
 
     /// Preview ID that the region selector is for
     region_select_preview_id: Option<PreviewId>,
+
+    /// Active canvas right-click "Add Window..." popup, if any.
+    quick_add: Option<QuickAddPopup>,
 }
 
 impl PluriviewApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        // Register phosphor icon glyphs alongside the default font so we can
+        // use crisp vector icons instead of emoji/text glyphs in the UI.
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        _cc.egui_ctx.set_fonts(fonts);
+
         let storage = Storage::new();
         let tray_manager = TrayManager::new();
 
@@ -74,6 +96,7 @@ impl PluriviewApp {
             show_shortcuts: false,
             region_selector: None,
             region_select_preview_id: None,
+            quick_add: None,
         };
 
         // Try to load autosave
@@ -96,6 +119,330 @@ impl PluriviewApp {
                 #[cfg(debug_assertions)]
                 println!("Set tray HWND: {:?}", hwnd.0);
             }
+        }
+    }
+
+    /// Custom title bar (we run with `with_decorations(false)` so the OS
+    /// doesn't draw its own white title bar over our dark theme).
+    fn title_bar_ui(&mut self, ctx: &egui::Context) {
+        let bg = egui::Color32::from_rgb(13, 13, 13);
+        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+
+        egui::TopBottomPanel::top("custom_title_bar")
+            .frame(egui::Frame::none().fill(bg))
+            .exact_height(34.0)
+            .show(ctx, |ui| {
+                let title_bar_rect = ui.max_rect();
+
+                // Background drag handle, allocated FIRST so the buttons
+                // (added after) take interaction priority where they overlap.
+                let drag_response = ui.interact(
+                    title_bar_rect,
+                    egui::Id::new("title_bar_drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag_response.double_clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                } else if drag_response.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_bar_rect), |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.add_space(10.0);
+                        let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            dot_rect.center(),
+                            4.0,
+                            egui::Color32::from_rgb(107, 170, 75),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Pluriview")
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(170, 170, 175)),
+                        );
+                        ui.add_space(16.0);
+                        // File / View / Help, inline next to the app name.
+                        self.menu_bar(ui, ctx);
+                    });
+                });
+
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_bar_rect), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+
+                        let btn_size = Vec2::new(44.0, 34.0);
+
+                        let close = ui.add_sized(
+                            btn_size,
+                            egui::Button::new(egui::RichText::new(egui_phosphor::regular::X).size(14.0))
+                                .frame(false),
+                        );
+                        if close.hovered() {
+                            ui.painter().rect_filled(close.rect, 0.0, egui::Color32::from_rgb(196, 43, 28));
+                            ui.painter().text(
+                                close.rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                egui_phosphor::regular::X,
+                                egui::FontId::proportional(14.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                        if close.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+
+                        let max_icon = if is_maximized {
+                            egui_phosphor::regular::COPY
+                        } else {
+                            egui_phosphor::regular::SQUARE
+                        };
+                        let maximize = ui.add_sized(
+                            btn_size,
+                            egui::Button::new(egui::RichText::new(max_icon).size(12.0))
+                                .frame(false),
+                        );
+                        if maximize.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                        }
+
+                        let minimize = ui.add_sized(
+                            btn_size,
+                            egui::Button::new(egui::RichText::new(egui_phosphor::regular::MINUS).size(14.0))
+                                .frame(false),
+                        );
+                        if minimize.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                    });
+                });
+            });
+    }
+
+    /// The File / View / Help menus. Rendered inline in the title bar next
+    /// to the app name (Minimal Void: one unified dark strip, no separate
+    /// menu-bar row).
+    fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+        ui.visuals_mut().widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(30, 30, 35);
+        ui.visuals_mut().widgets.active.weak_bg_fill = egui::Color32::from_rgb(40, 40, 45);
+
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Save Layout Now").clicked() {
+                    self.save_autosave();
+                    ui.close_menu();
+                }
+                if ui.button("Reload Layout").clicked() {
+                    self.load_autosave();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if self.tray_manager.is_some() {
+                    if ui.button("Minimize to Tray").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                }
+                if ui.button("Exit").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+
+            ui.menu_button("View", |ui| {
+                if ui.checkbox(&mut self.picker_open, "Window Picker").clicked() {
+                    ui.close_menu();
+                }
+                if ui.checkbox(&mut self.canvas.show_grid, "Show Grid (G)").clicked() {
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Reset View").clicked() {
+                    self.canvas.reset();
+                    ui.close_menu();
+                }
+            });
+
+            ui.menu_button("Help", |ui| {
+                if ui.button("Keyboard Shortcuts").clicked() {
+                    self.show_shortcuts = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("About").clicked() {
+                    self.show_about = true;
+                    ui.close_menu();
+                }
+            });
+        });
+    }
+
+    /// We turned off OS decorations for the custom title bar, which also
+    /// removes the native resize border. Re-implement it: a thin hit-band
+    /// along each edge that shows a resize cursor and starts an OS-driven
+    /// resize drag (so resizing still feels native).
+    fn handle_frameless_resize(&self, ctx: &egui::Context) {
+        use egui::viewport::ResizeDirection as RD;
+
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        // Don't fight with widgets that already want the pointer (e.g. a
+        // preview's own resize handles) by only acting near the window edge.
+        let border = 6.0;
+        // The custom title bar owns the entire top strip (drag-to-move plus
+        // the min/max/close buttons) — never treat that area as a resize
+        // zone, or a click on a title bar button can also start a native
+        // resize drag and leave the window stuck at a tiny size.
+        let title_bar_height = 34.0;
+        let rect = ctx.input(|i| i.screen_rect());
+        let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else { return; };
+
+        if pos.y < rect.min.y + title_bar_height {
+            return;
+        }
+
+        let on_left = pos.x <= rect.min.x + border;
+        let on_right = pos.x >= rect.max.x - border;
+        let on_bottom = pos.y >= rect.max.y - border;
+
+        let direction = match (on_left, on_right, on_bottom) {
+            (true, _, true) => Some(RD::SouthWest),
+            (_, true, true) => Some(RD::SouthEast),
+            (true, false, false) => Some(RD::West),
+            (false, true, false) => Some(RD::East),
+            (false, false, true) => Some(RD::South),
+            _ => None,
+        };
+
+        let Some(direction) = direction else { return; };
+
+        let cursor = match direction {
+            RD::NorthWest | RD::SouthEast => egui::CursorIcon::ResizeNwSe,
+            RD::NorthEast | RD::SouthWest => egui::CursorIcon::ResizeNeSw,
+            RD::North | RD::South => egui::CursorIcon::ResizeVertical,
+            RD::East | RD::West => egui::CursorIcon::ResizeHorizontal,
+        };
+        ctx.set_cursor_icon(cursor);
+
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
+    }
+
+    /// Render the canvas right-click "Add Window..." popup, if open.
+    fn quick_add_ui(&mut self, ctx: &egui::Context) {
+        let Some(popup) = &mut self.quick_add else { return; };
+
+        // Read this before drawing the popup: the focused search box's
+        // TextEdit consumes the Escape key itself (to drop focus), so
+        // checking afterwards would always see it as already consumed.
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let mut clicked_index = None;
+
+        let area_response = egui::Area::new(egui::Id::new("quick_add_popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(popup.screen_pos)
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(22, 22, 26))
+                    .rounding(8.0)
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 45, 52)))
+                    .inner_margin(egui::Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(240.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(egui_phosphor::regular::MAGNIFYING_GLASS)
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(140, 140, 150)),
+                            );
+                            ui.add_space(6.0);
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut popup.search)
+                                    .desired_width(ui.available_width())
+                                    .hint_text("Search windows...")
+                                    .frame(false),
+                            );
+                            resp.request_focus();
+                        });
+
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        let filter = popup.search.to_lowercase();
+                        let matches = |w: &WindowInfo| {
+                            filter.is_empty()
+                                || w.title.to_lowercase().contains(&filter)
+                                || w.exe_name.to_lowercase().contains(&filter)
+                        };
+
+                        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            let mut any = false;
+                            for (idx, window) in popup.windows.iter().enumerate() {
+                                if !matches(window) {
+                                    continue;
+                                }
+                                any = true;
+
+                                let label = if window.title.is_empty() {
+                                    &window.exe_name
+                                } else {
+                                    &window.title
+                                };
+                                let resp = ui.add_sized(
+                                    Vec2::new(ui.available_width(), 22.0),
+                                    egui::Button::new(egui::RichText::new(label).size(12.5))
+                                        .frame(false),
+                                );
+                                if resp.clicked() {
+                                    clicked_index = Some(idx);
+                                }
+                            }
+
+                            if !any {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new("No matching windows")
+                                        .size(11.5)
+                                        .color(egui::Color32::from_rgb(120, 120, 128)),
+                                );
+                            }
+                        });
+                    });
+            });
+
+        if ctx.input(|i| i.pointer.any_click()) {
+            if let Some(click_pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !area_response.response.rect.contains(click_pos) {
+                    close = true;
+                }
+            }
+        }
+
+        if let Some(idx) = clicked_index {
+            if let Some(popup) = &self.quick_add {
+                if let Some(window) = popup.windows.get(idx) {
+                    spawn_preview(
+                        window,
+                        &mut self.preview_manager,
+                        &mut self.capture_coordinator,
+                        popup.canvas_pos,
+                        Vec2::new(320.0, 240.0),
+                    );
+                }
+            }
+            close = true;
+        }
+
+        if close {
+            self.quick_add = None;
         }
     }
 
@@ -208,6 +555,10 @@ impl eframe::App for PluriviewApp {
         // Set up tray HWND on first frame (window now exists)
         self.setup_tray_hwnd();
 
+        // Custom title bar + manual resize border (decorations are off)
+        self.handle_frameless_resize(ctx);
+        self.title_bar_ui(ctx);
+
         // Process any pending captured frames
         self.capture_coordinator.process_frames(&mut self.preview_manager, ctx);
 
@@ -251,66 +602,8 @@ impl eframe::App for PluriviewApp {
             }
         }
 
-        // Minimal Void: Very dark, minimal menu bar
-        egui::TopBottomPanel::top("top_panel")
-            .frame(egui::Frame::none()
-                .fill(egui::Color32::from_rgb(13, 13, 13))
-                .inner_margin(egui::Margin::symmetric(8.0, 4.0)))
-            .show(ctx, |ui| {
-                ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-                ui.visuals_mut().widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(30, 30, 35);
-                ui.visuals_mut().widgets.active.weak_bg_fill = egui::Color32::from_rgb(40, 40, 45);
-
-                egui::menu::bar(ui, |ui| {
-                    ui.menu_button("File", |ui| {
-                        if ui.button("Save Layout Now").clicked() {
-                            self.save_autosave();
-                            ui.close_menu();
-                        }
-                        if ui.button("Reload Layout").clicked() {
-                            self.load_autosave();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if self.tray_manager.is_some() {
-                            if ui.button("Minimize to Tray").clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                        }
-                        if ui.button("Exit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-
-                    ui.menu_button("View", |ui| {
-                        if ui.checkbox(&mut self.picker_open, "Window Picker").clicked() {
-                            ui.close_menu();
-                        }
-                        if ui.checkbox(&mut self.canvas.show_grid, "Show Grid (G)").clicked() {
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Reset View").clicked() {
-                            self.canvas.reset();
-                            ui.close_menu();
-                        }
-                    });
-
-                    ui.menu_button("Help", |ui| {
-                        if ui.button("Keyboard Shortcuts").clicked() {
-                            self.show_shortcuts = true;
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("About").clicked() {
-                            self.show_about = true;
-                            ui.close_menu();
-                        }
-                    });
-                });
-            });
+        // Menu bar (File / View / Help) now lives inline in the custom
+        // title bar; see `title_bar_ui` / `menu_bar`.
 
         // Minimal Void: Dark sidebar
         if self.picker_open {
@@ -340,6 +633,19 @@ impl eframe::App for PluriviewApp {
                 self.canvas.ui(ui, &mut self.preview_manager, &mut self.capture_coordinator, ctx);
             });
 
+        // Canvas right-click "Add Window..." was selected: open the
+        // quick-add popup at that spot with a fresh window snapshot.
+        if let Some((canvas_pos, screen_pos)) = self.canvas.pending_quick_add.take() {
+            self.quick_add = Some(QuickAddPopup {
+                canvas_pos,
+                screen_pos,
+                windows: enumerate_windows(),
+                search: String::new(),
+            });
+        }
+
+        self.quick_add_ui(ctx);
+
         // Handle global keyboard shortcuts
         ctx.input(|i| {
             // G - Toggle grid
@@ -364,7 +670,7 @@ impl eframe::App for PluriviewApp {
                     ui.vertical_centered(|ui| {
                         ui.add_space(10.0);
                         ui.heading("Pluriview");
-                        ui.label("Version 0.1");
+                        ui.label("Version 0.2");
                         ui.add_space(10.0);
                         ui.label("Live window preview application");
                         ui.label("with infinite canvas");

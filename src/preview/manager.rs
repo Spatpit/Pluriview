@@ -1,6 +1,19 @@
 use eframe::egui::{Pos2, Vec2, Rect};
 use std::collections::HashMap;
-use super::{Preview, PreviewId, FpsPreset};
+use std::time::{Duration, Instant};
+use super::{Preview, PreviewId, FpsPreset, WindowHandle};
+
+/// Snapshot of a preview captured right before it's actually dropped from
+/// the manager, so the canvas can offer an "Undo" toast that restores it.
+#[derive(Clone)]
+pub struct RemovedPreviewInfo {
+    pub title: String,
+    pub window_handle: Option<WindowHandle>,
+    pub position: Pos2,
+    pub size: Vec2,
+    pub fps_preset: FpsPreset,
+    pub crop_uv: Option<(f32, f32, f32, f32)>,
+}
 
 /// Manages all preview windows
 pub struct PreviewManager {
@@ -62,9 +75,44 @@ impl PreviewManager {
         id
     }
 
-    /// Remove a preview
+    /// Remove a preview immediately (no fade-out). Prefer `start_removal`
+    /// for anything triggered by user interaction so it can animate out.
+    #[allow(dead_code)]
     pub fn remove(&mut self, id: PreviewId) {
         self.previews.remove(&id);
+    }
+
+    /// Begin the fade/shrink-out animation for a preview. The preview stays
+    /// in the manager (still rendered, but non-interactive) until its
+    /// removal animation finishes and `finalize_removals` reaps it.
+    pub fn start_removal(&mut self, id: PreviewId) {
+        if let Some(preview) = self.previews.get_mut(&id) {
+            preview.start_removal();
+        }
+    }
+
+    /// Drop any previews whose removal animation has finished, returning a
+    /// snapshot of each one so the caller can offer an "Undo".
+    pub fn finalize_removals(&mut self) -> Vec<RemovedPreviewInfo> {
+        let done: Vec<PreviewId> = self.previews.values()
+            .filter(|p| p.is_removal_complete())
+            .map(|p| p.id)
+            .collect();
+
+        let mut removed = Vec::with_capacity(done.len());
+        for id in done {
+            if let Some(preview) = self.previews.remove(&id) {
+                removed.push(RemovedPreviewInfo {
+                    title: preview.title,
+                    window_handle: preview.window_handle,
+                    position: preview.position,
+                    size: preview.size,
+                    fps_preset: preview.fps_preset,
+                    crop_uv: preview.crop_uv,
+                });
+            }
+        }
+        removed
     }
 
     /// Clear all previews
@@ -92,6 +140,8 @@ impl PreviewManager {
         let mut preview = Preview::for_window(id, hwnd, 0, title, position, size);
         preview.z_order = z_order;
         preview.set_fps_preset(fps_preset);
+        // Restored layouts should appear instantly, not all spawn-animate at once.
+        preview.created_at = Instant::now() - Duration::from_secs(1);
 
         self.previews.insert(id, preview);
         id
