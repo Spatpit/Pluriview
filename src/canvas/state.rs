@@ -44,6 +44,11 @@ mod tests {
     fn canvas_screen_rect_starts_empty() {
         assert!(CanvasState::default().last_screen_rect.is_none());
     }
+
+    #[test]
+    fn double_click_target_starts_empty() {
+        assert!(CanvasState::default().last_double_clicked.is_none());
+    }
 }
 
 /// Resize handle positions
@@ -130,6 +135,9 @@ pub struct CanvasState {
 
     /// Last canvas rectangle in egui screen coordinates.
     pub last_screen_rect: Option<Rect>,
+
+    /// Preview most recently double-clicked, consumed by the app.
+    pub last_double_clicked: Option<PreviewId>,
 }
 
 impl Default for CanvasState {
@@ -153,6 +161,7 @@ impl Default for CanvasState {
             last_secondary_click: None,
             pending_quick_add: None,
             last_screen_rect: None,
+            last_double_clicked: None,
         }
     }
 }
@@ -748,6 +757,7 @@ impl CanvasState {
 
             // Handle double-click to focus the source window
             if preview_response.double_clicked() {
+                self.last_double_clicked = Some(id);
                 if let Some(preview) = preview_manager.get(id) {
                     if let Some(ref handle) = preview.window_handle {
                         #[cfg(windows)]
