@@ -36,6 +36,26 @@ pub enum DragState {
     },
 }
 
+#[cfg(test)]
+mod tests {
+    use super::CanvasState;
+
+    #[test]
+    fn canvas_screen_rect_starts_empty() {
+        assert!(CanvasState::default().last_screen_rect.is_none());
+    }
+
+    #[test]
+    fn double_click_target_starts_empty() {
+        assert!(CanvasState::default().last_double_clicked.is_none());
+    }
+
+    #[test]
+    fn browser_add_request_starts_empty() {
+        assert!(CanvasState::default().pending_browser_add.is_none());
+    }
+}
+
 /// Resize handle positions
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResizeHandle {
@@ -117,6 +137,15 @@ pub struct CanvasState {
     /// place the new preview, screen position to anchor the popup). The app
     /// consumes this to open the quick-add popup.
     pub pending_quick_add: Option<(Pos2, Pos2)>,
+
+    /// Canvas position requested by the "Add Browser..." context action.
+    pub pending_browser_add: Option<Pos2>,
+
+    /// Last canvas rectangle in egui screen coordinates.
+    pub last_screen_rect: Option<Rect>,
+
+    /// Preview most recently double-clicked, consumed by the app.
+    pub last_double_clicked: Option<PreviewId>,
 }
 
 impl Default for CanvasState {
@@ -139,6 +168,9 @@ impl Default for CanvasState {
             last_removed: None,
             last_secondary_click: None,
             pending_quick_add: None,
+            pending_browser_add: None,
+            last_screen_rect: None,
+            last_double_clicked: None,
         }
     }
 }
@@ -222,6 +254,7 @@ impl CanvasState {
         ctx: &egui::Context,
     ) {
         let canvas_rect = ui.available_rect_before_wrap();
+        self.last_screen_rect = Some(canvas_rect);
 
         // Calculate delta time for animations
         let current_time = ui.input(|i| i.time);
@@ -470,6 +503,12 @@ impl CanvasState {
                 if let Some(screen_pos) = self.last_secondary_click {
                     let canvas_pos = self.screen_to_canvas(screen_pos, canvas_rect);
                     self.pending_quick_add = Some((canvas_pos, screen_pos));
+                }
+                ui.close_menu();
+            }
+            if ui.button("Add Browser...").clicked() {
+                if let Some(screen_pos) = self.last_secondary_click {
+                    self.pending_browser_add = Some(self.screen_to_canvas(screen_pos, canvas_rect));
                 }
                 ui.close_menu();
             }
@@ -733,6 +772,7 @@ impl CanvasState {
 
             // Handle double-click to focus the source window
             if preview_response.double_clicked() {
+                self.last_double_clicked = Some(id);
                 if let Some(preview) = preview_manager.get(id) {
                     if let Some(ref handle) = preview.window_handle {
                         #[cfg(windows)]

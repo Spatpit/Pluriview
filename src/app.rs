@@ -1,4 +1,5 @@
 use eframe::egui::{self, Vec2, Pos2};
+use std::collections::HashMap;
 #[cfg(debug_assertions)]
 use crate::privacy;
 use crate::canvas::CanvasState;
@@ -8,6 +9,8 @@ use crate::capture::CaptureCoordinator;
 use crate::persistence::{Storage, SavedLayout, CanvasLayout};
 use crate::tray::TrayManager;
 use crate::overlay::RegionSelector;
+#[cfg(windows)]
+use crate::browser::{normalize_url, BrowserHost};
 use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 use windows::core::w;
 
@@ -21,6 +24,12 @@ struct QuickAddPopup {
     /// Snapshot of open windows, taken when the popup was opened.
     windows: Vec<WindowInfo>,
     search: String,
+}
+
+struct AddBrowserDialog {
+    position: Pos2,
+    url: String,
+    error: Option<String>,
 }
 
 /// Main application state
@@ -63,6 +72,11 @@ pub struct PluriviewApp {
 
     /// Active canvas right-click "Add Window..." popup, if any.
     quick_add: Option<QuickAddPopup>,
+
+    #[cfg(windows)]
+    browser_hosts: HashMap<PreviewId, BrowserHost>,
+    #[cfg(windows)]
+    add_browser: Option<AddBrowserDialog>,
 }
 
 impl PluriviewApp {
@@ -97,12 +111,85 @@ impl PluriviewApp {
             region_selector: None,
             region_select_preview_id: None,
             quick_add: None,
+            #[cfg(windows)]
+            browser_hosts: HashMap::new(),
+            #[cfg(windows)]
+            add_browser: None,
         };
 
         // Try to load autosave
         app.load_autosave();
 
         app
+    }
+
+    #[cfg(windows)]
+    fn create_browser(&mut self, url: &str, position: Pos2) -> Result<(), String> {
+        let url = normalize_url(url).map_err(str::to_owned)?;
+        let host = BrowserHost::new(&url)?;
+        let id = self.preview_manager.add_for_window(
+            host.hwnd(),
+            std::process::id(),
+            url.clone(),
+            position,
+            Vec2::new(640.0, 360.0),
+        );
+        if let Some(preview) = self.preview_manager.get_mut(id) {
+            preview.capture_active = true;
+        }
+        self.capture_coordinator
+            .start_capture(id, host.hwnd(), url, 30);
+        self.browser_hosts.insert(id, host);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn add_browser_ui(&mut self, ctx: &egui::Context) {
+        let mut submit = None;
+        let mut cancel = false;
+
+        if let Some(dialog) = self.add_browser.as_mut() {
+            egui::Window::new("Add Browser")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Paste a website URL");
+                    let response = ui.add_sized(
+                        [420.0, 24.0],
+                        egui::TextEdit::singleline(&mut dialog.url)
+                            .hint_text("twitch.tv/channel or https://kick.com/channel"),
+                    );
+                    if let Some(error) = &dialog.error {
+                        ui.colored_label(egui::Color32::from_rgb(255, 100, 100), error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Add").clicked()
+                            || (response.has_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                        {
+                            submit = Some((dialog.url.clone(), dialog.position));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    response.request_focus();
+                });
+        }
+
+        if cancel {
+            self.add_browser = None;
+        } else if let Some((url, position)) = submit {
+            match self.create_browser(&url, position) {
+                Ok(()) => self.add_browser = None,
+                Err(error) => {
+                    if let Some(dialog) = self.add_browser.as_mut() {
+                        dialog.error = Some(error);
+                    }
+                }
+            }
+        }
     }
 
     /// Set the window HWND for the tray manager (call once after window is created)
@@ -555,6 +642,17 @@ impl eframe::App for PluriviewApp {
         // Set up tray HWND on first frame (window now exists)
         self.setup_tray_hwnd();
 
+        #[cfg(windows)]
+        if let Ok(parent) = unsafe { FindWindowW(None, w!("Pluriview")) } {
+            for host in self.browser_hosts.values_mut() {
+                if host.is_active() {
+                    if host.parent_has_focus(parent) {
+                        host.park();
+                    }
+                }
+            }
+        }
+
         // Custom title bar + manual resize border (decorations are off)
         self.handle_frameless_resize(ctx);
         self.title_bar_ui(ctx);
@@ -633,6 +731,50 @@ impl eframe::App for PluriviewApp {
                 self.canvas.ui(ui, &mut self.preview_manager, &mut self.capture_coordinator, ctx);
             });
 
+        #[cfg(windows)]
+        let browser_double_clicked = self
+            .canvas
+            .last_double_clicked
+            .filter(|id| self.browser_hosts.contains_key(id));
+        self.canvas.last_double_clicked = None;
+
+        #[cfg(windows)]
+        let browser_shortcut = ctx
+            .input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::B))
+            .then(|| {
+                self.canvas
+                    .selection
+                    .iter()
+                    .copied()
+                    .find(|id| self.browser_hosts.contains_key(id))
+            })
+            .flatten();
+
+        #[cfg(windows)]
+        if let Some(id) = browser_double_clicked.or(browser_shortcut) {
+            let active = self.browser_hosts.get(&id).is_some_and(BrowserHost::is_active);
+            if active {
+                if let Some(host) = self.browser_hosts.get_mut(&id) {
+                    host.park();
+                }
+            } else if let (Some(canvas_rect), Some(preview)) =
+                (self.canvas.last_screen_rect, self.preview_manager.get(id))
+            {
+                let rect = self.canvas.canvas_rect_to_screen(preview.rect(), canvas_rect);
+                for host in self.browser_hosts.values_mut() {
+                    if host.is_active() {
+                        host.park();
+                    }
+                }
+                if let (Ok(parent), Some(host)) = (
+                    unsafe { FindWindowW(None, w!("Pluriview")) },
+                    self.browser_hosts.get_mut(&id),
+                ) {
+                    host.activate(parent, rect, ctx.pixels_per_point());
+                }
+            }
+        }
+
         // Canvas right-click "Add Window..." was selected: open the
         // quick-add popup at that spot with a fresh window snapshot.
         if let Some((canvas_pos, screen_pos)) = self.canvas.pending_quick_add.take() {
@@ -644,7 +786,22 @@ impl eframe::App for PluriviewApp {
             });
         }
 
+        #[cfg(windows)]
+        if let Some(position) = self.canvas.pending_browser_add.take() {
+            self.add_browser = Some(AddBrowserDialog {
+                position,
+                url: String::new(),
+                error: None,
+            });
+        }
+
         self.quick_add_ui(ctx);
+        #[cfg(windows)]
+        self.add_browser_ui(ctx);
+
+        #[cfg(windows)]
+        self.browser_hosts
+            .retain(|id, _| self.preview_manager.get(*id).is_some());
 
         // Handle global keyboard shortcuts
         ctx.input(|i| {
