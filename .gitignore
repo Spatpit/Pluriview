@@ -28,6 +28,7 @@ nul
 
 # Claude Code settings (local)
 .claude/
+.worktrees/
 
 # Design mockups (development only)
 design_mockups.html
