@@ -36,6 +36,16 @@ pub enum DragState {
     },
 }
 
+#[cfg(test)]
+mod tests {
+    use super::CanvasState;
+
+    #[test]
+    fn canvas_screen_rect_starts_empty() {
+        assert!(CanvasState::default().last_screen_rect.is_none());
+    }
+}
+
 /// Resize handle positions
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResizeHandle {
@@ -117,6 +127,9 @@ pub struct CanvasState {
     /// place the new preview, screen position to anchor the popup). The app
     /// consumes this to open the quick-add popup.
     pub pending_quick_add: Option<(Pos2, Pos2)>,
+
+    /// Last canvas rectangle in egui screen coordinates.
+    pub last_screen_rect: Option<Rect>,
 }
 
 impl Default for CanvasState {
@@ -139,6 +152,7 @@ impl Default for CanvasState {
             last_removed: None,
             last_secondary_click: None,
             pending_quick_add: None,
+            last_screen_rect: None,
         }
     }
 }
@@ -222,6 +236,7 @@ impl CanvasState {
         ctx: &egui::Context,
     ) {
         let canvas_rect = ui.available_rect_before_wrap();
+        self.last_screen_rect = Some(canvas_rect);
 
         // Calculate delta time for animations
         let current_time = ui.input(|i| i.time);
