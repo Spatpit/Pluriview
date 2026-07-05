@@ -189,10 +189,14 @@ impl Drop for CaptureCoordinator {
     }
 }
 
+fn capture_target_from_hwnd(hwnd: isize) -> windows_capture::window::Window {
+    windows_capture::window::Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void)
+}
+
 /// Capture loop running in a separate thread
 fn capture_window_loop(
     preview_id: PreviewId,
-    _hwnd: isize,
+    hwnd: isize,
     window_title: String,
     target_fps: u32,
     active: Arc<RwLock<bool>>,
@@ -208,7 +212,6 @@ fn capture_window_loop(
             SecondaryWindowSettings, MinimumUpdateIntervalSettings,
             DirtyRegionSettings, Settings,
         },
-        window::Window,
     };
 
     // Capture flags passed to the handler
@@ -273,7 +276,7 @@ fn capture_window_loop(
             let width = buffer.width();
             let height = buffer.height();
 
-            // Copy frame data (BGRA format) - get buffer without padding
+            // Copy frame data without row padding
             let data = buffer.as_nopadding_buffer()?.to_vec();
 
             // Send frame to main thread
@@ -297,56 +300,8 @@ fn capture_window_loop(
         }
     }
 
-    // Find the window by title
-    let window = {
-        // First try exact title match
-        match Window::from_name(&window_title) {
-            Ok(w) => {
-                log::info!("Found window by exact title: {}", privacy::redact_title(&window_title));
-                w
-            }
-            Err(_) => {
-                // Try partial title match (contains)
-                match Window::from_contains_name(&window_title) {
-                    Ok(w) => {
-                        log::info!("Found window by partial title: {}", privacy::redact_title(&window_title));
-                        w
-                    }
-                    Err(_) => {
-                        // Last resort: enumerate and find by title substring
-                        let mut found_window = None;
-
-                        if let Ok(windows) = Window::enumerate() {
-                            for win in windows {
-                                if win.is_valid() {
-                                    if let Ok(title) = win.title() {
-                                        // Check if titles match (case-insensitive partial match)
-                                        if title.to_lowercase().contains(&window_title.to_lowercase())
-                                            || window_title.to_lowercase().contains(&title.to_lowercase())
-                                        {
-                                            log::info!("Found window by enumeration: {} (looking for {})", 
-                                                privacy::redact_title(&title), 
-                                                privacy::redact_title(&window_title));
-                                            found_window = Some(win);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        match found_window {
-                            Some(w) => w,
-                            None => {
-                                log::error!("Could not find window with title: {}", privacy::redact_title(&window_title));
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    };
+    let window = capture_target_from_hwnd(hwnd);
+    log::info!("Capturing HWND for {}", privacy::redact_title(&window_title));
 
     // Use default minimum update interval (windows-capture handles FPS internally)
     // We do our own throttling in on_frame_arrived
@@ -368,12 +323,24 @@ fn capture_window_loop(
         SecondaryWindowSettings::Default,
         min_interval,
         DirtyRegionSettings::Default,
-        ColorFormat::Bgra8,
+        ColorFormat::Rgba8,
         flags,
     );
 
     // Start capture - this blocks until capture is stopped
     if let Err(e) = Capture::start(settings) {
         log::error!("Failed to start capture: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_target_from_hwnd;
+
+    #[test]
+    fn capture_target_preserves_supplied_hwnd() {
+        let hwnd = 0x1234isize;
+        let target = capture_target_from_hwnd(hwnd);
+        assert_eq!(target.as_raw_hwnd() as isize, hwnd);
     }
 }
