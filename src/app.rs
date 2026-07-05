@@ -8,6 +8,8 @@ use crate::capture::CaptureCoordinator;
 use crate::persistence::{Storage, SavedLayout, CanvasLayout};
 use crate::tray::TrayManager;
 use crate::overlay::RegionSelector;
+#[cfg(windows)]
+use crate::browser::BrowserHost;
 use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 use windows::core::w;
 
@@ -63,6 +65,9 @@ pub struct PluriviewApp {
 
     /// Active canvas right-click "Add Window..." popup, if any.
     quick_add: Option<QuickAddPopup>,
+
+    #[cfg(windows)]
+    browser_spike: Option<(PreviewId, BrowserHost)>,
 }
 
 impl PluriviewApp {
@@ -97,10 +102,38 @@ impl PluriviewApp {
             region_selector: None,
             region_select_preview_id: None,
             quick_add: None,
+            #[cfg(windows)]
+            browser_spike: None,
         };
 
         // Try to load autosave
         app.load_autosave();
+
+        #[cfg(windows)]
+        if let Ok(url) = std::env::var("PLURIVIEW_BROWSER_SPIKE_URL") {
+            match BrowserHost::new(&url) {
+                Ok(host) => {
+                    let id = app.preview_manager.add_for_window(
+                        host.hwnd(),
+                        std::process::id(),
+                        "Browser spike".to_owned(),
+                        Pos2::new(100.0, 100.0),
+                        Vec2::new(640.0, 360.0),
+                    );
+                    if let Some(preview) = app.preview_manager.get_mut(id) {
+                        preview.capture_active = true;
+                    }
+                    app.capture_coordinator.start_capture(
+                        id,
+                        host.hwnd(),
+                        "Browser spike".to_owned(),
+                        30,
+                    );
+                    app.browser_spike = Some((id, host));
+                }
+                Err(error) => log::error!("Browser spike failed: {error}"),
+            }
+        }
 
         app
     }
@@ -555,6 +588,17 @@ impl eframe::App for PluriviewApp {
         // Set up tray HWND on first frame (window now exists)
         self.setup_tray_hwnd();
 
+        #[cfg(windows)]
+        if let Some((_, host)) = self.browser_spike.as_mut() {
+            if host.is_active() {
+                if let Ok(parent) = unsafe { FindWindowW(None, w!("Pluriview")) } {
+                    if host.parent_has_focus(parent) {
+                        host.park();
+                    }
+                }
+            }
+        }
+
         // Custom title bar + manual resize border (decorations are off)
         self.handle_frameless_resize(ctx);
         self.title_bar_ui(ctx);
@@ -632,6 +676,22 @@ impl eframe::App for PluriviewApp {
             .show(ctx, |ui| {
                 self.canvas.ui(ui, &mut self.preview_manager, &mut self.capture_coordinator, ctx);
             });
+
+        #[cfg(windows)]
+        if ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::B)) {
+            if let Some((id, host)) = self.browser_spike.as_mut() {
+                if host.is_active() {
+                    host.park();
+                } else if let (Some(canvas_rect), Some(preview)) =
+                    (self.canvas.last_screen_rect, self.preview_manager.get(*id))
+                {
+                    if let Ok(parent) = unsafe { FindWindowW(None, w!("Pluriview")) } {
+                        let rect = self.canvas.canvas_rect_to_screen(preview.rect(), canvas_rect);
+                        host.activate(parent, rect, ctx.pixels_per_point());
+                    }
+                }
+            }
+        }
 
         // Canvas right-click "Add Window..." was selected: open the
         // quick-add popup at that spot with a fresh window snapshot.

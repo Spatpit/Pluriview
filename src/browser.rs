@@ -30,6 +30,7 @@ const HEIGHT: i32 = 720;
 struct NativeWindow(HWND);
 
 impl NativeWindow {
+    #[cfg(test)]
     fn from_hwnd(hwnd: isize) -> Result<Self, HandleError> {
         NonZeroIsize::new(hwnd)
             .map(|_| Self(HWND(hwnd as *mut _)))
@@ -126,6 +127,9 @@ impl BrowserHost {
             let _ = ShowWindow(self.window.0, SW_SHOW);
             let _ = SetForegroundWindow(self.window.0);
         }
+        if let Some(webview) = self.webview.as_ref() {
+            let _ = webview.focus();
+        }
         self.active = true;
     }
 
@@ -144,12 +148,9 @@ impl BrowserHost {
         self.active = false;
     }
 
-    pub fn lost_focus(&self) -> bool {
-        if !self.active {
-            return false;
-        }
+    pub fn parent_has_focus(&self, parent: HWND) -> bool {
         let foreground = unsafe { GetForegroundWindow() };
-        foreground != self.window.0 && !unsafe { IsChild(self.window.0, foreground).as_bool() }
+        foreground == parent || unsafe { IsChild(parent, foreground).as_bool() }
     }
 }
 
