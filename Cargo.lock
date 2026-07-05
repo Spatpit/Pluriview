@@ -2613,6 +2613,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tray-icon",
+ "url",
  "windows 0.58.0",
  "windows-capture",
  "winres",

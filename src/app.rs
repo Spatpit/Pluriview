@@ -1,4 +1,5 @@
 use eframe::egui::{self, Vec2, Pos2};
+use std::collections::HashMap;
 #[cfg(debug_assertions)]
 use crate::privacy;
 use crate::canvas::CanvasState;
@@ -9,7 +10,7 @@ use crate::persistence::{Storage, SavedLayout, CanvasLayout};
 use crate::tray::TrayManager;
 use crate::overlay::RegionSelector;
 #[cfg(windows)]
-use crate::browser::BrowserHost;
+use crate::browser::{normalize_url, BrowserHost};
 use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 use windows::core::w;
 
@@ -23,6 +24,12 @@ struct QuickAddPopup {
     /// Snapshot of open windows, taken when the popup was opened.
     windows: Vec<WindowInfo>,
     search: String,
+}
+
+struct AddBrowserDialog {
+    position: Pos2,
+    url: String,
+    error: Option<String>,
 }
 
 /// Main application state
@@ -67,7 +74,9 @@ pub struct PluriviewApp {
     quick_add: Option<QuickAddPopup>,
 
     #[cfg(windows)]
-    browser_spike: Option<(PreviewId, BrowserHost)>,
+    browser_hosts: HashMap<PreviewId, BrowserHost>,
+    #[cfg(windows)]
+    add_browser: Option<AddBrowserDialog>,
 }
 
 impl PluriviewApp {
@@ -103,39 +112,84 @@ impl PluriviewApp {
             region_select_preview_id: None,
             quick_add: None,
             #[cfg(windows)]
-            browser_spike: None,
+            browser_hosts: HashMap::new(),
+            #[cfg(windows)]
+            add_browser: None,
         };
 
         // Try to load autosave
         app.load_autosave();
 
-        #[cfg(windows)]
-        if let Ok(url) = std::env::var("PLURIVIEW_BROWSER_SPIKE_URL") {
-            match BrowserHost::new(&url) {
-                Ok(host) => {
-                    let id = app.preview_manager.add_for_window(
-                        host.hwnd(),
-                        std::process::id(),
-                        "Browser spike".to_owned(),
-                        Pos2::new(100.0, 100.0),
-                        Vec2::new(640.0, 360.0),
+        app
+    }
+
+    #[cfg(windows)]
+    fn create_browser(&mut self, url: &str, position: Pos2) -> Result<(), String> {
+        let url = normalize_url(url).map_err(str::to_owned)?;
+        let host = BrowserHost::new(&url)?;
+        let id = self.preview_manager.add_for_window(
+            host.hwnd(),
+            std::process::id(),
+            url.clone(),
+            position,
+            Vec2::new(640.0, 360.0),
+        );
+        if let Some(preview) = self.preview_manager.get_mut(id) {
+            preview.capture_active = true;
+        }
+        self.capture_coordinator
+            .start_capture(id, host.hwnd(), url, 30);
+        self.browser_hosts.insert(id, host);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn add_browser_ui(&mut self, ctx: &egui::Context) {
+        let mut submit = None;
+        let mut cancel = false;
+
+        if let Some(dialog) = self.add_browser.as_mut() {
+            egui::Window::new("Add Browser")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Paste a website URL");
+                    let response = ui.add_sized(
+                        [420.0, 24.0],
+                        egui::TextEdit::singleline(&mut dialog.url)
+                            .hint_text("twitch.tv/channel or https://kick.com/channel"),
                     );
-                    if let Some(preview) = app.preview_manager.get_mut(id) {
-                        preview.capture_active = true;
+                    if let Some(error) = &dialog.error {
+                        ui.colored_label(egui::Color32::from_rgb(255, 100, 100), error);
                     }
-                    app.capture_coordinator.start_capture(
-                        id,
-                        host.hwnd(),
-                        "Browser spike".to_owned(),
-                        30,
-                    );
-                    app.browser_spike = Some((id, host));
-                }
-                Err(error) => log::error!("Browser spike failed: {error}"),
-            }
+                    ui.horizontal(|ui| {
+                        if ui.button("Add").clicked()
+                            || (response.has_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                        {
+                            submit = Some((dialog.url.clone(), dialog.position));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    response.request_focus();
+                });
         }
 
-        app
+        if cancel {
+            self.add_browser = None;
+        } else if let Some((url, position)) = submit {
+            match self.create_browser(&url, position) {
+                Ok(()) => self.add_browser = None,
+                Err(error) => {
+                    if let Some(dialog) = self.add_browser.as_mut() {
+                        dialog.error = Some(error);
+                    }
+                }
+            }
+        }
     }
 
     /// Set the window HWND for the tray manager (call once after window is created)
@@ -589,9 +643,9 @@ impl eframe::App for PluriviewApp {
         self.setup_tray_hwnd();
 
         #[cfg(windows)]
-        if let Some((_, host)) = self.browser_spike.as_mut() {
-            if host.is_active() {
-                if let Ok(parent) = unsafe { FindWindowW(None, w!("Pluriview")) } {
+        if let Ok(parent) = unsafe { FindWindowW(None, w!("Pluriview")) } {
+            for host in self.browser_hosts.values_mut() {
+                if host.is_active() {
                     if host.parent_has_focus(parent) {
                         host.park();
                     }
@@ -678,25 +732,45 @@ impl eframe::App for PluriviewApp {
             });
 
         #[cfg(windows)]
-        let browser_double_clicked = self.browser_spike.as_ref().is_some_and(|(id, _)| {
-            self.canvas.last_double_clicked == Some(*id)
-        });
+        let browser_double_clicked = self
+            .canvas
+            .last_double_clicked
+            .filter(|id| self.browser_hosts.contains_key(id));
         self.canvas.last_double_clicked = None;
 
         #[cfg(windows)]
-        if browser_double_clicked
-            || ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::B))
-        {
-            if let Some((id, host)) = self.browser_spike.as_mut() {
-                if host.is_active() {
+        let browser_shortcut = ctx
+            .input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::B))
+            .then(|| {
+                self.canvas
+                    .selection
+                    .iter()
+                    .copied()
+                    .find(|id| self.browser_hosts.contains_key(id))
+            })
+            .flatten();
+
+        #[cfg(windows)]
+        if let Some(id) = browser_double_clicked.or(browser_shortcut) {
+            let active = self.browser_hosts.get(&id).is_some_and(BrowserHost::is_active);
+            if active {
+                if let Some(host) = self.browser_hosts.get_mut(&id) {
                     host.park();
-                } else if let (Some(canvas_rect), Some(preview)) =
-                    (self.canvas.last_screen_rect, self.preview_manager.get(*id))
-                {
-                    if let Ok(parent) = unsafe { FindWindowW(None, w!("Pluriview")) } {
-                        let rect = self.canvas.canvas_rect_to_screen(preview.rect(), canvas_rect);
-                        host.activate(parent, rect, ctx.pixels_per_point());
+                }
+            } else if let (Some(canvas_rect), Some(preview)) =
+                (self.canvas.last_screen_rect, self.preview_manager.get(id))
+            {
+                let rect = self.canvas.canvas_rect_to_screen(preview.rect(), canvas_rect);
+                for host in self.browser_hosts.values_mut() {
+                    if host.is_active() {
+                        host.park();
                     }
+                }
+                if let (Ok(parent), Some(host)) = (
+                    unsafe { FindWindowW(None, w!("Pluriview")) },
+                    self.browser_hosts.get_mut(&id),
+                ) {
+                    host.activate(parent, rect, ctx.pixels_per_point());
                 }
             }
         }
@@ -712,7 +786,22 @@ impl eframe::App for PluriviewApp {
             });
         }
 
+        #[cfg(windows)]
+        if let Some(position) = self.canvas.pending_browser_add.take() {
+            self.add_browser = Some(AddBrowserDialog {
+                position,
+                url: String::new(),
+                error: None,
+            });
+        }
+
         self.quick_add_ui(ctx);
+        #[cfg(windows)]
+        self.add_browser_ui(ctx);
+
+        #[cfg(windows)]
+        self.browser_hosts
+            .retain(|id, _| self.preview_manager.get(*id).is_some());
 
         // Handle global keyboard shortcuts
         ctx.input(|i| {
