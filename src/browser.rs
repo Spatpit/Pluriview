@@ -15,16 +15,24 @@ use windows::{
     },
 };
 use wry::{
+    dpi::{LogicalPosition, LogicalSize},
     raw_window_handle::{
         HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
     },
-    WebContext, WebView, WebViewBuilder,
+    Rect, WebContext, WebView, WebViewBuilder,
 };
 
 const PARK_X: i32 = -30_000;
 const PARK_Y: i32 = -30_000;
 const WIDTH: i32 = 1280;
 const HEIGHT: i32 = 720;
+
+fn browser_bounds() -> Rect {
+    Rect {
+        position: LogicalPosition::new(0, 0).into(),
+        size: LogicalSize::new(WIDTH, HEIGHT).into(),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct NativeWindow(HWND);
@@ -85,6 +93,7 @@ impl BrowserHost {
         let mut context = WebContext::new(data_dir);
         let webview = WebViewBuilder::new_with_web_context(&mut context)
             .with_url(url)
+            .with_bounds(browser_bounds())
             .with_download_started_handler(|_, _| false)
             .build_as_child(&window)
             .map_err(|error| error.to_string())?;
@@ -191,7 +200,7 @@ unsafe extern "system" fn browser_window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::NativeWindow;
+    use super::{browser_bounds, NativeWindow};
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     #[test]
@@ -203,5 +212,15 @@ mod tests {
             RawWindowHandle::Win32(handle) => assert_eq!(handle.hwnd.get(), 0x1234),
             other => panic!("expected Win32 handle, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn browser_bounds_fill_the_host() {
+        let bounds = browser_bounds();
+
+        assert_eq!(bounds.position.to_logical::<i32>(1.0).x, 0);
+        assert_eq!(bounds.position.to_logical::<i32>(1.0).y, 0);
+        assert_eq!(bounds.size.to_logical::<i32>(1.0).width, 1280);
+        assert_eq!(bounds.size.to_logical::<i32>(1.0).height, 720);
     }
 }

@@ -678,7 +678,15 @@ impl eframe::App for PluriviewApp {
             });
 
         #[cfg(windows)]
-        if ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::B)) {
+        let browser_double_clicked = self.browser_spike.as_ref().is_some_and(|(id, _)| {
+            self.canvas.last_double_clicked == Some(*id)
+        });
+        self.canvas.last_double_clicked = None;
+
+        #[cfg(windows)]
+        if browser_double_clicked
+            || ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::B))
+        {
             if let Some((id, host)) = self.browser_spike.as_mut() {
                 if host.is_active() {
                     host.park();
