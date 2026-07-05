@@ -34,6 +34,25 @@ fn browser_bounds() -> Rect {
     }
 }
 
+pub fn normalize_url(input: &str) -> Result<String, &'static str> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("Enter a website URL");
+    }
+
+    match url::Url::parse(input) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(input.to_owned()),
+        Ok(_) => Err("Only HTTP and HTTPS websites are supported"),
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            let candidate = format!("https://{input}");
+            url::Url::parse(&candidate)
+                .map(|_| candidate)
+                .map_err(|_| "Enter a valid website URL")
+        }
+        Err(_) => Err("Enter a valid website URL"),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NativeWindow(HWND);
 
@@ -200,7 +219,7 @@ unsafe extern "system" fn browser_window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::{browser_bounds, NativeWindow};
+    use super::{browser_bounds, normalize_url, NativeWindow};
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     #[test]
@@ -222,5 +241,31 @@ mod tests {
         assert_eq!(bounds.position.to_logical::<i32>(1.0).y, 0);
         assert_eq!(bounds.size.to_logical::<i32>(1.0).width, 1280);
         assert_eq!(bounds.size.to_logical::<i32>(1.0).height, 720);
+    }
+
+    #[test]
+    fn normalize_url_adds_https() {
+        assert_eq!(
+            normalize_url(" twitch.tv/example ").unwrap(),
+            "https://twitch.tv/example"
+        );
+    }
+
+    #[test]
+    fn normalize_url_keeps_http_urls() {
+        assert_eq!(
+            normalize_url("http://kick.com/example").unwrap(),
+            "http://kick.com/example"
+        );
+        assert_eq!(
+            normalize_url("https://youtube.com").unwrap(),
+            "https://youtube.com"
+        );
+    }
+
+    #[test]
+    fn normalize_url_rejects_non_web_schemes() {
+        assert!(normalize_url("file:///secret").is_err());
+        assert!(normalize_url("javascript:alert(1)").is_err());
     }
 }

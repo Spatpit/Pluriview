@@ -37,6 +37,7 @@ directories = "5.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"
 env_logger = "0.11"
+url = "2.5"
 
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]

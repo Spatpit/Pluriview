@@ -49,6 +49,11 @@ mod tests {
     fn double_click_target_starts_empty() {
         assert!(CanvasState::default().last_double_clicked.is_none());
     }
+
+    #[test]
+    fn browser_add_request_starts_empty() {
+        assert!(CanvasState::default().pending_browser_add.is_none());
+    }
 }
 
 /// Resize handle positions
@@ -133,6 +138,9 @@ pub struct CanvasState {
     /// consumes this to open the quick-add popup.
     pub pending_quick_add: Option<(Pos2, Pos2)>,
 
+    /// Canvas position requested by the "Add Browser..." context action.
+    pub pending_browser_add: Option<Pos2>,
+
     /// Last canvas rectangle in egui screen coordinates.
     pub last_screen_rect: Option<Rect>,
 
@@ -160,6 +168,7 @@ impl Default for CanvasState {
             last_removed: None,
             last_secondary_click: None,
             pending_quick_add: None,
+            pending_browser_add: None,
             last_screen_rect: None,
             last_double_clicked: None,
         }
@@ -494,6 +503,12 @@ impl CanvasState {
                 if let Some(screen_pos) = self.last_secondary_click {
                     let canvas_pos = self.screen_to_canvas(screen_pos, canvas_rect);
                     self.pending_quick_add = Some((canvas_pos, screen_pos));
+                }
+                ui.close_menu();
+            }
+            if ui.button("Add Browser...").clicked() {
+                if let Some(screen_pos) = self.last_secondary_click {
+                    self.pending_browser_add = Some(self.screen_to_canvas(screen_pos, canvas_rect));
                 }
                 ui.close_menu();
             }
