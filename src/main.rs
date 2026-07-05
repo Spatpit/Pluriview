@@ -9,6 +9,8 @@ mod persistence;
 mod tray;
 mod overlay;
 mod privacy;
+#[cfg(windows)]
+mod browser;
 
 use app::PluriviewApp;
 use eframe::egui;
