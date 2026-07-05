@@ -274,19 +274,20 @@ impl Preview {
         };
 
         if let Some(frame) = frame_data {
-            // Create or update texture
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
-                &rgba_from_bgra(&frame.data),
+                &frame.data,
             );
 
-            let texture = ctx.load_texture(
-                format!("preview_{}", self.id.0),
-                image,
-                egui::TextureOptions::LINEAR,
-            );
-
-            self.texture = Some(texture);
+            if let Some(texture) = self.texture.as_mut() {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.texture = Some(ctx.load_texture(
+                    format!("preview_{}", self.id.0),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
         }
 
         self.texture.as_ref()
@@ -327,20 +328,6 @@ impl Preview {
     }
 }
 
-/// Convert BGRA to RGBA - optimized version
-/// Processes 4 pixels at a time and uses extend_from_slice for efficiency
-fn rgba_from_bgra(bgra: &[u8]) -> Vec<u8> {
-    let mut rgba = vec![0u8; bgra.len()];
-    // Process in chunks of 4 bytes (one pixel)
-    for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
-        dst[0] = src[2]; // R <- B
-        dst[1] = src[1]; // G <- G
-        dst[2] = src[0]; // B <- R
-        dst[3] = src[3]; // A <- A
-    }
-    rgba
-}
-
 /// Serializable layout for persistence
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreviewLayout {
@@ -368,5 +355,24 @@ impl From<&Preview> for PreviewLayout {
             fps_preset: preview.fps_preset,
             crop_uv: preview.crop_uv,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Preview, PreviewId};
+    use eframe::egui::{Context, Pos2, Vec2};
+
+    #[test]
+    fn frame_updates_reuse_the_texture() {
+        let context = Context::default();
+        let mut preview = Preview::new(PreviewId(1), "test".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+
+        preview.update_frame(1, 1, vec![255, 0, 0, 255]);
+        let first = preview.get_texture(&context).unwrap().id();
+        preview.update_frame(1, 1, vec![0, 255, 0, 255]);
+        let second = preview.get_texture(&context).unwrap().id();
+
+        assert_eq!(first, second);
     }
 }
