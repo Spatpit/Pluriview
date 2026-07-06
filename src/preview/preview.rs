@@ -360,6 +360,9 @@ pub struct PreviewLayout {
     /// matching an open window.
     #[serde(default)]
     pub browser_url: Option<String>,
+    /// WebView2 mute is per-session, so remember it and reapply on restore.
+    #[serde(default)]
+    pub browser_muted: bool,
 }
 
 impl From<&Preview> for PreviewLayout {
@@ -374,6 +377,7 @@ impl From<&Preview> for PreviewLayout {
             fps_preset: preview.fps_preset,
             crop_uv: preview.crop_uv,
             browser_url: preview.browser_url.clone(),
+            browser_muted: preview.browser_muted,
         }
     }
 }

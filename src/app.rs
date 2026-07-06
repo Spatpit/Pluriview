@@ -194,6 +194,22 @@ impl PluriviewApp {
         }
     }
 
+    /// Reapply a saved mute state to a freshly created browser tile
+    /// (WebView2 mute is per-session, so restores must set it again).
+    #[cfg(windows)]
+    fn apply_browser_mute(&mut self, id: PreviewId, muted: bool) {
+        if !muted {
+            return;
+        }
+        if let Some(host) = self.browser.get_mut(id) {
+            if host.set_muted(true).is_ok() {
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.browser_muted = true;
+                }
+            }
+        }
+    }
+
     fn remember_recent_url(&mut self, url: &str) {
         self.recent_urls.retain(|u| u != url);
         self.recent_urls.insert(0, url.to_owned());
@@ -862,6 +878,7 @@ impl PluriviewApp {
                             // Restored tiles appear instantly, no spawn animation.
                             preview.created_at = Instant::now() - Duration::from_secs(1);
                         }
+                        self.apply_browser_mute(id, preview_layout.browser_muted);
                     }
                     Err(error) => {
                         log::error!("Failed to restore browser tile: {error}");
@@ -1095,10 +1112,10 @@ impl eframe::App for PluriviewApp {
             // its saved URL (the original host window is already destroyed).
             if let Some(info) = self.canvas.pending_browser_restore.take() {
                 if let Some(url) = info.browser_url.clone() {
-                    if let Err(error) =
-                        self.create_browser_tile(&url, info.position, info.size, info.fps_preset)
+                    match self.create_browser_tile(&url, info.position, info.size, info.fps_preset)
                     {
-                        log::error!("Failed to restore browser tile: {error}");
+                        Ok(id) => self.apply_browser_mute(id, info.browser_muted),
+                        Err(error) => log::error!("Failed to restore browser tile: {error}"),
                     }
                 }
             }
@@ -1140,7 +1157,7 @@ impl eframe::App for PluriviewApp {
                     ui.vertical_centered(|ui| {
                         ui.add_space(10.0);
                         ui.heading("Pluriview");
-                        ui.label("Version 0.2");
+                        ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
                         ui.add_space(10.0);
                         ui.label("Live window preview application");
                         ui.label("with infinite canvas");
