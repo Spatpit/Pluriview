@@ -26,8 +26,9 @@ desktop.ini
 # Temporary files
 nul
 
-# Claude Code settings (local)
+# Local AI-assistant settings (not part of the project)
 .claude/
+.codex/
 .worktrees/
 
 # Design mockups (development only)

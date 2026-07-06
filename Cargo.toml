@@ -1,6 +1,6 @@
 [package]
 name = "pluriview"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Live window preview application with infinite canvas"
 authors = ["Spatpit"]

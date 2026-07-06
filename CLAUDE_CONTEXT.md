@@ -9,7 +9,7 @@ Use this file to quickly get Claude up to speed on the project.
 **Pluriview** is a Windows application (similar to PureRef/Kosmik) that displays live window previews on an infinite canvas. Built with Rust + egui.
 
 - **GitHub:** https://github.com/Spatpit/Pluriview
-- **Version:** 0.1
+- **Version:** 0.3.0
 - **Author:** Spatpit
 - **License:** MIT
 
@@ -20,7 +20,7 @@ Use this file to quickly get Claude up to speed on the project.
 Copy this into a new chat:
 
 ```
-I'm continuing work on Pluriview, a Rust + egui Windows app for live window previews on an infinite canvas. The project is at S:\AI\My Own apps\pluriview
+I'm continuing work on Pluriview, a Rust + egui Windows app for live window previews on an infinite canvas.
 
 Please read CLAUDE_CONTEXT.md for the full project context.
 ```
@@ -209,7 +209,7 @@ let text_secondary = Color32::from_rgb(140, 140, 150);
 
 - **Main branch:** `main`
 - **Remote:** `https://github.com/Spatpit/Pluriview.git`
-- **Last release:** v0.1
+- **Last release:** v0.3.0
 
 ---
 
@@ -235,10 +235,9 @@ The project has `.claude/skills.md` with these shortcuts:
 
 1. Set up GitHub repository with proper README, LICENSE, CHANGELOG
 2. Created custom leaf icon for all contexts (tray, taskbar, title bar, .exe)
-3. Changed author name from "Javier" to "Spatpit" throughout
-4. Implemented ShareX-style region selector for cropping
-5. Redesigned Window Picker with modern card-based UI
-6. Fixed cursor issues in region selector (crosshair instead of loading)
+3. Implemented ShareX-style region selector for cropping
+4. Redesigned Window Picker with modern card-based UI
+5. Fixed cursor issues in region selector (crosshair instead of loading)
 
 ---
 
@@ -246,6 +245,6 @@ The project has `.claude/skills.md` with these shortcuts:
 
 Just tell Claude:
 
-> "I'm working on Pluriview at `S:\AI\My Own apps\pluriview`. Read CLAUDE_CONTEXT.md to get up to speed."
+> "I'm working on Pluriview. Read CLAUDE_CONTEXT.md to get up to speed."
 
 Then describe what you want to work on!

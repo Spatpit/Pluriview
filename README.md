@@ -26,17 +26,29 @@
 | Feature | Description |
 |---------|-------------|
 | **Live Capture** | Real-time window previews using Windows Graphics Capture API |
+| **Browser Tiles** | Put live web pages (YouTube, Twitch, anything) on the canvas with their own audio — no separate browser needed |
 | **Infinite Canvas** | Pan and zoom freely to organize your workspace |
 | **Crop Regions** | Focus on specific parts of windows with Alt+drag |
 | **Adjustable FPS** | Choose 5, 15, 30, or 60 FPS per preview |
-| **Auto-Save** | Layouts persist automatically between sessions |
+| **Auto-Save** | Layouts persist automatically between sessions, including browser URLs |
 | **System Tray** | Minimize to tray for background operation |
 | **Quick Focus** | Double-click any preview to bring its window to front |
+
+### Browser tiles
+
+Right-click the canvas → **Add Browser...** and paste a URL. The page renders as a
+normal tile (move, resize, overlap, z-order) while audio keeps playing — ideal for
+music, streams, or reference pages. Double-click (or `Ctrl+B`) to interact with the
+real page — log in, scroll, pick a video — and press `Esc` or click outside to go
+back to canvas mode. Hover a browser tile for back/forward/reload/mute controls;
+logins and cookies persist in a dedicated WebView2 profile, separate from your main
+browser.
 
 ## Requirements
 
 - **OS:** Windows 10 (version 1903+) or Windows 11
 - **GPU:** DirectX 11 compatible graphics card
+- **Browser tiles:** [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (preinstalled on Windows 11 and current Windows 10; everything else works without it)
 
 ## Installation
 
@@ -55,10 +67,11 @@ The executable will be at `target/release/pluriview.exe` (~6MB).
 
 1. **Launch** `pluriview.exe`
 2. **Add windows** from the Window Picker panel (left side)
-3. **Arrange** by dragging previews on the canvas
-4. **Resize** by dragging corners or edges
-5. **Crop** by holding Alt and dragging corners
-6. **Right-click** for context menu options
+3. **Add browsers** by right-clicking the canvas → Add Browser...
+4. **Arrange** by dragging previews on the canvas
+5. **Resize** by dragging corners or edges
+6. **Crop** by holding Alt and dragging corners
+7. **Right-click** for context menu options
 
 ## Keyboard Shortcuts
 
@@ -72,6 +85,8 @@ The executable will be at `target/release/pluriview.exe` (~6MB).
 | Delete selected | `Delete` |
 | Crop preview | `Alt + Drag corners` |
 | Focus window | `Double-click preview` |
+| Interact with browser tile | `Double-click` or `Ctrl + B` |
+| Exit browser interaction | `Esc` or click outside |
 | Show shortcuts | `F1` |
 
 ## Project Structure
@@ -81,8 +96,10 @@ Pluriview/
 ├── src/
 │   ├── app.rs              # Main application state and UI
 │   ├── main.rs             # Entry point
+│   ├── browser.rs          # WebView2 browser tiles
 │   ├── canvas/             # Infinite canvas (pan, zoom, selection)
 │   ├── capture/            # Window capture coordinator
+│   ├── overlay/            # Region selector overlay (crop)
 │   ├── persistence/        # Layout save/load
 │   ├── preview/            # Preview window management
 │   ├── tray/               # System tray integration
@@ -103,6 +120,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - Built with [egui](https://github.com/emilk/egui) - Immediate mode GUI library for Rust
 - Window capture via [windows-rs](https://github.com/microsoft/windows-rs)
+- Browser tiles via [wry](https://github.com/tauri-apps/wry) (WebView2)
 
 ---
 

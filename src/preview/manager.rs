@@ -16,6 +16,8 @@ pub struct RemovedPreviewInfo {
     /// Set for browser tiles; undo recreates the WebView from this URL
     /// because the original host window is destroyed on removal.
     pub browser_url: Option<String>,
+    /// Reapplied when undo recreates the browser tile.
+    pub browser_muted: bool,
 }
 
 /// Manages all preview windows
@@ -113,6 +115,7 @@ impl PreviewManager {
                     fps_preset: preview.fps_preset,
                     crop_uv: preview.crop_uv,
                     browser_url: preview.browser_url,
+                    browser_muted: preview.browser_muted,
                 });
             }
         }

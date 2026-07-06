@@ -5,10 +5,11 @@ All notable changes to Pluriview will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-07-06
 
 ### Added
-- Browser tiles are saved and restored with layouts (current URL, position, size, FPS, z-order)
+- Browser tiles: app-owned WebView2 pages (YouTube, Twitch, any site) on the canvas with independent audio; double-click or Ctrl+B for native interaction, Esc or click outside to exit
+- Browser tiles are saved and restored with layouts (current URL, position, size, FPS, z-order, mute state)
 - Browser hover controls: back, forward, reload, mute/unmute, open in default browser
 - Browser context menu: Interact, Mute, Reload, Change URL, Copy URL, Open in Default Browser
 - Live page titles on browser tiles (instead of the raw URL)
