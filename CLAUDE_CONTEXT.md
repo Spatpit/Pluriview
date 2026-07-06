@@ -38,6 +38,7 @@ Please read CLAUDE_CONTEXT.md for the full project context.
 7. **ShareX-Style Region Selector** - Native overlay for precise crop selection
 8. **Layout Persistence** - Saves/loads canvas state automatically
 9. **Portable .exe** - Single file with embedded icon
+10. **Browser Tiles** - App-owned WebView2 pages (YouTube/Twitch/etc.) with independent audio; captured like other tiles, double-click (or Ctrl+B) for native interaction, Esc/click-outside to exit. Hover controls: back/forward/reload/mute/open-external. URLs persist in layouts.
 
 ---
 
@@ -53,6 +54,7 @@ pluriview/
 ├── src/
 │   ├── main.rs             # Entry point, window creation, tray setup
 │   ├── app.rs              # Main app state, UI layout (side panel + canvas)
+│   ├── browser.rs          # BrowserManager + WebView2 host windows for browser tiles
 │   ├── canvas/
 │   │   ├── mod.rs
 │   │   ├── state.rs        # Canvas rendering, pan/zoom, context menu, crop
@@ -110,9 +112,15 @@ egui = "0.29"
 # Window Capture
 windows-capture = "1.4"
 
+# Browser tiles (WebView2)
+wry = "0.55"
+webview2-com = "0.38"   # ICoreWebView2_8 for audio mute
+windows-core = "0.61"
+
 # Win32 API
 windows = "0.58"  # Features: Win32_Foundation, Win32_UI_WindowsAndMessaging,
-                  # Win32_Graphics_Gdi, Win32_System_*, Win32_UI_Input_KeyboardAndMouse
+                  # Win32_Graphics_Gdi, Win32_System_*, Win32_UI_Input_KeyboardAndMouse,
+                  # Win32_UI_Shell
 
 # System Tray
 tray-icon = "0.19"

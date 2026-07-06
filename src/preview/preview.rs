@@ -105,6 +105,14 @@ pub struct Preview {
     /// Frame data buffer (BGRA)
     frame_buffer: Arc<RwLock<Option<FrameData>>>,
 
+    /// Current URL when this preview is a browser tile, None otherwise.
+    /// Kept up to date as the page navigates so layouts save where the
+    /// user actually is, not where the tile started.
+    pub browser_url: Option<String>,
+
+    /// Is this browser tile's audio muted? (Only meaningful for browsers.)
+    pub browser_muted: bool,
+
     /// When this preview was created (drives the spawn-in animation)
     pub created_at: Instant,
 
@@ -143,9 +151,16 @@ impl Preview {
             frame_size: None,
             texture: None,
             frame_buffer: Arc::new(RwLock::new(None)),
+            browser_url: None,
+            browser_muted: false,
             created_at: Instant::now(),
             removing: None,
         }
+    }
+
+    /// Is this preview an app-owned browser tile?
+    pub fn is_browser(&self) -> bool {
+        self.browser_url.is_some()
     }
 
     /// Create a preview for a specific window
@@ -341,6 +356,10 @@ pub struct PreviewLayout {
     /// Crop region in UV coordinates (optional)
     #[serde(default)]
     pub crop_uv: Option<(f32, f32, f32, f32)>,
+    /// Browser tiles restore by recreating a WebView at this URL instead of
+    /// matching an open window.
+    #[serde(default)]
+    pub browser_url: Option<String>,
 }
 
 impl From<&Preview> for PreviewLayout {
@@ -354,6 +373,7 @@ impl From<&Preview> for PreviewLayout {
             z_order: preview.z_order,
             fps_preset: preview.fps_preset,
             crop_uv: preview.crop_uv,
+            browser_url: preview.browser_url.clone(),
         }
     }
 }

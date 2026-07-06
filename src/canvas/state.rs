@@ -83,6 +83,52 @@ pub struct PendingFpsChange {
     pub new_fps: FpsPreset,
 }
 
+/// Actions requested from a browser tile's hover controls or context menu.
+/// The canvas only queues these; the app (which owns the browser hosts)
+/// consumes them after the UI pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserAction {
+    Back,
+    Forward,
+    Reload,
+    ToggleMute,
+    OpenExternal,
+    CopyUrl,
+    EditUrl,
+}
+
+/// Snapshot of the input state the canvas actually needs, gathered once per
+/// frame instead of cloning the entire egui `InputState` several times.
+struct FrameInput {
+    hover_pos: Option<Pos2>,
+    interact_pos: Option<Pos2>,
+    pointer_delta: Vec2,
+    scroll_y: f32,
+    alt: bool,
+    ctrl: bool,
+    middle_down: bool,
+    primary_down: bool,
+    time: f64,
+    delete_pressed: bool,
+    select_all: bool,
+}
+
+/// Per-tile data collected up front so the manager isn't borrowed during
+/// the interaction pass.
+struct TileInfo {
+    id: PreviewId,
+    rect: Rect,
+    title: String,
+    target_fps: u32,
+    fps_preset: FpsPreset,
+    has_crop: bool,
+    is_removing: bool,
+    spawn_t: f32,
+    remove_t: f32,
+    is_browser: bool,
+    muted: bool,
+}
+
 /// Canvas state managing pan, zoom, and interactions
 #[derive(Clone)]
 pub struct CanvasState {
@@ -141,6 +187,18 @@ pub struct CanvasState {
     /// Canvas position requested by the "Add Browser..." context action.
     pub pending_browser_add: Option<Pos2>,
 
+    /// Browser tile actions queued by hover controls / context menus,
+    /// consumed by the app.
+    pub pending_browser_actions: Vec<(PreviewId, BrowserAction)>,
+
+    /// A removed browser tile whose "Undo" was clicked; the app recreates
+    /// the WebView from its saved URL (the original host is already gone).
+    pub pending_browser_restore: Option<RemovedPreviewInfo>,
+
+    /// The browser tile currently in interaction mode, set by the app each
+    /// frame so the canvas can outline it in the accent color.
+    pub interactive_browser: Option<PreviewId>,
+
     /// Last canvas rectangle in egui screen coordinates.
     pub last_screen_rect: Option<Rect>,
 
@@ -169,6 +227,9 @@ impl Default for CanvasState {
             last_secondary_click: None,
             pending_quick_add: None,
             pending_browser_add: None,
+            pending_browser_actions: Vec::new(),
+            pending_browser_restore: None,
+            interactive_browser: None,
             last_screen_rect: None,
             last_double_clicked: None,
         }
@@ -256,8 +317,24 @@ impl CanvasState {
         let canvas_rect = ui.available_rect_before_wrap();
         self.last_screen_rect = Some(canvas_rect);
 
+        // Snapshot the input fields we need once, instead of cloning the
+        // whole InputState in every interaction pass.
+        let input = ui.input(|i| FrameInput {
+            hover_pos: i.pointer.hover_pos(),
+            interact_pos: i.pointer.interact_pos(),
+            pointer_delta: i.pointer.delta(),
+            scroll_y: i.raw_scroll_delta.y,
+            alt: i.modifiers.alt,
+            ctrl: i.modifiers.ctrl,
+            middle_down: i.pointer.middle_down(),
+            primary_down: i.pointer.primary_down(),
+            time: i.time,
+            delete_pressed: i.key_pressed(egui::Key::Delete),
+            select_all: i.modifiers.ctrl && i.key_pressed(egui::Key::A),
+        });
+
         // Calculate delta time for animations
-        let current_time = ui.input(|i| i.time);
+        let current_time = input.time;
         let dt = (current_time - self.animation.last_frame_time) as f32;
         self.animation.last_frame_time = current_time;
 
@@ -307,11 +384,11 @@ impl CanvasState {
         }
 
         // Draw previews and handle their interactions (AFTER bg allocation)
-        self.draw_and_interact_previews(ui, canvas_rect, preview_manager, ctx, capture_coordinator);
+        self.draw_and_interact_previews(ui, canvas_rect, preview_manager, ctx, capture_coordinator, &input);
 
         // Draw selection rectangles and interactive resize handles
         // Handles are allocated AFTER previews so they have higher interaction priority
-        self.draw_and_interact_selection(ui, canvas_rect, preview_manager);
+        self.draw_and_interact_selection(ui, canvas_rect, preview_manager, &input);
 
         // Minimal Void: Floating status indicator (bottom-right corner)
         self.draw_floating_status(&painter, canvas_rect, preview_manager.count());
@@ -320,7 +397,7 @@ impl CanvasState {
         self.draw_and_interact_undo_toast(ui, canvas_rect, preview_manager, capture_coordinator);
 
         // Handle canvas-level input using the pre-allocated bg_response
-        self.handle_canvas_input_with_response(ui, canvas_rect, preview_manager, capture_coordinator, bg_response);
+        self.handle_canvas_input_with_response(ui, canvas_rect, preview_manager, capture_coordinator, bg_response, &input);
 
         // Apply pending FPS changes
         self.apply_pending_fps_changes(preview_manager, capture_coordinator);
@@ -389,19 +466,10 @@ impl CanvasState {
                 let old_fps = preview.target_fps;
                 preview.set_fps_preset(change.new_fps);
 
-                // Restart capture with new FPS if it changed
+                // The capture thread reads the target live; no restart (and
+                // no black flash) needed.
                 if preview.target_fps != old_fps {
-                    if let Some(handle) = &preview.window_handle {
-                        let hwnd = handle.hwnd;
-                        let title = preview.title.clone();
-                        let new_fps = preview.target_fps;
-                        capture_coordinator.start_capture(
-                            change.preview_id,
-                            hwnd,
-                            title,
-                            new_fps,
-                        );
-                    }
+                    capture_coordinator.set_target_fps(change.preview_id, preview.target_fps);
                 }
             }
         }
@@ -415,13 +483,12 @@ impl CanvasState {
         preview_manager: &mut PreviewManager,
         capture_coordinator: &mut CaptureCoordinator,
         bg_response: egui::Response,
+        input: &FrameInput,
     ) {
         // Use the pre-allocated background response
 
-        let input = ui.input(|i| i.clone());
-
         // Update cursor based on drag state or handle hover
-        if let Some(mouse_pos) = input.pointer.hover_pos() {
+        if let Some(mouse_pos) = input.hover_pos {
             if canvas_rect.contains(mouse_pos) {
                 if let Some((_, handle)) = self.get_handle_at(mouse_pos, canvas_rect, preview_manager) {
                     ui.ctx().set_cursor_icon(handle.cursor());
@@ -432,9 +499,9 @@ impl CanvasState {
         // Zoom with scroll wheel - works anywhere on canvas, even over previews
         // We check canvas_rect.contains() instead of bg_response.hovered() because
         // bg_response.hovered() returns false when the mouse is over a preview widget
-        if let Some(mouse_pos) = input.pointer.hover_pos() {
+        if let Some(mouse_pos) = input.hover_pos {
             if canvas_rect.contains(mouse_pos) {
-                let scroll_delta = input.raw_scroll_delta.y;
+                let scroll_delta = input.scroll_y;
                 if scroll_delta != 0.0 {
                     let zoom_factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
                     let new_zoom = (self.zoom * zoom_factor).clamp(self.zoom_min, self.zoom_max);
@@ -449,11 +516,8 @@ impl CanvasState {
 
         // Pan with middle mouse button or Alt+Left drag
         // Works anywhere on canvas, even over previews (similar to zoom)
-        let alt_held = input.modifiers.alt;
-        let middle_pressed = input.pointer.middle_down();
-        let left_pressed = input.pointer.primary_down();
-        let is_panning = (middle_pressed || (alt_held && left_pressed))
-            && canvas_rect.contains(input.pointer.hover_pos().unwrap_or_default());
+        let is_panning = (input.middle_down || (input.alt && input.primary_down))
+            && canvas_rect.contains(input.hover_pos.unwrap_or_default());
 
         if is_panning {
             // Start panning
@@ -466,13 +530,13 @@ impl CanvasState {
             }
 
             // Track velocity for momentum
-            if let Some(mouse_pos) = input.pointer.hover_pos() {
+            if let Some(mouse_pos) = input.hover_pos {
                 self.pan_drag_tracker.record(mouse_pos, input.time);
             }
 
             // Use pointer delta directly instead of bg_response.drag_delta()
             // because bg_response.dragged() returns false when over a preview
-            let delta = input.pointer.delta();
+            let delta = input.pointer_delta;
             if delta != Vec2::ZERO {
                 self.pan += delta / self.zoom;
             }
@@ -484,8 +548,8 @@ impl CanvasState {
         }
 
         // Click on empty space to deselect
-        if bg_response.clicked() && !input.modifiers.ctrl {
-            if let Some(mouse_pos) = input.pointer.interact_pos() {
+        if bg_response.clicked() && !input.ctrl {
+            if let Some(mouse_pos) = input.interact_pos {
                 let canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
                 if preview_manager.get_preview_at(canvas_pos).is_none() {
                     self.selection.clear();
@@ -495,7 +559,7 @@ impl CanvasState {
 
         // Canvas context menu (right-click on empty space)
         if bg_response.secondary_clicked() {
-            self.last_secondary_click = input.pointer.interact_pos();
+            self.last_secondary_click = input.interact_pos;
         }
 
         bg_response.context_menu(|ui| {
@@ -534,7 +598,7 @@ impl CanvasState {
 
         // Keyboard shortcuts
         if bg_response.has_focus() || bg_response.hovered() {
-            if input.key_pressed(egui::Key::Delete) {
+            if input.delete_pressed {
                 for id in self.selection.clone() {
                     capture_coordinator.stop_capture(id);
                     preview_manager.start_removal(id);
@@ -542,7 +606,7 @@ impl CanvasState {
                 self.selection.clear();
             }
 
-            if input.modifiers.ctrl && input.key_pressed(egui::Key::A) {
+            if input.select_all {
                 self.selection = preview_manager.all_ids();
             }
         }
@@ -556,22 +620,35 @@ impl CanvasState {
         preview_manager: &mut PreviewManager,
         ctx: &egui::Context,
         capture_coordinator: &mut CaptureCoordinator,
+        input: &FrameInput,
     ) {
         let viewport = self.get_viewport(canvas_rect);
 
         // Collect preview info first
-        let preview_info: Vec<_> = {
+        let preview_info: Vec<TileInfo> = {
             let previews = preview_manager.get_visible_previews(&viewport);
-            previews.iter().map(|p| {
-                (p.id, p.rect(), p.title.clone(), p.target_fps, p.fps_preset, p.crop_uv.is_some(),
-                 p.removing.is_some(), p.spawn_progress(), p.removal_progress())
+            previews.iter().map(|p| TileInfo {
+                id: p.id,
+                rect: p.rect(),
+                title: p.title.clone(),
+                target_fps: p.target_fps,
+                fps_preset: p.fps_preset,
+                has_crop: p.crop_uv.is_some(),
+                is_removing: p.removing.is_some(),
+                spawn_t: p.spawn_progress(),
+                remove_t: p.removal_progress(),
+                is_browser: p.is_browser(),
+                muted: p.browser_muted,
             }).collect()
         };
 
-        let input = ui.input(|i| i.clone());
         let mut any_spawn_or_remove_animating = false;
 
-        for (id, rect, title, target_fps, current_preset, has_crop, is_removing, spawn_t, remove_t) in preview_info {
+        for info in preview_info {
+            let TileInfo {
+                id, rect, title, target_fps, fps_preset: current_preset, has_crop,
+                is_removing, spawn_t, remove_t, is_browser, muted,
+            } = info;
             let screen_rect = self.canvas_rect_to_screen(rect, canvas_rect);
 
             if !canvas_rect.intersects(screen_rect) {
@@ -649,7 +726,7 @@ impl CanvasState {
 
             if !has_texture {
                 // Shimmering placeholder while the capture connects
-                let t = ui.input(|i| i.time) as f32;
+                let t = input.time as f32;
                 let pulse = (t * 1.8).sin() * 0.5 + 0.5;
                 let v = (18.0 + pulse * 14.0) as u8;
                 painter.rect_filled(anim_rect, 8.0, Color32::from_rgb(v, v, v + 2));
@@ -727,13 +804,82 @@ impl CanvasState {
                 } else {
                     title.clone()
                 };
+                let title_pos = if is_browser {
+                    // Globe badge marks browser tiles; shift the title right.
+                    painter.text(
+                        screen_rect.left_top() + Vec2::new(12.0, 20.0),
+                        egui::Align2::LEFT_CENTER,
+                        egui_phosphor::regular::GLOBE,
+                        egui::FontId::proportional(12.0),
+                        Color32::from_rgb(107, 170, 75),
+                    );
+                    screen_rect.left_top() + Vec2::new(28.0, 20.0)
+                } else {
+                    screen_rect.left_top() + Vec2::new(12.0, 20.0)
+                };
                 painter.text(
-                    screen_rect.left_top() + Vec2::new(12.0, 20.0),
+                    title_pos,
                     egui::Align2::LEFT_CENTER,
                     &title_text,
                     egui::FontId::proportional(11.0),
                     Color32::from_rgb(200, 200, 200),
                 );
+
+                // Browser tiles: navigation + audio controls along the bottom
+                if is_browser {
+                    let bottom_overlay = Rect::from_min_size(
+                        screen_rect.left_bottom() + Vec2::new(0.0, -42.0),
+                        Vec2::new(screen_rect.width(), 42.0),
+                    );
+                    painter.rect_filled(
+                        bottom_overlay,
+                        egui::Rounding { nw: 0.0, ne: 0.0, sw: 8.0, se: 8.0 },
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                    );
+
+                    let buttons: [(&str, BrowserAction, &str); 5] = [
+                        (egui_phosphor::regular::CARET_LEFT, BrowserAction::Back, "Back"),
+                        (egui_phosphor::regular::CARET_RIGHT, BrowserAction::Forward, "Forward"),
+                        (egui_phosphor::regular::ARROW_CLOCKWISE, BrowserAction::Reload, "Reload"),
+                        (
+                            if muted { egui_phosphor::regular::SPEAKER_SLASH } else { egui_phosphor::regular::SPEAKER_HIGH },
+                            BrowserAction::ToggleMute,
+                            if muted { "Unmute" } else { "Mute" },
+                        ),
+                        (egui_phosphor::regular::ARROW_SQUARE_OUT, BrowserAction::OpenExternal, "Open in browser"),
+                    ];
+                    for (idx, (icon, action, tip)) in buttons.iter().enumerate() {
+                        let btn_rect = Rect::from_min_size(
+                            screen_rect.left_bottom() + Vec2::new(10.0 + idx as f32 * 30.0, -34.0),
+                            Vec2::splat(26.0),
+                        );
+                        let resp = ui
+                            .interact(
+                                btn_rect,
+                                ui.id().with(("browser_btn", id.0, idx)),
+                                Sense::click(),
+                            )
+                            .on_hover_text(*tip);
+                        if resp.hovered() {
+                            painter.rect_filled(btn_rect, 6.0, Color32::from_rgba_unmultiplied(255, 255, 255, 35));
+                        }
+                        let icon_color = if *action == BrowserAction::ToggleMute && muted {
+                            Color32::from_rgb(255, 150, 100)
+                        } else {
+                            Color32::from_rgb(215, 215, 220)
+                        };
+                        painter.text(
+                            btn_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            *icon,
+                            egui::FontId::proportional(14.0),
+                            icon_color,
+                        );
+                        if resp.clicked() {
+                            self.pending_browser_actions.push((id, *action));
+                        }
+                    }
+                }
 
                 // Crop indicator (if has crop)
                 if has_crop {
@@ -752,14 +898,34 @@ impl CanvasState {
                 }
             }
 
-            // Minimal Void: Only show border when selected (thin blue accent)
-            if self.selection.contains(&id) {
+            // Muted badge stays visible even without hover so silent tiles
+            // are recognizable at a glance.
+            if is_browser && muted && !preview_response.hovered() {
+                let badge_rect = Rect::from_min_size(
+                    screen_rect.right_top() + Vec2::new(-30.0, 8.0),
+                    Vec2::splat(22.0),
+                );
+                painter.rect_filled(badge_rect, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+                painter.text(
+                    badge_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    egui_phosphor::regular::SPEAKER_SLASH,
+                    egui::FontId::proportional(12.0),
+                    Color32::from_rgb(255, 150, 100),
+                );
+            }
+
+            // Minimal Void: Only show border when selected (thin blue accent);
+            // green accent marks the browser tile currently in interaction mode.
+            if self.interactive_browser == Some(id) {
+                painter.rect_stroke(screen_rect, 8.0, Stroke::new(2.0, Color32::from_rgb(107, 170, 75)));
+            } else if self.selection.contains(&id) {
                 painter.rect_stroke(screen_rect, 8.0, Stroke::new(2.0, Color32::from_rgb(74, 158, 255)));
             }
 
             // Handle click to select
             if preview_response.clicked() {
-                if input.modifiers.ctrl {
+                if input.ctrl {
                     if self.selection.contains(&id) {
                         self.selection.retain(|&x| x != id);
                     } else {
@@ -770,23 +936,27 @@ impl CanvasState {
                 }
             }
 
-            // Handle double-click to focus the source window
+            // Handle double-click: browsers enter interaction mode (the app
+            // consumes last_double_clicked); other previews focus their
+            // source window.
             if preview_response.double_clicked() {
                 self.last_double_clicked = Some(id);
-                if let Some(preview) = preview_manager.get(id) {
-                    if let Some(ref handle) = preview.window_handle {
-                        #[cfg(windows)]
-                        unsafe {
-                            let hwnd = HWND(handle.hwnd as *mut _);
-                            let _ = ShowWindow(hwnd, SW_RESTORE);
-                            let _ = SetForegroundWindow(hwnd);
+                if !is_browser {
+                    if let Some(preview) = preview_manager.get(id) {
+                        if let Some(ref handle) = preview.window_handle {
+                            #[cfg(windows)]
+                            unsafe {
+                                let hwnd = HWND(handle.hwnd as *mut _);
+                                let _ = ShowWindow(hwnd, SW_RESTORE);
+                                let _ = SetForegroundWindow(hwnd);
+                            }
                         }
                     }
                 }
             }
 
             // Handle drag start - initialize spring and tracker
-            if preview_response.drag_started() && !input.modifiers.alt && !input.pointer.middle_down() {
+            if preview_response.drag_started() && !input.alt && !input.middle_down {
                 self.preview_dragging = true;
                 self.animation.drag_tracker.clear();
 
@@ -807,13 +977,13 @@ impl CanvasState {
 
             // Handle drag to move (only when not panning with Alt or middle mouse)
             // Resize is handled separately in draw_and_interact_selection()
-            if preview_response.dragged() && !input.modifiers.alt && !input.pointer.middle_down() {
+            if preview_response.dragged() && !input.alt && !input.middle_down {
                 // Only move if we're not in a resize operation
                 if self.drag_state.is_none() {
                     let delta = preview_response.drag_delta() / self.zoom;
 
                     // Track velocity for momentum
-                    if let Some(mouse_pos) = input.pointer.hover_pos() {
+                    if let Some(mouse_pos) = input.hover_pos {
                         self.animation.drag_tracker.record(mouse_pos, input.time);
                     }
 
@@ -901,26 +1071,55 @@ impl CanvasState {
 
                 ui.separator();
 
-                // Crop section
-                ui.menu_button("Crop", |ui| {
-                    // Select Region button (ShareX-style)
-                    if ui.button("Select Region...").clicked() {
-                        self.pending_region_select = Some(id);
+                if is_browser {
+                    // Browser tiles: navigation and audio instead of crop
+                    // (a cropped page has ambiguous interactive coordinates).
+                    if ui.button("Interact").clicked() {
+                        self.last_double_clicked = Some(id);
                         ui.close_menu();
                     }
-
-                    if has_crop {
-                        if ui.button("Clear Crop").clicked() {
-                            if let Some(preview) = preview_manager.get_mut(id) {
-                                preview.clear_crop();
-                            }
+                    if ui.button(if muted { "Unmute" } else { "Mute" }).clicked() {
+                        self.pending_browser_actions.push((id, BrowserAction::ToggleMute));
+                        ui.close_menu();
+                    }
+                    if ui.button("Reload").clicked() {
+                        self.pending_browser_actions.push((id, BrowserAction::Reload));
+                        ui.close_menu();
+                    }
+                    if ui.button("Change URL...").clicked() {
+                        self.pending_browser_actions.push((id, BrowserAction::EditUrl));
+                        ui.close_menu();
+                    }
+                    if ui.button("Copy URL").clicked() {
+                        self.pending_browser_actions.push((id, BrowserAction::CopyUrl));
+                        ui.close_menu();
+                    }
+                    if ui.button("Open in Default Browser").clicked() {
+                        self.pending_browser_actions.push((id, BrowserAction::OpenExternal));
+                        ui.close_menu();
+                    }
+                } else {
+                    // Crop section
+                    ui.menu_button("Crop", |ui| {
+                        // Select Region button (ShareX-style)
+                        if ui.button("Select Region...").clicked() {
+                            self.pending_region_select = Some(id);
                             ui.close_menu();
                         }
-                    }
 
-                    ui.separator();
-                    ui.label(egui::RichText::new("Tip: Alt+drag corners to fine-tune").weak().small());
-                });
+                        if has_crop {
+                            if ui.button("Clear Crop").clicked() {
+                                if let Some(preview) = preview_manager.get_mut(id) {
+                                    preview.clear_crop();
+                                }
+                                ui.close_menu();
+                            }
+                        }
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Tip: Alt+drag corners to fine-tune").weak().small());
+                    });
+                }
 
                 ui.separator();
 
@@ -1061,7 +1260,7 @@ impl CanvasState {
         painter.text(
             center + Vec2::new(0.0, 44.0),
             egui::Align2::CENTER_CENTER,
-            "Search and add a window from the left panel to get started",
+            "Add a window from the left panel, or right-click for a window or browser tile",
             egui::FontId::proportional(12.0),
             Color32::from_rgb(75, 75, 82),
         );
@@ -1139,7 +1338,11 @@ impl CanvasState {
         );
 
         if undo_response.clicked() {
-            if let Some(handle) = info.window_handle {
+            if info.browser_url.is_some() {
+                // The browser's host window was destroyed with the tile, so
+                // the app must recreate the WebView from the saved URL.
+                self.pending_browser_restore = Some(info.clone());
+            } else if let Some(handle) = info.window_handle {
                 let id = preview_manager.add_for_window(
                     handle.hwnd,
                     handle.process_id,
@@ -1167,23 +1370,26 @@ impl CanvasState {
         ui: &mut egui::Ui,
         canvas_rect: Rect,
         preview_manager: &mut PreviewManager,
+        input: &FrameInput,
     ) {
         let painter = ui.painter_at(canvas_rect);
-        let input = ui.input(|i| i.clone());
-        let alt_held = input.modifiers.alt;
+        let alt_held = input.alt;
 
         // Collect selection info to avoid borrow issues
         let selection_info: Vec<_> = self.selection.iter()
             .filter_map(|id| preview_manager.get(*id).map(|p| {
-                (*id, p.rect(), p.source_aspect_ratio, p.crop_uv, p.frame_size)
+                (*id, p.rect(), p.source_aspect_ratio, p.crop_uv, p.frame_size, p.is_browser())
             }))
             .collect();
 
-        for (id, preview_rect, aspect_ratio, crop_uv, frame_size) in selection_info {
+        for (id, preview_rect, aspect_ratio, crop_uv, frame_size, is_browser) in selection_info {
             let screen_rect = self.canvas_rect_to_screen(preview_rect, canvas_rect);
 
             // Minimal Void: Selection border with accent color
-            let border_color = if alt_held {
+            // (browsers can't be cropped, so no orange crop hint for them)
+            let border_color = if self.interactive_browser == Some(id) {
+                Color32::from_rgb(107, 170, 75) // Green: live interaction mode
+            } else if alt_held && !is_browser {
                 Color32::from_rgb(255, 150, 100) // Orange for crop mode
             } else {
                 Color32::from_rgb(74, 158, 255) // #4a9eff blue accent
@@ -1229,7 +1435,7 @@ impl CanvasState {
                 let hit_rect = Rect::from_center_size(handle_pos, Vec2::splat(handle_hit_size));
 
                 // Minimal Void: Clean handles matching selection color
-                let handle_fill = if alt_held {
+                let handle_fill = if alt_held && !is_browser {
                     Color32::from_rgb(255, 150, 100) // Orange for crop mode
                 } else {
                     Color32::from_rgb(74, 158, 255) // Match accent color
@@ -1250,14 +1456,16 @@ impl CanvasState {
                 }
 
                 // Handle drag start - check if Alt is held for crop mode
+                // (browser tiles never crop: interactive coordinates would
+                // no longer match the page)
                 if handle_response.drag_started() {
-                    if alt_held && frame_size.is_some() {
+                    if alt_held && frame_size.is_some() && !is_browser {
                         // Start crop mode
                         let current_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
                         self.drag_state = Some(DragState::Cropping {
                             id,
                             handle: handle_type,
-                            start_mouse: input.pointer.interact_pos().unwrap_or(handle_pos),
+                            start_mouse: input.interact_pos.unwrap_or(handle_pos),
                             start_crop_uv: current_crop,
                         });
                     } else {
@@ -1266,7 +1474,7 @@ impl CanvasState {
                             id,
                             handle: handle_type,
                             start_rect: preview_rect,
-                            start_mouse: input.pointer.interact_pos().unwrap_or(handle_pos),
+                            start_mouse: input.interact_pos.unwrap_or(handle_pos),
                             aspect_ratio,
                         });
                     }
@@ -1277,7 +1485,7 @@ impl CanvasState {
                     // Handle resize mode
                     if let Some(DragState::Resizing { id: resize_id, handle, start_rect, start_mouse, aspect_ratio: ar }) = &self.drag_state {
                         if *resize_id == id && *handle == handle_type {
-                            if let Some(current_pos) = input.pointer.interact_pos() {
+                            if let Some(current_pos) = input.interact_pos {
                                 let delta = (current_pos - *start_mouse) / self.zoom;
                                 let new_rect = apply_resize(*handle, *start_rect, delta, Some(*ar));
 
@@ -1296,7 +1504,7 @@ impl CanvasState {
                     // Handle crop mode
                     if let Some(DragState::Cropping { id: crop_id, handle, start_mouse, start_crop_uv }) = &self.drag_state {
                         if *crop_id == id && *handle == handle_type {
-                            if let Some(current_pos) = input.pointer.interact_pos() {
+                            if let Some(current_pos) = input.interact_pos {
                                 // Calculate delta in screen space, then convert to UV delta
                                 let delta_screen = current_pos - *start_mouse;
 
