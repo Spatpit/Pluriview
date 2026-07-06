@@ -16,6 +16,10 @@ pub struct SavedLayout {
     /// All previews
     pub previews: Vec<PreviewLayout>,
 
+    /// Recently used browser URLs, newest first (shown in the Add Browser dialog)
+    #[serde(default)]
+    pub recent_browser_urls: Vec<String>,
+
     /// Creation timestamp
     pub created_at: String,
 
@@ -54,6 +58,7 @@ impl SavedLayout {
                 show_grid: true,
             },
             previews: Vec::new(),
+            recent_browser_urls: Vec::new(),
             created_at: now.clone(),
             modified_at: now,
         }

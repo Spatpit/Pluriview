@@ -13,6 +13,9 @@ pub struct RemovedPreviewInfo {
     pub size: Vec2,
     pub fps_preset: FpsPreset,
     pub crop_uv: Option<(f32, f32, f32, f32)>,
+    /// Set for browser tiles; undo recreates the WebView from this URL
+    /// because the original host window is destroyed on removal.
+    pub browser_url: Option<String>,
 }
 
 /// Manages all preview windows
@@ -109,6 +112,7 @@ impl PreviewManager {
                     size: preview.size,
                     fps_preset: preview.fps_preset,
                     crop_uv: preview.crop_uv,
+                    browser_url: preview.browser_url,
                 });
             }
         }
@@ -214,6 +218,17 @@ impl PreviewManager {
     pub fn translate(&mut self, id: PreviewId, delta: Vec2) {
         if let Some(preview) = self.previews.get_mut(&id) {
             preview.translate(delta);
+        }
+    }
+
+    /// Set a preview's z-order directly (used by layout restore), keeping
+    /// the max-z counter in sync so bring-to-front keeps working.
+    pub fn set_z_order(&mut self, id: PreviewId, z_order: u32) {
+        if z_order > self.max_z_order {
+            self.max_z_order = z_order;
+        }
+        if let Some(preview) = self.previews.get_mut(&id) {
+            preview.z_order = z_order;
         }
     }
 

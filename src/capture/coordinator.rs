@@ -2,6 +2,7 @@ use crate::privacy;
 use crate::preview::{PreviewManager, PreviewId};
 use eframe::egui;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::sync::mpsc::{self, Sender, Receiver};
@@ -40,8 +41,9 @@ struct CaptureSession {
     #[allow(dead_code)]
     window_title: String,
 
-    /// Target FPS
-    target_fps: u32,
+    /// Target FPS, shared with the capture thread so changes apply live
+    /// without restarting the capture session.
+    target_fps: Arc<AtomicU32>,
 
     /// Is capture active?
     active: Arc<RwLock<bool>>,
@@ -72,21 +74,23 @@ impl CaptureCoordinator {
 
         let active = Arc::new(RwLock::new(true));
         let paused = Arc::new(RwLock::new(false));
+        let fps = Arc::new(AtomicU32::new(target_fps.max(1)));
         let active_clone = active.clone();
         let paused_clone = paused.clone();
+        let fps_clone = fps.clone();
         let sender = self.frame_sender.clone();
         let title_clone = window_title.clone();
 
         // Start capture in a new thread
         let handle = std::thread::spawn(move || {
-            capture_window_loop(preview_id, hwnd, title_clone, target_fps, active_clone, paused_clone, sender);
+            capture_window_loop(preview_id, hwnd, title_clone, fps_clone, active_clone, paused_clone, sender);
         });
 
         let session = CaptureSession {
             preview_id,
             hwnd,
             window_title,
-            target_fps,
+            target_fps: fps,
             active,
             paused,
             handle: Some(handle),
@@ -103,20 +107,19 @@ impl CaptureCoordinator {
         }
     }
 
-    /// Update target FPS for a capture session
-    #[allow(dead_code)]
+    /// Update target FPS for a capture session; applies live on the
+    /// capture thread's next frame, no restart needed.
     pub fn set_target_fps(&mut self, preview_id: PreviewId, fps: u32) {
         if let Some(session) = self.sessions.get_mut(&preview_id) {
-            session.target_fps = fps;
-            // Note: The actual FPS change will happen on next capture restart
-            // For live update, we'd need to use a shared atomic or channel
+            session.target_fps.store(fps.max(1), Ordering::Relaxed);
         }
     }
 
-    /// Process any pending captured frames
+    /// Process any pending captured frames. Drains the channel completely:
+    /// each preview keeps only its newest frame, so a stalled UI can never
+    /// accumulate a backlog of multi-megabyte video frames.
     pub fn process_frames(&mut self, preview_manager: &mut PreviewManager, _ctx: &egui::Context) {
-        // Process up to 10 frames per update to avoid blocking
-        for _ in 0..10 {
+        loop {
             match self.frame_receiver.try_recv() {
                 Ok(frame) => {
                     if let Some(preview) = preview_manager.get_mut(frame.preview_id) {
@@ -198,7 +201,7 @@ fn capture_window_loop(
     preview_id: PreviewId,
     hwnd: isize,
     window_title: String,
-    target_fps: u32,
+    target_fps: Arc<AtomicU32>,
     active: Arc<RwLock<bool>>,
     paused: Arc<RwLock<bool>>,
     sender: Sender<CapturedFrame>,
@@ -220,7 +223,7 @@ fn capture_window_loop(
         sender: Sender<CapturedFrame>,
         active: Arc<RwLock<bool>>,
         paused: Arc<RwLock<bool>>,
-        fps: u32,
+        fps: Arc<AtomicU32>,
     }
 
     struct Capture {
@@ -228,7 +231,7 @@ fn capture_window_loop(
         sender: Sender<CapturedFrame>,
         active: Arc<RwLock<bool>>,
         paused: Arc<RwLock<bool>>,
-        frame_interval: std::time::Duration,
+        fps: Arc<AtomicU32>,
         last_frame: std::time::Instant,
     }
 
@@ -237,13 +240,12 @@ fn capture_window_loop(
         type Error = Box<dyn std::error::Error + Send + Sync>;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-            let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.flags.fps as f64);
             Ok(Self {
                 preview_id: ctx.flags.preview_id,
                 sender: ctx.flags.sender,
                 active: ctx.flags.active,
                 paused: ctx.flags.paused,
-                frame_interval,
+                fps: ctx.flags.fps,
                 last_frame: std::time::Instant::now(),
             })
         }
@@ -264,9 +266,11 @@ fn capture_window_loop(
                 return Ok(());
             }
 
-            // Throttle frame rate
+            // Throttle frame rate (read live so preset changes apply instantly)
+            let fps = self.fps.load(Ordering::Relaxed).max(1);
+            let frame_interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
             let elapsed = self.last_frame.elapsed();
-            if elapsed < self.frame_interval {
+            if elapsed < frame_interval {
                 return Ok(());
             }
             self.last_frame = std::time::Instant::now();
