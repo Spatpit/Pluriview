@@ -33,6 +33,8 @@
 | **Auto-Save** | Layouts persist automatically between sessions, including browser URLs |
 | **System Tray** | Minimize to tray for background operation |
 | **Quick Focus** | Double-click any preview to bring its window to front |
+| **Canvas-Only Mode** | Press `H` to hide all visual chrome while keeping right-click menus available |
+| **Tile Focus** | Fit any captured window or browser tile to the canvas, then restore with `Esc` |
 
 ### Browser tiles
 
@@ -43,6 +45,14 @@ real page — log in, scroll, pick a video — and press `Esc` or click outside 
 back to canvas mode. Hover a browser tile for back/forward/reload/mute controls;
 logins and cookies persist in a dedicated WebView2 profile, separate from your main
 browser.
+
+**Streaming-friendly audio:** browser-tile sound is replayed through Pluriview
+itself, so sharing the Pluriview window on Discord (or capturing it with OBS's
+Application Audio Capture / Game Bar) carries the tiles' audio to your viewers.
+Without this, WebView2 audio belongs to separate `msedgewebview2.exe` processes
+that per-app capture tools can't hear. While Pluriview runs, its browser tiles
+show up in the Windows volume mixer under **Pluriview** (the WebView2 entries are
+held near-silent and restored on exit).
 
 ## Requirements
 
@@ -71,7 +81,8 @@ The executable will be at `target/release/pluriview.exe` (~6MB).
 4. **Arrange** by dragging previews on the canvas
 5. **Resize** by dragging corners or edges
 6. **Crop** by holding Alt and dragging corners
-7. **Right-click** for context menu options
+7. **Focus** a tile with right-click → **Focus on This Tile**; press `Esc` to restore the canvas
+8. **Right-click** for other context menu options
 
 ## Keyboard Shortcuts
 
@@ -80,11 +91,13 @@ The executable will be at `target/release/pluriview.exe` (~6MB).
 | Pan canvas | `Middle Mouse` or `Alt + Drag` |
 | Zoom | `Scroll Wheel` |
 | Toggle grid | `G` |
+| Toggle canvas-only mode | `H` |
 | Select all | `Ctrl + A` |
 | Multi-select | `Ctrl + Click` |
 | Delete selected | `Delete` |
 | Crop preview | `Alt + Drag corners` |
 | Focus window | `Double-click preview` |
+| Exit tile focus | `Esc` |
 | Interact with browser tile | `Double-click` or `Ctrl + B` |
 | Exit browser interaction | `Esc` or click outside |
 | Show shortcuts | `F1` |

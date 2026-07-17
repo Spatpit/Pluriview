@@ -23,7 +23,7 @@ use windows::{
         },
     },
 };
-use windows_core::Interface;
+use webview2_core::Interface;
 use wry::{
     dpi::{PhysicalPosition, PhysicalSize},
     raw_window_handle::{
@@ -353,6 +353,18 @@ impl BrowserHost {
         }
     }
 
+    /// PID of the WebView2 browser process (shared by every host on the
+    /// same profile). Roots the streaming audio relay's loopback capture.
+    pub fn browser_process_id(&self) -> Option<u32> {
+        self.with_core(|core| {
+            let mut pid = 0u32;
+            unsafe { core.BrowserProcessId(&mut pid) }.map_err(|e| e.to_string())?;
+            Ok(pid)
+        })
+        .ok()
+        .filter(|pid| *pid != 0)
+    }
+
     pub fn set_muted(&mut self, muted: bool) -> Result<(), String> {
         self.with_core(|core| {
             let core8: ICoreWebView2_8 = core.cast().map_err(|e| e.to_string())?;
@@ -412,6 +424,15 @@ impl BrowserManager {
 
     pub fn contains(&self, id: PreviewId) -> bool {
         self.hosts.contains_key(&id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+    }
+
+    /// PID of the shared WebView2 browser process, once any host can report it.
+    pub fn browser_process_id(&self) -> Option<u32> {
+        self.hosts.values().find_map(BrowserHost::browser_process_id)
     }
 
     pub fn get(&self, id: PreviewId) -> Option<&BrowserHost> {

@@ -38,7 +38,10 @@ pub enum DragState {
 
 #[cfg(test)]
 mod tests {
-    use super::CanvasState;
+    use super::{CanvasState, DragState, ResizeHandle};
+    use crate::capture::CaptureCoordinator;
+    use crate::preview::{PreviewId, PreviewManager};
+    use eframe::egui::{CentralPanel, Context, CursorIcon, Event, Pos2, RawInput, Rect, Shape, Vec2};
 
     #[test]
     fn canvas_screen_rect_starts_empty() {
@@ -53,6 +56,149 @@ mod tests {
     #[test]
     fn browser_add_request_starts_empty() {
         assert!(CanvasState::default().pending_browser_add.is_none());
+    }
+
+    #[test]
+    fn canvas_only_hides_empty_canvas_overlays() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let mut captures = CaptureCoordinator::new();
+        let output = context.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+                ..Default::default()
+            },
+            |context| {
+                CentralPanel::default().show(context, |ui| {
+                    canvas.ui(ui, &mut previews, &mut captures, context, false);
+                });
+            },
+        );
+
+        assert!(!output.shapes.iter().any(|shape| {
+            matches!(shape.shape, Shape::Text(_) | Shape::LineSegment { .. })
+        }));
+    }
+
+    #[test]
+    fn canvas_only_cancels_active_handle_drag() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        canvas.drag_state = Some(DragState::Resizing {
+            id: PreviewId(1),
+            handle: ResizeHandle::BottomRight,
+            start_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
+            start_mouse: Pos2::new(100.0, 100.0),
+            aspect_ratio: 1.0,
+        });
+        let mut previews = PreviewManager::new();
+        let mut captures = CaptureCoordinator::new();
+
+        let _ = context.run(RawInput::default(), |context| {
+            CentralPanel::default().show(context, |ui| {
+                canvas.ui(ui, &mut previews, &mut captures, context, false);
+            });
+        });
+
+        assert!(canvas.drag_state.is_none());
+    }
+
+    #[test]
+    fn canvas_only_does_not_show_resize_cursor_for_hidden_handles() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add(
+            "tile".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::splat(100.0),
+        );
+        canvas.selection = vec![id];
+        let mut captures = CaptureCoordinator::new();
+        let output = context.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+                events: vec![Event::PointerMoved(Pos2::new(200.0, 200.0))],
+                ..Default::default()
+            },
+            |context| {
+                CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(context, |ui| {
+                        canvas.ui(ui, &mut previews, &mut captures, context, false);
+                    });
+            },
+        );
+
+        assert_eq!(output.platform_output.cursor_icon, CursorIcon::Default);
+    }
+
+    #[test]
+    fn focus_fits_tile_and_restores_canvas_view() {
+        let mut canvas = CanvasState::default();
+        canvas.pan = Vec2::new(21.0, -8.0);
+        canvas.zoom = 0.75;
+        canvas.selection = vec![PreviewId(9)];
+        canvas.animation.momentum_active = true;
+        canvas.animation.momentum_velocity = Vec2::splat(10.0);
+        let viewport = Rect::from_min_size(
+            Pos2::new(40.0, 30.0),
+            Vec2::new(1200.0, 700.0),
+        );
+        let tile = Rect::from_min_size(
+            Pos2::new(300.0, 150.0),
+            Vec2::new(800.0, 450.0),
+        );
+
+        canvas.focus_on_tile(PreviewId(2), tile, viewport);
+        let focused = canvas.canvas_rect_to_screen(tile, viewport);
+        assert!((focused.center() - viewport.center()).length() < 0.01);
+        assert!((focused.min.x - viewport.min.x).abs() < 0.01);
+        assert!((focused.max.x - viewport.max.x).abs() < 0.01);
+        assert!(focused.min.y >= viewport.min.y - 0.01);
+        assert!(focused.max.y <= viewport.max.y + 0.01);
+        assert_eq!(canvas.selection, vec![PreviewId(2)]);
+        assert!(!canvas.animation.momentum_active);
+        assert_eq!(canvas.animation.momentum_velocity, Vec2::ZERO);
+
+        assert!(canvas.exit_focus());
+        assert_eq!(canvas.pan, Vec2::new(21.0, -8.0));
+        assert_eq!(canvas.zoom, 0.75);
+        assert_eq!(canvas.selection, vec![PreviewId(9)]);
+        assert!(!canvas.exit_focus());
+    }
+
+    #[test]
+    fn focus_fits_tall_tile_without_cropping() {
+        let mut canvas = CanvasState::default();
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0));
+        let tile = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 600.0));
+
+        canvas.focus_on_tile(PreviewId(3), tile, viewport);
+        let focused = canvas.canvas_rect_to_screen(tile, viewport);
+
+        assert!((focused.center() - viewport.center()).length() < 0.01);
+        assert!((focused.min.y - viewport.min.y).abs() < 0.01);
+        assert!((focused.max.y - viewport.max.y).abs() < 0.01);
+        assert!(focused.min.x >= viewport.min.x - 0.01);
+        assert!(focused.max.x <= viewport.max.x + 0.01);
+    }
+
+    #[test]
+    fn removing_focused_tile_exits_focus_without_restoring_deleted_selection() {
+        let mut previews = PreviewManager::new();
+        let id = previews.add("focused".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let mut canvas = CanvasState::default();
+        canvas.selection = vec![id, PreviewId(99)];
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        canvas.focus_on_tile(id, previews.get(id).unwrap().rect(), viewport);
+
+        previews.start_removal(id);
+        canvas.refit_focus(&previews, viewport);
+
+        assert_eq!(canvas.selection, vec![PreviewId(99)]);
+        assert!(!canvas.exit_focus());
     }
 }
 
@@ -111,6 +257,15 @@ struct FrameInput {
     time: f64,
     delete_pressed: bool,
     select_all: bool,
+    escape_pressed: bool,
+}
+
+#[derive(Clone)]
+struct FocusState {
+    id: PreviewId,
+    pan: Vec2,
+    zoom: f32,
+    selection: Vec<PreviewId>,
 }
 
 /// Per-tile data collected up front so the manager isn't borrowed during
@@ -204,6 +359,9 @@ pub struct CanvasState {
 
     /// Preview most recently double-clicked, consumed by the app.
     pub last_double_clicked: Option<PreviewId>,
+
+    /// Canvas view to restore when the user exits temporary tile focus.
+    focus: Option<FocusState>,
 }
 
 impl Default for CanvasState {
@@ -232,6 +390,7 @@ impl Default for CanvasState {
             interactive_browser: None,
             last_screen_rect: None,
             last_double_clicked: None,
+            focus: None,
         }
     }
 }
@@ -243,6 +402,58 @@ impl CanvasState {
         self.zoom = 1.0;
         self.selection.clear();
         self.drag_state = None;
+    }
+
+    /// Fit one tile in the current canvas without changing its saved geometry.
+    pub fn focus_on_tile(&mut self, id: PreviewId, tile_rect: Rect, canvas_rect: Rect) {
+        if let Some(focus) = &mut self.focus {
+            focus.id = id;
+        } else {
+            self.focus = Some(FocusState {
+                id,
+                pan: self.pan,
+                zoom: self.zoom,
+                selection: self.selection.clone(),
+            });
+        }
+
+        let available = canvas_rect.size().max(Vec2::splat(1.0));
+        let tile_size = tile_rect.size().max(Vec2::splat(1.0));
+        self.zoom = (available.x / tile_size.x)
+            .min(available.y / tile_size.y)
+            .clamp(self.zoom_min, self.zoom_max);
+        self.pan = (canvas_rect.center() - canvas_rect.min) / self.zoom
+            - tile_rect.center().to_vec2();
+        self.selection = vec![id];
+        self.animation.momentum_active = false;
+        self.animation.momentum_velocity = Vec2::ZERO;
+    }
+
+    /// Restore the canvas view saved before tile focus.
+    pub fn exit_focus(&mut self) -> bool {
+        let Some(focus) = self.focus.take() else {
+            return false;
+        };
+        self.pan = focus.pan;
+        self.zoom = focus.zoom;
+        self.selection = focus.selection;
+        true
+    }
+
+    fn refit_focus(&mut self, preview_manager: &PreviewManager, canvas_rect: Rect) {
+        let Some(id) = self.focus.as_ref().map(|focus| focus.id) else {
+            return;
+        };
+        if let Some(tile_rect) = preview_manager
+            .get(id)
+            .filter(|preview| preview.removing.is_none())
+            .map(|preview| preview.rect())
+        {
+            self.focus_on_tile(id, tile_rect, canvas_rect);
+        } else {
+            self.exit_focus();
+            self.selection.retain(|selected| *selected != id);
+        }
     }
 
     /// Convert screen position to canvas position
@@ -313,6 +524,7 @@ impl CanvasState {
         preview_manager: &mut PreviewManager,
         capture_coordinator: &mut CaptureCoordinator,
         ctx: &egui::Context,
+        show_overlays: bool,
     ) {
         let canvas_rect = ui.available_rect_before_wrap();
         self.last_screen_rect = Some(canvas_rect);
@@ -331,7 +543,15 @@ impl CanvasState {
             time: i.time,
             delete_pressed: i.key_pressed(egui::Key::Delete),
             select_all: i.modifiers.ctrl && i.key_pressed(egui::Key::A),
+            escape_pressed: i.key_pressed(egui::Key::Escape),
         });
+
+        if input.escape_pressed {
+            self.exit_focus();
+        }
+        if !show_overlays {
+            self.drag_state = None;
+        }
 
         // Calculate delta time for animations
         let current_time = input.time;
@@ -349,6 +569,9 @@ impl CanvasState {
 
         // Update preview positions from their spring animations
         self.update_preview_animations(preview_manager);
+
+        // Keep the focused tile fitted after camera and tile animations move.
+        self.refit_focus(preview_manager, canvas_rect);
 
         // Reap any previews whose fade/shrink-out animation has finished,
         // keeping the most recent one around briefly for the undo toast.
@@ -374,30 +597,53 @@ impl CanvasState {
         painter.rect_filled(canvas_rect, 0.0, Color32::from_rgb(13, 13, 13));
 
         // Draw grid
-        if self.show_grid {
+        if show_overlays && self.show_grid {
             self.draw_grid(&painter, canvas_rect);
         }
 
         // Empty-canvas hint (only relevant before anything has been added)
-        if preview_manager.count() == 0 {
+        if show_overlays && preview_manager.count() == 0 {
             self.draw_empty_state(&painter, canvas_rect);
         }
 
         // Draw previews and handle their interactions (AFTER bg allocation)
-        self.draw_and_interact_previews(ui, canvas_rect, preview_manager, ctx, capture_coordinator, &input);
+        self.draw_and_interact_previews(
+            ui,
+            canvas_rect,
+            preview_manager,
+            ctx,
+            capture_coordinator,
+            &input,
+            show_overlays,
+        );
 
         // Draw selection rectangles and interactive resize handles
         // Handles are allocated AFTER previews so they have higher interaction priority
-        self.draw_and_interact_selection(ui, canvas_rect, preview_manager, &input);
+        if show_overlays {
+            self.draw_and_interact_selection(ui, canvas_rect, preview_manager, &input);
+        }
 
         // Minimal Void: Floating status indicator (bottom-right corner)
-        self.draw_floating_status(&painter, canvas_rect, preview_manager.count());
-
-        // Undo toast for the most recently removed preview
-        self.draw_and_interact_undo_toast(ui, canvas_rect, preview_manager, capture_coordinator);
+        if show_overlays {
+            self.draw_floating_status(&painter, canvas_rect, preview_manager.count());
+            self.draw_and_interact_undo_toast(
+                ui,
+                canvas_rect,
+                preview_manager,
+                capture_coordinator,
+            );
+        }
 
         // Handle canvas-level input using the pre-allocated bg_response
-        self.handle_canvas_input_with_response(ui, canvas_rect, preview_manager, capture_coordinator, bg_response, &input);
+        self.handle_canvas_input_with_response(
+            ui,
+            canvas_rect,
+            preview_manager,
+            capture_coordinator,
+            bg_response,
+            &input,
+            show_overlays,
+        );
 
         // Apply pending FPS changes
         self.apply_pending_fps_changes(preview_manager, capture_coordinator);
@@ -484,14 +730,17 @@ impl CanvasState {
         capture_coordinator: &mut CaptureCoordinator,
         bg_response: egui::Response,
         input: &FrameInput,
+        show_overlays: bool,
     ) {
         // Use the pre-allocated background response
 
         // Update cursor based on drag state or handle hover
-        if let Some(mouse_pos) = input.hover_pos {
-            if canvas_rect.contains(mouse_pos) {
-                if let Some((_, handle)) = self.get_handle_at(mouse_pos, canvas_rect, preview_manager) {
-                    ui.ctx().set_cursor_icon(handle.cursor());
+        if show_overlays {
+            if let Some(mouse_pos) = input.hover_pos {
+                if canvas_rect.contains(mouse_pos) {
+                    if let Some((_, handle)) = self.get_handle_at(mouse_pos, canvas_rect, preview_manager) {
+                        ui.ctx().set_cursor_icon(handle.cursor());
+                    }
                 }
             }
         }
@@ -621,6 +870,7 @@ impl CanvasState {
         ctx: &egui::Context,
         capture_coordinator: &mut CaptureCoordinator,
         input: &FrameInput,
+        show_overlays: bool,
     ) {
         let viewport = self.get_viewport(canvas_rect);
 
@@ -694,14 +944,16 @@ impl CanvasState {
 
             let is_active = self.selection.contains(&id) || preview_response.dragged();
 
-            // Soft drop shadow underneath the preview, stronger when selected/dragged.
-            let shadow_alpha = ((if is_active { 90.0 } else { 40.0 }) * alpha) as u8;
-            let shadow_offset = if is_active { Vec2::new(0.0, 6.0) } else { Vec2::new(0.0, 3.0) };
-            painter.rect_filled(
-                anim_rect.translate(shadow_offset),
-                8.0,
-                Color32::from_rgba_unmultiplied(0, 0, 0, shadow_alpha),
-            );
+            if show_overlays {
+                // Soft drop shadow underneath the preview, stronger when selected/dragged.
+                let shadow_alpha = ((if is_active { 90.0 } else { 40.0 }) * alpha) as u8;
+                let shadow_offset = if is_active { Vec2::new(0.0, 6.0) } else { Vec2::new(0.0, 3.0) };
+                painter.rect_filled(
+                    anim_rect.translate(shadow_offset),
+                    8.0,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, shadow_alpha),
+                );
+            }
 
             // Minimal Void: No background fill - content fills entire area
             // Draw preview content (full rect, no title bar offset)
@@ -741,7 +993,7 @@ impl CanvasState {
             }
 
             // Minimal Void: Hover-reveal controls (no permanent title bar)
-            if preview_response.hovered() {
+            if show_overlays && preview_response.hovered() {
                 // Semi-transparent overlay gradient at top for controls
                 let overlay_rect = Rect::from_min_size(
                     screen_rect.min,
@@ -900,7 +1152,7 @@ impl CanvasState {
 
             // Muted badge stays visible even without hover so silent tiles
             // are recognizable at a glance.
-            if is_browser && muted && !preview_response.hovered() {
+            if show_overlays && is_browser && muted && !preview_response.hovered() {
                 let badge_rect = Rect::from_min_size(
                     screen_rect.right_top() + Vec2::new(-30.0, 8.0),
                     Vec2::splat(22.0),
@@ -917,10 +1169,12 @@ impl CanvasState {
 
             // Minimal Void: Only show border when selected (thin blue accent);
             // green accent marks the browser tile currently in interaction mode.
-            if self.interactive_browser == Some(id) {
-                painter.rect_stroke(screen_rect, 8.0, Stroke::new(2.0, Color32::from_rgb(107, 170, 75)));
-            } else if self.selection.contains(&id) {
-                painter.rect_stroke(screen_rect, 8.0, Stroke::new(2.0, Color32::from_rgb(74, 158, 255)));
+            if show_overlays {
+                if self.interactive_browser == Some(id) {
+                    painter.rect_stroke(screen_rect, 8.0, Stroke::new(2.0, Color32::from_rgb(107, 170, 75)));
+                } else if self.selection.contains(&id) {
+                    painter.rect_stroke(screen_rect, 8.0, Stroke::new(2.0, Color32::from_rgb(74, 158, 255)));
+                }
             }
 
             // Handle click to select
@@ -1122,6 +1376,11 @@ impl CanvasState {
                 }
 
                 ui.separator();
+
+                if ui.button("Focus on This Tile").clicked() {
+                    self.focus_on_tile(id, rect, canvas_rect);
+                    ui.close_menu();
+                }
 
                 if ui.button("Bring to Front").clicked() {
                     preview_manager.bring_to_front(id);

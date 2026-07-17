@@ -67,6 +67,9 @@ pub struct PluriviewApp {
     /// Is the window picker panel open?
     pub picker_open: bool,
 
+    /// Hide app chrome without changing the user's sidebar preference.
+    canvas_only: bool,
+
     /// Storage for persistence
     storage: Option<Storage>,
 
@@ -104,6 +107,14 @@ pub struct PluriviewApp {
     /// When the current browser interaction mode started (focus grace period).
     #[cfg(windows)]
     browser_activated_at: Option<Instant>,
+
+    /// Replays WebView2 audio from this process so Discord/OBS per-app
+    /// capture picks up browser tiles. Runs while browser tiles exist.
+    #[cfg(windows)]
+    audio_relay: Option<crate::audio::AudioRelay>,
+    /// Last time the relay checked the WebView2 browser process PID.
+    #[cfg(windows)]
+    audio_relay_checked: Option<Instant>,
 }
 
 impl PluriviewApp {
@@ -130,6 +141,7 @@ impl PluriviewApp {
             window_picker: WindowPicker::new(),
             capture_coordinator: CaptureCoordinator::new(),
             picker_open: true,
+            canvas_only: false,
             storage,
             tray_manager,
             hwnd_set: false,
@@ -146,6 +158,10 @@ impl PluriviewApp {
             add_browser: None,
             #[cfg(windows)]
             browser_activated_at: None,
+            #[cfg(windows)]
+            audio_relay: None,
+            #[cfg(windows)]
+            audio_relay_checked: None,
         };
 
         // Try to load autosave
@@ -386,10 +402,39 @@ impl PluriviewApp {
         Some(rect.shrink(inset.max(0.0)))
     }
 
+    /// Keep the streaming audio relay alive while browser tiles exist and
+    /// pointed at the current WebView2 browser process (which changes if the
+    /// WebView2 runtime crashes and restarts).
+    #[cfg(windows)]
+    fn audio_relay_upkeep(&mut self) {
+        if self.browser.is_empty() {
+            // Dropping the relay restores the WebView2 mixer volumes.
+            self.audio_relay = None;
+            self.audio_relay_checked = None;
+            return;
+        }
+        let due = self
+            .audio_relay_checked
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
+        if !due {
+            return;
+        }
+        self.audio_relay_checked = Some(Instant::now());
+        if let Some(pid) = self.browser.browser_process_id() {
+            let current = self.audio_relay.as_ref().map(crate::audio::AudioRelay::browser_pid);
+            if current != Some(pid) {
+                self.audio_relay = None; // stop (and restore) before retargeting
+                self.audio_relay = Some(crate::audio::AudioRelay::start(pid));
+            }
+        }
+    }
+
     /// Per-frame browser housekeeping. Runs after the canvas UI so tile
     /// rects and double-click state are fresh.
     #[cfg(windows)]
     fn browser_frame(&mut self, ctx: &egui::Context) {
+        self.audio_relay_upkeep();
+
         // Mirror page titles and current URLs onto the tiles so the hover
         // overlay shows "lofi hip hop radio..." instead of the raw URL and
         // layouts save where the user actually navigated.
@@ -437,6 +482,9 @@ impl PluriviewApp {
                     host.park();
                 }
                 self.browser_activated_at = None;
+                if escape {
+                    self.canvas.exit_focus();
+                }
                 // On Escape the (now offscreen) WebView still holds focus;
                 // hand it back to the main window so keyboard input works.
                 if escape && !minimized {
@@ -648,7 +696,7 @@ impl PluriviewApp {
         // the min/max/close buttons) — never treat that area as a resize
         // zone, or a click on a title bar button can also start a native
         // resize drag and leave the window stuck at a tiny size.
-        let title_bar_height = 34.0;
+        let title_bar_height = if self.canvas_only { 0.0 } else { 34.0 };
         let rect = ctx.input(|i| i.screen_rect());
         let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else { return; };
 
@@ -949,7 +997,9 @@ impl eframe::App for PluriviewApp {
 
         // Custom title bar + manual resize border (decorations are off)
         self.handle_frameless_resize(ctx);
-        self.title_bar_ui(ctx);
+        if !self.canvas_only {
+            self.title_bar_ui(ctx);
+        }
 
         // Process any pending captured frames
         self.capture_coordinator.process_frames(&mut self.preview_manager, ctx);
@@ -998,7 +1048,7 @@ impl eframe::App for PluriviewApp {
         // title bar; see `title_bar_ui` / `menu_bar`.
 
         // Minimal Void: Dark sidebar
-        if self.picker_open {
+        if self.picker_open && !self.canvas_only {
             egui::SidePanel::left("window_picker_panel")
                 .default_width(250.0)
                 .min_width(200.0)
@@ -1022,7 +1072,13 @@ impl eframe::App for PluriviewApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(13, 13, 13)))
             .show(ctx, |ui| {
-                self.canvas.ui(ui, &mut self.preview_manager, &mut self.capture_coordinator, ctx);
+                self.canvas.ui(
+                    ui,
+                    &mut self.preview_manager,
+                    &mut self.capture_coordinator,
+                    ctx,
+                    !self.canvas_only,
+                );
             });
 
         #[cfg(windows)]
@@ -1138,6 +1194,10 @@ impl eframe::App for PluriviewApp {
                 if i.key_pressed(egui::Key::G) && !i.modifiers.ctrl && !i.modifiers.alt {
                     self.canvas.show_grid = !self.canvas.show_grid;
                 }
+                // H - Toggle canvas-only mode
+                if i.key_pressed(egui::Key::H) && !i.modifiers.ctrl && !i.modifiers.alt {
+                    self.canvas_only = !self.canvas_only;
+                }
                 // F1 - Show keyboard shortcuts
                 if i.key_pressed(egui::Key::F1) {
                     self.show_shortcuts = true;
@@ -1201,6 +1261,14 @@ impl eframe::App for PluriviewApp {
 
                             ui.label("Toggle grid");
                             ui.label(egui::RichText::new("G").weak());
+                            ui.end_row();
+
+                            ui.label("Canvas-only mode");
+                            ui.label(egui::RichText::new("H").weak());
+                            ui.end_row();
+
+                            ui.label("Exit tile focus");
+                            ui.label(egui::RichText::new("Esc").weak());
                             ui.end_row();
 
                             ui.add_space(10.0);
