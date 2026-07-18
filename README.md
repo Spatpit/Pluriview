@@ -46,14 +46,6 @@ back to canvas mode. Hover a browser tile for back/forward/reload/mute controls;
 logins and cookies persist in a dedicated WebView2 profile, separate from your main
 browser.
 
-**Streaming-friendly audio:** browser-tile sound is replayed through Pluriview
-itself, so sharing the Pluriview window on Discord (or capturing it with OBS's
-Application Audio Capture / Game Bar) carries the tiles' audio to your viewers.
-Without this, WebView2 audio belongs to separate `msedgewebview2.exe` processes
-that per-app capture tools can't hear. While Pluriview runs, its browser tiles
-show up in the Windows volume mixer under **Pluriview** (the WebView2 entries are
-held near-silent and restored on exit).
-
 ## Requirements
 
 - **OS:** Windows 10 (version 1903+) or Windows 11

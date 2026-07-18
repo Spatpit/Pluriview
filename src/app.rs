@@ -107,14 +107,6 @@ pub struct PluriviewApp {
     /// When the current browser interaction mode started (focus grace period).
     #[cfg(windows)]
     browser_activated_at: Option<Instant>,
-
-    /// Replays WebView2 audio from this process so Discord/OBS per-app
-    /// capture picks up browser tiles. Runs while browser tiles exist.
-    #[cfg(windows)]
-    audio_relay: Option<crate::audio::AudioRelay>,
-    /// Last time the relay checked the WebView2 browser process PID.
-    #[cfg(windows)]
-    audio_relay_checked: Option<Instant>,
 }
 
 impl PluriviewApp {
@@ -158,10 +150,6 @@ impl PluriviewApp {
             add_browser: None,
             #[cfg(windows)]
             browser_activated_at: None,
-            #[cfg(windows)]
-            audio_relay: None,
-            #[cfg(windows)]
-            audio_relay_checked: None,
         };
 
         // Try to load autosave
@@ -402,39 +390,10 @@ impl PluriviewApp {
         Some(rect.shrink(inset.max(0.0)))
     }
 
-    /// Keep the streaming audio relay alive while browser tiles exist and
-    /// pointed at the current WebView2 browser process (which changes if the
-    /// WebView2 runtime crashes and restarts).
-    #[cfg(windows)]
-    fn audio_relay_upkeep(&mut self) {
-        if self.browser.is_empty() {
-            // Dropping the relay restores the WebView2 mixer volumes.
-            self.audio_relay = None;
-            self.audio_relay_checked = None;
-            return;
-        }
-        let due = self
-            .audio_relay_checked
-            .is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
-        if !due {
-            return;
-        }
-        self.audio_relay_checked = Some(Instant::now());
-        if let Some(pid) = self.browser.browser_process_id() {
-            let current = self.audio_relay.as_ref().map(crate::audio::AudioRelay::browser_pid);
-            if current != Some(pid) {
-                self.audio_relay = None; // stop (and restore) before retargeting
-                self.audio_relay = Some(crate::audio::AudioRelay::start(pid));
-            }
-        }
-    }
-
     /// Per-frame browser housekeeping. Runs after the canvas UI so tile
     /// rects and double-click state are fresh.
     #[cfg(windows)]
     fn browser_frame(&mut self, ctx: &egui::Context) {
-        self.audio_relay_upkeep();
-
         // Mirror page titles and current URLs onto the tiles so the hover
         // overlay shows "lofi hip hop radio..." instead of the raw URL and
         // layouts save where the user actually navigated.
