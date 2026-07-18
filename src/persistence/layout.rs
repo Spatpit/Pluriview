@@ -1,5 +1,5 @@
-use serde::{Serialize, Deserialize};
 use crate::preview::PreviewLayout;
+use serde::{Deserialize, Serialize};
 
 /// Complete saved layout
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,6 +24,11 @@ pub struct SavedLayout {
     /// None = monitoring off.
     #[serde(default)]
     pub monitor_device: Option<(String, String)>,
+
+    /// Profile-wide uBlock Origin Lite state. Defaults on for layouts saved
+    /// before integrated content blocking was added.
+    #[serde(default = "default_true")]
+    pub adblock_enabled: bool,
 
     /// Creation timestamp
     pub created_at: String,
@@ -65,6 +70,7 @@ impl SavedLayout {
             previews: Vec::new(),
             recent_browser_urls: Vec::new(),
             monitor_device: None,
+            adblock_enabled: true,
             created_at: now.clone(),
             modified_at: now,
         }
@@ -77,6 +83,10 @@ impl SavedLayout {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Get current timestamp as string
 fn chrono_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -86,4 +96,19 @@ fn chrono_now() -> String {
         .unwrap_or_default();
 
     format!("{}", duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SavedLayout;
+
+    #[test]
+    fn older_layouts_default_adblocking_to_enabled() {
+        let layout = SavedLayout::new("test".to_owned());
+        let mut value = serde_json::to_value(layout).unwrap();
+        value.as_object_mut().unwrap().remove("adblock_enabled");
+
+        let restored: SavedLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.adblock_enabled);
+    }
 }

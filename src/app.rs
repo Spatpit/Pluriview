@@ -676,6 +676,24 @@ impl PluriviewApp {
                 #[cfg(windows)]
                 {
                     ui.separator();
+                    let mut enabled = self.browser.adblock_enabled();
+                    let response = ui
+                        .checkbox(&mut enabled, "Block Ads & Trackers (uBOL)")
+                        .on_hover_text(self.browser.adblock_status_text());
+                    if response.clicked() {
+                        if let Err(error) = self.browser.set_adblock_enabled(enabled) {
+                            log::error!("Could not change ad blocker state: {error}");
+                        } else {
+                            self.save_autosave();
+                        }
+                        ui.close_menu();
+                    }
+                    ui.label(
+                        egui::RichText::new(self.browser.adblock_status_text())
+                            .small()
+                            .weak(),
+                    );
+                    ui.separator();
                     self.stream_audio_menu(ui);
                 }
             });
@@ -945,6 +963,7 @@ impl PluriviewApp {
         #[cfg(windows)]
         {
             layout.monitor_device = self.monitor_device.clone();
+            layout.adblock_enabled = self.browser.adblock_enabled();
         }
 
         layout
@@ -967,6 +986,9 @@ impl PluriviewApp {
         #[cfg(windows)]
         {
             self.monitor_device = layout.monitor_device.clone();
+            if let Err(error) = self.browser.set_adblock_enabled(layout.adblock_enabled) {
+                log::error!("Could not restore ad blocker state: {error}");
+            }
         }
 
         // Enumerate current windows to find matching ones

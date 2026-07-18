@@ -1,11 +1,23 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
+    fs,
+    io::{self, Cursor},
     num::NonZeroIsize,
+    path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, OnceLock},
 };
 
 use parking_lot::Mutex;
-use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_8;
+use webview2_com::{
+    BrowserExtensionEnableCompletedHandler,
+    Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2BrowserExtension, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_8,
+    },
+    ProfileAddBrowserExtensionCompletedHandler,
+};
+use webview2_core::{Interface, HSTRING as WebViewHString};
 use windows::{
     core::w,
     Win32::{
@@ -23,13 +35,13 @@ use windows::{
         },
     },
 };
-use webview2_core::Interface;
 use wry::{
     dpi::{PhysicalPosition, PhysicalSize},
     raw_window_handle::{
         HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
     },
-    NewWindowResponse, Rect, WebContext, WebView, WebViewBuilder, WebViewExtWindows,
+    NewWindowResponse, Rect, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows,
+    WebViewExtWindows,
 };
 
 use crate::preview::PreviewId;
@@ -44,6 +56,10 @@ const HEIGHT: i32 = 720;
 /// WebView2 rejects zoom factors outside roughly this range.
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
+
+const UBOL_VERSION: &str = "2026.714.1952";
+const UBOL_ARCHIVE: &[u8] =
+    include_bytes!("../assets/third_party/ubol/uBOLite_2026.714.1952.edge.zip");
 
 fn parked_bounds() -> Rect {
     Rect {
@@ -174,6 +190,10 @@ impl BrowserHost {
         let new_window_shared = shared.clone();
 
         let webview = WebViewBuilder::new_with_web_context(context)
+            // All tiles share one WebView2 environment/profile, so this must
+            // be identical on every builder. Runtime 120+ supports the flag;
+            // uBOL itself requires Chromium/WebView2 122+.
+            .with_browser_extensions_enabled(true)
             .with_url(url)
             .with_bounds(parked_bounds())
             .with_download_started_handler(|_, _| false)
@@ -255,7 +275,13 @@ impl BrowserHost {
     /// Position the host window over `rect` (egui points, client coordinates
     /// of `parent`). Sizes the WebView to fill the host and matches the zoom
     /// factor so the page keeps the exact layout it had as a captured tile.
-    pub fn place(&mut self, parent: HWND, rect: egui::Rect, pixels_per_point: f32, take_focus: bool) {
+    pub fn place(
+        &mut self,
+        parent: HWND,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+        take_focus: bool,
+    ) {
         let mut origin = POINT {
             x: (rect.min.x * pixels_per_point).round() as i32,
             y: (rect.min.y * pixels_per_point).round() as i32,
@@ -278,7 +304,15 @@ impl BrowserHost {
             SWP_SHOWWINDOW | SWP_NOACTIVATE
         };
         unsafe {
-            let _ = SetWindowPos(self.window.0, HWND_TOP, origin.x, origin.y, width, height, flags);
+            let _ = SetWindowPos(
+                self.window.0,
+                HWND_TOP,
+                origin.x,
+                origin.y,
+                width,
+                height,
+                flags,
+            );
         }
         if let Some(webview) = self.webview.as_ref() {
             let _ = webview.set_bounds(Rect {
@@ -374,6 +408,46 @@ impl BrowserHost {
         Ok(())
     }
 
+    fn install_browser_extension(
+        &self,
+        extension_dir: &Path,
+    ) -> Result<ICoreWebView2BrowserExtension, String> {
+        self.with_core(|core| {
+            let profile: ICoreWebView2Profile7 = unsafe {
+                core.cast::<ICoreWebView2_13>()
+                    .and_then(|core13| core13.Profile())
+                    .and_then(|profile| profile.cast())
+            }
+            .map_err(|error| {
+                format!("This WebView2 Runtime cannot install browser extensions: {error}")
+            })?;
+
+            let installed = Rc::new(RefCell::new(None));
+            let completed_result = installed.clone();
+            let profile_for_call = profile.clone();
+            let path = WebViewHString::from(extension_dir);
+            ProfileAddBrowserExtensionCompletedHandler::wait_for_async_operation(
+                Box::new(move |handler| unsafe {
+                    profile_for_call
+                        .AddBrowserExtension(&path, &handler)
+                        .map_err(webview2_com::Error::WindowsError)
+                }),
+                Box::new(move |result, extension| {
+                    result?;
+                    *completed_result.borrow_mut() = extension;
+                    Ok(())
+                }),
+            )
+            .map_err(|error| format!("uBlock Origin Lite could not be installed: {error}"))?;
+
+            let extension = installed
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| "WebView2 did not return the installed extension".to_owned())?;
+            Ok(extension)
+        })
+    }
+
     fn with_core<T>(
         &self,
         f: impl FnOnce(
@@ -401,25 +475,121 @@ impl Drop for BrowserHost {
 pub struct BrowserManager {
     context: WebContext,
     hosts: HashMap<PreviewId, BrowserHost>,
+    extension_dir: Option<PathBuf>,
+    extension_initialized: bool,
+    extension: Option<ICoreWebView2BrowserExtension>,
+    adblock_enabled: bool,
+    adblock_error: Option<String>,
 }
 
 impl BrowserManager {
     pub fn new() -> Self {
         let data_dir = directories::ProjectDirs::from("com", "pluriview", "Pluriview")
-            .map(|dirs| dirs.data_dir().join("webview2"));
+            .map(|dirs| dirs.data_dir().to_owned());
+        let webview_data_dir = data_dir.as_ref().map(|dir| dir.join("webview2"));
         Self {
-            context: WebContext::new(data_dir),
+            context: WebContext::new(webview_data_dir),
             hosts: HashMap::new(),
+            extension_dir: data_dir.map(|dir| dir.join("extensions").join("ubol")),
+            extension_initialized: false,
+            extension: None,
+            adblock_enabled: true,
+            adblock_error: None,
         }
     }
 
     /// Create a host + WebView for `url` and register it under `id`.
     /// Returns the host HWND for capture.
     pub fn create(&mut self, id: PreviewId, url: &str) -> Result<isize, String> {
-        let host = BrowserHost::new(&mut self.context, url)?;
+        // Hold the first real navigation on about:blank until uBOL has been
+        // installed and enabled, avoiding an initial burst of unfiltered
+        // requests. Extension failure is non-fatal: browser tiles still work.
+        let initialize_extension = !self.extension_initialized;
+        // Files must be at their final version before the shared WebView2
+        // environment starts; an installed unpacked extension must not be
+        // mutated while that environment is using it.
+        let prepared_extension = initialize_extension.then(|| {
+            self.extension_dir
+                .clone()
+                .ok_or_else(|| {
+                    "Pluriview could not determine its application data directory".to_owned()
+                })
+                .and_then(|extension_dir| {
+                    prepare_ubol(&extension_dir)?;
+                    Ok(extension_dir)
+                })
+        });
+        let initial_url = if initialize_extension {
+            "about:blank"
+        } else {
+            url
+        };
+        let host = BrowserHost::new(&mut self.context, initial_url)?;
+
+        if initialize_extension {
+            self.extension_initialized = true;
+            let initialized = prepared_extension
+                .expect("extension preparation is present for first initialization")
+                .and_then(|extension_dir| self.initialize_adblock(&host, &extension_dir));
+            if let Err(error) = initialized {
+                log::error!("Ad blocker unavailable: {error}");
+                self.adblock_error = Some(error);
+            }
+            host.load(url);
+        }
+
         let hwnd = host.hwnd();
         self.hosts.insert(id, host);
         Ok(hwnd)
+    }
+
+    fn initialize_adblock(
+        &mut self,
+        host: &BrowserHost,
+        extension_dir: &Path,
+    ) -> Result<(), String> {
+        let extension = host.install_browser_extension(extension_dir)?;
+        set_extension_enabled(&extension, self.adblock_enabled)?;
+        self.extension = Some(extension);
+        self.adblock_error = None;
+        Ok(())
+    }
+
+    pub fn adblock_enabled(&self) -> bool {
+        self.adblock_enabled
+    }
+
+    pub fn adblock_status_text(&self) -> String {
+        if let Some(error) = &self.adblock_error {
+            return format!("Unavailable: {error}");
+        }
+        if !self.extension_initialized {
+            return "uBlock Origin Lite loads with the first browser tile".to_owned();
+        }
+        if self.extension.is_some() {
+            if self.adblock_enabled {
+                format!("uBlock Origin Lite {UBOL_VERSION} is active")
+            } else {
+                format!("uBlock Origin Lite {UBOL_VERSION} is disabled")
+            }
+        } else {
+            "uBlock Origin Lite is unavailable".to_owned()
+        }
+    }
+
+    /// Update the profile-wide uBOL state. Before the first browser tile this
+    /// only records the preference; initialization applies it before loading.
+    pub fn set_adblock_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        if let Some(extension) = &self.extension {
+            set_extension_enabled(extension, enabled)?;
+        } else if self.extension_initialized {
+            return Err(self
+                .adblock_error
+                .clone()
+                .unwrap_or_else(|| "uBlock Origin Lite is unavailable".to_owned()));
+        }
+        self.adblock_enabled = enabled;
+        Ok(())
     }
 
     pub fn contains(&self, id: PreviewId) -> bool {
@@ -432,7 +602,9 @@ impl BrowserManager {
 
     /// PID of the shared WebView2 browser process, once any host can report it.
     pub fn browser_process_id(&self) -> Option<u32> {
-        self.hosts.values().find_map(BrowserHost::browser_process_id)
+        self.hosts
+            .values()
+            .find_map(BrowserHost::browser_process_id)
     }
 
     pub fn get(&self, id: PreviewId) -> Option<&BrowserHost> {
@@ -473,6 +645,95 @@ impl BrowserManager {
     }
 }
 
+fn set_extension_enabled(
+    extension: &ICoreWebView2BrowserExtension,
+    enabled: bool,
+) -> Result<(), String> {
+    let extension = extension.clone();
+    BrowserExtensionEnableCompletedHandler::wait_for_async_operation(
+        Box::new(move |handler| unsafe {
+            extension
+                .Enable(enabled, &handler)
+                .map_err(webview2_com::Error::WindowsError)
+        }),
+        Box::new(|result| result),
+    )
+    .map_err(|error| format!("uBlock Origin Lite could not be toggled: {error}"))
+}
+
+fn prepare_ubol(extension_dir: &Path) -> Result<(), String> {
+    if installed_ubol_version(extension_dir).as_deref() == Some(UBOL_VERSION) {
+        return Ok(());
+    }
+
+    let parent = extension_dir
+        .parent()
+        .ok_or("Invalid uBlock Origin Lite installation path")?;
+    fs::create_dir_all(parent).map_err(|error| format!("Create extension directory: {error}"))?;
+
+    let staging = parent.join("ubol-staging");
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .map_err(|error| format!("Remove stale extension staging directory: {error}"))?;
+    }
+    fs::create_dir(&staging)
+        .map_err(|error| format!("Create extension staging directory: {error}"))?;
+
+    let extract_result = extract_ubol_archive(&staging);
+    if let Err(error) = extract_result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if installed_ubol_version(&staging).as_deref() != Some(UBOL_VERSION) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err("Embedded uBlock Origin Lite package has an unexpected manifest".to_owned());
+    }
+
+    if extension_dir.exists() {
+        fs::remove_dir_all(extension_dir)
+            .map_err(|error| format!("Replace old extension version: {error}"))?;
+    }
+    fs::rename(&staging, extension_dir)
+        .map_err(|error| format!("Activate uBlock Origin Lite files: {error}"))
+}
+
+fn extract_ubol_archive(destination: &Path) -> Result<(), String> {
+    let reader = Cursor::new(UBOL_ARCHIVE);
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|error| format!("Open embedded uBlock Origin Lite package: {error}"))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("Read extension archive entry: {error}"))?;
+        let relative = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("Unsafe path in extension archive: {}", entry.name()))?;
+        let output = destination.join(relative);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&output)
+                .map_err(|error| format!("Create extension subdirectory: {error}"))?;
+            continue;
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Create extension subdirectory: {error}"))?;
+        }
+        let mut file =
+            fs::File::create(&output).map_err(|error| format!("Create extension file: {error}"))?;
+        io::copy(&mut entry, &mut file)
+            .map_err(|error| format!("Extract extension file: {error}"))?;
+    }
+    Ok(())
+}
+
+fn installed_ubol_version(extension_dir: &Path) -> Option<String> {
+    let manifest = fs::read(extension_dir.join("manifest.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
+    value.get("version")?.as_str().map(str::to_owned)
+}
+
 fn register_window_class() -> Result<(), String> {
     let class = WNDCLASSW {
         lpfnWndProc: Some(browser_window_proc),
@@ -501,7 +762,11 @@ unsafe extern "system" fn browser_window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_navigation, normalize_url, parked_bounds, NativeWindow};
+    use super::{
+        is_allowed_navigation, normalize_url, parked_bounds, NativeWindow, UBOL_ARCHIVE,
+        UBOL_VERSION,
+    };
+    use std::io::{Cursor, Read};
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     #[test]
@@ -557,5 +822,20 @@ mod tests {
         assert!(is_allowed_navigation("about:blank"));
         assert!(!is_allowed_navigation("file:///C:/secret.txt"));
         assert!(!is_allowed_navigation("ms-settings:display"));
+    }
+
+    #[test]
+    fn embedded_ubol_package_matches_pinned_version() {
+        let mut archive = zip::ZipArchive::new(Cursor::new(UBOL_ARCHIVE)).unwrap();
+        let mut manifest = String::new();
+        archive
+            .by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut manifest)
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+
+        assert_eq!(manifest["manifest_version"], 3);
+        assert_eq!(manifest["version"], UBOL_VERSION);
     }
 }

@@ -9,7 +9,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-blue" alt="Platform">
-  <img src="https://img.shields.io/badge/rust-1.70%2B-orange" alt="Rust">
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="Rust">
   <img src="https://img.shields.io/github/license/Spatpit/Pluriview" alt="License">
   <img src="https://img.shields.io/github/v/release/Spatpit/Pluriview?include_prereleases" alt="Release">
 </p>
@@ -27,6 +27,7 @@
 |---------|-------------|
 | **Live Capture** | Real-time window previews using Windows Graphics Capture API |
 | **Browser Tiles** | Put live web pages (YouTube, Twitch, anything) on the canvas with their own audio — no separate browser needed |
+| **Ad & Tracker Blocking** | uBlock Origin Lite is integrated into the shared browser-tile profile and enabled by default |
 | **Infinite Canvas** | Pan and zoom freely to organize your workspace |
 | **Crop Regions** | Focus on specific parts of windows with Alt+drag |
 | **Adjustable FPS** | Choose 5, 15, 30, or 60 FPS per preview |
@@ -46,6 +47,13 @@ back to canvas mode. Hover a browser tile for back/forward/reload/mute controls;
 logins and cookies persist in a dedicated WebView2 profile, separate from your main
 browser.
 
+Browser tiles use the official **uBlock Origin Lite** extension to block ads,
+trackers, and known malicious URLs. It is enabled by default for the shared
+Pluriview browser profile and can be toggled globally under **View → Block Ads
+& Trackers (uBOL)**. The extension loads locally from the executable; no
+separate browser installation is needed. WebView2 does not expose a normal
+extension toolbar, so uBOL's per-site popup and dashboard are not shown.
+
 **Streaming with audio (Discord/OBS):** browser-tile sound normally belongs to
 WebView2's own processes, so sharing the Pluriview window carries no tile audio.
 To fix that, enable **View → Stream Audio Monitor** and pick an output device you
@@ -59,6 +67,8 @@ modified. Off by default.
 - **OS:** Windows 10 (version 1903+) or Windows 11
 - **GPU:** DirectX 11 compatible graphics card
 - **Browser tiles:** [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (preinstalled on Windows 11 and current Windows 10; everything else works without it)
+- **Integrated ad blocking:** WebView2 Runtime 122 or newer (update the runtime if the View menu reports uBOL as unavailable)
+- **Building from source:** Rust 1.88 or newer
 
 ## Installation
 
@@ -71,7 +81,7 @@ git clone https://github.com/Spatpit/Pluriview.git
 cd Pluriview
 cargo build --release
 ```
-The executable will be at `target/release/pluriview.exe` (~6MB).
+The executable will be at `target/release/pluriview.exe`.
 
 ## Usage
 
@@ -118,7 +128,8 @@ Pluriview/
 │   ├── tray/               # System tray integration
 │   └── window_picker/      # Window enumeration and picker UI
 ├── assets/
-│   └── icon.ico            # Application icon
+│   ├── icon.ico            # Application icon
+│   └── third_party/ubol/   # Pinned official uBlock Origin Lite package
 ├── Cargo.toml              # Dependencies and metadata
 ├── build.rs                # Windows resource compilation
 ├── LICENSE                 # MIT License
@@ -128,12 +139,15 @@ Pluriview/
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Bundled third-party components retain their own licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Acknowledgments
 
 - Built with [egui](https://github.com/emilk/egui) - Immediate mode GUI library for Rust
 - Window capture via [windows-rs](https://github.com/microsoft/windows-rs)
 - Browser tiles via [wry](https://github.com/tauri-apps/wry) (WebView2)
+- Ad and tracker blocking via [uBlock Origin Lite](https://github.com/gorhill/uBlock) (GPL-3.0)
 
 ---
 

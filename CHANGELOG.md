@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-07-06
 
 ### Added
+- Integrated uBlock Origin Lite ad/tracker blocking for browser tiles, enabled by default with a persistent global View-menu toggle
 - Browser tiles: app-owned WebView2 pages (YouTube, Twitch, any site) on the canvas with independent audio; double-click or Ctrl+B for native interaction, Esc or click outside to exit
 - Browser tiles are saved and restored with layouts (current URL, position, size, FPS, z-order, mute state)
 - Browser hover controls: back, forward, reload, mute/unmute, open in default browser
