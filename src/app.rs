@@ -107,6 +107,18 @@ pub struct PluriviewApp {
     /// When the current browser interaction mode started (focus grace period).
     #[cfg(windows)]
     browser_activated_at: Option<Instant>,
+
+    /// OBS-style stream audio monitor target: `(device id, friendly name)`.
+    /// None = off (default). When set, browser-tile audio is replayed from
+    /// this process to that device so Discord/OBS per-app capture hears it.
+    #[cfg(windows)]
+    monitor_device: Option<(String, String)>,
+    /// Running monitor pipeline, present while tiles exist and a device is set.
+    #[cfg(windows)]
+    audio_monitor: Option<crate::audio::AudioMonitor>,
+    /// Last time the monitor checked the WebView2 browser process PID.
+    #[cfg(windows)]
+    audio_monitor_checked: Option<Instant>,
 }
 
 impl PluriviewApp {
@@ -150,6 +162,12 @@ impl PluriviewApp {
             add_browser: None,
             #[cfg(windows)]
             browser_activated_at: None,
+            #[cfg(windows)]
+            monitor_device: None,
+            #[cfg(windows)]
+            audio_monitor: None,
+            #[cfg(windows)]
+            audio_monitor_checked: None,
         };
 
         // Try to load autosave
@@ -390,10 +408,43 @@ impl PluriviewApp {
         Some(rect.shrink(inset.max(0.0)))
     }
 
+    /// Keep the stream audio monitor alive while it's enabled and browser
+    /// tiles exist, pointed at the current WebView2 browser process (which
+    /// changes if the WebView2 runtime crashes and restarts).
+    #[cfg(windows)]
+    fn audio_monitor_upkeep(&mut self) {
+        let enabled = self.monitor_device.is_some();
+        if !enabled || self.browser.is_empty() {
+            self.audio_monitor = None;
+            self.audio_monitor_checked = None;
+            return;
+        }
+        let due = self
+            .audio_monitor_checked
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
+        if !due {
+            return;
+        }
+        self.audio_monitor_checked = Some(Instant::now());
+        let device_id = self.monitor_device.as_ref().map(|(id, _)| id.clone());
+        let (Some(device_id), Some(pid)) = (device_id, self.browser.browser_process_id()) else {
+            return;
+        };
+        let current = self
+            .audio_monitor
+            .as_ref()
+            .map(|m| (m.browser_pid(), m.device_id().to_owned()));
+        if current != Some((pid, device_id.clone())) {
+            self.audio_monitor = Some(crate::audio::AudioMonitor::start(pid, device_id));
+        }
+    }
+
     /// Per-frame browser housekeeping. Runs after the canvas UI so tile
     /// rects and double-click state are fresh.
     #[cfg(windows)]
     fn browser_frame(&mut self, ctx: &egui::Context) {
+        self.audio_monitor_upkeep();
+
         // Mirror page titles and current URLs onto the tiles so the hover
         // overlay shows "lofi hip hop radio..." instead of the raw URL and
         // layouts save where the user actually navigated.
@@ -622,6 +673,11 @@ impl PluriviewApp {
                     self.canvas.reset();
                     ui.close_menu();
                 }
+                #[cfg(windows)]
+                {
+                    ui.separator();
+                    self.stream_audio_menu(ui);
+                }
             });
 
             ui.menu_button("Help", |ui| {
@@ -635,6 +691,47 @@ impl PluriviewApp {
                     ui.close_menu();
                 }
             });
+        });
+    }
+
+    /// "Stream Audio Monitor" submenu: pick the output device that receives
+    /// a copy of the browser tiles' audio (so Discord/OBS window capture can
+    /// hear them), or Off. Pick a device you don't listen to — a virtual
+    /// cable or an unconnected output — or you'll hear tiles twice.
+    #[cfg(windows)]
+    fn stream_audio_menu(&mut self, ui: &mut egui::Ui) {
+        let current_name = self
+            .monitor_device
+            .as_ref()
+            .map(|(_, name)| name.clone());
+        let label = match &current_name {
+            Some(name) => format!("Stream Audio Monitor: {name}"),
+            None => "Stream Audio Monitor: Off".to_owned(),
+        };
+        ui.menu_button(label, |ui| {
+            ui.label("Replay tile audio to a device so Discord/OBS\nwindow shares carry sound. Pick one you don't\nlisten to (virtual cable, unused output).");
+            ui.separator();
+            if ui
+                .radio(self.monitor_device.is_none(), "Off")
+                .clicked()
+            {
+                self.monitor_device = None;
+                ui.close_menu();
+            }
+            for device in crate::audio::render_devices() {
+                if device.is_default {
+                    // Monitoring to the device you're hearing = double audio.
+                    continue;
+                }
+                let selected = self
+                    .monitor_device
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == device.id);
+                if ui.radio(selected, &device.name).clicked() {
+                    self.monitor_device = Some((device.id, device.name));
+                    ui.close_menu();
+                }
+            }
         });
     }
 
@@ -845,6 +942,10 @@ impl PluriviewApp {
             .collect();
 
         layout.recent_browser_urls = self.recent_urls.clone();
+        #[cfg(windows)]
+        {
+            layout.monitor_device = self.monitor_device.clone();
+        }
 
         layout
     }
@@ -863,6 +964,10 @@ impl PluriviewApp {
         self.canvas.show_grid = layout.canvas.show_grid;
 
         self.recent_urls = layout.recent_browser_urls.clone();
+        #[cfg(windows)]
+        {
+            self.monitor_device = layout.monitor_device.clone();
+        }
 
         // Enumerate current windows to find matching ones
         let current_windows = enumerate_windows();

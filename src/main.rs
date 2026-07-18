@@ -11,6 +11,8 @@ mod overlay;
 mod privacy;
 #[cfg(windows)]
 mod browser;
+#[cfg(windows)]
+mod audio;
 
 use app::PluriviewApp;
 use eframe::egui;

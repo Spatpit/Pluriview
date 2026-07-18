@@ -46,6 +46,14 @@ back to canvas mode. Hover a browser tile for back/forward/reload/mute controls;
 logins and cookies persist in a dedicated WebView2 profile, separate from your main
 browser.
 
+**Streaming with audio (Discord/OBS):** browser-tile sound normally belongs to
+WebView2's own processes, so sharing the Pluriview window carries no tile audio.
+To fix that, enable **View → Stream Audio Monitor** and pick an output device you
+don't listen to (a virtual cable like VB-Cable, or an unconnected output).
+Pluriview then plays a copy of the tile audio from its own process — window
+shares pick it up, you don't hear it twice, and nothing outside Pluriview is
+modified. Off by default.
+
 ## Requirements
 
 - **OS:** Windows 10 (version 1903+) or Windows 11

@@ -20,6 +20,11 @@ pub struct SavedLayout {
     #[serde(default)]
     pub recent_browser_urls: Vec<String>,
 
+    /// Stream audio monitor target as (device id, friendly name);
+    /// None = monitoring off.
+    #[serde(default)]
+    pub monitor_device: Option<(String, String)>,
+
     /// Creation timestamp
     pub created_at: String,
 
@@ -59,6 +64,7 @@ impl SavedLayout {
             },
             previews: Vec::new(),
             recent_browser_urls: Vec::new(),
+            monitor_device: None,
             created_at: now.clone(),
             modified_at: now,
         }
