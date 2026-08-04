@@ -16,6 +16,7 @@ mod audio;
 
 use app::PluriviewApp;
 use eframe::egui;
+use persistence::{Storage, WindowLayout, DEFAULT_WINDOW_SIZE};
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
@@ -23,15 +24,33 @@ fn main() -> eframe::Result<()> {
     // Create the window icon (leaf)
     let icon = create_window_icon();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([DEFAULT_WINDOW_SIZE.0, DEFAULT_WINDOW_SIZE.1])
+        .with_min_inner_size([800.0, 600.0])
+        .with_title("Pluriview")
+        .with_icon(icon)
+        // We draw our own title bar (see app.rs) so it can match the
+        // app's dark theme instead of the OS chrome.
+        .with_decorations(false);
+
+    // Reopen where the window was left. The app itself loads this layout
+    // again for its tiles; the geometry has to be read here because the
+    // viewport is built before the app exists.
+    //
+    // The saved size and position are the *restored* ones even when the
+    // window was closed maximized, so the window is always built at them and
+    // the app re-maximizes on its first frame. Building it maximized here
+    // would not survive anyway: winit applies the position afterwards, which
+    // restores the window.
+    if let Some(window) = saved_window_geometry() {
+        viewport = viewport.with_inner_size([window.size.0, window.size.1]);
+        if let Some(position) = window.position.filter(is_on_screen) {
+            viewport = viewport.with_position([position.0, position.1]);
+        }
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 720.0])
-            .with_min_inner_size([800.0, 600.0])
-            .with_title("Pluriview")
-            .with_icon(icon)
-            // We draw our own title bar (see app.rs) so it can match the
-            // app's dark theme instead of the OS chrome.
-            .with_decorations(false),
+        viewport,
         ..Default::default()
     };
 
@@ -42,94 +61,48 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Geometry the main window was last closed at, if a layout has one.
+fn saved_window_geometry() -> Option<WindowLayout> {
+    Storage::new()?.load_autosave().ok()?.window
+}
+
+/// Whether a saved top-left corner still lands somewhere the user can reach.
+/// Without this, a window saved on a monitor that is now unplugged would
+/// reopen off-screen — and with the OS decorations off there is no title bar
+/// to drag it back with.
+#[cfg(windows)]
+fn is_on_screen(position: &(f32, f32)) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+
+    // Logical points, compared against physical pixels: on a scaled display
+    // the logical rect is the smaller of the two, so this only ever errs
+    // toward rejecting a position and opening centered instead.
+    let (x, y) = *position;
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) } as f32;
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) } as f32;
+    let right = left + unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) } as f32;
+    let bottom = top + unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) } as f32;
+
+    // Leave room for a grabbable strip of the window rather than accepting a
+    // corner that sits one pixel inside the desktop.
+    const VISIBLE_MARGIN: f32 = 80.0;
+    x >= left && y >= top && x <= right - VISIBLE_MARGIN && y <= bottom - VISIBLE_MARGIN
+}
+
+#[cfg(not(windows))]
+fn is_on_screen(_position: &(f32, f32)) -> bool {
+    true
+}
+
 /// Create the window icon (green leaf) for title bar and taskbar
 fn create_window_icon() -> egui::IconData {
-    let size = 32usize;
-    let mut rgba = vec![0u8; size * size * 4];
-
-    let cx = size as f64 / 2.0;
-    let cy = size as f64 / 2.0;
-    let margin = size as f64 / 10.0;
-    let leaf_length = size as f64 - 2.0 * margin;
-    let leaf_width = leaf_length * 0.55;
-
-    // Rotation angle (35 degrees)
-    let angle = 35.0_f64.to_radians();
-    let cos_a = angle.cos();
-    let sin_a = angle.sin();
-
-    // Colors
-    let base_color = (107u8, 170u8, 75u8);  // Main green
-    let dark_color = (70u8, 125u8, 50u8);   // Vein color
-
-    // Draw each pixel
-    for y in 0..size {
-        for x in 0..size {
-            let idx = (y * size + x) * 4;
-
-            // Transform point back to unrotated space
-            let px = x as f64;
-            let py = y as f64;
-
-            // Inverse rotation
-            let ux = cos_a * (px - cx) + sin_a * (py - cy) + cx;
-            let uy = -sin_a * (px - cx) + cos_a * (py - cy) + cy;
-
-            // Check if point is inside leaf shape
-            let t = (uy - margin) / leaf_length;
-
-            if t >= 0.0 && t <= 1.0 {
-                // Leaf width at this height
-                let width_factor = (t * std::f64::consts::PI).sin().powf(0.8);
-                let half_width = (leaf_width / 2.0) * width_factor;
-
-                let dist_from_center = (ux - cx).abs();
-
-                if dist_from_center <= half_width {
-                    // Inside leaf - check if on vein
-                    let on_main_vein = dist_from_center < size as f64 / 18.0 && t > 0.08 && t < 0.92;
-
-                    // Check side veins
-                    let mut on_side_vein = false;
-                    for i in 1..=5 {
-                        let vein_t = 0.15 + (i as f64 / 6.0) * 0.7;
-                        let vein_y = margin + vein_t * leaf_length;
-                        let y_dist = (uy - vein_y).abs();
-
-                        if y_dist < size as f64 / 20.0 {
-                            let vein_width_factor = (vein_t * std::f64::consts::PI).sin().powf(0.8);
-                            let vein_len = (leaf_width / 2.0) * vein_width_factor * 0.75;
-
-                            // Side veins go diagonally upward
-                            let expected_x_offset = (ux - cx).abs();
-                            let expected_y_offset = expected_x_offset * 0.35;
-                            let actual_y = vein_y - expected_y_offset;
-
-                            if (uy - actual_y).abs() < size as f64 / 25.0 && expected_x_offset < vein_len {
-                                on_side_vein = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    let color = if on_main_vein || on_side_vein {
-                        dark_color
-                    } else {
-                        base_color
-                    };
-
-                    rgba[idx] = color.0;     // R
-                    rgba[idx + 1] = color.1; // G
-                    rgba[idx + 2] = color.2; // B
-                    rgba[idx + 3] = 255;     // A
-                }
-            }
-        }
-    }
-
+    let size = 32;
     egui::IconData {
-        rgba,
-        width: size as u32,
-        height: size as u32,
+        rgba: crate::tray::create_leaf_rgba(size),
+        width: size,
+        height: size,
     }
 }

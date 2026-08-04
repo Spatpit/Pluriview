@@ -1,7 +1,7 @@
 use crate::privacy;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
     IsWindowVisible, GetWindowLongW, GWL_EXSTYLE,
@@ -28,9 +28,6 @@ pub struct WindowInfo {
     /// Executable name
     pub exe_name: String,
 
-    /// Window class name (reserved for future use)
-    #[allow(dead_code)]
-    pub class_name: String,
 }
 
 impl WindowInfo {
@@ -56,7 +53,7 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
     }
 
     // Sort by title
-    windows.sort_by(|a, b| a.display_name().to_lowercase().cmp(&b.display_name().to_lowercase()));
+    windows.sort_by_key(|window| window.display_name().to_lowercase());
 
     windows
 }
@@ -153,7 +150,6 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
         title,
         process_id,
         exe_name,
-        class_name,
     });
 
     BOOL(1) // Continue enumeration
@@ -170,7 +166,7 @@ fn get_process_name(process_id: u32) -> String {
         let mut buffer: Vec<u16> = vec![0; 260];
         let mut size = buffer.len() as u32;
 
-        if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, windows::core::PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
+        let result = if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, windows::core::PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
             let path = OsString::from_wide(&buffer[..size as usize])
                 .to_string_lossy()
                 .to_string();
@@ -179,6 +175,8 @@ fn get_process_name(process_id: u32) -> String {
             path.rsplit('\\').next().unwrap_or(&path).to_string()
         } else {
             String::from("Unknown")
-        }
+        };
+        let _ = CloseHandle(handle);
+        result
     }
 }

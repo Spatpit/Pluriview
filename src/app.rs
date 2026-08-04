@@ -1,16 +1,22 @@
 use eframe::egui::{self, Vec2, Pos2};
+#[cfg(windows)]
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 #[cfg(debug_assertions)]
 use crate::privacy;
 use crate::canvas::{BrowserAction, CanvasState};
-use crate::preview::{PreviewManager, PreviewLayout, PreviewId, FpsPreset, WindowHandle};
+use crate::preview::{
+    BrowserTileStatus, FpsPreset, PreviewId, PreviewLayout, PreviewManager, WindowHandle,
+};
 use crate::window_picker::{WindowPicker, WindowInfo, enumerate_windows, spawn_preview};
 use crate::capture::CaptureCoordinator;
-use crate::persistence::{Storage, SavedLayout, CanvasLayout};
+use crate::persistence::{CanvasLayout, SavedLayout, Storage, WindowLayout};
 use crate::tray::TrayManager;
 use crate::overlay::RegionSelector;
 #[cfg(windows)]
-use crate::browser::{self, normalize_url, BrowserManager};
+use crate::browser::{
+    self, normalize_url, scrub_url_for_storage, BrowserManager, ExtensionPreparationStatus,
+};
 #[cfg(windows)]
 use windows::core::HSTRING;
 #[cfg(windows)]
@@ -18,7 +24,9 @@ use windows::Win32::Foundation::HWND;
 #[cfg(windows)]
 use windows::Win32::UI::Shell::ShellExecuteW;
 #[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, SW_SHOWNORMAL};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, SetForegroundWindow, SW_SHOWNORMAL,
+};
 use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
 /// How long after activating a browser we skip the focus-loss check, so the
@@ -48,6 +56,14 @@ struct AddBrowserDialog {
     target: Option<PreviewId>,
     /// The URL field grabs focus once when the dialog opens.
     focused: bool,
+}
+
+#[cfg(windows)]
+struct PendingBrowserTile {
+    url: String,
+    fps: FpsPreset,
+    muted: bool,
+    shown_once: bool,
 }
 
 /// Main application state
@@ -97,11 +113,21 @@ pub struct PluriviewApp {
     /// Main window HWND, cached from eframe on the first frame.
     main_hwnd: Option<isize>,
 
+    /// Main window geometry, mirrored every frame so the layout can be saved
+    /// from `on_exit`, where no `Context` is available.
+    window_layout: WindowLayout,
+
+    /// Set when the layout was saved maximized; applied on the first frame,
+    /// since the window has to be *built* at its restored geometry.
+    pending_maximize: bool,
+
     /// Recently added browser URLs, newest first.
     recent_urls: Vec<String>,
 
     #[cfg(windows)]
     browser: BrowserManager,
+    #[cfg(windows)]
+    pending_browser_tiles: HashMap<PreviewId, PendingBrowserTile>,
     #[cfg(windows)]
     add_browser: Option<AddBrowserDialog>,
     /// When the current browser interaction mode started (focus grace period).
@@ -119,6 +145,11 @@ pub struct PluriviewApp {
     /// Last time the monitor checked the WebView2 browser process PID.
     #[cfg(windows)]
     audio_monitor_checked: Option<Instant>,
+
+    /// Held state of the polled numpad shortcuts (`[Numpad 1, Numpad 2]`),
+    /// kept so the toggles fire once per press instead of every frame.
+    #[cfg(windows)]
+    numpad_held: [bool; 2],
 }
 
 impl PluriviewApp {
@@ -155,9 +186,13 @@ impl PluriviewApp {
             region_select_preview_id: None,
             quick_add: None,
             main_hwnd: None,
+            window_layout: WindowLayout::default(),
+            pending_maximize: false,
             recent_urls: Vec::new(),
             #[cfg(windows)]
             browser: BrowserManager::new(),
+            #[cfg(windows)]
+            pending_browser_tiles: HashMap::new(),
             #[cfg(windows)]
             add_browser: None,
             #[cfg(windows)]
@@ -168,10 +203,13 @@ impl PluriviewApp {
             audio_monitor: None,
             #[cfg(windows)]
             audio_monitor_checked: None,
+            #[cfg(windows)]
+            numpad_held: [false; 2],
         };
 
         // Try to load autosave
         app.load_autosave();
+        app.pending_maximize = app.window_layout.maximized;
 
         app
     }
@@ -188,31 +226,114 @@ impl PluriviewApp {
     ) -> Result<PreviewId, String> {
         let url = normalize_url(url).map_err(str::to_owned)?;
 
-        // Reserve the preview first so the host and capture share its ID.
+        // Reserve the visual tile immediately. If uBOL needs extraction, the
+        // app can render progress here while filesystem work runs off-thread.
         let id = self
             .preview_manager
-            .add_for_window(0, std::process::id(), url.clone(), position, size);
+            .add_browser_placeholder(url.clone(), position, size, fps);
+        self.remember_recent_url(&url);
 
-        match self.browser.create(id, &url) {
-            Ok(hwnd) => {
-                if let Some(preview) = self.preview_manager.get_mut(id) {
-                    preview.window_handle = Some(WindowHandle {
-                        hwnd,
-                        process_id: std::process::id(),
-                    });
-                    preview.capture_active = true;
-                    preview.browser_url = Some(url.clone());
-                    preview.set_fps_preset(fps);
+        if !self.browser.can_create_browser() {
+            self.browser.start_extension_preparation();
+        }
+
+        self.pending_browser_tiles.insert(
+            id,
+            PendingBrowserTile {
+                url,
+                fps,
+                muted: false,
+                shown_once: false,
+            },
+        );
+        Ok(id)
+    }
+
+    #[cfg(windows)]
+    fn activate_browser_tile(
+        &mut self,
+        id: PreviewId,
+        url: &str,
+        fps: FpsPreset,
+    ) -> Result<(), String> {
+        if let Some(preview) = self.preview_manager.get_mut(id) {
+            preview.browser_status = BrowserTileStatus::Starting;
+        }
+        let hwnd = self.browser.create(id, url)?;
+        if let Some(preview) = self.preview_manager.get_mut(id) {
+            preview.window_handle = Some(WindowHandle {
+                hwnd,
+                process_id: std::process::id(),
+            });
+            preview.capture_active = true;
+            preview.browser_status = BrowserTileStatus::Ready;
+            preview.set_fps_preset(fps);
+        }
+        self.capture_coordinator
+            .start_capture(id, hwnd, url.to_owned(), fps.as_u32());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn browser_preparation_upkeep(&mut self, ctx: &egui::Context) {
+        let status = self.browser.poll_extension_preparation();
+        let progress = match &status {
+            ExtensionPreparationStatus::Preparing(progress) => *progress,
+            ExtensionPreparationStatus::Ready => 1.0,
+            ExtensionPreparationStatus::Idle | ExtensionPreparationStatus::Failed(_) => 0.0,
+        };
+
+        let can_create = self.browser.can_create_browser();
+        for id in self.pending_browser_tiles.keys().copied() {
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.browser_status = if can_create {
+                    BrowserTileStatus::Starting
+                } else {
+                    match &status {
+                        ExtensionPreparationStatus::Failed(error) => {
+                            BrowserTileStatus::Failed(error.clone())
+                        }
+                        _ => BrowserTileStatus::PreparingAdblock { progress },
+                    }
+                };
+            }
+        }
+
+        if can_create {
+            let ready_ids: Vec<_> = self
+                .pending_browser_tiles
+                .iter()
+                .filter_map(|(id, pending)| pending.shown_once.then_some(*id))
+                .collect();
+            // Creating WebView2 hosts still happens on the UI thread. Start
+            // one per frame so restoring several tiles cannot monopolize a
+            // single frame after preparation finishes.
+            for id in ready_ids.into_iter().take(1) {
+                let Some(pending) = self.pending_browser_tiles.remove(&id) else {
+                    continue;
+                };
+                if self.preview_manager.get(id).is_none() {
+                    continue;
                 }
-                self.capture_coordinator
-                    .start_capture(id, hwnd, url.clone(), fps.as_u32());
-                self.remember_recent_url(&url);
-                Ok(id)
+                match self.activate_browser_tile(id, &pending.url, pending.fps) {
+                    Ok(()) => self.apply_browser_mute(id, pending.muted),
+                    Err(error) => {
+                        log::error!("Failed to start browser tile: {error}");
+                        if let Some(preview) = self.preview_manager.get_mut(id) {
+                            preview.browser_status = BrowserTileStatus::Failed(error);
+                        }
+                    }
+                }
             }
-            Err(error) => {
-                self.preview_manager.remove(id);
-                Err(error)
-            }
+            self.browser.initialize_prepared_extension_for_existing_host();
+        }
+
+        self.browser.poll_adblock_settle();
+
+        if matches!(status, ExtensionPreparationStatus::Preparing(_))
+            || self.browser.adblock_settling()
+        {
+            ctx.request_repaint();
         }
     }
 
@@ -221,6 +342,13 @@ impl PluriviewApp {
     #[cfg(windows)]
     fn apply_browser_mute(&mut self, id: PreviewId, muted: bool) {
         if !muted {
+            return;
+        }
+        if let Some(pending) = self.pending_browser_tiles.get_mut(&id) {
+            pending.muted = true;
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.browser_muted = true;
+            }
             return;
         }
         if let Some(host) = self.browser.get_mut(id) {
@@ -233,8 +361,11 @@ impl PluriviewApp {
     }
 
     fn remember_recent_url(&mut self, url: &str) {
-        self.recent_urls.retain(|u| u != url);
-        self.recent_urls.insert(0, url.to_owned());
+        let Some(url) = scrub_url_for_storage(url) else {
+            return;
+        };
+        self.recent_urls.retain(|u| u != &url);
+        self.recent_urls.insert(0, url);
         self.recent_urls.truncate(MAX_RECENT_URLS);
     }
 
@@ -304,6 +435,9 @@ impl PluriviewApp {
                     if let Some(host) = self.browser.get(id) {
                         host.load(&url);
                     }
+                    if let Some(pending) = self.pending_browser_tiles.get_mut(&id) {
+                        pending.url = url.clone();
+                    }
                     if let Some(preview) = self.preview_manager.get_mut(id) {
                         preview.browser_url = Some(url.clone());
                         preview.title = url.clone();
@@ -363,16 +497,18 @@ impl PluriviewApp {
             }
             BrowserAction::OpenExternal => {
                 if let Some(host) = self.browser.get(id) {
-                    let url = HSTRING::from(host.current_url());
-                    unsafe {
-                        ShellExecuteW(
-                            None,
-                            windows::core::w!("open"),
-                            &url,
-                            None,
-                            None,
-                            SW_SHOWNORMAL,
-                        );
+                    if let Ok(url) = normalize_url(&host.current_url()) {
+                        let url = HSTRING::from(url);
+                        unsafe {
+                            ShellExecuteW(
+                                None,
+                                windows::core::w!("open"),
+                                &url,
+                                None,
+                                None,
+                                SW_SHOWNORMAL,
+                            );
+                        }
                     }
                 }
             }
@@ -381,6 +517,11 @@ impl PluriviewApp {
                     .browser
                     .get(id)
                     .map(|host| host.current_url())
+                    .or_else(|| {
+                        self.preview_manager
+                            .get(id)
+                            .and_then(|preview| preview.browser_url.clone())
+                    })
                     .unwrap_or_default();
                 self.add_browser = Some(AddBrowserDialog {
                     position: Pos2::ZERO,
@@ -515,6 +656,45 @@ impl PluriviewApp {
 
         // Let the canvas outline the interactive tile in the accent color.
         self.canvas.interactive_browser = self.browser.active_id();
+    }
+
+    /// True when Pluriview owns keyboard focus, either through its main window
+    /// or through the WebView host of an interactive browser tile.
+    #[cfg(windows)]
+    fn owns_foreground(&self) -> bool {
+        let foreground = unsafe { GetForegroundWindow() };
+        if self.main_hwnd == Some(foreground.0 as isize) {
+            return true;
+        }
+        self.browser
+            .active_id()
+            .and_then(|id| self.browser.get(id))
+            .is_some_and(|host| host.owns_foreground())
+    }
+
+    /// Edge-detect the polled numpad shortcuts, returning `[Numpad 1, Numpad 2]`.
+    ///
+    /// These are polled instead of read from egui for two reasons: an
+    /// interactive WebView swallows all keyboard input before egui sees it,
+    /// and egui reports numpad digits identically to the number row. Polling is
+    /// process-wide, so presses only count while Pluriview is in the
+    /// foreground; the held state is still tracked when it is not, so a key
+    /// pressed in another app doesn't fire on the way back.
+    #[cfg(windows)]
+    fn poll_numpad_shortcuts(&mut self, ctx: &egui::Context) -> [bool; 2] {
+        let listening = self.owns_foreground() && !ctx.wants_keyboard_input();
+        if listening {
+            // Polling only sees keys still held at frame time, so tick fast
+            // enough that a quick tap can't fall between two frames.
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        let mut pressed = [false; 2];
+        for (index, digit) in [1u8, 2].into_iter().enumerate() {
+            let down = browser::numpad_digit_down(digit);
+            pressed[index] = down && !self.numpad_held[index] && listening;
+            self.numpad_held[index] = down;
+        }
+        pressed
     }
 
     /// Set the window HWND for the tray manager (call once after window is created)
@@ -684,6 +864,9 @@ impl PluriviewApp {
                         if let Err(error) = self.browser.set_adblock_enabled(enabled) {
                             log::error!("Could not change ad blocker state: {error}");
                         } else {
+                            if enabled {
+                                self.browser.start_extension_preparation();
+                            }
                             self.save_autosave();
                         }
                         ui.close_menu();
@@ -933,7 +1116,7 @@ impl PluriviewApp {
     /// Save the current layout to autosave
     fn save_autosave(&self) {
         if let Some(storage) = &self.storage {
-            let layout = self.create_layout("autosave".to_string());
+            let layout = self.create_layout();
             if let Err(e) = storage.save_autosave(&layout) {
                 eprintln!("Failed to save autosave: {}", e);
             } else {
@@ -943,9 +1126,38 @@ impl PluriviewApp {
         }
     }
 
+    /// Mirror the window's geometry into [`Self::window_layout`]. Minimized
+    /// and maximized windows report the geometry they currently occupy, not
+    /// the one to reopen at, so only the restored size and position are kept.
+    fn remember_window_geometry(&mut self, ctx: &egui::Context) {
+        let (position, size, maximized, minimized) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (
+                viewport.outer_rect.map(|rect| (rect.min.x, rect.min.y)),
+                viewport.inner_rect.map(|rect| (rect.width(), rect.height())),
+                viewport.maximized.unwrap_or(false),
+                viewport.minimized.unwrap_or(false),
+            )
+        });
+        if minimized {
+            return;
+        }
+
+        self.window_layout.maximized = maximized;
+        if maximized {
+            return;
+        }
+        if let Some(position) = position {
+            self.window_layout.position = Some(position);
+        }
+        if let Some(size) = size {
+            self.window_layout.size = size;
+        }
+    }
+
     /// Create a SavedLayout from current state
-    fn create_layout(&self, name: String) -> SavedLayout {
-        let mut layout = SavedLayout::new(name);
+    fn create_layout(&self) -> SavedLayout {
+        let mut layout = SavedLayout::new();
 
         // Save canvas state
         layout.canvas = CanvasLayout {
@@ -956,10 +1168,29 @@ impl PluriviewApp {
 
         // Save all previews
         layout.previews = self.preview_manager.all()
-            .map(|p| PreviewLayout::from(p))
+            .map(|p| {
+                let mut saved = PreviewLayout::from(p);
+                #[cfg(windows)]
+                {
+                    // Ask the live WebView where it actually is, so the tile
+                    // reopens on the last page browsed rather than the one it
+                    // was created with. Falls back to the mirrored URL for
+                    // tiles whose host is gone.
+                    saved.browser_url = self
+                        .browser
+                        .get(p.id)
+                        .and_then(|host| host.live_url())
+                        .or(saved.browser_url)
+                        .as_deref()
+                        .and_then(scrub_url_for_storage);
+                }
+                saved
+            })
             .collect();
 
         layout.recent_browser_urls = self.recent_urls.clone();
+        layout.picker_open = self.picker_open;
+        layout.window = Some(self.window_layout);
         #[cfg(windows)]
         {
             layout.monitor_device = self.monitor_device.clone();
@@ -975,14 +1206,34 @@ impl PluriviewApp {
         self.preview_manager.clear();
         self.capture_coordinator.stop_all();
         #[cfg(windows)]
-        self.browser.clear();
+        {
+            self.browser.clear();
+            self.pending_browser_tiles.clear();
+        }
 
         // Restore canvas state
         self.canvas.pan = Vec2::new(layout.canvas.pan.0, layout.canvas.pan.1);
         self.canvas.zoom = layout.canvas.zoom;
         self.canvas.show_grid = layout.canvas.show_grid;
+        self.picker_open = layout.picker_open;
+        // The window is not moved from here — main.rs opens it at the saved
+        // geometry, and reloading a layout mid-session should not move the
+        // window out from under the user. Mirroring the value only keeps
+        // `pending_maximize` (read once, in `new`) in sync.
+        self.window_layout = layout.window.unwrap_or(self.window_layout);
 
-        self.recent_urls = layout.recent_browser_urls.clone();
+        #[cfg(windows)]
+        {
+            self.recent_urls = layout
+                .recent_browser_urls
+                .iter()
+                .filter_map(|url| scrub_url_for_storage(url))
+                .collect();
+        }
+        #[cfg(not(windows))]
+        {
+            self.recent_urls = layout.recent_browser_urls.clone();
+        }
         #[cfg(windows)]
         {
             self.monitor_device = layout.monitor_device.clone();
@@ -1081,6 +1332,18 @@ impl eframe::App for PluriviewApp {
         // Set up tray HWND on first frame (window now exists)
         self.setup_tray_hwnd();
 
+        if self.pending_maximize {
+            self.pending_maximize = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+        self.remember_window_geometry(ctx);
+
+        // Never block first paint on extension extraction/integrity work.
+        // Pending browser tiles render their progress while this polls the
+        // background worker and activates them when preparation completes.
+        #[cfg(windows)]
+        self.browser_preparation_upkeep(ctx);
+
         // Custom title bar + manual resize border (decorations are off)
         self.handle_frameless_resize(ctx);
         if !self.canvas_only {
@@ -1168,20 +1431,37 @@ impl eframe::App for PluriviewApp {
             });
 
         #[cfg(windows)]
+        if !self.pending_browser_tiles.is_empty() {
+            for pending in self.pending_browser_tiles.values_mut() {
+                pending.shown_once = true;
+            }
+            // Guarantee at least one painted placeholder frame before any
+            // WebView creation can occupy the UI thread.
+            ctx.request_repaint();
+        }
+
+        #[cfg(windows)]
         {
+            let [numpad_interact, numpad_focus] = self.poll_numpad_shortcuts(ctx);
+
             let browser_double_clicked = self
                 .canvas
                 .last_double_clicked
                 .filter(|id| self.browser.contains(*id));
 
-            let browser_shortcut = (!ctx.wants_keyboard_input()
+            let browser_shortcut = ((!ctx.wants_keyboard_input()
                 && ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::B)))
+                || numpad_interact)
             .then(|| {
-                self.canvas
-                    .selection
-                    .iter()
-                    .copied()
-                    .find(|id| self.browser.contains(*id))
+                // The live tile first, so Numpad 1 toggles interaction back off
+                // even if the selection drifted while the page had focus.
+                self.browser.active_id().or_else(|| {
+                    self.canvas
+                        .selection
+                        .iter()
+                        .copied()
+                        .find(|id| self.browser.contains(*id))
+                })
             })
             .flatten();
 
@@ -1192,6 +1472,13 @@ impl eframe::App for PluriviewApp {
                         host.park();
                     }
                     self.browser_activated_at = None;
+                    // The parked WebView still holds keyboard focus; hand it
+                    // back so the next shortcut reaches us.
+                    if let Some(hwnd) = self.main_hwnd {
+                        unsafe {
+                            let _ = SetForegroundWindow(HWND(hwnd as *mut _));
+                        }
+                    }
                 } else if let (Some(hwnd), Some(canvas_rect)) =
                     (self.main_hwnd, self.canvas.last_screen_rect)
                 {
@@ -1214,6 +1501,26 @@ impl eframe::App for PluriviewApp {
                 }
             }
             self.canvas.last_double_clicked = None;
+
+            // Numpad 2: fit the current tile to the canvas, or restore the
+            // pre-focus view if a tile is already focused (same as Escape).
+            if numpad_focus && !self.canvas.exit_focus() {
+                let target = self
+                    .browser
+                    .active_id()
+                    .or_else(|| self.canvas.selection.first().copied());
+                let tile_rect = target.and_then(|id| {
+                    self.preview_manager
+                        .get(id)
+                        .filter(|preview| preview.removing.is_none())
+                        .map(|preview| preview.rect())
+                });
+                if let (Some(id), Some(rect), Some(canvas_rect)) =
+                    (target, tile_rect, self.canvas.last_screen_rect)
+                {
+                    self.canvas.focus_on_tile(id, rect, canvas_rect);
+                }
+            }
 
             // Per-frame browser housekeeping: mirror page titles/URLs onto
             // tiles, exit interaction mode on Escape/focus loss/minimize,
@@ -1271,6 +1578,8 @@ impl eframe::App for PluriviewApp {
         {
             let previews = &self.preview_manager;
             self.browser.retain(|id| previews.get(id).is_some());
+            self.pending_browser_tiles
+                .retain(|id, _| previews.get(*id).is_some());
         }
 
         // Handle global keyboard shortcuts (skip while typing in a text field)
@@ -1353,8 +1662,12 @@ impl eframe::App for PluriviewApp {
                             ui.label(egui::RichText::new("H").weak());
                             ui.end_row();
 
+                            ui.label("Focus current tile");
+                            ui.label(egui::RichText::new("Numpad 2").weak());
+                            ui.end_row();
+
                             ui.label("Exit tile focus");
-                            ui.label(egui::RichText::new("Esc").weak());
+                            ui.label(egui::RichText::new("Numpad 2 / Esc").weak());
                             ui.end_row();
 
                             ui.add_space(10.0);
@@ -1407,11 +1720,17 @@ impl eframe::App for PluriviewApp {
                             ui.end_row();
 
                             ui.label("Interact with page");
-                            ui.label(egui::RichText::new("Double-click / Ctrl+B").weak());
+                            ui.label(
+                                egui::RichText::new("Numpad 1 / Double-click / Ctrl+B").weak(),
+                            );
                             ui.end_row();
 
                             ui.label("Exit interaction");
-                            ui.label(egui::RichText::new("Esc / click outside").weak());
+                            ui.label(egui::RichText::new("Numpad 1 / Esc / click outside").weak());
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new("Numpad shortcuts need NumLock on").weak());
+                            ui.label("");
                             ui.end_row();
 
                             ui.add_space(10.0);

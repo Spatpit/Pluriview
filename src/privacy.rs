@@ -1,23 +1,17 @@
 /// Privacy and security utilities for Pluriview
-use std::collections::HashSet;
-use once_cell::sync::Lazy;
-
 /// A list of process names that should never be captured for privacy reasons.
 /// Users can eventually customize this in settings.
-pub static BLACKLISTED_PROCESSES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    let mut m = HashSet::new();
-    m.insert("1Password.exe");
-    m.insert("Bitwarden.exe");
-    m.insert("KeePassXC.exe");
-    m.insert("LastPass.exe");
-    m.insert("Dashlane.exe");
-    m.insert("Enpass.exe");
-    // Add common sensitive apps
-    m.insert("Signal.exe");
-    m.insert("Telegram.exe");
-    m.insert("WhatsApp.exe");
-    m
-});
+pub const BLACKLISTED_PROCESSES: &[&str] = &[
+    "1Password.exe",
+    "Bitwarden.exe",
+    "KeePassXC.exe",
+    "LastPass.exe",
+    "Dashlane.exe",
+    "Enpass.exe",
+    "Signal.exe",
+    "Telegram.exe",
+    "WhatsApp.exe",
+];
 
 /// Redact a window title for safe logging.
 /// In release builds, this returns a shortened/masked version of the title.
@@ -39,7 +33,10 @@ pub fn redact_title(title: &str) -> String {
 /// Check if a window should be ignored based on its process name or title.
 pub fn is_sensitive_window(exe_name: &str, title: &str) -> bool {
     // Check process blacklist
-    if BLACKLISTED_PROCESSES.contains(exe_name) {
+    if BLACKLISTED_PROCESSES
+        .iter()
+        .any(|blocked| exe_name.eq_ignore_ascii_case(blocked))
+    {
         return true;
     }
 
@@ -48,4 +45,15 @@ pub fn is_sensitive_window(exe_name: &str, title: &str) -> bool {
     let lower_title = title.to_lowercase();
     
     sensitive_keywords.iter().any(|&k| lower_title.contains(k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_sensitive_window;
+
+    #[test]
+    fn process_blacklist_is_case_insensitive() {
+        assert!(is_sensitive_window("bitwarden.exe", "Vault"));
+        assert!(is_sensitive_window("KEEPASSXC.EXE", "Database"));
+    }
 }

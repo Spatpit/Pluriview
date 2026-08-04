@@ -39,7 +39,7 @@ pub struct RegionSelection {
 
 impl RegionSelection {
     /// Convert pixel selection to UV coordinates (0.0 to 1.0)
-    pub fn to_uv(&self, source_width: u32, source_height: u32) -> (f32, f32, f32, f32) {
+    pub fn to_uv(self, source_width: u32, source_height: u32) -> (f32, f32, f32, f32) {
         let min_u = self.x as f32 / source_width as f32;
         let min_v = self.y as f32 / source_height as f32;
         let max_u = (self.x + self.width) as f32 / source_width as f32;
@@ -54,7 +54,6 @@ impl RegionSelection {
 }
 
 /// Shared state for the overlay window
-#[allow(dead_code)]
 struct OverlayState {
     /// Is the user currently dragging?
     is_dragging: bool,
@@ -64,8 +63,6 @@ struct OverlayState {
     current_point: POINT,
     /// Final selection result (None = cancelled, Some = selected)
     result: Option<Option<RegionSelection>>,
-    /// Source window rect (for coordinate conversion)
-    source_rect: RECT,
 }
 
 /// Static storage for overlay state (needed for window proc callback)
@@ -96,7 +93,6 @@ impl RegionSelector {
             start_point: POINT::default(),
             current_point: POINT::default(),
             result: None,
-            source_rect,
         }));
 
         // Store state globally for window proc

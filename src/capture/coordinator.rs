@@ -4,12 +4,10 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use parking_lot::RwLock;
-use std::sync::mpsc::{self, Sender, Receiver};
+use parking_lot::{Mutex, RwLock};
 
 /// Frame data sent from capture threads
-pub struct CapturedFrame {
-    pub preview_id: PreviewId,
+struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
@@ -20,27 +18,13 @@ pub struct CaptureCoordinator {
     /// Active capture sessions by preview ID
     sessions: HashMap<PreviewId, CaptureSession>,
 
-    /// Channel receiver for captured frames
-    frame_receiver: Receiver<CapturedFrame>,
-
-    /// Channel sender (cloned to capture threads)
-    frame_sender: Sender<CapturedFrame>,
+    /// At most one pending frame per preview. Capture threads replace stale
+    /// frames instead of building an unbounded queue when the UI is busy.
+    latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
 }
 
 /// A single capture session
 struct CaptureSession {
-    /// Preview ID this session belongs to
-    #[allow(dead_code)]
-    preview_id: PreviewId,
-
-    /// Window handle being captured (kept for reference)
-    #[allow(dead_code)]
-    hwnd: isize,
-
-    /// Window title for matching (kept for reference)
-    #[allow(dead_code)]
-    window_title: String,
-
     /// Target FPS, shared with the capture thread so changes apply live
     /// without restarting the capture session.
     target_fps: Arc<AtomicU32>,
@@ -51,19 +35,13 @@ struct CaptureSession {
     /// Is capture paused? (shared with capture thread)
     paused: Arc<RwLock<bool>>,
 
-    /// Handle to the capture task
-    #[allow(dead_code)]
-    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CaptureCoordinator {
     pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
-
         Self {
             sessions: HashMap::new(),
-            frame_receiver: receiver,
-            frame_sender: sender,
+            latest_frames: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -78,22 +56,26 @@ impl CaptureCoordinator {
         let active_clone = active.clone();
         let paused_clone = paused.clone();
         let fps_clone = fps.clone();
-        let sender = self.frame_sender.clone();
+        let latest_frames = self.latest_frames.clone();
         let title_clone = window_title.clone();
 
         // Start capture in a new thread
-        let handle = std::thread::spawn(move || {
-            capture_window_loop(preview_id, hwnd, title_clone, fps_clone, active_clone, paused_clone, sender);
+        std::thread::spawn(move || {
+            capture_window_loop(
+                preview_id,
+                hwnd,
+                title_clone,
+                fps_clone,
+                active_clone,
+                paused_clone,
+                latest_frames,
+            );
         });
 
         let session = CaptureSession {
-            preview_id,
-            hwnd,
-            window_title,
             target_fps: fps,
             active,
             paused,
-            handle: Some(handle),
         };
 
         self.sessions.insert(preview_id, session);
@@ -105,6 +87,7 @@ impl CaptureCoordinator {
             // Signal the capture thread to stop
             *session.active.write() = false;
         }
+        self.latest_frames.lock().remove(&preview_id);
     }
 
     /// Update target FPS for a capture session; applies live on the
@@ -115,32 +98,17 @@ impl CaptureCoordinator {
         }
     }
 
-    /// Process any pending captured frames. Drains the channel completely:
-    /// each preview keeps only its newest frame, so a stalled UI can never
-    /// accumulate a backlog of multi-megabyte video frames.
+    /// Process the newest pending frame for each preview.
     pub fn process_frames(&mut self, preview_manager: &mut PreviewManager, _ctx: &egui::Context) {
-        loop {
-            match self.frame_receiver.try_recv() {
-                Ok(frame) => {
-                    if let Some(preview) = preview_manager.get_mut(frame.preview_id) {
-                        preview.update_frame(frame.width, frame.height, frame.data);
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    log::error!("Frame channel disconnected");
-                    break;
-                }
+        let frames = {
+            let mut latest = self.latest_frames.lock();
+            std::mem::take(&mut *latest)
+        };
+        for (preview_id, frame) in frames {
+            if let Some(preview) = preview_manager.get_mut(preview_id) {
+                preview.update_frame(frame.width, frame.height, frame.data);
             }
         }
-    }
-
-    /// Check if a preview has an active capture
-    #[allow(dead_code)]
-    pub fn is_capturing(&self, preview_id: PreviewId) -> bool {
-        self.sessions.get(&preview_id)
-            .map(|s| *s.active.read())
-            .unwrap_or(false)
     }
 
     /// Stop all captures
@@ -163,14 +131,6 @@ impl CaptureCoordinator {
         if let Some(session) = self.sessions.get(&preview_id) {
             *session.paused.write() = false;
         }
-    }
-
-    /// Check if a preview's capture is paused
-    #[allow(dead_code)]
-    pub fn is_paused(&self, preview_id: PreviewId) -> bool {
-        self.sessions.get(&preview_id)
-            .map(|s| *s.paused.read())
-            .unwrap_or(false)
     }
 
     /// True if at least one capture session is active and not paused.
@@ -204,7 +164,7 @@ fn capture_window_loop(
     target_fps: Arc<AtomicU32>,
     active: Arc<RwLock<bool>>,
     paused: Arc<RwLock<bool>>,
-    sender: Sender<CapturedFrame>,
+    latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
 ) {
     use windows_capture::{
         capture::{Context, GraphicsCaptureApiHandler},
@@ -220,7 +180,7 @@ fn capture_window_loop(
     // Capture flags passed to the handler
     struct CaptureFlags {
         preview_id: PreviewId,
-        sender: Sender<CapturedFrame>,
+        latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
         active: Arc<RwLock<bool>>,
         paused: Arc<RwLock<bool>>,
         fps: Arc<AtomicU32>,
@@ -228,7 +188,7 @@ fn capture_window_loop(
 
     struct Capture {
         preview_id: PreviewId,
-        sender: Sender<CapturedFrame>,
+        latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
         active: Arc<RwLock<bool>>,
         paused: Arc<RwLock<bool>>,
         fps: Arc<AtomicU32>,
@@ -242,7 +202,7 @@ fn capture_window_loop(
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
             Ok(Self {
                 preview_id: ctx.flags.preview_id,
-                sender: ctx.flags.sender,
+                latest_frames: ctx.flags.latest_frames,
                 active: ctx.flags.active,
                 paused: ctx.flags.paused,
                 fps: ctx.flags.fps,
@@ -285,15 +245,13 @@ fn capture_window_loop(
 
             // Send frame to main thread
             let captured_frame = CapturedFrame {
-                preview_id: self.preview_id,
                 width,
                 height,
                 data,
             };
-
-            if self.sender.send(captured_frame).is_err() {
-                capture_control.stop();
-            }
+            self.latest_frames
+                .lock()
+                .insert(self.preview_id, captured_frame);
 
             Ok(())
         }
@@ -314,7 +272,7 @@ fn capture_window_loop(
     // Configure capture settings
     let flags = CaptureFlags {
         preview_id,
-        sender,
+        latest_frames,
         active: active.clone(),
         paused: paused.clone(),
         fps: target_fps,
@@ -339,12 +297,40 @@ fn capture_window_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::capture_target_from_hwnd;
+    use super::{capture_target_from_hwnd, CapturedFrame, CaptureCoordinator};
+    use crate::preview::PreviewId;
 
     #[test]
     fn capture_target_preserves_supplied_hwnd() {
         let hwnd = 0x1234isize;
         let target = capture_target_from_hwnd(hwnd);
         assert_eq!(target.as_raw_hwnd() as isize, hwnd);
+    }
+
+    #[test]
+    fn pending_frames_replace_stale_frames_per_preview() {
+        let coordinator = CaptureCoordinator::new();
+        let id = PreviewId(7);
+        let mut pending = coordinator.latest_frames.lock();
+        pending.insert(
+            id,
+            CapturedFrame {
+                width: 1,
+                height: 1,
+                data: vec![1; 4],
+            },
+        );
+        pending.insert(
+            id,
+            CapturedFrame {
+                width: 2,
+                height: 2,
+                data: vec![2; 16],
+            },
+        );
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[&id].width, 2);
+        assert_eq!(pending[&id].data, vec![2; 16]);
     }
 }

@@ -1,7 +1,8 @@
 use eframe::egui::{Pos2, Vec2, Rect};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use super::{Preview, PreviewId, FpsPreset, WindowHandle};
+use super::{BrowserTileStatus, Preview, PreviewId, FpsPreset, WindowHandle};
 
 /// Snapshot of a preview captured right before it's actually dropped from
 /// the manager, so the canvas can offer an "Undo" toast that restores it.
@@ -49,7 +50,7 @@ impl PreviewManager {
     }
 
     /// Add a new preview
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn add(&mut self, title: String, position: Pos2, size: Vec2) -> PreviewId {
         let id = self.generate_id();
         self.max_z_order += 1;
@@ -80,11 +81,24 @@ impl PreviewManager {
         id
     }
 
-    /// Remove a preview immediately (no fade-out). Prefer `start_removal`
-    /// for anything triggered by user interaction so it can animate out.
-    #[allow(dead_code)]
-    pub fn remove(&mut self, id: PreviewId) {
-        self.previews.remove(&id);
+    /// Reserve a browser tile before its WebView/capture host is ready.
+    pub fn add_browser_placeholder(
+        &mut self,
+        url: String,
+        position: Pos2,
+        size: Vec2,
+        fps: FpsPreset,
+    ) -> PreviewId {
+        let id = self.generate_id();
+        self.max_z_order += 1;
+
+        let mut preview = Preview::new(id, url.clone(), position, size);
+        preview.z_order = self.max_z_order;
+        preview.browser_url = Some(url);
+        preview.browser_status = BrowserTileStatus::PreparingAdblock { progress: 0.0 };
+        preview.set_fps_preset(fps);
+        self.previews.insert(id, preview);
+        id
     }
 
     /// Begin the fade/shrink-out animation for a preview. The preview stays
@@ -174,12 +188,6 @@ impl PreviewManager {
         self.previews.len()
     }
 
-    /// Check if there are any active captures
-    #[allow(dead_code)]
-    pub fn has_active_captures(&self) -> bool {
-        self.previews.values().any(|p| p.capture_active)
-    }
-
     /// Get preview at a canvas position (topmost first)
     pub fn get_preview_at(&self, pos: Pos2) -> Option<PreviewId> {
         let mut candidates: Vec<_> = self.previews
@@ -188,7 +196,7 @@ impl PreviewManager {
             .collect();
 
         // Sort by z-order descending (topmost first)
-        candidates.sort_by(|a, b| b.z_order.cmp(&a.z_order));
+        candidates.sort_by_key(|preview| Reverse(preview.z_order));
 
         candidates.first().map(|p| p.id)
     }
@@ -201,15 +209,9 @@ impl PreviewManager {
             .collect();
 
         // Sort by z-order ascending (draw bottom to top)
-        visible.sort_by(|a, b| a.z_order.cmp(&b.z_order));
+        visible.sort_by_key(|preview| preview.z_order);
 
         visible
-    }
-
-    /// Get all previews as mutable (for updating textures)
-    #[allow(dead_code)]
-    pub fn all_mut(&mut self) -> impl Iterator<Item = &mut Preview> {
-        self.previews.values_mut()
     }
 
     /// Get all previews (immutable)
@@ -268,24 +270,6 @@ impl PreviewManager {
         self.max_z_order = self.previews.len() as u32;
     }
 
-    /// Set FPS preset for a preview
-    #[allow(dead_code)]
-    pub fn set_fps_preset(&mut self, id: PreviewId, preset: FpsPreset) {
-        if let Some(preview) = self.previews.get_mut(&id) {
-            preview.set_fps_preset(preset);
-        }
-    }
-
-    /// Get all previews with their window handles (for capture coordination)
-    #[allow(dead_code)]
-    pub fn get_capture_targets(&self) -> Vec<(PreviewId, isize)> {
-        self.previews
-            .values()
-            .filter_map(|p| {
-                p.window_handle.as_ref().map(|h| (p.id, h.hwnd))
-            })
-            .collect()
-    }
 }
 
 impl Default for PreviewManager {

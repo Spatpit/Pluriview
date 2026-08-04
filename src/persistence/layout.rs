@@ -7,9 +7,6 @@ pub struct SavedLayout {
     /// Version for compatibility
     pub version: u32,
 
-    /// Layout name
-    pub name: String,
-
     /// Canvas state
     pub canvas: CanvasLayout,
 
@@ -30,11 +27,40 @@ pub struct SavedLayout {
     #[serde(default = "default_true")]
     pub adblock_enabled: bool,
 
-    /// Creation timestamp
-    pub created_at: String,
+    /// Window picker sidebar visibility. Defaults to shown, which is what
+    /// layouts saved before it was persisted opened with.
+    #[serde(default = "default_true")]
+    pub picker_open: bool,
 
-    /// Last modified timestamp
-    pub modified_at: String,
+    /// Where the main window was. None for layouts saved before the window
+    /// remembered its geometry; those open at the default size.
+    #[serde(default)]
+    pub window: Option<WindowLayout>,
+}
+
+/// Size the main window opens at before it has ever been saved.
+pub const DEFAULT_WINDOW_SIZE: (f32, f32) = (1280.0, 720.0);
+
+/// Main window geometry in logical points.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct WindowLayout {
+    /// Top-left corner. None until the window reports a position.
+    pub position: Option<(f32, f32)>,
+
+    /// Inner size while *not* maximized, so unmaximizing lands back here.
+    pub size: (f32, f32),
+
+    pub maximized: bool,
+}
+
+impl Default for WindowLayout {
+    fn default() -> Self {
+        Self {
+            position: None,
+            size: DEFAULT_WINDOW_SIZE,
+            maximized: false,
+        }
+    }
 }
 
 /// Serializable canvas state
@@ -57,11 +83,9 @@ impl Default for CanvasLayout {
 
 impl SavedLayout {
     /// Create a new layout
-    pub fn new(name: String) -> Self {
-        let now = chrono_now();
+    pub fn new() -> Self {
         Self {
             version: 1,
-            name,
             canvas: CanvasLayout {
                 pan: (0.0, 0.0),
                 zoom: 1.0,
@@ -71,15 +95,9 @@ impl SavedLayout {
             recent_browser_urls: Vec::new(),
             monitor_device: None,
             adblock_enabled: true,
-            created_at: now.clone(),
-            modified_at: now,
+            picker_open: true,
+            window: None,
         }
-    }
-
-    /// Update modification time
-    #[allow(dead_code)]
-    pub fn touch(&mut self) {
-        self.modified_at = chrono_now();
     }
 }
 
@@ -87,28 +105,66 @@ fn default_true() -> bool {
     true
 }
 
-/// Get current timestamp as string
-fn chrono_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-
-    format!("{}", duration.as_secs())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::SavedLayout;
+    use super::{SavedLayout, WindowLayout};
 
     #[test]
     fn older_layouts_default_adblocking_to_enabled() {
-        let layout = SavedLayout::new("test".to_owned());
+        let layout = SavedLayout::new();
         let mut value = serde_json::to_value(layout).unwrap();
         value.as_object_mut().unwrap().remove("adblock_enabled");
 
         let restored: SavedLayout = serde_json::from_value(value).unwrap();
         assert!(restored.adblock_enabled);
+    }
+
+    #[test]
+    fn a_hidden_picker_survives_a_round_trip() {
+        let mut layout = SavedLayout::new();
+        layout.picker_open = false;
+        let json = serde_json::to_string(&layout).unwrap();
+
+        let restored: SavedLayout = serde_json::from_str(&json).unwrap();
+        assert!(!restored.picker_open);
+    }
+
+    #[test]
+    fn window_geometry_survives_a_round_trip() {
+        let mut layout = SavedLayout::new();
+        layout.window = Some(WindowLayout {
+            position: Some((-1920.0, 240.0)),
+            size: (1600.0, 900.0),
+            maximized: true,
+        });
+        let json = serde_json::to_string(&layout).unwrap();
+
+        let window = serde_json::from_str::<SavedLayout>(&json)
+            .unwrap()
+            .window
+            .unwrap();
+        assert_eq!(window.position, Some((-1920.0, 240.0)));
+        assert_eq!(window.size, (1600.0, 900.0));
+        assert!(window.maximized);
+    }
+
+    #[test]
+    fn older_layouts_have_no_window_geometry() {
+        let layout = SavedLayout::new();
+        let mut value = serde_json::to_value(layout).unwrap();
+        value.as_object_mut().unwrap().remove("window");
+
+        let restored: SavedLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.window.is_none());
+    }
+
+    #[test]
+    fn older_layouts_default_to_a_visible_picker() {
+        let layout = SavedLayout::new();
+        let mut value = serde_json::to_value(layout).unwrap();
+        value.as_object_mut().unwrap().remove("picker_open");
+
+        let restored: SavedLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.picker_open);
     }
 }

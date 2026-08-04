@@ -28,17 +28,6 @@ impl SpringValue {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn with_params(initial: f32, stiffness: f32, damping: f32) -> Self {
-        Self {
-            current: initial,
-            target: initial,
-            velocity: 0.0,
-            stiffness,
-            damping,
-        }
-    }
-
     /// Update the spring animation (call each frame)
     /// Note: dt is passed for API consistency but animation uses fixed timestep
     pub fn update(&mut self, _dt: f32) {
@@ -100,43 +89,18 @@ impl SpringVec2 {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn with_params(initial: Vec2, stiffness: f32, damping: f32) -> Self {
-        Self {
-            x: SpringValue::with_params(initial.x, stiffness, damping),
-            y: SpringValue::with_params(initial.y, stiffness, damping),
-        }
-    }
-
     pub fn update(&mut self, dt: f32) {
         self.x.update(dt);
         self.y.update(dt);
-    }
-
-    #[allow(dead_code)]
-    pub fn current(&self) -> Vec2 {
-        Vec2::new(self.x.current, self.y.current)
     }
 
     pub fn current_pos(&self) -> Pos2 {
         Pos2::new(self.x.current, self.y.current)
     }
 
-    #[allow(dead_code)]
-    pub fn set_target(&mut self, target: Vec2) {
-        self.x.set_target(target.x);
-        self.y.set_target(target.y);
-    }
-
     pub fn set_target_pos(&mut self, target: Pos2) {
         self.x.set_target(target.x);
         self.y.set_target(target.y);
-    }
-
-    #[allow(dead_code)]
-    pub fn set_immediate(&mut self, value: Vec2) {
-        self.x.set_immediate(value.x);
-        self.y.set_immediate(value.y);
     }
 
     pub fn set_immediate_pos(&mut self, value: Pos2) {
@@ -262,13 +226,6 @@ impl SnapConfig {
         }
     }
 
-    /// Always snap to nearest grid position
-    #[allow(dead_code)]
-    pub fn force_snap(&self, pos: Pos2) -> Pos2 {
-        let snapped_x = (pos.x / self.grid_size).round() * self.grid_size;
-        let snapped_y = (pos.y / self.grid_size).round() * self.grid_size;
-        Pos2::new(snapped_x, snapped_y)
-    }
 }
 
 /// Animation state for the canvas
@@ -318,12 +275,6 @@ impl AnimationState {
         self.preview_springs.entry(id).or_insert_with(|| {
             SpringVec2::new(initial_pos.to_vec2())
         })
-    }
-
-    /// Remove spring for a preview (when preview is deleted)
-    #[allow(dead_code)]
-    pub fn remove_spring(&mut self, id: PreviewId) {
-        self.preview_springs.remove(&id);
     }
 
     /// Update all animations (call each frame)

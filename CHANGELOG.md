@@ -5,6 +5,14 @@ All notable changes to Pluriview will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Hiding the window picker sidebar now survives a restart instead of coming back on every launch
+- The main window reopens at the size, position, and maximized state it was closed at, instead of always 1280x720; a position on a monitor that is no longer attached falls back to the default placement
+- Ad blocking no longer misses the pages a launch starts with: uBlock Origin Lite is reused from the WebView2 profile instead of being reinstalled every launch, which used to clear its request rules and script injections and leave tiles (YouTube especially) unfiltered for the rest of the session
+- Browser tiles wait on a blank page while uBlock Origin Lite starts after an install or after the blocker is switched back on, and pages that already loaded unfiltered reload once it is filtering
+
 ## [0.3.0] - 2026-07-06
 
 ### Added

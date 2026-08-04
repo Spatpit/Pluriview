@@ -1,23 +1,28 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
-    io::{self, Cursor},
+    io::{self, Cursor, Read},
     num::NonZeroIsize,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+        Arc, OnceLock,
+    },
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
 use webview2_com::{
-    BrowserExtensionEnableCompletedHandler,
+    take_pwstr, BrowserExtensionEnableCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
         ICoreWebView2BrowserExtension, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_8,
     },
-    ProfileAddBrowserExtensionCompletedHandler,
+    ProfileAddBrowserExtensionCompletedHandler, ProfileGetBrowserExtensionsCompletedHandler,
 };
-use webview2_core::{Interface, HSTRING as WebViewHString};
+use webview2_core::{Interface, HSTRING as WebViewHString, PWSTR as WebViewPWSTR};
 use windows::{
     core::w,
     Win32::{
@@ -25,7 +30,7 @@ use windows::{
         Graphics::Gdi::ClientToScreen,
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
+            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_NUMPAD0},
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, IsChild,
                 RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_BOTTOM,
@@ -60,6 +65,34 @@ const MAX_ZOOM: f64 = 4.0;
 const UBOL_VERSION: &str = "2026.714.1952";
 const UBOL_ARCHIVE: &[u8] =
     include_bytes!("../assets/third_party/ubol/uBOLite_2026.714.1952.edge.zip");
+const UBOL_ARCHIVE_FINGERPRINT: &str = env!("PLURIVIEW_UBOL_SHA256");
+const PREPARATION_PROGRESS_SCALE: u32 = 10_000;
+
+/// Installing or re-enabling an extension makes Chromium drop the request
+/// rules and content scripts it had registered; uBOL's service worker rebuilds
+/// both asynchronously on its next start. Pages loaded inside that window are
+/// unfiltered, and a single-page app like YouTube never reloads on its own, so
+/// a tile that opens there keeps playing ads for the rest of the session.
+/// Browser tiles therefore stay on `about:blank` until the window closes.
+const ADBLOCK_SETTLE: Duration = Duration::from_secs(8);
+
+struct ExtensionPreparationTask {
+    progress: Arc<AtomicU32>,
+    receiver: Receiver<Result<PathBuf, String>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExtensionPreparationStatus {
+    Idle,
+    Preparing(f32),
+    Ready,
+    Failed(String),
+}
+
+/// How often a tile re-reads its address from WebView2. Frequent enough that
+/// a layout saved right after browsing is current, cheap enough to run for
+/// every tile on every frame budget.
+const URL_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 fn parked_bounds() -> Rect {
     Rect {
@@ -75,33 +108,105 @@ pub fn normalize_url(input: &str) -> Result<String, &'static str> {
     }
 
     match url::Url::parse(input) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(input.to_owned()),
+        Ok(url) if matches!(url.scheme(), "http" | "https") => {
+            validate_web_url_credentials(&url)?;
+            Ok(input.to_owned())
+        }
         Ok(_) => Err("Only HTTP and HTTPS websites are supported"),
         Err(url::ParseError::RelativeUrlWithoutBase) => {
             let candidate = format!("https://{input}");
             url::Url::parse(&candidate)
-                .map(|_| candidate)
                 .map_err(|_| "Enter a valid website URL")
+                .and_then(|url| {
+                    validate_web_url_credentials(&url)?;
+                    Ok(candidate)
+                })
         }
         Err(_) => Err("Enter a valid website URL"),
     }
 }
 
+fn validate_web_url_credentials(url: &url::Url) -> Result<(), &'static str> {
+    if !url.username().is_empty() || url.password().is_some() {
+        Err("URLs containing usernames or passwords are not supported")
+    } else {
+        Ok(())
+    }
+}
+
+fn is_web_url(url: &str) -> bool {
+    url::Url::parse(url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+/// Remove values that should not be written to the plaintext layout file.
+/// The in-memory WebView keeps its complete URL; only persisted history is
+/// scrubbed.
+pub fn scrub_url_for_storage(input: &str) -> Option<String> {
+    let mut url = url::Url::parse(input).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_fragment(None);
+
+    let retained: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| !is_sensitive_query_key(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    if url.query().is_some() {
+        url.query_pairs_mut().clear().extend_pairs(retained);
+        if url.query() == Some("") {
+            url.set_query(None);
+        }
+    }
+    Some(url.into())
+}
+
+fn is_sensitive_query_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(key.as_str(), "code" | "state" | "key" | "sig" | "session" | "sessionid")
+        || [
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "authorization",
+            "credential",
+            "signature",
+            "api_key",
+            "apikey",
+        ]
+        .iter()
+        .any(|marker| key.contains(marker))
+}
+
 /// Schemes a page may navigate to while staying inside the tile. `about:` is
 /// needed because sites navigate iframes/blank targets through it.
 fn is_allowed_navigation(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.starts_with("http:")
-        || lower.starts_with("https:")
-        || lower.starts_with("about:")
-        || lower.starts_with("blob:")
-        || lower.starts_with("data:")
+    url::Url::parse(url).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data")
+    })
 }
 
-/// True while the Escape key is held. Used to exit interaction mode: once the
-/// WebView has focus, egui never sees keyboard input, so we poll instead.
+/// True while the virtual key is held. Once the WebView has focus, egui never
+/// sees keyboard input, so keys that must work in interaction mode are polled.
+fn key_down(vk: i32) -> bool {
+    (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
+}
+
+/// True while the Escape key is held. Used to exit interaction mode.
 pub fn escape_pressed() -> bool {
-    (unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } as u16 & 0x8000) != 0
+    key_down(VK_ESCAPE.0 as i32)
+}
+
+/// True while the numpad `digit` key is held. Requires NumLock on: with it off
+/// Windows reports the navigation keys (End, Down, ...) instead, which we must
+/// not steal.
+pub fn numpad_digit_down(digit: u8) -> bool {
+    key_down(VK_NUMPAD0.0 as i32 + i32::from(digit))
 }
 
 #[derive(Clone, Copy)]
@@ -150,6 +255,8 @@ pub struct BrowserHost {
     /// Last screen rect applied while active (physical px), to skip redundant
     /// SetWindowPos calls while glued to the tile.
     last_rect: Option<(i32, i32, i32, i32)>,
+    /// When the live address was last read from WebView2 (see [`Self::poll`]).
+    last_url_check: Option<Instant>,
     shared: Arc<Mutex<SharedState>>,
 }
 
@@ -214,7 +321,7 @@ impl BrowserHost {
                 state.dirty = true;
             })
             .with_new_window_req_handler(move |url, _features| {
-                if url.starts_with("http") {
+                if is_web_url(&url) {
                     new_window_shared.lock().pending_navigation = Some(url);
                 }
                 NewWindowResponse::Deny
@@ -228,6 +335,7 @@ impl BrowserHost {
             active: false,
             muted: false,
             last_rect: None,
+            last_url_check: None,
             shared,
         })
     }
@@ -248,9 +356,39 @@ impl BrowserHost {
         self.shared.lock().current_url.clone()
     }
 
+    /// The page's address read straight from WebView2, or None while the host
+    /// has no WebView or sits on a non-web page.
+    pub fn live_url(&self) -> Option<String> {
+        let url = self.webview.as_ref()?.url().ok()?;
+        url.starts_with("http").then_some(url)
+    }
+
+    /// WebView2 reports navigation only for real document loads, so a
+    /// single-page app (YouTube, Reddit, ...) would leave the tile stuck on
+    /// the address it opened with. Re-read the live address on a timer so
+    /// tiles — and the layouts saved from them — follow in-page navigation.
+    fn refresh_live_url(&mut self) {
+        let due = self
+            .last_url_check
+            .is_none_or(|at| at.elapsed() >= URL_POLL_INTERVAL);
+        if !due {
+            return;
+        }
+        self.last_url_check = Some(Instant::now());
+        let Some(url) = self.live_url() else {
+            return;
+        };
+        let mut state = self.shared.lock();
+        if state.current_url != url {
+            state.current_url = url;
+            state.dirty = true;
+        }
+    }
+
     /// Drain pending title/URL changes and apply queued same-tile navigation
     /// from blocked new-window requests. Call once per frame.
     pub fn poll(&mut self) -> BrowserUpdate {
+        self.refresh_live_url();
         let (update, navigate) = {
             let mut state = self.shared.lock();
             let navigate = state.pending_navigation.take();
@@ -363,9 +501,21 @@ impl BrowserHost {
     }
 
     pub fn load(&self, url: &str) {
+        if !is_web_url(url) {
+            log::warn!("Blocked non-web browser navigation");
+            return;
+        }
         if let Some(webview) = self.webview.as_ref() {
             let _ = webview.load_url(url);
         }
+        let mut state = self.shared.lock();
+        state.current_url = url.to_owned();
+        state.dirty = true;
+    }
+
+    /// Record the address a tile held on `about:blank` will navigate to once
+    /// filtering is live, so its label and saved layout show the real target.
+    fn set_deferred_url(&self, url: &str) {
         let mut state = self.shared.lock();
         state.current_url = url.to_owned();
         state.dirty = true;
@@ -408,19 +558,55 @@ impl BrowserHost {
         Ok(())
     }
 
+    /// The extension WebView2 already keeps in the shared profile under `id`,
+    /// if it is still there. Extensions survive across sessions, so reusing
+    /// one avoids the reinstall that would clear uBOL's registrations.
+    fn installed_browser_extension(
+        &self,
+        id: &str,
+    ) -> Result<Option<ICoreWebView2BrowserExtension>, String> {
+        self.with_core(|core| {
+            let profile = extension_profile(core)?;
+
+            let listed = Rc::new(RefCell::new(None));
+            let completed_result = listed.clone();
+            let profile_for_call = profile.clone();
+            ProfileGetBrowserExtensionsCompletedHandler::wait_for_async_operation(
+                Box::new(move |handler| unsafe {
+                    profile_for_call
+                        .GetBrowserExtensions(&handler)
+                        .map_err(webview2_com::Error::WindowsError)
+                }),
+                Box::new(move |result, extensions| {
+                    result?;
+                    *completed_result.borrow_mut() = extensions;
+                    Ok(())
+                }),
+            )
+            .map_err(|error| format!("Installed extensions could not be listed: {error}"))?;
+
+            let Some(extensions) = listed.borrow_mut().take() else {
+                return Ok(None);
+            };
+            let mut count = 0u32;
+            unsafe { extensions.Count(&mut count) }.map_err(|e| e.to_string())?;
+            for index in 0..count {
+                let extension =
+                    unsafe { extensions.GetValueAtIndex(index) }.map_err(|e| e.to_string())?;
+                if extension_id(&extension)? == id {
+                    return Ok(Some(extension));
+                }
+            }
+            Ok(None)
+        })
+    }
+
     fn install_browser_extension(
         &self,
         extension_dir: &Path,
     ) -> Result<ICoreWebView2BrowserExtension, String> {
         self.with_core(|core| {
-            let profile: ICoreWebView2Profile7 = unsafe {
-                core.cast::<ICoreWebView2_13>()
-                    .and_then(|core13| core13.Profile())
-                    .and_then(|profile| profile.cast())
-            }
-            .map_err(|error| {
-                format!("This WebView2 Runtime cannot install browser extensions: {error}")
-            })?;
+            let profile = extension_profile(core)?;
 
             let installed = Rc::new(RefCell::new(None));
             let completed_result = installed.clone();
@@ -476,10 +662,17 @@ pub struct BrowserManager {
     context: WebContext,
     hosts: HashMap<PreviewId, BrowserHost>,
     extension_dir: Option<PathBuf>,
+    prepared_extension: Option<PathBuf>,
+    extension_preparation: Option<ExtensionPreparationTask>,
     extension_initialized: bool,
     extension: Option<ICoreWebView2BrowserExtension>,
     adblock_enabled: bool,
     adblock_error: Option<String>,
+    /// When uBOL should be filtering again after an install or an enable.
+    /// See [`ADBLOCK_SETTLE`].
+    adblock_settle_until: Option<Instant>,
+    /// Tiles parked on `about:blank` until that moment, and where they go.
+    deferred_loads: HashMap<PreviewId, String>,
 }
 
 impl BrowserManager {
@@ -491,10 +684,14 @@ impl BrowserManager {
             context: WebContext::new(webview_data_dir),
             hosts: HashMap::new(),
             extension_dir: data_dir.map(|dir| dir.join("extensions").join("ubol")),
+            prepared_extension: None,
+            extension_preparation: None,
             extension_initialized: false,
             extension: None,
             adblock_enabled: true,
             adblock_error: None,
+            adblock_settle_until: None,
+            deferred_loads: HashMap::new(),
         }
     }
 
@@ -504,38 +701,37 @@ impl BrowserManager {
         // Hold the first real navigation on about:blank until uBOL has been
         // installed and enabled, avoiding an initial burst of unfiltered
         // requests. Extension failure is non-fatal: browser tiles still work.
-        let initialize_extension = !self.extension_initialized;
-        // Files must be at their final version before the shared WebView2
-        // environment starts; an installed unpacked extension must not be
-        // mutated while that environment is using it.
-        let prepared_extension = initialize_extension.then(|| {
-            self.extension_dir
-                .clone()
-                .ok_or_else(|| {
-                    "Pluriview could not determine its application data directory".to_owned()
-                })
-                .and_then(|extension_dir| {
-                    prepare_ubol(&extension_dir)?;
-                    Ok(extension_dir)
-                })
-        });
-        let initial_url = if initialize_extension {
-            "about:blank"
-        } else {
-            url
-        };
+        let initialize_extension = self.adblock_enabled
+            && !self.extension_initialized
+            && self.prepared_extension.is_some();
+        if self.adblock_enabled
+            && !self.extension_initialized
+            && self.prepared_extension.is_none()
+            && self.adblock_error.is_none()
+        {
+            return Err("The ad blocker is still being prepared".to_owned());
+        }
+        let hold_navigation = initialize_extension || self.adblock_settling();
+        let initial_url = if hold_navigation { "about:blank" } else { url };
         let host = BrowserHost::new(&mut self.context, initial_url)?;
 
         if initialize_extension {
             self.extension_initialized = true;
-            let initialized = prepared_extension
-                .expect("extension preparation is present for first initialization")
-                .and_then(|extension_dir| self.initialize_adblock(&host, &extension_dir));
-            if let Err(error) = initialized {
-                log::error!("Ad blocker unavailable: {error}");
-                self.adblock_error = Some(error);
+            let extension_dir = self
+                .prepared_extension
+                .clone()
+                .expect("prepared extension is present for initialization");
+            let activated = activate_adblock(&host, &extension_dir, self.adblock_enabled);
+            self.apply_activation(activated);
+        }
+
+        if hold_navigation {
+            if self.adblock_settling() {
+                host.set_deferred_url(url);
+                self.deferred_loads.insert(id, url.to_owned());
+            } else {
+                host.load(url);
             }
-            host.load(url);
         }
 
         let hwnd = host.hwnd();
@@ -543,16 +739,147 @@ impl BrowserManager {
         Ok(hwnd)
     }
 
-    fn initialize_adblock(
-        &mut self,
-        host: &BrowserHost,
-        extension_dir: &Path,
-    ) -> Result<(), String> {
-        let extension = host.install_browser_extension(extension_dir)?;
-        set_extension_enabled(&extension, self.adblock_enabled)?;
-        self.extension = Some(extension);
+    /// Start filesystem-heavy extension preparation away from the UI thread.
+    pub fn start_extension_preparation(&mut self) {
+        if !self.adblock_enabled
+            || self.extension_initialized
+            || self.prepared_extension.is_some()
+            || self.extension_preparation.is_some()
+        {
+            return;
+        }
+        let Some(extension_dir) = self.extension_dir.clone() else {
+            self.adblock_error = Some(
+                "Pluriview could not determine its application data directory".to_owned(),
+            );
+            return;
+        };
+
         self.adblock_error = None;
-        Ok(())
+        let progress = Arc::new(AtomicU32::new(0));
+        let worker_progress = progress.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = prepare_ubol_with_progress(&extension_dir, &worker_progress)
+                .map(|_| extension_dir);
+            let _ = sender.send(result);
+        });
+        self.extension_preparation = Some(ExtensionPreparationTask { progress, receiver });
+    }
+
+    /// Poll the worker without blocking the UI thread.
+    pub fn poll_extension_preparation(&mut self) -> ExtensionPreparationStatus {
+        let completed = self.extension_preparation.as_ref().and_then(|task| {
+            match task.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("The ad blocker preparation worker stopped unexpectedly".to_owned()))
+                }
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+
+        if let Some(result) = completed {
+            self.extension_preparation = None;
+            match result {
+                Ok(extension_dir) => {
+                    self.prepared_extension = Some(extension_dir);
+                    self.adblock_error = None;
+                }
+                Err(error) => {
+                    log::error!("Ad blocker unavailable: {error}");
+                    self.adblock_error = Some(error);
+                }
+            }
+        }
+
+        if let Some(task) = &self.extension_preparation {
+            let progress = task.progress.load(Ordering::Relaxed) as f32
+                / PREPARATION_PROGRESS_SCALE as f32;
+            ExtensionPreparationStatus::Preparing(progress.clamp(0.0, 1.0))
+        } else if self.prepared_extension.is_some() || self.extension_initialized {
+            ExtensionPreparationStatus::Ready
+        } else if let Some(error) = &self.adblock_error {
+            ExtensionPreparationStatus::Failed(error.clone())
+        } else {
+            ExtensionPreparationStatus::Idle
+        }
+    }
+
+    /// Browser hosts can be created immediately when filtering is off, the
+    /// extension is ready, or preparation failed and we are falling back to
+    /// an unfiltered browser.
+    pub fn can_create_browser(&self) -> bool {
+        !self.adblock_enabled
+            || self.extension_initialized
+            || self.prepared_extension.is_some()
+            || self.adblock_error.is_some()
+    }
+
+    /// If browsers were created while filtering was off, install the prepared
+    /// extension into their shared profile once the worker finishes.
+    pub fn initialize_prepared_extension_for_existing_host(&mut self) {
+        if !self.adblock_enabled
+            || self.extension_initialized
+            || self.prepared_extension.is_none()
+            || self.hosts.is_empty()
+        {
+            return;
+        }
+        let extension_dir = self.prepared_extension.clone().unwrap();
+        let activated = {
+            let host = self.hosts.values().next().unwrap();
+            activate_adblock(host, &extension_dir, self.adblock_enabled)
+        };
+        self.extension_initialized = true;
+        self.apply_activation(activated);
+    }
+
+    fn apply_activation(&mut self, activated: Result<Activation, String>) {
+        match activated {
+            Ok(activation) => {
+                self.extension = Some(activation.extension);
+                self.adblock_error = None;
+                if activation.filtering_interrupted {
+                    self.begin_adblock_settle();
+                }
+            }
+            Err(error) => {
+                log::error!("Ad blocker unavailable: {error}");
+                self.adblock_error = Some(error);
+            }
+        }
+    }
+
+    fn begin_adblock_settle(&mut self) {
+        self.adblock_settle_until = Some(Instant::now() + ADBLOCK_SETTLE);
+    }
+
+    /// True while uBOL is rebuilding its rules and browser tiles must not
+    /// navigate. Callers should keep repainting so the wait actually ends.
+    pub fn adblock_settling(&self) -> bool {
+        self.adblock_settle_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Send held tiles to their address once filtering is live again, and
+    /// reload the ones that were already showing an unfiltered page. Call
+    /// once per frame.
+    pub fn poll_adblock_settle(&mut self) {
+        let Some(until) = self.adblock_settle_until else {
+            return;
+        };
+        if Instant::now() < until {
+            return;
+        }
+        self.adblock_settle_until = None;
+        let deferred = std::mem::take(&mut self.deferred_loads);
+        for (id, host) in &self.hosts {
+            match deferred.get(id) {
+                Some(url) => host.load(url),
+                None => host.reload(),
+            }
+        }
     }
 
     pub fn adblock_enabled(&self) -> bool {
@@ -560,11 +887,24 @@ impl BrowserManager {
     }
 
     pub fn adblock_status_text(&self) -> String {
+        if !self.adblock_enabled {
+            return "Off — browser tiles load without the extension".to_owned();
+        }
+        if let Some(task) = &self.extension_preparation {
+            let percent = task.progress.load(Ordering::Relaxed) / 100;
+            return format!("Preparing uBlock Origin Lite… {percent}%");
+        }
         if let Some(error) = &self.adblock_error {
             return format!("Unavailable: {error}");
         }
+        if self.adblock_settling() {
+            return "Starting uBlock Origin Lite — tiles open once it filters".to_owned();
+        }
         if !self.extension_initialized {
-            return "uBlock Origin Lite loads with the first browser tile".to_owned();
+            if self.prepared_extension.is_some() {
+                return "uBlock Origin Lite is ready".to_owned();
+            }
+            return "uBlock Origin Lite prepares with the first browser tile".to_owned();
         }
         if self.extension.is_some() {
             if self.adblock_enabled {
@@ -580,9 +920,16 @@ impl BrowserManager {
     /// Update the profile-wide uBOL state. Before the first browser tile this
     /// only records the preference; initialization applies it before loading.
     pub fn set_adblock_enabled(&mut self, enabled: bool) -> Result<(), String> {
-        if let Some(extension) = &self.extension {
-            set_extension_enabled(extension, enabled)?;
-        } else if self.extension_initialized {
+        if let Some(extension) = self.extension.clone() {
+            if extension_is_enabled(&extension)? != enabled {
+                set_extension_enabled(&extension, enabled)?;
+                // Pages loaded while uBOL was off (or while it restarts) stay
+                // unfiltered until they load again.
+                if enabled {
+                    self.begin_adblock_settle();
+                }
+            }
+        } else if self.extension_initialized && enabled {
             return Err(self
                 .adblock_error
                 .clone()
@@ -638,10 +985,109 @@ impl BrowserManager {
     /// Drop hosts whose previews no longer exist.
     pub fn retain(&mut self, keep: impl Fn(PreviewId) -> bool) {
         self.hosts.retain(|id, _| keep(*id));
+        self.deferred_loads.retain(|id, _| keep(*id));
     }
 
     pub fn clear(&mut self) {
         self.hosts.clear();
+        self.deferred_loads.clear();
+    }
+}
+
+/// Result of putting uBOL into the state the user asked for.
+struct Activation {
+    extension: ICoreWebView2BrowserExtension,
+    /// Chromium dropped uBOL's registrations to get here, so nothing is
+    /// filtered until its service worker has rebuilt them.
+    filtering_interrupted: bool,
+}
+
+/// Make the shared profile's uBOL match `enabled`, installing it only when the
+/// profile does not already carry this exact package.
+fn activate_adblock(
+    host: &BrowserHost,
+    extension_dir: &Path,
+    enabled: bool,
+) -> Result<Activation, String> {
+    let installed = match read_profile_install_marker(extension_dir) {
+        Some(id) => host.installed_browser_extension(&id)?,
+        None => None,
+    };
+
+    let mut filtering_interrupted = false;
+    let extension = match installed {
+        Some(extension) => extension,
+        None => {
+            let extension = host.install_browser_extension(extension_dir)?;
+            write_profile_install_marker(extension_dir, &extension_id(&extension)?);
+            filtering_interrupted = true;
+            extension
+        }
+    };
+
+    // Enabling an already-enabled extension is not free: it restarts uBOL and
+    // clears what it had registered, so only touch the state that is wrong.
+    if extension_is_enabled(&extension)? != enabled {
+        set_extension_enabled(&extension, enabled)?;
+        filtering_interrupted |= enabled;
+    }
+
+    Ok(Activation {
+        extension,
+        filtering_interrupted,
+    })
+}
+
+fn extension_profile(
+    core: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
+) -> Result<ICoreWebView2Profile7, String> {
+    unsafe {
+        core.cast::<ICoreWebView2_13>()
+            .and_then(|core13| core13.Profile())
+            .and_then(|profile| profile.cast())
+    }
+    .map_err(|error| format!("This WebView2 Runtime cannot install browser extensions: {error}"))
+}
+
+fn extension_id(extension: &ICoreWebView2BrowserExtension) -> Result<String, String> {
+    let mut id = WebViewPWSTR::null();
+    unsafe { extension.Id(&mut id) }.map_err(|error| error.to_string())?;
+    Ok(take_pwstr(id))
+}
+
+fn extension_is_enabled(extension: &ICoreWebView2BrowserExtension) -> Result<bool, String> {
+    let mut enabled = Default::default();
+    unsafe { extension.IsEnabled(&mut enabled) }.map_err(|error| error.to_string())?;
+    Ok(enabled.as_bool())
+}
+
+/// Records which package the shared WebView2 profile was given, and the id it
+/// got, so later launches can find that extension instead of reinstalling it.
+fn profile_install_marker_path(extension_dir: &Path) -> Option<PathBuf> {
+    let directory_name = extension_dir.file_name()?.to_string_lossy();
+    Some(
+        extension_dir
+            .parent()?
+            .join(format!(".{directory_name}.profile-install")),
+    )
+}
+
+/// The installed extension's id, when the profile holds this exact package.
+fn read_profile_install_marker(extension_dir: &Path) -> Option<String> {
+    let contents = fs::read_to_string(profile_install_marker_path(extension_dir)?).ok()?;
+    let (fingerprint, id) = contents.trim().split_once('\n')?;
+    (fingerprint.trim() == UBOL_ARCHIVE_FINGERPRINT).then(|| id.trim().to_owned())
+}
+
+fn write_profile_install_marker(extension_dir: &Path, id: &str) {
+    let Some(marker_path) = profile_install_marker_path(extension_dir) else {
+        log::warn!("Could not determine the uBlock Origin Lite install marker path");
+        return;
+    };
+    if let Err(error) = fs::write(marker_path, format!("{UBOL_ARCHIVE_FINGERPRINT}\n{id}")) {
+        // Filtering still works; the next launch just reinstalls the
+        // extension and waits for it to settle again.
+        log::warn!("Could not record the uBlock Origin Lite installation: {error}");
     }
 }
 
@@ -661,8 +1107,26 @@ fn set_extension_enabled(
     .map_err(|error| format!("uBlock Origin Lite could not be toggled: {error}"))
 }
 
-fn prepare_ubol(extension_dir: &Path) -> Result<(), String> {
-    if installed_ubol_version(extension_dir).as_deref() == Some(UBOL_VERSION) {
+fn set_preparation_progress(progress: &AtomicU32, value: f32) {
+    progress.store(
+        (value.clamp(0.0, 1.0) * PREPARATION_PROGRESS_SCALE as f32) as u32,
+        Ordering::Relaxed,
+    );
+}
+
+fn prepare_ubol_with_progress(
+    extension_dir: &Path,
+    progress: &AtomicU32,
+) -> Result<(), String> {
+    set_preparation_progress(progress, 0.02);
+    if installed_ubol_has_current_marker(extension_dir) {
+        set_preparation_progress(progress, 1.0);
+        return Ok(());
+    }
+
+    if installed_ubol_matches_embedded_with_progress(extension_dir, progress, 0.03, 0.38) {
+        write_ubol_verification_marker(extension_dir);
+        set_preparation_progress(progress, 1.0);
         return Ok(());
     }
 
@@ -679,14 +1143,15 @@ fn prepare_ubol(extension_dir: &Path) -> Result<(), String> {
     fs::create_dir(&staging)
         .map_err(|error| format!("Create extension staging directory: {error}"))?;
 
-    let extract_result = extract_ubol_archive(&staging);
+    set_preparation_progress(progress, 0.4);
+    let extract_result = extract_ubol_archive_with_progress(&staging, progress, 0.4, 0.74);
     if let Err(error) = extract_result {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
-    if installed_ubol_version(&staging).as_deref() != Some(UBOL_VERSION) {
+    if !installed_ubol_matches_embedded_with_progress(&staging, progress, 0.75, 0.98) {
         let _ = fs::remove_dir_all(&staging);
-        return Err("Embedded uBlock Origin Lite package has an unexpected manifest".to_owned());
+        return Err("Extracted uBlock Origin Lite package failed its integrity check".to_owned());
     }
 
     if extension_dir.exists() {
@@ -694,14 +1159,69 @@ fn prepare_ubol(extension_dir: &Path) -> Result<(), String> {
             .map_err(|error| format!("Replace old extension version: {error}"))?;
     }
     fs::rename(&staging, extension_dir)
-        .map_err(|error| format!("Activate uBlock Origin Lite files: {error}"))
+        .map_err(|error| format!("Activate uBlock Origin Lite files: {error}"))?;
+    write_ubol_verification_marker(extension_dir);
+    set_preparation_progress(progress, 1.0);
+    Ok(())
 }
 
-fn extract_ubol_archive(destination: &Path) -> Result<(), String> {
+fn ubol_verification_marker_path(extension_dir: &Path) -> Option<PathBuf> {
+    let directory_name = extension_dir.file_name()?.to_string_lossy();
+    Some(
+        extension_dir
+            .parent()?
+            .join(format!(".{directory_name}.verified-sha256")),
+    )
+}
+
+fn installed_ubol_has_current_marker(extension_dir: &Path) -> bool {
+    if !extension_dir.is_dir() || !installed_ubol_manifest_matches_embedded(extension_dir) {
+        return false;
+    }
+    let Some(marker_path) = ubol_verification_marker_path(extension_dir) else {
+        return false;
+    };
+    fs::read_to_string(marker_path)
+        .is_ok_and(|fingerprint| fingerprint.trim() == UBOL_ARCHIVE_FINGERPRINT)
+}
+
+fn installed_ubol_manifest_matches_embedded(extension_dir: &Path) -> bool {
+    let Ok(installed_manifest) = fs::read(extension_dir.join("manifest.json")) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(UBOL_ARCHIVE)) else {
+        return false;
+    };
+    let Ok(mut embedded_manifest) = archive.by_name("manifest.json") else {
+        return false;
+    };
+    let mut expected = Vec::with_capacity(embedded_manifest.size() as usize);
+    embedded_manifest.read_to_end(&mut expected).is_ok() && installed_manifest == expected
+}
+
+fn write_ubol_verification_marker(extension_dir: &Path) {
+    let Some(marker_path) = ubol_verification_marker_path(extension_dir) else {
+        log::warn!("Could not determine the uBlock Origin Lite verification marker path");
+        return;
+    };
+    if let Err(error) = fs::write(marker_path, UBOL_ARCHIVE_FINGERPRINT) {
+        // The verified extension is still safe to use. A missing marker only
+        // means the next launch will repeat the full verification.
+        log::warn!("Could not cache uBlock Origin Lite verification: {error}");
+    }
+}
+
+fn extract_ubol_archive_with_progress(
+    destination: &Path,
+    progress: &AtomicU32,
+    start: f32,
+    end: f32,
+) -> Result<(), String> {
     let reader = Cursor::new(UBOL_ARCHIVE);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|error| format!("Open embedded uBlock Origin Lite package: {error}"))?;
 
+    let entry_count = archive.len().max(1);
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -724,14 +1244,82 @@ fn extract_ubol_archive(destination: &Path) -> Result<(), String> {
             fs::File::create(&output).map_err(|error| format!("Create extension file: {error}"))?;
         io::copy(&mut entry, &mut file)
             .map_err(|error| format!("Extract extension file: {error}"))?;
+        let completed = (index + 1) as f32 / entry_count as f32;
+        set_preparation_progress(progress, start + (end - start) * completed);
     }
+    set_preparation_progress(progress, end);
     Ok(())
 }
 
-fn installed_ubol_version(extension_dir: &Path) -> Option<String> {
-    let manifest = fs::read(extension_dir.join("manifest.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
-    value.get("version")?.as_str().map(str::to_owned)
+#[cfg(test)]
+fn installed_ubol_matches_embedded(extension_dir: &Path) -> bool {
+    let progress = AtomicU32::new(0);
+    installed_ubol_matches_embedded_with_progress(extension_dir, &progress, 0.0, 1.0)
+}
+
+fn installed_ubol_matches_embedded_with_progress(
+    extension_dir: &Path,
+    progress: &AtomicU32,
+    start: f32,
+    end: f32,
+) -> bool {
+    let reader = Cursor::new(UBOL_ARCHIVE);
+    let Ok(mut archive) = zip::ZipArchive::new(reader) else {
+        return false;
+    };
+    let mut expected_files = HashSet::new();
+    let entry_count = archive.len().max(1);
+    for index in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(index) else {
+            return false;
+        };
+        let Some(relative) = entry.enclosed_name() else {
+            return false;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        expected_files.insert(relative.to_path_buf());
+        let Ok(installed) = fs::read(extension_dir.join(relative)) else {
+            return false;
+        };
+        let mut embedded = Vec::with_capacity(entry.size() as usize);
+        if entry.read_to_end(&mut embedded).is_err() || installed != embedded {
+            return false;
+        }
+        let completed = (index + 1) as f32 / entry_count as f32;
+        set_preparation_progress(progress, start + (end - start) * completed);
+    }
+
+    let mut pending = vec![extension_dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_symlink() {
+                return false;
+            }
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() {
+                let Ok(relative) = path.strip_prefix(extension_dir) else {
+                    return false;
+                };
+                if !expected_files.contains(relative) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+    set_preparation_progress(progress, end);
+    true
 }
 
 fn register_window_class() -> Result<(), String> {
@@ -763,10 +1351,15 @@ unsafe extern "system" fn browser_window_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_allowed_navigation, normalize_url, parked_bounds, NativeWindow, UBOL_ARCHIVE,
+        extract_ubol_archive_with_progress, installed_ubol_has_current_marker,
+        installed_ubol_matches_embedded, is_allowed_navigation, normalize_url, parked_bounds,
+        profile_install_marker_path, read_profile_install_marker, scrub_url_for_storage,
+        ubol_verification_marker_path, write_profile_install_marker,
+        write_ubol_verification_marker, NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE,
         UBOL_VERSION,
     };
     use std::io::{Cursor, Read};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     #[test]
@@ -814,6 +1407,7 @@ mod tests {
     fn normalize_url_rejects_non_web_schemes() {
         assert!(normalize_url("file:///secret").is_err());
         assert!(normalize_url("javascript:alert(1)").is_err());
+        assert!(normalize_url("https://user:password@example.com").is_err());
     }
 
     #[test]
@@ -822,6 +1416,18 @@ mod tests {
         assert!(is_allowed_navigation("about:blank"));
         assert!(!is_allowed_navigation("file:///C:/secret.txt"));
         assert!(!is_allowed_navigation("ms-settings:display"));
+        assert!(!is_allowed_navigation("http-custom:payload"));
+    }
+
+    #[test]
+    fn persisted_urls_drop_secrets_and_fragments() {
+        assert_eq!(
+            scrub_url_for_storage(
+                "https://user:pass@example.com/watch?v=42&access_token=secret&X-Amz-Signature=signed#private"
+            )
+            .unwrap(),
+            "https://example.com/watch?v=42"
+        );
     }
 
     #[test]
@@ -837,5 +1443,53 @@ mod tests {
 
         assert_eq!(manifest["manifest_version"], 3);
         assert_eq!(manifest["version"], UBOL_VERSION);
+    }
+
+    #[test]
+    fn profile_install_marker_only_matches_the_embedded_package() {
+        let extension_dir = std::env::temp_dir().join(format!(
+            "pluriview-ubol-install-marker-test-{}",
+            std::process::id()
+        ));
+        let marker = profile_install_marker_path(&extension_dir).unwrap();
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(read_profile_install_marker(&extension_dir), None);
+
+        write_profile_install_marker(&extension_dir, "abcdefghijklmnopqrstuvwxyzabcdef");
+        assert_eq!(
+            read_profile_install_marker(&extension_dir).as_deref(),
+            Some("abcdefghijklmnopqrstuvwxyzabcdef")
+        );
+
+        // A different embedded package must force a reinstall.
+        std::fs::write(&marker, "0000\nabcdefghijklmnopqrstuvwxyzabcdef").unwrap();
+        assert_eq!(read_profile_install_marker(&extension_dir), None);
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn installed_extension_integrity_detects_tampering() {
+        let destination = std::env::temp_dir().join(format!(
+            "pluriview-ubol-integrity-test-{}",
+            std::process::id()
+        ));
+        let marker = ubol_verification_marker_path(&destination).unwrap();
+        let _ = std::fs::remove_dir_all(&destination);
+        let _ = std::fs::remove_file(&marker);
+        std::fs::create_dir(&destination).unwrap();
+        let progress = AtomicU32::new(0);
+        extract_ubol_archive_with_progress(&destination, &progress, 0.0, 1.0).unwrap();
+        assert_eq!(progress.load(Ordering::Relaxed), PREPARATION_PROGRESS_SCALE);
+        assert!(installed_ubol_matches_embedded(&destination));
+        assert!(!installed_ubol_has_current_marker(&destination));
+
+        write_ubol_verification_marker(&destination);
+        assert!(installed_ubol_has_current_marker(&destination));
+
+        std::fs::write(destination.join("manifest.json"), b"{}").unwrap();
+        assert!(!installed_ubol_has_current_marker(&destination));
+        assert!(!installed_ubol_matches_embedded(&destination));
+        std::fs::remove_dir_all(&destination).unwrap();
+        std::fs::remove_file(marker).unwrap();
     }
 }

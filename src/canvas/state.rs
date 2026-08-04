@@ -2,7 +2,9 @@ use eframe::egui::{self, Pos2, Vec2, Rect, Color32, Stroke, Sense, CursorIcon};
 use std::time::Instant;
 #[cfg(debug_assertions)]
 use crate::privacy;
-use crate::preview::{PreviewManager, PreviewId, FpsPreset, RemovedPreviewInfo};
+use crate::preview::{
+    BrowserTileStatus, FpsPreset, PreviewId, PreviewManager, RemovedPreviewInfo,
+};
 use crate::capture::CaptureCoordinator;
 use super::animation::{AnimationState, DragTracker};
 
@@ -41,7 +43,10 @@ mod tests {
     use super::{CanvasState, DragState, ResizeHandle};
     use crate::capture::CaptureCoordinator;
     use crate::preview::{PreviewId, PreviewManager};
-    use eframe::egui::{CentralPanel, Context, CursorIcon, Event, Pos2, RawInput, Rect, Shape, Vec2};
+    use eframe::egui::{
+        CentralPanel, Context, CursorIcon, Event, Modifiers, PointerButton, Pos2, RawInput,
+        Rect, Shape, Vec2,
+    };
 
     #[test]
     fn canvas_screen_rect_starts_empty() {
@@ -132,6 +137,54 @@ mod tests {
         );
 
         assert_eq!(output.platform_output.cursor_icon, CursorIcon::Default);
+    }
+
+    #[test]
+    fn tile_close_button_starts_removal() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add(
+            "closable".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 120.0),
+        );
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+
+        let mut run_frame = |events| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            );
+        };
+
+        let close_button_center = Pos2::new(280.0, 120.0);
+        run_frame(vec![Event::PointerMoved(close_button_center)]);
+        run_frame(vec![Event::PointerButton {
+            pos: close_button_center,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerButton {
+            pos: close_button_center,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        assert!(previews.get(id).unwrap().removing.is_some());
     }
 
     #[test]
@@ -282,6 +335,127 @@ struct TileInfo {
     remove_t: f32,
     is_browser: bool,
     muted: bool,
+    browser_status: BrowserTileStatus,
+}
+
+fn paint_browser_placeholder(
+    painter: &egui::Painter,
+    rect: Rect,
+    status: &BrowserTileStatus,
+    time: f32,
+) {
+    let accent = Color32::from_rgb(107, 170, 75);
+    painter.rect_filled(rect, 8.0, Color32::from_rgb(14, 17, 15));
+
+    // A restrained moving glow keeps the tile feeling alive without making
+    // the loading state visually noisy.
+    let sweep = ((time * 0.16).fract() * 1.5 - 0.25) * rect.width();
+    let glow = Rect::from_center_size(
+        Pos2::new(rect.left() + sweep, rect.center().y),
+        Vec2::new((rect.width() * 0.24).max(36.0), rect.height()),
+    )
+    .intersect(rect);
+    painter.rect_filled(glow, 8.0, Color32::from_rgba_unmultiplied(107, 170, 75, 10));
+
+    let (title, detail, progress, determinate, icon, color) = match status {
+        BrowserTileStatus::PreparingAdblock { progress } => (
+            "Preparing privacy protection",
+            "Installing ad-blocking files",
+            progress.clamp(0.0, 1.0),
+            true,
+            egui_phosphor::regular::SHIELD_CHECK,
+            accent,
+        ),
+        BrowserTileStatus::Starting => (
+            "Starting browser preview",
+            "Almost ready",
+            1.0,
+            true,
+            egui_phosphor::regular::GLOBE,
+            accent,
+        ),
+        BrowserTileStatus::Failed(_) => (
+            "Browser preview unavailable",
+            "Restart Pluriview to try again",
+            0.0,
+            false,
+            egui_phosphor::regular::WARNING,
+            Color32::from_rgb(225, 112, 96),
+        ),
+        BrowserTileStatus::Ready => (
+            "Connecting browser preview",
+            "Waiting for the first frame",
+            ((time * 0.35).sin() * 0.15 + 0.75).clamp(0.0, 1.0),
+            false,
+            egui_phosphor::regular::GLOBE,
+            accent,
+        ),
+    };
+
+    let compact = rect.height() < 170.0;
+    let center = rect.center();
+    let icon_y = center.y - if compact { 28.0 } else { 50.0 };
+    painter.circle_filled(
+        Pos2::new(center.x, icon_y),
+        if compact { 18.0 } else { 23.0 },
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 24),
+    );
+    painter.circle_stroke(
+        Pos2::new(center.x, icon_y),
+        if compact { 18.0 } else { 23.0 },
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 75)),
+    );
+    painter.text(
+        Pos2::new(center.x, icon_y),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        egui::FontId::proportional(if compact { 17.0 } else { 21.0 }),
+        color,
+    );
+
+    let title_y = center.y + if compact { 1.0 } else { -8.0 };
+    painter.text(
+        Pos2::new(center.x, title_y),
+        egui::Align2::CENTER_CENTER,
+        title,
+        egui::FontId::proportional(if compact { 12.0 } else { 14.0 }),
+        Color32::from_rgb(224, 228, 224),
+    );
+    if !compact {
+        painter.text(
+            Pos2::new(center.x, title_y + 22.0),
+            egui::Align2::CENTER_CENTER,
+            detail,
+            egui::FontId::proportional(11.0),
+            Color32::from_rgb(128, 136, 130),
+        );
+    }
+
+    if !matches!(status, BrowserTileStatus::Failed(_)) {
+        let bar_width = (rect.width() - 72.0).clamp(60.0, 320.0);
+        let bar_rect = Rect::from_center_size(
+            Pos2::new(center.x, title_y + if compact { 27.0 } else { 52.0 }),
+            Vec2::new(bar_width, 6.0),
+        );
+        painter.rect_filled(bar_rect, 3.0, Color32::from_rgb(35, 41, 36));
+        let fill_width = (bar_rect.width() * progress).max(if progress > 0.0 { 6.0 } else { 0.0 });
+        let fill_rect = Rect::from_min_size(bar_rect.min, Vec2::new(fill_width, bar_rect.height()));
+        painter.rect_filled(fill_rect, 3.0, color);
+        painter.circle_filled(
+            Pos2::new(fill_rect.right(), fill_rect.center().y),
+            4.0 + ((time * 3.0).sin() * 0.5 + 0.5),
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 150),
+        );
+        if !compact && determinate {
+            painter.text(
+                Pos2::new(center.x, bar_rect.bottom() + 15.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{}%", (progress * 100.0).round() as u32),
+                egui::FontId::monospace(10.0),
+                Color32::from_rgb(112, 143, 115),
+            );
+        }
+    }
 }
 
 /// Canvas state managing pan, zoom, and interactions
@@ -889,6 +1063,7 @@ impl CanvasState {
                 remove_t: p.removal_progress(),
                 is_browser: p.is_browser(),
                 muted: p.browser_muted,
+                browser_status: p.browser_status.clone(),
             }).collect()
         };
 
@@ -897,7 +1072,7 @@ impl CanvasState {
         for info in preview_info {
             let TileInfo {
                 id, rect, title, target_fps, fps_preset: current_preset, has_crop,
-                is_removing, spawn_t, remove_t, is_browser, muted,
+                is_removing, spawn_t, remove_t, is_browser, muted, browser_status,
             } = info;
             let screen_rect = self.canvas_rect_to_screen(rect, canvas_rect);
 
@@ -977,23 +1152,45 @@ impl CanvasState {
             };
 
             if !has_texture {
-                // Shimmering placeholder while the capture connects
-                let t = input.time as f32;
-                let pulse = (t * 1.8).sin() * 0.5 + 0.5;
-                let v = (18.0 + pulse * 14.0) as u8;
-                painter.rect_filled(anim_rect, 8.0, Color32::from_rgb(v, v, v + 2));
-                painter.text(
-                    anim_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Connecting...",
-                    egui::FontId::proportional(12.0),
-                    Color32::from_rgb(95, 95, 95),
-                );
+                if is_browser {
+                    paint_browser_placeholder(
+                        &painter,
+                        anim_rect,
+                        &browser_status,
+                        input.time as f32,
+                    );
+                } else {
+                    // Shimmering placeholder while the capture connects
+                    let t = input.time as f32;
+                    let pulse = (t * 1.8).sin() * 0.5 + 0.5;
+                    let v = (18.0 + pulse * 14.0) as u8;
+                    painter.rect_filled(anim_rect, 8.0, Color32::from_rgb(v, v, v + 2));
+                    painter.text(
+                        anim_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Connecting...",
+                        egui::FontId::proportional(12.0),
+                        Color32::from_rgb(95, 95, 95),
+                    );
+                }
                 any_spawn_or_remove_animating = true;
             }
 
-            // Minimal Void: Hover-reveal controls (no permanent title bar)
-            if show_overlays && preview_response.hovered() {
+            // Minimal Void: Hover-reveal controls (no permanent title bar).
+            // Do not gate these child widgets on `preview_response.hovered()`:
+            // once a child (such as the close button) owns the pointer, egui
+            // may stop reporting the parent as hovered on the mouse-down
+            // frame. That removes the child before it can receive the release
+            // and makes the button appear inert. A geometry/z-order hit test
+            // stays stable for the complete click while still limiting the
+            // controls to the topmost tile under the pointer.
+            let pointer_over_tile = input.hover_pos.is_some_and(|pointer_pos| {
+                screen_rect.contains(pointer_pos)
+                    && preview_manager.get_preview_at(
+                        self.screen_to_canvas(pointer_pos, canvas_rect),
+                    ) == Some(id)
+            });
+            if show_overlays && pointer_over_tile {
                 // Semi-transparent overlay gradient at top for controls
                 let overlay_rect = Rect::from_min_size(
                     screen_rect.min,
@@ -1078,7 +1275,7 @@ impl CanvasState {
                 );
 
                 // Browser tiles: navigation + audio controls along the bottom
-                if is_browser {
+                if is_browser && browser_status == BrowserTileStatus::Ready {
                     let bottom_overlay = Rect::from_min_size(
                         screen_rect.left_bottom() + Vec2::new(0.0, -42.0),
                         Vec2::new(screen_rect.width(), 42.0),
@@ -1328,15 +1525,22 @@ impl CanvasState {
                 if is_browser {
                     // Browser tiles: navigation and audio instead of crop
                     // (a cropped page has ambiguous interactive coordinates).
-                    if ui.button("Interact").clicked() {
+                    let browser_ready = browser_status == BrowserTileStatus::Ready;
+                    if !browser_ready {
+                        ui.label(egui::RichText::new("Browser preview is starting…").weak());
+                    }
+                    if ui.add_enabled(browser_ready, egui::Button::new("Interact")).clicked() {
                         self.last_double_clicked = Some(id);
                         ui.close_menu();
                     }
-                    if ui.button(if muted { "Unmute" } else { "Mute" }).clicked() {
+                    if ui
+                        .add_enabled(browser_ready, egui::Button::new(if muted { "Unmute" } else { "Mute" }))
+                        .clicked()
+                    {
                         self.pending_browser_actions.push((id, BrowserAction::ToggleMute));
                         ui.close_menu();
                     }
-                    if ui.button("Reload").clicked() {
+                    if ui.add_enabled(browser_ready, egui::Button::new("Reload")).clicked() {
                         self.pending_browser_actions.push((id, BrowserAction::Reload));
                         ui.close_menu();
                     }
@@ -1344,11 +1548,14 @@ impl CanvasState {
                         self.pending_browser_actions.push((id, BrowserAction::EditUrl));
                         ui.close_menu();
                     }
-                    if ui.button("Copy URL").clicked() {
+                    if ui.add_enabled(browser_ready, egui::Button::new("Copy URL")).clicked() {
                         self.pending_browser_actions.push((id, BrowserAction::CopyUrl));
                         ui.close_menu();
                     }
-                    if ui.button("Open in Default Browser").clicked() {
+                    if ui
+                        .add_enabled(browser_ready, egui::Button::new("Open in Default Browser"))
+                        .clicked()
+                    {
                         self.pending_browser_actions.push((id, BrowserAction::OpenExternal));
                         ui.close_menu();
                     }

@@ -536,7 +536,6 @@ impl Drop for Render {
 mod tests {
     use super::{fold_to_stereo, render_devices, AudioMonitor, Capture, MixFormat};
     use std::time::{Duration, Instant};
-    use windows::core::Interface as _;
     use windows::Win32::{
         Media::Audio::{
             eConsole, eRender, Endpoints::IAudioEndpointVolume, IMMDevice, IMMDeviceEnumerator,
@@ -703,6 +702,7 @@ mod tests {
 
         drop(monitor);
         let _ = child.kill();
+        let _ = child.wait();
     }
 
     fn write_tone_wav(path: &std::path::Path) {

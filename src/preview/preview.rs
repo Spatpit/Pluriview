@@ -1,8 +1,6 @@
 use eframe::egui::{self, Pos2, Vec2, Rect, TextureHandle};
 use serde::{Serialize, Deserialize};
-use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::RwLock;
 
 /// How long the spawn-in / fade-out animations take.
 const SPAWN_DURATION_SECS: f32 = 0.22;
@@ -18,10 +16,20 @@ fn ease_out_cubic(t: f32) -> f32 {
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct PreviewId(pub u64);
 
+/// Browser-specific startup state shown inside a tile before capture begins.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrowserTileStatus {
+    Ready,
+    PreparingAdblock { progress: f32 },
+    Starting,
+    Failed(String),
+}
+
 /// FPS presets for capture
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FpsPreset {
     Low = 15,
+    #[default]
     Medium = 30,
     High = 60,
 }
@@ -40,17 +48,10 @@ impl FpsPreset {
     }
 }
 
-impl Default for FpsPreset {
-    fn default() -> Self {
-        FpsPreset::Medium
-    }
-}
-
 /// Window handle information
 #[derive(Clone, Debug)]
 pub struct WindowHandle {
     pub hwnd: isize,
-    #[allow(dead_code)]
     pub process_id: u32,
 }
 
@@ -103,7 +104,7 @@ pub struct Preview {
     texture: Option<TextureHandle>,
 
     /// Frame data buffer (BGRA)
-    frame_buffer: Arc<RwLock<Option<FrameData>>>,
+    frame_buffer: Option<FrameData>,
 
     /// Current URL when this preview is a browser tile, None otherwise.
     /// Kept up to date as the page navigates so layouts save where the
@@ -112,6 +113,9 @@ pub struct Preview {
 
     /// Is this browser tile's audio muted? (Only meaningful for browsers.)
     pub browser_muted: bool,
+
+    /// Loading/error state rendered while a browser host is being prepared.
+    pub browser_status: BrowserTileStatus,
 
     /// When this preview was created (drives the spawn-in animation)
     pub created_at: Instant,
@@ -123,11 +127,10 @@ pub struct Preview {
 }
 
 /// Raw frame data from capture
-#[derive(Clone)]
-pub struct FrameData {
-    pub width: u32,
-    pub height: u32,
-    pub data: Vec<u8>,
+struct FrameData {
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
 }
 
 impl Preview {
@@ -150,9 +153,10 @@ impl Preview {
             crop_uv: None,
             frame_size: None,
             texture: None,
-            frame_buffer: Arc::new(RwLock::new(None)),
+            frame_buffer: None,
             browser_url: None,
             browser_muted: false,
+            browser_status: BrowserTileStatus::Ready,
             created_at: Instant::now(),
             removing: None,
         }
@@ -193,12 +197,6 @@ impl Preview {
         self.position += delta;
     }
 
-    /// Get frame buffer for capture thread to write to
-    #[allow(dead_code)]
-    pub fn get_frame_buffer(&self) -> Arc<RwLock<Option<FrameData>>> {
-        self.frame_buffer.clone()
-    }
-
     /// Update frame data from capture
     pub fn update_frame(&mut self, width: u32, height: u32, data: Vec<u8>) {
         // Update source aspect ratio from actual frame dimensions
@@ -210,24 +208,7 @@ impl Preview {
             }
         }
 
-        let mut buffer = self.frame_buffer.write();
-        *buffer = Some(FrameData { width, height, data });
-    }
-
-    /// Get the effective aspect ratio (considering crop region)
-    #[allow(dead_code)]
-    pub fn effective_aspect_ratio(&self) -> f32 {
-        if let (Some(crop), Some((w, h))) = (self.crop_uv, self.frame_size) {
-            let crop_width = (crop.2 - crop.0) * w as f32;
-            let crop_height = (crop.3 - crop.1) * h as f32;
-            if crop_height > 0.0 {
-                crop_width / crop_height
-            } else {
-                self.source_aspect_ratio
-            }
-        } else {
-            self.source_aspect_ratio
-        }
+        self.frame_buffer = Some(FrameData { width, height, data });
     }
 
     /// Get UV coordinates for rendering (either crop region or full frame)
@@ -242,27 +223,6 @@ impl Preview {
         }
     }
 
-    /// Set crop region from pixel coordinates
-    #[allow(dead_code)]
-    pub fn set_crop_pixels(&mut self, min_x: u32, min_y: u32, max_x: u32, max_y: u32) {
-        if let Some((w, h)) = self.frame_size {
-            if w > 0 && h > 0 {
-                self.crop_uv = Some((
-                    min_x as f32 / w as f32,
-                    min_y as f32 / h as f32,
-                    max_x as f32 / w as f32,
-                    max_y as f32 / h as f32,
-                ));
-                // Update aspect ratio for the crop region
-                let crop_width = (max_x - min_x) as f32;
-                let crop_height = (max_y - min_y) as f32;
-                if crop_height > 0.0 {
-                    self.source_aspect_ratio = crop_width / crop_height;
-                }
-            }
-        }
-    }
-
     /// Clear crop region (show full frame)
     pub fn clear_crop(&mut self) {
         self.crop_uv = None;
@@ -274,19 +234,10 @@ impl Preview {
         }
     }
 
-    /// Check if there's a new frame to upload
-    #[allow(dead_code)]
-    pub fn has_pending_frame(&self) -> bool {
-        self.frame_buffer.read().is_some()
-    }
-
     /// Get or create texture from frame buffer
     pub fn get_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         // Check if we have a new frame to upload
-        let frame_data = {
-            let mut buffer = self.frame_buffer.write();
-            buffer.take()
-        };
+        let frame_data = self.frame_buffer.take();
 
         if let Some(frame) = frame_data {
             let image = egui::ColorImage::from_rgba_unmultiplied(

@@ -6,8 +6,7 @@ use tray_icon::{
 use std::sync::OnceLock;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    ShowWindow, SetForegroundWindow,
-    SW_RESTORE, SW_MINIMIZE,
+    PostMessageW, SetForegroundWindow, ShowWindow, SW_MINIMIZE, SW_RESTORE, WM_CLOSE,
 };
 
 /// Menu item IDs
@@ -61,9 +60,11 @@ impl TrayManager {
                 MENU_QUIT => {
                     #[cfg(debug_assertions)]
                     println!("Quit clicked");
-                    // Use std::process::exit for immediate termination
-                    // PostQuitMessage doesn't work well with eframe/winit
-                    std::process::exit(0);
+                    if let Some(&hwnd) = MAIN_WINDOW_HWND.get() {
+                        unsafe {
+                            let _ = PostMessageW(HWND(hwnd as *mut _), WM_CLOSE, None, None);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -103,7 +104,13 @@ fn create_default_icon() -> Option<Icon> {
 }
 
 /// Create leaf icon at specified size - used for both tray and window icon
-pub fn create_leaf_icon(size: u32) -> Icon {
+fn create_leaf_icon(size: u32) -> Icon {
+    let rgba = create_leaf_rgba(size);
+    Icon::from_rgba(rgba, size, size).unwrap()
+}
+
+/// Generate the shared leaf pixels used by both the window and tray icons.
+pub(crate) fn create_leaf_rgba(size: u32) -> Vec<u8> {
     let size = size as usize;
     let mut rgba = vec![0u8; size * size * 4];
 
@@ -138,7 +145,7 @@ pub fn create_leaf_icon(size: u32) -> Icon {
             // Check if point is inside leaf shape
             let t = (uy - margin) / leaf_length;
 
-            if t >= 0.0 && t <= 1.0 {
+            if (0.0..=1.0).contains(&t) {
                 // Leaf width at this height
                 let width_factor = (t * std::f64::consts::PI).sin().powf(0.8);
                 let half_width = (leaf_width / 2.0) * width_factor;
@@ -187,7 +194,7 @@ pub fn create_leaf_icon(size: u32) -> Icon {
         }
     }
 
-    Icon::from_rgba(rgba, size as u32, size as u32).unwrap()
+    rgba
 }
 
 impl Default for TrayManager {
