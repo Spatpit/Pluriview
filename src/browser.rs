@@ -301,6 +301,11 @@ impl BrowserHost {
             // be identical on every builder. Runtime 120+ supports the flag;
             // uBOL itself requires Chromium/WebView2 122+.
             .with_browser_extensions_enabled(true)
+            // Wry enables autoplay by default, which passes WebView2 the
+            // `no-user-gesture-required` Chromium policy. Do not opt into
+            // that policy: restored media pages (notably YouTube watch URLs)
+            // should wait for the user to press Play after app startup.
+            .with_autoplay(false)
             .with_url(url)
             .with_bounds(parked_bounds())
             .with_download_started_handler(|_, _| false)
