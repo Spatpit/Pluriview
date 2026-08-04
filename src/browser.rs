@@ -68,6 +68,48 @@ const UBOL_ARCHIVE: &[u8] =
 const UBOL_ARCHIVE_FINGERPRINT: &str = env!("PLURIVIEW_UBOL_SHA256");
 const PREPARATION_PROGRESS_SCALE: u32 = 10_000;
 
+/// WebView2's autoplay policy can still allow a previously used site through
+/// its media-engagement heuristics. Install a document-start guard as well so
+/// restored pages cannot call `play()` until this tile receives real input.
+/// The capture-phase listeners unlock before the site's own Play handler runs.
+const MEDIA_AUTOPLAY_GUARD: &str = r#"
+(() => {
+    let unlocked = false;
+    const inputEvents = ["pointerdown", "keydown", "touchstart"];
+    const unlock = (event) => {
+        if (!event.isTrusted) return;
+        unlocked = true;
+        for (const eventName of inputEvents) {
+            window.removeEventListener(eventName, unlock, true);
+        }
+    };
+
+    for (const eventName of inputEvents) {
+        window.addEventListener(eventName, unlock, true);
+    }
+
+    const nativePlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function (...args) {
+        if (!unlocked) {
+            this.pause();
+            return Promise.reject(new DOMException(
+                "Media playback requires user interaction",
+                "NotAllowedError"
+            ));
+        }
+        return Reflect.apply(nativePlay, this, args);
+    };
+
+    // Also catch declarative <video autoplay> playback, which does not need
+    // to call the JavaScript play() method overridden above.
+    document.addEventListener("play", (event) => {
+        if (!unlocked && event.target instanceof HTMLMediaElement) {
+            event.target.pause();
+        }
+    }, true);
+})();
+"#;
+
 /// Installing or re-enabling an extension makes Chromium drop the request
 /// rules and content scripts it had registered; uBOL's service worker rebuilds
 /// both asynchronously on its next start. Pages loaded inside that window are
@@ -306,6 +348,7 @@ impl BrowserHost {
             // that policy: restored media pages (notably YouTube watch URLs)
             // should wait for the user to press Play after app startup.
             .with_autoplay(false)
+            .with_initialization_script(MEDIA_AUTOPLAY_GUARD)
             .with_url(url)
             .with_bounds(parked_bounds())
             .with_download_started_handler(|_, _| false)
