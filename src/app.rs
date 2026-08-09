@@ -627,21 +627,22 @@ impl PluriviewApp {
             }
         }
 
-        // Keep every visible parked browser at the same physical resolution
-        // as its canvas tile. This makes the captured texture a 1:1 match for
-        // the live WebView before interaction begins, instead of enlarging a
-        // fixed 1280x720 bitmap and then swapping to a sharper native page.
-        if let Some(canvas_rect) = self.canvas.last_screen_rect {
-            let pixels_per_point = ctx.pixels_per_point();
-            let ids: Vec<_> = self.browser.ids().collect();
-            for id in ids {
-                let Some(placement) = self.browser_tile_placement(id, canvas_rect) else {
-                    continue;
-                };
-                let size = placement.page_rect.size() * pixels_per_point;
-                if let Some(host) = self.browser.get_mut(id) {
-                    host.sync_capture_size(size.x.round() as i32, size.y.round() as i32);
-                }
+        // Give parked browsers a stable supersampled backing derived from the
+        // tile's model size, not the canvas zoom. This keeps previews sharp
+        // without making responsive pages resize while the canvas zooms.
+        let pixels_per_point = ctx.pixels_per_point();
+        let ids: Vec<_> = self.browser.ids().collect();
+        for id in ids {
+            let Some(preview) = self.preview_manager.get(id) else {
+                continue;
+            };
+            let physical_size = preview.size * pixels_per_point;
+            let capture_size = browser::capture_size_for_tile(
+                physical_size.x.round() as i32,
+                physical_size.y.round() as i32,
+            );
+            if let Some(host) = self.browser.get_mut(id) {
+                host.sync_capture_size(capture_size.0, capture_size.1);
             }
         }
 

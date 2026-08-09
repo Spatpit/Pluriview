@@ -61,6 +61,11 @@ const HEIGHT: i32 = 720;
 /// WebView2 rejects zoom factors outside roughly this range.
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
+/// Parked browsers use a stable supersampled backing. It is deliberately
+/// independent of canvas zoom so navigation never resizes the webpage.
+const MIN_CAPTURE_WIDTH: i32 = 2560;
+const MAX_CAPTURE_WIDTH: i32 = 3840;
+const MAX_CAPTURE_HEIGHT: i32 = 2160;
 /// Give WebView2's compositor time to apply a new viewport and zoom before
 /// the native host replaces the frozen captured preview onscreen.
 const INTERACTION_PREP_DELAY: Duration = Duration::from_millis(80);
@@ -322,6 +327,19 @@ fn browser_geometry(
         page_width: (page_size.x.round() as i32).max(1),
         page_height: (page_size.y.round() as i32).max(1),
     }
+}
+
+pub fn capture_size_for_tile(width: i32, height: i32) -> (i32, i32) {
+    let width = width.max(1) as f64;
+    let height = height.max(1) as f64;
+    let upscale = (MIN_CAPTURE_WIDTH as f64 / width).max(1.0);
+    let cap = (MAX_CAPTURE_WIDTH as f64 / width)
+        .min(MAX_CAPTURE_HEIGHT as f64 / height);
+    let scale = upscale.min(cap).max(f64::MIN_POSITIVE);
+    (
+        (width * scale).round().max(1.0) as i32,
+        (height * scale).round().max(1.0) as i32,
+    )
 }
 
 pub struct BrowserHost {
@@ -674,9 +692,6 @@ impl BrowserHost {
     /// Move the host back offscreen at capture resolution. Audio keeps
     /// playing and Windows Graphics Capture keeps rendering it.
     pub fn park(&mut self) {
-        if let Some(geometry) = self.last_geometry {
-            self.capture_size = (geometry.page_width, geometry.page_height);
-        }
         let (width, height) = self.capture_size;
         unsafe {
             let _ = SetWindowPos(
@@ -1563,12 +1578,12 @@ unsafe extern "system" fn browser_window_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_geometry, extract_ubol_archive_with_progress, installed_ubol_has_current_marker,
-        installed_ubol_matches_embedded, is_allowed_navigation, normalize_url, parked_bounds,
-        profile_install_marker_path, read_profile_install_marker, scrub_url_for_storage,
-        ubol_verification_marker_path, write_profile_install_marker,
-        write_ubol_verification_marker, NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE,
-        UBOL_VERSION,
+        browser_geometry, capture_size_for_tile, extract_ubol_archive_with_progress,
+        installed_ubol_has_current_marker, installed_ubol_matches_embedded,
+        is_allowed_navigation, normalize_url, parked_bounds, profile_install_marker_path,
+        read_profile_install_marker, scrub_url_for_storage, ubol_verification_marker_path,
+        write_profile_install_marker, write_ubol_verification_marker, NativeWindow,
+        PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE, UBOL_VERSION,
     };
     use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1609,6 +1624,13 @@ mod tests {
         assert_eq!((geometry.host_width, geometry.host_height), (800, 600));
         assert_eq!((geometry.page_x, geometry.page_y), (-100, -50));
         assert_eq!((geometry.page_width, geometry.page_height), (1600, 950));
+    }
+
+    #[test]
+    fn browser_capture_is_supersampled_without_following_canvas_zoom() {
+        assert_eq!(capture_size_for_tile(640, 360), (2560, 1440));
+        assert_eq!(capture_size_for_tile(1280, 720), (2560, 1440));
+        assert_eq!(capture_size_for_tile(5000, 2813), (3839, 2160));
     }
 
     #[test]
