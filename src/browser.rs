@@ -484,6 +484,26 @@ impl BrowserHost {
             return;
         }
 
+        let resize_webview = |webview: &WebView| {
+            let _ = webview.set_bounds(Rect {
+                position: PhysicalPosition::new(0, 0).into(),
+                size: PhysicalSize::new(width, height).into(),
+            });
+            // Keep the page's apparent scale identical to the captured
+            // texture: layout width stays WIDTH/dpi CSS px in both modes.
+            let _ = webview.zoom((width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
+        };
+
+        if take_focus {
+            // Prepare the child while the parked host is still offscreen.
+            // Moving the host first briefly exposes the 1280x720 capture
+            // viewport before WebView2 applies its interactive bounds and
+            // zoom, making the page grow and then snap back on entry.
+            if let Some(webview) = self.webview.as_ref() {
+                resize_webview(webview);
+            }
+        }
+
         let flags = if take_focus {
             SWP_SHOWWINDOW
         } else {
@@ -500,18 +520,18 @@ impl BrowserHost {
                 flags,
             );
         }
-        if let Some(webview) = self.webview.as_ref() {
-            let _ = webview.set_bounds(Rect {
-                position: PhysicalPosition::new(0, 0).into(),
-                size: PhysicalSize::new(width, height).into(),
-            });
-            // Keep the page's apparent scale identical to the captured
-            // texture: layout width stays WIDTH/dpi CSS px in both modes.
-            let _ = webview.zoom((width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
-            if take_focus {
-                unsafe {
-                    let _ = SetForegroundWindow(self.window.0);
-                }
+        if !take_focus {
+            // While already active, keep the existing move-then-resize order
+            // so a panning or zooming tile stays glued to its new position.
+            if let Some(webview) = self.webview.as_ref() {
+                resize_webview(webview);
+            }
+        }
+        if take_focus {
+            unsafe {
+                let _ = SetForegroundWindow(self.window.0);
+            }
+            if let Some(webview) = self.webview.as_ref() {
                 let _ = webview.focus();
             }
         }
