@@ -61,6 +61,9 @@ const HEIGHT: i32 = 720;
 /// WebView2 rejects zoom factors outside roughly this range.
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
+/// Give WebView2's compositor time to apply a new viewport and zoom before
+/// the native host replaces the frozen captured preview onscreen.
+const INTERACTION_PREP_DELAY: Duration = Duration::from_millis(80);
 
 const UBOL_VERSION: &str = "2026.714.1952";
 const UBOL_ARCHIVE: &[u8] =
@@ -297,6 +300,9 @@ pub struct BrowserHost {
     /// Last screen rect applied while active (physical px), to skip redundant
     /// SetWindowPos calls while glued to the tile.
     last_rect: Option<(i32, i32, i32, i32)>,
+    /// While set, the host remains offscreen at its interactive size until
+    /// WebView2 has had time to render the resized/zoomed page.
+    reveal_at: Option<Instant>,
     /// When the live address was last read from WebView2 (see [`Self::poll`]).
     last_url_check: Option<Instant>,
     shared: Arc<Mutex<SharedState>>,
@@ -383,6 +389,7 @@ impl BrowserHost {
             active: false,
             muted: false,
             last_rect: None,
+            reveal_at: None,
             last_url_check: None,
             shared,
         })
@@ -394,6 +401,10 @@ impl BrowserHost {
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    pub fn is_preparing_interaction(&self) -> bool {
+        self.reveal_at.is_some()
     }
 
     pub fn is_muted(&self) -> bool {
@@ -480,7 +491,11 @@ impl BrowserHost {
         let height = (size.y.round() as i32).max(1);
 
         let screen_rect = (origin.x, origin.y, width, height);
-        if !take_focus && self.active && self.last_rect == Some(screen_rect) {
+        if !take_focus
+            && self.active
+            && self.reveal_at.is_none()
+            && self.last_rect == Some(screen_rect)
+        {
             return;
         }
 
@@ -495,20 +510,75 @@ impl BrowserHost {
         };
 
         if take_focus {
-            // Prepare the child while the parked host is still offscreen.
-            // Moving the host first briefly exposes the 1280x720 capture
-            // viewport before WebView2 applies its interactive bounds and
-            // zoom, making the page grow and then snap back on entry.
+            // Resize both the offscreen host and its child, then leave them
+            // parked long enough for WebView2's asynchronous compositor to
+            // settle. The app freezes the captured tile during this window.
+            unsafe {
+                let _ = SetWindowPos(
+                    self.window.0,
+                    HWND_BOTTOM,
+                    PARK_X,
+                    PARK_Y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
             if let Some(webview) = self.webview.as_ref() {
                 resize_webview(webview);
             }
+            self.active = true;
+            self.last_rect = Some(screen_rect);
+            self.reveal_at = Some(Instant::now() + INTERACTION_PREP_DELAY);
+            return;
         }
 
-        let flags = if take_focus {
-            SWP_SHOWWINDOW
-        } else {
-            SWP_SHOWWINDOW | SWP_NOACTIVATE
-        };
+        if let Some(reveal_at) = self.reveal_at {
+            // If layout changed while preparing (for example, the context
+            // menu closed), settle once more at the final tile dimensions.
+            if self.last_rect != Some(screen_rect) {
+                unsafe {
+                    let _ = SetWindowPos(
+                        self.window.0,
+                        HWND_BOTTOM,
+                        PARK_X,
+                        PARK_Y,
+                        width,
+                        height,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                }
+                if let Some(webview) = self.webview.as_ref() {
+                    resize_webview(webview);
+                }
+                self.last_rect = Some(screen_rect);
+                self.reveal_at = Some(Instant::now() + INTERACTION_PREP_DELAY);
+                return;
+            }
+            if Instant::now() < reveal_at {
+                return;
+            }
+
+            unsafe {
+                let _ = SetWindowPos(
+                    self.window.0,
+                    HWND_TOP,
+                    origin.x,
+                    origin.y,
+                    width,
+                    height,
+                    SWP_SHOWWINDOW,
+                );
+                let _ = SetForegroundWindow(self.window.0);
+            }
+            if let Some(webview) = self.webview.as_ref() {
+                let _ = webview.focus();
+            }
+            self.reveal_at = None;
+            self.last_rect = Some(screen_rect);
+            return;
+        }
+
         unsafe {
             let _ = SetWindowPos(
                 self.window.0,
@@ -517,23 +587,13 @@ impl BrowserHost {
                 origin.y,
                 width,
                 height,
-                flags,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
             );
         }
-        if !take_focus {
-            // While already active, keep the existing move-then-resize order
-            // so a panning or zooming tile stays glued to its new position.
-            if let Some(webview) = self.webview.as_ref() {
-                resize_webview(webview);
-            }
-        }
-        if take_focus {
-            unsafe {
-                let _ = SetForegroundWindow(self.window.0);
-            }
-            if let Some(webview) = self.webview.as_ref() {
-                let _ = webview.focus();
-            }
+        // While already active, resize after moving so a panning or zooming
+        // tile stays glued to its new position.
+        if let Some(webview) = self.webview.as_ref() {
+            resize_webview(webview);
         }
         self.active = true;
         self.last_rect = Some(screen_rect);
@@ -559,6 +619,7 @@ impl BrowserHost {
         }
         self.active = false;
         self.last_rect = None;
+        self.reveal_at = None;
     }
 
     /// True when keyboard focus belongs to this host (or one of the WebView's

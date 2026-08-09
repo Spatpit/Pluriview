@@ -632,6 +632,7 @@ impl PluriviewApp {
                 if let Some(host) = self.browser.get_mut(active_id) {
                     host.park();
                 }
+                self.capture_coordinator.resume_capture(active_id);
                 self.browser_activated_at = None;
                 if escape {
                     self.canvas.exit_focus();
@@ -648,8 +649,18 @@ impl PluriviewApp {
             } else if let (Some(hwnd), Some(rect)) = (self.main_hwnd, tile_rect) {
                 // Glue the live host to its tile so panning/zooming the
                 // canvas or moving the window keeps them in lockstep.
-                if let Some(host) = self.browser.get_mut(active_id) {
+                let preparing = if let Some(host) = self.browser.get_mut(active_id) {
                     host.place(HWND(hwnd as *mut _), rect, ctx.pixels_per_point(), false);
+                    host.is_preparing_interaction()
+                } else {
+                    false
+                };
+                if preparing {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                } else {
+                    // The live host now covers the preview, so capture can
+                    // continue underneath without exposing its resize frames.
+                    self.capture_coordinator.resume_capture(active_id);
                 }
             }
         }
@@ -1471,6 +1482,7 @@ impl eframe::App for PluriviewApp {
                     if let Some(host) = self.browser.get_mut(id) {
                         host.park();
                     }
+                    self.capture_coordinator.resume_capture(id);
                     self.browser_activated_at = None;
                     // The parked WebView still holds keyboard focus; hand it
                     // back so the next shortcut reaches us.
@@ -1483,7 +1495,13 @@ impl eframe::App for PluriviewApp {
                     (self.main_hwnd, self.canvas.last_screen_rect)
                 {
                     if let Some(rect) = self.browser_tile_rect(id, canvas_rect) {
+                        if let Some(active_id) = self.browser.active_id() {
+                            self.capture_coordinator.resume_capture(active_id);
+                        }
                         self.browser.park_all();
+                        // Hold the last correct captured frame onscreen while
+                        // WebView2 prepares its interactive viewport offscreen.
+                        self.capture_coordinator.pause_capture(id);
                         // Bring to front + select so the accent outline shows
                         // around the live window's inset edge.
                         self.preview_manager.bring_to_front(id);
