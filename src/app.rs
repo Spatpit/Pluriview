@@ -36,6 +36,15 @@ const BROWSER_FOCUS_GRACE: Duration = Duration::from_millis(300);
 /// How many recent browser URLs to keep for the Add Browser dialog.
 const MAX_RECENT_URLS: usize = 8;
 
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct BrowserTilePlacement {
+    /// Full tile rect, which determines the page's stable viewport and zoom.
+    page_rect: egui::Rect,
+    /// Portion of the tile allowed to become a native window inside the canvas.
+    visible_rect: egui::Rect,
+}
+
 /// Canvas right-click "Add Window..." popup: a small searchable list shown
 /// at the click position so windows can be added without the sidebar.
 struct QuickAddPopup {
@@ -539,14 +548,25 @@ impl PluriviewApp {
     /// outline stays visible around the live window. None when the tile is
     /// fully outside the canvas area.
     #[cfg(windows)]
-    fn browser_tile_rect(&self, id: PreviewId, canvas_rect: egui::Rect) -> Option<egui::Rect> {
+    fn browser_tile_placement(
+        &self,
+        id: PreviewId,
+        canvas_rect: egui::Rect,
+    ) -> Option<BrowserTilePlacement> {
         let preview = self.preview_manager.get(id)?;
         let rect = self.canvas.canvas_rect_to_screen(preview.rect(), canvas_rect);
         if !rect.intersects(canvas_rect) {
             return None;
         }
         let inset = 3.0_f32.min(rect.width() / 4.0).min(rect.height() / 4.0);
-        Some(rect.shrink(inset.max(0.0)))
+        let page_rect = rect.shrink(inset.max(0.0));
+        let visible_rect = page_rect.intersect(canvas_rect);
+        (visible_rect.width() >= 1.0 && visible_rect.height() >= 1.0).then_some(
+            BrowserTilePlacement {
+                page_rect,
+                visible_rect,
+            },
+        )
     }
 
     /// Keep the stream audio monitor alive while it's enabled and browser
@@ -623,7 +643,7 @@ impl PluriviewApp {
             let tile_rect = self
                 .canvas
                 .last_screen_rect
-                .and_then(|canvas_rect| self.browser_tile_rect(active_id, canvas_rect));
+                .and_then(|canvas_rect| self.browser_tile_placement(active_id, canvas_rect));
 
             let should_park =
                 escape || minimized || tile_rect.is_none() || (!owns_focus && !in_grace);
@@ -646,11 +666,17 @@ impl PluriviewApp {
                         }
                     }
                 }
-            } else if let (Some(hwnd), Some(rect)) = (self.main_hwnd, tile_rect) {
+            } else if let (Some(hwnd), Some(placement)) = (self.main_hwnd, tile_rect) {
                 // Glue the live host to its tile so panning/zooming the
                 // canvas or moving the window keeps them in lockstep.
                 let preparing = if let Some(host) = self.browser.get_mut(active_id) {
-                    host.place(HWND(hwnd as *mut _), rect, ctx.pixels_per_point(), false);
+                    host.place(
+                        HWND(hwnd as *mut _),
+                        placement.page_rect,
+                        placement.visible_rect,
+                        ctx.pixels_per_point(),
+                        false,
+                    );
                     host.is_preparing_interaction()
                 } else {
                     false
@@ -1494,7 +1520,7 @@ impl eframe::App for PluriviewApp {
                 } else if let (Some(hwnd), Some(canvas_rect)) =
                     (self.main_hwnd, self.canvas.last_screen_rect)
                 {
-                    if let Some(rect) = self.browser_tile_rect(id, canvas_rect) {
+                    if let Some(placement) = self.browser_tile_placement(id, canvas_rect) {
                         if let Some(active_id) = self.browser.active_id() {
                             self.capture_coordinator.resume_capture(active_id);
                         }
@@ -1509,7 +1535,8 @@ impl eframe::App for PluriviewApp {
                         if let Some(host) = self.browser.get_mut(id) {
                             host.place(
                                 HWND(hwnd as *mut _),
-                                rect,
+                                placement.page_rect,
+                                placement.visible_rect,
                                 ctx.pixels_per_point(),
                                 true,
                             );

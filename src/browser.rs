@@ -292,14 +292,46 @@ pub struct BrowserUpdate {
     pub url: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BrowserGeometry {
+    host_x: i32,
+    host_y: i32,
+    host_width: i32,
+    host_height: i32,
+    page_x: i32,
+    page_y: i32,
+    page_width: i32,
+    page_height: i32,
+}
+
+fn browser_geometry(
+    page_rect: egui::Rect,
+    visible_rect: egui::Rect,
+    pixels_per_point: f32,
+    host_screen_origin: (i32, i32),
+) -> BrowserGeometry {
+    let host_size = visible_rect.size() * pixels_per_point;
+    let page_size = page_rect.size() * pixels_per_point;
+    BrowserGeometry {
+        host_x: host_screen_origin.0,
+        host_y: host_screen_origin.1,
+        host_width: (host_size.x.round() as i32).max(1),
+        host_height: (host_size.y.round() as i32).max(1),
+        page_x: ((page_rect.min.x - visible_rect.min.x) * pixels_per_point).round() as i32,
+        page_y: ((page_rect.min.y - visible_rect.min.y) * pixels_per_point).round() as i32,
+        page_width: (page_size.x.round() as i32).max(1),
+        page_height: (page_size.y.round() as i32).max(1),
+    }
+}
+
 pub struct BrowserHost {
     webview: Option<WebView>,
     window: NativeWindow,
     active: bool,
     muted: bool,
-    /// Last screen rect applied while active (physical px), to skip redundant
-    /// SetWindowPos calls while glued to the tile.
-    last_rect: Option<(i32, i32, i32, i32)>,
+    /// Last host/page geometry applied while active (physical px), to skip
+    /// redundant positioning calls while glued to the tile.
+    last_geometry: Option<BrowserGeometry>,
     /// While set, the host remains offscreen at its interactive size until
     /// WebView2 has had time to render the resized/zoomed page.
     reveal_at: Option<Instant>,
@@ -388,7 +420,7 @@ impl BrowserHost {
             window,
             active: false,
             muted: false,
-            last_rect: None,
+            last_geometry: None,
             reveal_at: None,
             last_url_check: None,
             shared,
@@ -469,44 +501,48 @@ impl BrowserHost {
         update
     }
 
-    /// Position the host window over `rect` (egui points, client coordinates
-    /// of `parent`). Sizes the WebView to fill the host and matches the zoom
-    /// factor so the page keeps the exact layout it had as a captured tile.
+    /// Position the host over the visible part of `page_rect` inside
+    /// `visible_rect` (egui points, client coordinates of `parent`). The
+    /// WebView retains the full page size and is offset inside the clipped
+    /// host, so viewport clipping never changes the page's layout or scale.
     pub fn place(
         &mut self,
         parent: HWND,
-        rect: egui::Rect,
+        page_rect: egui::Rect,
+        visible_rect: egui::Rect,
         pixels_per_point: f32,
         take_focus: bool,
     ) {
-        let mut origin = POINT {
-            x: (rect.min.x * pixels_per_point).round() as i32,
-            y: (rect.min.y * pixels_per_point).round() as i32,
+        let mut host_origin = POINT {
+            x: (visible_rect.min.x * pixels_per_point).round() as i32,
+            y: (visible_rect.min.y * pixels_per_point).round() as i32,
         };
         unsafe {
-            let _ = ClientToScreen(parent, &mut origin);
+            let _ = ClientToScreen(parent, &mut host_origin);
         }
-        let size = rect.size() * pixels_per_point;
-        let width = (size.x.round() as i32).max(1);
-        let height = (size.y.round() as i32).max(1);
-
-        let screen_rect = (origin.x, origin.y, width, height);
+        let geometry = browser_geometry(
+            page_rect,
+            visible_rect,
+            pixels_per_point,
+            (host_origin.x, host_origin.y),
+        );
         if !take_focus
             && self.active
             && self.reveal_at.is_none()
-            && self.last_rect == Some(screen_rect)
+            && self.last_geometry == Some(geometry)
         {
             return;
         }
 
         let resize_webview = |webview: &WebView| {
             let _ = webview.set_bounds(Rect {
-                position: PhysicalPosition::new(0, 0).into(),
-                size: PhysicalSize::new(width, height).into(),
+                position: PhysicalPosition::new(geometry.page_x, geometry.page_y).into(),
+                size: PhysicalSize::new(geometry.page_width, geometry.page_height).into(),
             });
             // Keep the page's apparent scale identical to the captured
             // texture: layout width stays WIDTH/dpi CSS px in both modes.
-            let _ = webview.zoom((width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
+            let _ = webview
+                .zoom((geometry.page_width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
         };
 
         if take_focus {
@@ -519,8 +555,8 @@ impl BrowserHost {
                     HWND_BOTTOM,
                     PARK_X,
                     PARK_Y,
-                    width,
-                    height,
+                    geometry.host_width,
+                    geometry.host_height,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
             }
@@ -528,7 +564,7 @@ impl BrowserHost {
                 resize_webview(webview);
             }
             self.active = true;
-            self.last_rect = Some(screen_rect);
+            self.last_geometry = Some(geometry);
             self.reveal_at = Some(Instant::now() + INTERACTION_PREP_DELAY);
             return;
         }
@@ -536,22 +572,22 @@ impl BrowserHost {
         if let Some(reveal_at) = self.reveal_at {
             // If layout changed while preparing (for example, the context
             // menu closed), settle once more at the final tile dimensions.
-            if self.last_rect != Some(screen_rect) {
+            if self.last_geometry != Some(geometry) {
                 unsafe {
                     let _ = SetWindowPos(
                         self.window.0,
                         HWND_BOTTOM,
                         PARK_X,
                         PARK_Y,
-                        width,
-                        height,
+                        geometry.host_width,
+                        geometry.host_height,
                         SWP_NOACTIVATE | SWP_SHOWWINDOW,
                     );
                 }
                 if let Some(webview) = self.webview.as_ref() {
                     resize_webview(webview);
                 }
-                self.last_rect = Some(screen_rect);
+                self.last_geometry = Some(geometry);
                 self.reveal_at = Some(Instant::now() + INTERACTION_PREP_DELAY);
                 return;
             }
@@ -563,10 +599,10 @@ impl BrowserHost {
                 let _ = SetWindowPos(
                     self.window.0,
                     HWND_TOP,
-                    origin.x,
-                    origin.y,
-                    width,
-                    height,
+                    geometry.host_x,
+                    geometry.host_y,
+                    geometry.host_width,
+                    geometry.host_height,
                     SWP_SHOWWINDOW,
                 );
                 let _ = SetForegroundWindow(self.window.0);
@@ -575,7 +611,7 @@ impl BrowserHost {
                 let _ = webview.focus();
             }
             self.reveal_at = None;
-            self.last_rect = Some(screen_rect);
+            self.last_geometry = Some(geometry);
             return;
         }
 
@@ -583,10 +619,10 @@ impl BrowserHost {
             let _ = SetWindowPos(
                 self.window.0,
                 HWND_TOP,
-                origin.x,
-                origin.y,
-                width,
-                height,
+                geometry.host_x,
+                geometry.host_y,
+                geometry.host_width,
+                geometry.host_height,
                 SWP_SHOWWINDOW | SWP_NOACTIVATE,
             );
         }
@@ -596,7 +632,7 @@ impl BrowserHost {
             resize_webview(webview);
         }
         self.active = true;
-        self.last_rect = Some(screen_rect);
+        self.last_geometry = Some(geometry);
     }
 
     /// Move the host back offscreen at capture resolution. Audio keeps
@@ -618,7 +654,7 @@ impl BrowserHost {
             let _ = webview.zoom(1.0);
         }
         self.active = false;
-        self.last_rect = None;
+        self.last_geometry = None;
         self.reveal_at = None;
     }
 
@@ -1480,7 +1516,7 @@ unsafe extern "system" fn browser_window_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_ubol_archive_with_progress, installed_ubol_has_current_marker,
+        browser_geometry, extract_ubol_archive_with_progress, installed_ubol_has_current_marker,
         installed_ubol_matches_embedded, is_allowed_navigation, normalize_url, parked_bounds,
         profile_install_marker_path, read_profile_install_marker, scrub_url_for_storage,
         ubol_verification_marker_path, write_profile_install_marker,
@@ -1510,6 +1546,22 @@ mod tests {
         assert_eq!(bounds.position.to_physical::<i32>(1.0).y, 0);
         assert_eq!(bounds.size.to_physical::<i32>(1.0).width, 1280);
         assert_eq!(bounds.size.to_physical::<i32>(1.0).height, 720);
+    }
+
+    #[test]
+    fn oversized_page_is_clipped_to_canvas_without_changing_page_size() {
+        let page = egui::Rect::from_min_max(
+            egui::pos2(-100.0, -50.0),
+            egui::pos2(1500.0, 900.0),
+        );
+        let visible = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(800.0, 600.0));
+
+        let geometry = browser_geometry(page, visible, 1.0, (200, 300));
+
+        assert_eq!((geometry.host_x, geometry.host_y), (200, 300));
+        assert_eq!((geometry.host_width, geometry.host_height), (800, 600));
+        assert_eq!((geometry.page_x, geometry.page_y), (-100, -50));
+        assert_eq!((geometry.page_width, geometry.page_height), (1600, 950));
     }
 
     #[test]
