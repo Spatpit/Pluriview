@@ -335,6 +335,9 @@ pub struct BrowserHost {
     /// While set, the host remains offscreen at its interactive size until
     /// WebView2 has had time to render the resized/zoomed page.
     reveal_at: Option<Instant>,
+    /// Backing resolution used while parked and captured. Kept in sync with
+    /// the tile's physical display size so preview and live modes are 1:1.
+    capture_size: (i32, i32),
     /// When the live address was last read from WebView2 (see [`Self::poll`]).
     last_url_check: Option<Instant>,
     shared: Arc<Mutex<SharedState>>,
@@ -422,6 +425,7 @@ impl BrowserHost {
             muted: false,
             last_geometry: None,
             reveal_at: None,
+            capture_size: (WIDTH, HEIGHT),
             last_url_check: None,
             shared,
         })
@@ -441,6 +445,38 @@ impl BrowserHost {
 
     pub fn is_muted(&self) -> bool {
         self.muted
+    }
+
+    /// Match an inactive browser's capture backing to its displayed physical
+    /// size. The zoom changes with the backing width, preserving the same CSS
+    /// viewport while eliminating bitmap upscaling in the canvas preview.
+    pub fn sync_capture_size(&mut self, width: i32, height: i32) {
+        if self.active {
+            return;
+        }
+        let size = (width.max(1), height.max(1));
+        if self.capture_size == size {
+            return;
+        }
+        self.capture_size = size;
+        unsafe {
+            let _ = SetWindowPos(
+                self.window.0,
+                HWND_BOTTOM,
+                PARK_X,
+                PARK_Y,
+                size.0,
+                size.1,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        if let Some(webview) = self.webview.as_ref() {
+            let _ = webview.set_bounds(Rect {
+                position: PhysicalPosition::new(0, 0).into(),
+                size: PhysicalSize::new(size.0, size.1).into(),
+            });
+            let _ = webview.zoom((size.0 as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
+        }
     }
 
     pub fn current_url(&self) -> String {
@@ -638,20 +674,27 @@ impl BrowserHost {
     /// Move the host back offscreen at capture resolution. Audio keeps
     /// playing and Windows Graphics Capture keeps rendering it.
     pub fn park(&mut self) {
+        if let Some(geometry) = self.last_geometry {
+            self.capture_size = (geometry.page_width, geometry.page_height);
+        }
+        let (width, height) = self.capture_size;
         unsafe {
             let _ = SetWindowPos(
                 self.window.0,
                 HWND_BOTTOM,
                 PARK_X,
                 PARK_Y,
-                WIDTH,
-                HEIGHT,
+                width,
+                height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
         }
         if let Some(webview) = self.webview.as_ref() {
-            let _ = webview.set_bounds(parked_bounds());
-            let _ = webview.zoom(1.0);
+            let _ = webview.set_bounds(Rect {
+                position: PhysicalPosition::new(0, 0).into(),
+                size: PhysicalSize::new(width, height).into(),
+            });
+            let _ = webview.zoom((width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
         }
         self.active = false;
         self.last_geometry = None;
@@ -1125,6 +1168,10 @@ impl BrowserManager {
 
     pub fn get_mut(&mut self, id: PreviewId) -> Option<&mut BrowserHost> {
         self.hosts.get_mut(&id)
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = PreviewId> + '_ {
+        self.hosts.keys().copied()
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PreviewId, &mut BrowserHost)> {

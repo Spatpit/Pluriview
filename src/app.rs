@@ -543,10 +543,9 @@ impl PluriviewApp {
         }
     }
 
-    /// Where a browser host window should sit for tile `id`, in egui points
-    /// (window client coordinates). Inset a little so the canvas' accent
-    /// outline stays visible around the live window. None when the tile is
-    /// fully outside the canvas area.
+    /// Full and canvas-clipped browser geometry for tile `id`, in egui points
+    /// (window client coordinates). The page uses the exact tile rect so live
+    /// interaction does not introduce an inset/size change.
     #[cfg(windows)]
     fn browser_tile_placement(
         &self,
@@ -558,8 +557,7 @@ impl PluriviewApp {
         if !rect.intersects(canvas_rect) {
             return None;
         }
-        let inset = 3.0_f32.min(rect.width() / 4.0).min(rect.height() / 4.0);
-        let page_rect = rect.shrink(inset.max(0.0));
+        let page_rect = rect;
         let visible_rect = page_rect.intersect(canvas_rect);
         (visible_rect.width() >= 1.0 && visible_rect.height() >= 1.0).then_some(
             BrowserTilePlacement {
@@ -625,6 +623,24 @@ impl PluriviewApp {
                 }
                 if let Some(url) = update.url {
                     preview.browser_url = Some(url);
+                }
+            }
+        }
+
+        // Keep every visible parked browser at the same physical resolution
+        // as its canvas tile. This makes the captured texture a 1:1 match for
+        // the live WebView before interaction begins, instead of enlarging a
+        // fixed 1280x720 bitmap and then swapping to a sharper native page.
+        if let Some(canvas_rect) = self.canvas.last_screen_rect {
+            let pixels_per_point = ctx.pixels_per_point();
+            let ids: Vec<_> = self.browser.ids().collect();
+            for id in ids {
+                let Some(placement) = self.browser_tile_placement(id, canvas_rect) else {
+                    continue;
+                };
+                let size = placement.page_rect.size() * pixels_per_point;
+                if let Some(host) = self.browser.get_mut(id) {
+                    host.sync_capture_size(size.x.round() as i32, size.y.round() as i32);
                 }
             }
         }
