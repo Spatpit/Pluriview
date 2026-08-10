@@ -2,8 +2,6 @@
   <h1 align="center">Pluriview</h1>
   <p align="center">
     Live window previews on an infinite canvas for Windows
-    <br />
-    <em>Like PureRef, but for live windows</em>
   </p>
 </p>
 
