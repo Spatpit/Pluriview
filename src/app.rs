@@ -13,6 +13,7 @@ use crate::capture::CaptureCoordinator;
 use crate::persistence::{CanvasLayout, SavedLayout, Storage, WindowLayout};
 use crate::tray::TrayManager;
 use crate::overlay::RegionSelector;
+use crate::media;
 #[cfg(windows)]
 use crate::browser::{
     self, normalize_url, scrub_url_for_storage, BrowserManager, ExtensionPreparationStatus,
@@ -43,6 +44,14 @@ struct BrowserTilePlacement {
     page_rect: egui::Rect,
     /// Portion of the tile allowed to become a native window inside the canvas.
     visible_rect: egui::Rect,
+}
+
+/// Initial image tile size, fitted inside 640×480 while preserving aspect.
+fn media_tile_size(width: u32, height: u32) -> Vec2 {
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    let scale = (640.0 / width).min(480.0 / height);
+    Vec2::new(width * scale, height * scale)
 }
 
 /// Canvas right-click "Add Window..." popup: a small searchable list shown
@@ -119,6 +128,9 @@ pub struct PluriviewApp {
     /// Active canvas right-click "Add Window..." popup, if any.
     quick_add: Option<QuickAddPopup>,
 
+    /// Last image import/decode error, shown as a dismissible dialog.
+    media_error: Option<String>,
+
     /// Main window HWND, cached from eframe on the first frame.
     main_hwnd: Option<isize>,
 
@@ -194,6 +206,7 @@ impl PluriviewApp {
             region_selector: None,
             region_select_preview_id: None,
             quick_add: None,
+            media_error: None,
             main_hwnd: None,
             window_layout: WindowLayout::default(),
             pending_maximize: false,
@@ -376,6 +389,123 @@ impl PluriviewApp {
         self.recent_urls.retain(|u| u != &url);
         self.recent_urls.insert(0, url);
         self.recent_urls.truncate(MAX_RECENT_URLS);
+    }
+
+    /// Import an external image into portable managed storage and create its tile.
+    fn import_media_tile(&mut self, source: &std::path::Path, position: Pos2) -> Result<PreviewId, String> {
+        // Decode first so an unsupported or damaged file is not copied into
+        // managed storage as an unusable orphan.
+        let asset = media::load(source)?;
+        let storage = self.storage.as_ref().ok_or_else(|| "Pluriview storage is unavailable".to_owned())?;
+        let managed_path = storage.import_media(source)
+            .map_err(|error| format!("Could not copy image into managed storage: {error}"))?;
+        let title = source.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Image")
+            .to_owned();
+        let size = media_tile_size(asset.width, asset.height);
+        Ok(self.preview_manager.add_media(
+            managed_path,
+            title,
+            asset.frames,
+            position,
+            size,
+        ))
+    }
+
+    /// Recreate a tile from a relative filename already in managed storage.
+    fn restore_media_tile(
+        &mut self,
+        managed_path: &str,
+        title: String,
+        position: Pos2,
+        size: Vec2,
+    ) -> Result<PreviewId, String> {
+        let storage = self.storage.as_ref().ok_or_else(|| "Pluriview storage is unavailable".to_owned())?;
+        let path = storage.resolve_media(managed_path)
+            .ok_or_else(|| "Saved image path is invalid".to_owned())?;
+        if !path.is_file() {
+            return Err(format!("Saved image is missing: {}", path.display()));
+        }
+        let asset = media::load(&path)?;
+        Ok(self.preview_manager.add_media(
+            managed_path.to_owned(),
+            title,
+            asset.frames,
+            position,
+            size,
+        ))
+    }
+
+    /// Import files dropped anywhere over the app and place them where the
+    /// pointer meets the canvas. Multiple images fan out slightly so each is
+    /// visible and remains individually selectable.
+    fn import_dropped_media(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+
+        let Some(canvas_rect) = self.canvas.last_screen_rect else { return; };
+        let pointer = ctx.input(|input| input.pointer.hover_pos())
+            .unwrap_or_else(|| canvas_rect.center());
+        let pointer = Pos2::new(
+            pointer.x.clamp(canvas_rect.left(), canvas_rect.right()),
+            pointer.y.clamp(canvas_rect.top(), canvas_rect.bottom()),
+        );
+        let base_position = self.canvas.screen_to_canvas(pointer, canvas_rect);
+        let mut imported = Vec::new();
+        let mut errors = Vec::new();
+
+        for (index, file) in dropped.into_iter().enumerate() {
+            let Some(path) = file.path else {
+                let name = if file.name.is_empty() { "dragged item" } else { &file.name };
+                errors.push(format!("{name}: this drag source did not provide a local file"));
+                continue;
+            };
+            let offset = Vec2::splat(index as f32 * 24.0 / self.canvas.zoom.max(0.1));
+            match self.import_media_tile(&path, base_position + offset) {
+                Ok(id) => imported.push(id),
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
+            }
+        }
+
+        if !imported.is_empty() {
+            self.canvas.selection = imported;
+        }
+        if !errors.is_empty() {
+            self.media_error = Some(errors.join("\n\n"));
+        }
+    }
+
+    /// Highlight the canvas while Windows is carrying files over the app.
+    fn media_drop_overlay(&self, ctx: &egui::Context) {
+        if !ctx.input(|input| !input.raw.hovered_files.is_empty()) {
+            return;
+        }
+        let Some(rect) = self.canvas.last_screen_rect else { return; };
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("media_drop_overlay"),
+        ));
+        painter.rect_filled(
+            rect,
+            8.0,
+            egui::Color32::from_rgba_unmultiplied(35, 95, 55, 90),
+        );
+        painter.rect_stroke(
+            rect.shrink(8.0),
+            8.0,
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(107, 200, 110)),
+        );
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Drop images onto the canvas",
+            egui::FontId::proportional(18.0),
+            egui::Color32::WHITE,
+        );
+        ctx.request_repaint();
     }
 
     #[cfg(windows)]
@@ -874,6 +1004,16 @@ impl PluriviewApp {
 
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
+                if ui.button("Add Image...").clicked() {
+                    let position = self
+                        .canvas
+                        .last_screen_rect
+                        .map(|rect| self.canvas.screen_to_canvas(rect.center(), rect))
+                        .unwrap_or(Pos2::ZERO);
+                    self.canvas.pending_media_add = Some(position);
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("Save Layout Now").clicked() {
                     self.save_autosave();
                     ui.close_menu();
@@ -1326,6 +1466,29 @@ impl PluriviewApp {
                 continue;
             }
 
+            if let Some(media_path) = &preview_layout.media_path {
+                match self.restore_media_tile(
+                    media_path,
+                    preview_layout.window_title.clone(),
+                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
+                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
+                ) {
+                    Ok(id) => {
+                        self.preview_manager.set_z_order(id, preview_layout.z_order);
+                        if let Some(preview) = self.preview_manager.get_mut(id) {
+                            preview.lock_aspect_ratio = preview_layout.lock_aspect_ratio;
+                            preview.crop_uv = preview_layout.crop_uv;
+                            preview.created_at = Instant::now() - Duration::from_secs(1);
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Failed to restore image tile: {error}");
+                        self.media_error = Some(error);
+                    }
+                }
+                continue;
+            }
+
             // Try to find a matching window by title
             let matching_window = current_windows.iter()
                 .find(|w| w.title == preview_layout.window_title);
@@ -1484,6 +1647,9 @@ impl eframe::App for PluriviewApp {
                 );
             });
 
+        self.media_drop_overlay(ctx);
+        self.import_dropped_media(ctx);
+
         #[cfg(windows)]
         if !self.pending_browser_tiles.is_empty() {
             for pending in self.pending_browser_tiles.values_mut() {
@@ -1602,6 +1768,17 @@ impl eframe::App for PluriviewApp {
             });
         }
 
+        // Image files are copied into `pluriview_data/media` so the saved
+        // relative path remains valid when a portable install is moved.
+        if let Some(position) = self.canvas.pending_media_add.take() {
+            if let Some(path) = media::pick_file(self.main_hwnd) {
+                if let Err(error) = self.import_media_tile(&path, position) {
+                    log::error!("Failed to import image tile: {error}");
+                    self.media_error = Some(error);
+                }
+            }
+        }
+
         #[cfg(windows)]
         {
             if let Some(position) = self.canvas.pending_browser_add.take() {
@@ -1632,9 +1809,50 @@ impl eframe::App for PluriviewApp {
             }
         }
 
+        if let Some(info) = self.canvas.pending_media_restore.take() {
+            if let Some(media_path) = info.media_path.clone() {
+                match self.restore_media_tile(
+                    &media_path,
+                    info.title,
+                    info.position,
+                    info.size,
+                ) {
+                    Ok(id) => {
+                        if let Some(preview) = self.preview_manager.get_mut(id) {
+                            preview.crop_uv = info.crop_uv;
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Failed to undo image tile removal: {error}");
+                        self.media_error = Some(error);
+                    }
+                }
+            }
+        }
+
         self.quick_add_ui(ctx);
         #[cfg(windows)]
         self.add_browser_ui(ctx);
+
+        if self.media_error.is_some() {
+            let mut dismiss = false;
+            egui::Window::new("Image Tile Error")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    if let Some(error) = &self.media_error {
+                        ui.label(error);
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("OK").clicked() {
+                        dismiss = true;
+                    }
+                });
+            if dismiss {
+                self.media_error = None;
+            }
+        }
 
         #[cfg(windows)]
         {

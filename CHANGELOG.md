@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-10
+
+### Added
+- Image tiles for PNG, JPEG, WebP, and BMP files, plus animated GIF tiles with authored frame timing
+- Imported tile media is copied into `pluriview_data/media` and restored from portable relative paths in saved layouts
+- Image files can be dragged onto the canvas, with pointer placement, multi-file fan-out, and a visible drop target
+
+### Changed
+- Animated GIF playback schedules repaints around each frame's authored delay and bounds catch-up work after UI stalls
+- uBlock Origin Lite is reused from the existing WebView2 profile instead of being reinstalled on every launch, reducing startup work and preserving active filtering rules
+
 ### Fixed
 - Restored browser tiles block media such as YouTube videos from autoplaying until that tile receives user interaction
 - Hiding the window picker sidebar now survives a restart instead of coming back on every launch

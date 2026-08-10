@@ -30,6 +30,8 @@ nul
 .claude/
 .codex/
 .worktrees/
+/CLAUDE_CONTEXT.md
+/docs/superpowers/
 
 # Design mockups (development only)
 design_mockups.html

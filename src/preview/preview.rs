@@ -1,6 +1,8 @@
 use eframe::egui::{self, Pos2, Vec2, Rect, TextureHandle};
 use serde::{Serialize, Deserialize};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::media::MediaFrame;
 
 /// How long the spawn-in / fade-out animations take.
 const SPAWN_DURATION_SECS: f32 = 0.22;
@@ -117,6 +119,14 @@ pub struct Preview {
     /// Loading/error state rendered while a browser host is being prepared.
     pub browser_status: BrowserTileStatus,
 
+    /// Managed filename in `pluriview_data/media` for image and GIF tiles.
+    pub media_path: Option<String>,
+
+    /// Decoded frames for a managed image. A single frame is a static image.
+    media_frames: Vec<MediaFrame>,
+    media_frame_index: usize,
+    media_frame_started: Instant,
+
     /// When this preview was created (drives the spawn-in animation)
     pub created_at: Instant,
 
@@ -157,6 +167,10 @@ impl Preview {
             browser_url: None,
             browser_muted: false,
             browser_status: BrowserTileStatus::Ready,
+            media_path: None,
+            media_frames: Vec::new(),
+            media_frame_index: 0,
+            media_frame_started: Instant::now(),
             created_at: Instant::now(),
             removing: None,
         }
@@ -165,6 +179,28 @@ impl Preview {
     /// Is this preview an app-owned browser tile?
     pub fn is_browser(&self) -> bool {
         self.browser_url.is_some()
+    }
+
+    /// Is this preview backed by a managed image or GIF?
+    pub fn is_media(&self) -> bool {
+        self.media_path.is_some()
+    }
+
+    /// Attach decoded image data to this preview.
+    pub fn set_media(&mut self, managed_path: String, frames: Vec<MediaFrame>) {
+        self.media_path = Some(managed_path);
+        self.media_frames = frames;
+        self.media_frame_index = 0;
+        self.media_frame_started = Instant::now();
+        if let Some(frame) = self.media_frames.first() {
+            self.frame_buffer = Some(FrameData {
+                width: frame.width,
+                height: frame.height,
+                data: frame.rgba.clone(),
+            });
+            self.frame_size = Some((frame.width, frame.height));
+            self.source_aspect_ratio = frame.width as f32 / frame.height as f32;
+        }
     }
 
     /// Create a preview for a specific window
@@ -236,6 +272,8 @@ impl Preview {
 
     /// Get or create texture from frame buffer
     pub fn get_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
+        self.advance_media_animation(ctx);
+
         // Check if we have a new frame to upload
         let frame_data = self.frame_buffer.take();
 
@@ -257,6 +295,41 @@ impl Preview {
         }
 
         self.texture.as_ref()
+    }
+
+    /// Advance an animated image according to its authored per-frame delays.
+    fn advance_media_animation(&mut self, ctx: &egui::Context) {
+        if self.media_frames.len() <= 1 {
+            return;
+        }
+
+        let mut elapsed = self.media_frame_started.elapsed();
+        let mut advanced = false;
+        // Consume overdue frames so GIFs recover after the UI thread was busy,
+        // while bounding work per paint.
+        for _ in 0..self.media_frames.len() {
+            let delay = self.media_frames[self.media_frame_index].duration;
+            if elapsed < delay {
+                break;
+            }
+            elapsed = elapsed.saturating_sub(delay);
+            self.media_frame_index = (self.media_frame_index + 1) % self.media_frames.len();
+            self.media_frame_started = Instant::now() - elapsed;
+            advanced = true;
+        }
+
+        if advanced {
+            let frame = &self.media_frames[self.media_frame_index];
+            self.frame_buffer = Some(FrameData {
+                width: frame.width,
+                height: frame.height,
+                data: frame.rgba.clone(),
+            });
+        }
+
+        let delay = self.media_frames[self.media_frame_index].duration;
+        let remaining = delay.saturating_sub(self.media_frame_started.elapsed());
+        ctx.request_repaint_after(remaining.max(Duration::from_millis(1)));
     }
 
     /// Check if this preview contains the given canvas point
@@ -314,6 +387,10 @@ pub struct PreviewLayout {
     /// WebView2 mute is per-session, so remember it and reapply on restore.
     #[serde(default)]
     pub browser_muted: bool,
+    /// Managed filename for an image/GIF tile. Kept relative so portable
+    /// installs can be moved as a unit.
+    #[serde(default)]
+    pub media_path: Option<String>,
 }
 
 impl From<&Preview> for PreviewLayout {
@@ -329,13 +406,14 @@ impl From<&Preview> for PreviewLayout {
             crop_uv: preview.crop_uv,
             browser_url: preview.browser_url.clone(),
             browser_muted: preview.browser_muted,
+            media_path: preview.media_path.clone(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Preview, PreviewId};
+    use super::{Preview, PreviewId, PreviewLayout};
     use eframe::egui::{Context, Pos2, Vec2};
 
     #[test]
@@ -349,5 +427,15 @@ mod tests {
         let second = preview.get_texture(&context).unwrap().id();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn older_saved_tiles_default_to_no_media() {
+        let preview = Preview::new(PreviewId(1), "test".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        value.as_object_mut().unwrap().remove("media_path");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.media_path.is_none());
     }
 }

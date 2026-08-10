@@ -334,6 +334,7 @@ struct TileInfo {
     spawn_t: f32,
     remove_t: f32,
     is_browser: bool,
+    is_media: bool,
     muted: bool,
     browser_status: BrowserTileStatus,
 }
@@ -516,6 +517,9 @@ pub struct CanvasState {
     /// Canvas position requested by the "Add Browser..." context action.
     pub pending_browser_add: Option<Pos2>,
 
+    /// Canvas position requested by the "Add Image..." context action.
+    pub pending_media_add: Option<Pos2>,
+
     /// Browser tile actions queued by hover controls / context menus,
     /// consumed by the app.
     pub pending_browser_actions: Vec<(PreviewId, BrowserAction)>,
@@ -523,6 +527,9 @@ pub struct CanvasState {
     /// A removed browser tile whose "Undo" was clicked; the app recreates
     /// the WebView from its saved URL (the original host is already gone).
     pub pending_browser_restore: Option<RemovedPreviewInfo>,
+
+    /// A removed image/GIF tile whose managed asset should be decoded again.
+    pub pending_media_restore: Option<RemovedPreviewInfo>,
 
     /// The browser tile currently in interaction mode, set by the app each
     /// frame so the canvas can outline it in the accent color.
@@ -559,8 +566,10 @@ impl Default for CanvasState {
             last_secondary_click: None,
             pending_quick_add: None,
             pending_browser_add: None,
+            pending_media_add: None,
             pending_browser_actions: Vec::new(),
             pending_browser_restore: None,
+            pending_media_restore: None,
             interactive_browser: None,
             last_screen_rect: None,
             last_double_clicked: None,
@@ -999,6 +1008,12 @@ impl CanvasState {
                 }
                 ui.close_menu();
             }
+            if ui.button("Add Image...").clicked() {
+                if let Some(screen_pos) = self.last_secondary_click {
+                    self.pending_media_add = Some(self.screen_to_canvas(screen_pos, canvas_rect));
+                }
+                ui.close_menu();
+            }
             ui.separator();
             if ui.button("Reset View").clicked() {
                 self.reset();
@@ -1062,6 +1077,7 @@ impl CanvasState {
                 spawn_t: p.spawn_progress(),
                 remove_t: p.removal_progress(),
                 is_browser: p.is_browser(),
+                is_media: p.is_media(),
                 muted: p.browser_muted,
                 browser_status: p.browser_status.clone(),
             }).collect()
@@ -1072,7 +1088,7 @@ impl CanvasState {
         for info in preview_info {
             let TileInfo {
                 id, rect, title, target_fps, fps_preset: current_preset, has_crop,
-                is_removing, spawn_t, remove_t, is_browser, muted, browser_status,
+                is_removing, spawn_t, remove_t, is_browser, is_media, muted, browser_status,
             } = info;
             let screen_rect = self.canvas_rect_to_screen(rect, canvas_rect);
 
@@ -1231,20 +1247,22 @@ impl CanvasState {
                     self.selection.retain(|&x| x != id);
                 }
 
-                // FPS badge (left of close button)
-                let fps_text = format!("{}", target_fps);
-                let fps_rect = Rect::from_min_size(
-                    screen_rect.right_top() + Vec2::new(-72.0, 10.0),
-                    Vec2::new(36.0, 20.0),
-                );
-                painter.rect_filled(fps_rect, 10.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
-                painter.text(
-                    fps_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    &fps_text,
-                    egui::FontId::proportional(10.0),
-                    Color32::from_rgb(150, 150, 150),
-                );
+                // Capture FPS does not apply to file-backed image tiles.
+                if !is_media {
+                    let fps_text = format!("{}", target_fps);
+                    let fps_rect = Rect::from_min_size(
+                        screen_rect.right_top() + Vec2::new(-72.0, 10.0),
+                        Vec2::new(36.0, 20.0),
+                    );
+                    painter.rect_filled(fps_rect, 10.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
+                    painter.text(
+                        fps_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        &fps_text,
+                        egui::FontId::proportional(10.0),
+                        Color32::from_rgb(150, 150, 150),
+                    );
+                }
 
                 // Title (truncated, on the left) - handle UTF-8 properly
                 let title_text = if title.chars().count() > 25 {
@@ -1253,12 +1271,12 @@ impl CanvasState {
                 } else {
                     title.clone()
                 };
-                let title_pos = if is_browser {
-                    // Globe badge marks browser tiles; shift the title right.
+                let title_pos = if is_browser || is_media {
+                    // Source badge marks browser/media tiles; shift the title right.
                     painter.text(
                         screen_rect.left_top() + Vec2::new(12.0, 20.0),
                         egui::Align2::LEFT_CENTER,
-                        egui_phosphor::regular::GLOBE,
+                        if is_browser { egui_phosphor::regular::GLOBE } else { egui_phosphor::regular::IMAGE },
                         egui::FontId::proportional(12.0),
                         Color32::from_rgb(107, 170, 75),
                     );
@@ -1502,27 +1520,30 @@ impl CanvasState {
                 ui.label(egui::RichText::new(&title).strong());
                 ui.separator();
 
-                ui.label("Frame Rate:");
-                for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
-                    let is_current = current_preset == preset;
-                    let label = if is_current {
-                        format!("  {} ✓", preset.label())
-                    } else {
-                        format!("  {}", preset.label())
-                    };
+                if !is_media {
+                    ui.label("Frame Rate:");
+                    for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
+                        let is_current = current_preset == preset;
+                        let label = if is_current {
+                            format!("  {} ✓", preset.label())
+                        } else {
+                            format!("  {}", preset.label())
+                        };
 
-                    if ui.selectable_label(is_current, label).clicked() {
-                        self.pending_fps_changes.push(PendingFpsChange {
-                            preview_id: id,
-                            new_fps: preset,
-                        });
-                        ui.close_menu();
+                        if ui.selectable_label(is_current, label).clicked() {
+                            self.pending_fps_changes.push(PendingFpsChange {
+                                preview_id: id,
+                                new_fps: preset,
+                            });
+                            ui.close_menu();
+                        }
                     }
+                    ui.separator();
                 }
 
-                ui.separator();
-
-                if is_browser {
+                if is_media {
+                    ui.label(egui::RichText::new("Image / animated GIF tile").weak());
+                } else if is_browser {
                     // Browser tiles: navigation and audio instead of crop
                     // (a cropped page has ambiguous interactive coordinates).
                     let browser_ready = browser_status == BrowserTileStatus::Ready;
@@ -1726,7 +1747,7 @@ impl CanvasState {
         painter.text(
             center + Vec2::new(0.0, 44.0),
             egui::Align2::CENTER_CENTER,
-            "Add a window from the left panel, or right-click for a window or browser tile",
+            "Add a window from the left panel, or right-click for a window, browser, or image tile",
             egui::FontId::proportional(12.0),
             Color32::from_rgb(75, 75, 82),
         );
@@ -1808,6 +1829,8 @@ impl CanvasState {
                 // The browser's host window was destroyed with the tile, so
                 // the app must recreate the WebView from the saved URL.
                 self.pending_browser_restore = Some(info.clone());
+            } else if info.media_path.is_some() {
+                self.pending_media_restore = Some(info.clone());
             } else if let Some(handle) = info.window_handle {
                 let id = preview_manager.add_for_window(
                     handle.hwnd,

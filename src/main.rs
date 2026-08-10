@@ -9,6 +9,7 @@ mod persistence;
 mod tray;
 mod overlay;
 mod privacy;
+mod media;
 #[cfg(windows)]
 mod browser;
 #[cfg(windows)]

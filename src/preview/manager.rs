@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use super::{BrowserTileStatus, Preview, PreviewId, FpsPreset, WindowHandle};
+use crate::media::MediaFrame;
 
 /// Snapshot of a preview captured right before it's actually dropped from
 /// the manager, so the canvas can offer an "Undo" toast that restores it.
@@ -19,6 +20,8 @@ pub struct RemovedPreviewInfo {
     pub browser_url: Option<String>,
     /// Reapplied when undo recreates the browser tile.
     pub browser_muted: bool,
+    /// Set for managed image and GIF tiles.
+    pub media_path: Option<String>,
 }
 
 /// Manages all preview windows
@@ -101,6 +104,25 @@ impl PreviewManager {
         id
     }
 
+    /// Add a decoded image or GIF tile.
+    pub fn add_media(
+        &mut self,
+        managed_path: String,
+        title: String,
+        frames: Vec<MediaFrame>,
+        position: Pos2,
+        size: Vec2,
+    ) -> PreviewId {
+        let id = self.generate_id();
+        self.max_z_order += 1;
+
+        let mut preview = Preview::new(id, title, position, size);
+        preview.z_order = self.max_z_order;
+        preview.set_media(managed_path, frames);
+        self.previews.insert(id, preview);
+        id
+    }
+
     /// Begin the fade/shrink-out animation for a preview. The preview stays
     /// in the manager (still rendered, but non-interactive) until its
     /// removal animation finishes and `finalize_removals` reaps it.
@@ -130,6 +152,7 @@ impl PreviewManager {
                     crop_uv: preview.crop_uv,
                     browser_url: preview.browser_url,
                     browser_muted: preview.browser_muted,
+                    media_path: preview.media_path,
                 });
             }
         }

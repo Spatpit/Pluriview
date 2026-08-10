@@ -14,12 +14,11 @@
   <img src="https://img.shields.io/github/v/release/Spatpit/Pluriview?include_prereleases" alt="Release">
 </p>
 
----
+<p align="center">
+  <img src="assets/pluriview-preview.gif" alt="Pluriview arranging live windows, browser pages, and image tiles on the infinite canvas">
+</p>
 
-<!--
-## Screenshot
-![Pluriview Screenshot](assets/screenshot.png)
--->
+---
 
 ## Features
 
@@ -27,6 +26,7 @@
 |---------|-------------|
 | **Live Capture** | Real-time window previews using Windows Graphics Capture API |
 | **Browser Tiles** | Put live web pages (YouTube, Twitch, anything) on the canvas with their own audio — no separate browser needed |
+| **Image & GIF Tiles** | Add static images or animated GIFs; portable copies are managed beside the executable |
 | **Ad & Tracker Blocking** | uBlock Origin Lite is integrated into the shared browser-tile profile and enabled by default |
 | **Infinite Canvas** | Pan and zoom freely to organize your workspace |
 | **Crop Regions** | Focus on specific parts of windows with Alt+drag |
@@ -36,6 +36,16 @@
 | **Quick Focus** | Double-click any preview to bring its window to front |
 | **Canvas-Only Mode** | Press `H` to hide all visual chrome while keeping right-click menus available |
 | **Tile Focus** | Fit any captured window or browser tile to the canvas, then restore with `Esc` |
+
+### Image and GIF tiles
+
+Choose **File → Add Image...** or right-click the canvas → **Add Image...**.
+Pluriview supports PNG, JPEG, GIF, WebP, and BMP files. Animated GIFs retain
+their original frame timing. Imported files are copied into
+`pluriview_data/media` and layouts store only the managed filename, so the
+executable and its data folder can be moved together without breaking tiles.
+You can also drag one or several supported image files from File Explorer (or
+another app that provides local files) and drop them directly onto the canvas.
 
 ### Browser tiles
 
@@ -76,23 +86,26 @@ modified. Off by default.
 Download the latest `pluriview.exe` from [Releases](https://github.com/Spatpit/Pluriview/releases).
 
 ### Build from Source
-```bash
+```powershell
 git clone https://github.com/Spatpit/Pluriview.git
 cd Pluriview
-cargo build --release
+.\scripts\build-release.ps1
 ```
-The executable will be at `target/release/pluriview.exe`.
+The privacy-safe executable will be at `target/release/pluriview.exe`. Publish only
+that file. Do not distribute `pluriview.pdb`; Windows debug symbols can contain
+local source paths.
 
 ## Usage
 
 1. **Launch** `pluriview.exe`
 2. **Add windows** from the Window Picker panel (left side)
 3. **Add browsers** by right-clicking the canvas → Add Browser...
-4. **Arrange** by dragging previews on the canvas
-5. **Resize** by dragging corners or edges
-6. **Crop** by holding Alt and dragging corners
-7. **Focus** a tile with right-click → **Focus on This Tile**; press `Esc` to restore the canvas
-8. **Right-click** for other context menu options
+4. **Add images or GIFs** with File → Add Image... or the canvas context menu
+5. **Arrange** by dragging previews on the canvas
+6. **Resize** by dragging corners or edges
+7. **Crop** window previews by holding Alt and dragging corners
+8. **Focus** a tile with right-click → **Focus on This Tile**; press `Esc` to restore the canvas
+9. **Right-click** for other context menu options
 
 ## Keyboard Shortcuts
 
@@ -120,6 +133,7 @@ Pluriview/
 │   ├── app.rs              # Main application state and UI
 │   ├── main.rs             # Entry point
 │   ├── browser.rs          # WebView2 browser tiles
+│   ├── media.rs            # Static image and animated GIF decoding
 │   ├── canvas/             # Infinite canvas (pan, zoom, selection)
 │   ├── capture/            # Window capture coordinator
 │   ├── overlay/            # Region selector overlay (crop)
@@ -128,8 +142,11 @@ Pluriview/
 │   ├── tray/               # System tray integration
 │   └── window_picker/      # Window enumeration and picker UI
 ├── assets/
-│   ├── icon.ico            # Application icon
-│   └── third_party/ubol/   # Pinned official uBlock Origin Lite package
+│   ├── icon.ico                  # Application icon
+│   ├── pluriview-preview.gif     # README preview
+│   └── third_party/ubol/         # Pinned official uBlock Origin Lite package
+├── scripts/
+│   └── build-release.ps1   # Privacy-safe Windows release build
 ├── Cargo.toml              # Dependencies and metadata
 ├── build.rs                # Windows resource compilation
 ├── LICENSE                 # MIT License
