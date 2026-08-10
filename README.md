@@ -30,6 +30,7 @@
 | **Crop Regions** | Focus on specific parts of windows with Alt+drag |
 | **Adjustable FPS** | Choose 5, 15, 30, or 60 FPS per preview |
 | **Auto-Save** | Layouts persist automatically between sessions, including browser URLs |
+| **Named Workspaces** | Create, duplicate, rename, and switch between reusable canvas setups |
 | **System Tray** | Minimize to tray for background operation |
 | **Quick Focus** | Double-click any preview to bring its window to front |
 | **Canvas-Only Mode** | Press `H` to hide all visual chrome while keeping right-click menus available |
@@ -44,6 +45,10 @@ their original frame timing. Imported files are copied into
 executable and its data folder can be moved together without breaking tiles.
 You can also drag one or several supported image files from File Explorer (or
 another app that provides local files) and drop them directly onto the canvas.
+
+Development builds keep this folder at the repository root rather than under
+Cargo's disposable `target` directory. Release builds remain portable and keep
+`pluriview_data` beside the executable.
 
 ### Browser tiles
 
@@ -104,6 +109,9 @@ local source paths.
 7. **Crop** window previews by holding Alt and dragging corners
 8. **Focus** a tile with right-click → **Focus on This Tile**; press `Esc` to restore the canvas
 9. **Right-click** for other context menu options
+
+Use the **Workspace** menu to create separate reusable setups. Existing installs
+are migrated into a workspace named **Default** the first time this version runs.
 
 ## Keyboard Shortcuts
 

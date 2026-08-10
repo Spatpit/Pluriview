@@ -10,7 +10,7 @@ use crate::preview::{
 };
 use crate::window_picker::{WindowPicker, WindowInfo, enumerate_windows, spawn_preview};
 use crate::capture::CaptureCoordinator;
-use crate::persistence::{CanvasLayout, SavedLayout, Storage, WindowLayout};
+use crate::persistence::{CanvasLayout, SavedLayout, Storage, WindowLayout, WorkspaceIndex};
 use crate::tray::TrayManager;
 use crate::overlay::RegionSelector;
 use crate::media;
@@ -76,6 +76,25 @@ struct AddBrowserDialog {
     focused: bool,
 }
 
+#[derive(Clone, Copy)]
+enum WorkspaceDialogKind {
+    Create,
+    Duplicate,
+    Rename,
+}
+
+struct WorkspaceDialog {
+    kind: WorkspaceDialogKind,
+    name: String,
+    focused: bool,
+}
+
+enum WorkspaceMenuAction {
+    Switch(String),
+    OpenDialog(WorkspaceDialogKind),
+    ConfirmDelete,
+}
+
 #[cfg(windows)]
 struct PendingBrowserTile {
     url: String,
@@ -106,6 +125,18 @@ pub struct PluriviewApp {
 
     /// Storage for persistence
     storage: Option<Storage>,
+
+    /// Named workspace catalog introduced in v0.5.
+    workspaces: WorkspaceIndex,
+
+    /// Create, duplicate, or rename dialog.
+    workspace_dialog: Option<WorkspaceDialog>,
+
+    /// Confirmation guard for deleting the active workspace.
+    confirm_workspace_delete: bool,
+
+    /// Last workspace persistence error, shown as a dismissible dialog.
+    workspace_error: Option<String>,
 
     /// System tray manager
     tray_manager: Option<TrayManager>,
@@ -182,6 +213,19 @@ impl PluriviewApp {
         _cc.egui_ctx.set_fonts(fonts);
 
         let storage = Storage::new();
+        let (workspaces, workspace_error) = match &storage {
+            Some(storage) => match storage.load_or_initialize_workspaces() {
+                Ok(index) => (index, None),
+                Err(error) => (
+                    WorkspaceIndex::default(),
+                    Some(format!("Could not load workspaces: {error}")),
+                ),
+            },
+            None => (
+                WorkspaceIndex::default(),
+                Some("Workspace storage is unavailable.".to_owned()),
+            ),
+        };
         let tray_manager = TrayManager::new();
 
         #[cfg(debug_assertions)]
@@ -199,6 +243,10 @@ impl PluriviewApp {
             picker_open: true,
             canvas_only: false,
             storage,
+            workspaces,
+            workspace_dialog: None,
+            confirm_workspace_delete: false,
+            workspace_error,
             tray_manager,
             hwnd_set: false,
             show_about: false,
@@ -229,8 +277,8 @@ impl PluriviewApp {
             numpad_held: [false; 2],
         };
 
-        // Try to load autosave
-        app.load_autosave();
+        // Restore the active named workspace (or the migrated legacy autosave).
+        app.load_active_workspace();
         app.pending_maximize = app.window_layout.maximized;
 
         app
@@ -900,6 +948,11 @@ impl PluriviewApp {
     fn title_bar_ui(&mut self, ctx: &egui::Context) {
         let bg = egui::Color32::from_rgb(13, 13, 13);
         let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let workspace_name = self
+            .workspaces
+            .active()
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| "Default".to_owned());
 
         egui::TopBottomPanel::top("custom_title_bar")
             .frame(egui::Frame::none().fill(bg))
@@ -934,6 +987,12 @@ impl PluriviewApp {
                             egui::RichText::new("Pluriview")
                                 .size(13.0)
                                 .color(egui::Color32::from_rgb(170, 170, 175)),
+                        );
+                        ui.add_space(7.0);
+                        ui.label(
+                            egui::RichText::new(format!("/ {workspace_name}"))
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(105, 105, 112)),
                         );
                         ui.add_space(16.0);
                         // File / View / Help, inline next to the app name.
@@ -998,6 +1057,15 @@ impl PluriviewApp {
     /// to the app name (Minimal Void: one unified dark strip, no separate
     /// menu-bar row).
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let workspace_entries = self.workspaces.workspaces.clone();
+        let active_workspace_id = self.workspaces.active_workspace_id.clone();
+        let active_workspace_name = self
+            .workspaces
+            .active()
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| "Default".to_owned());
+        let mut workspace_action = None;
+
         ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
         ui.visuals_mut().widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(30, 30, 35);
         ui.visuals_mut().widgets.active.weak_bg_fill = egui::Color32::from_rgb(40, 40, 45);
@@ -1014,12 +1082,14 @@ impl PluriviewApp {
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Save Layout Now").clicked() {
-                    self.save_autosave();
+                if ui.button("Save Workspace Now").clicked() {
+                    if let Err(error) = self.save_active_workspace() {
+                        self.workspace_error = Some(error);
+                    }
                     ui.close_menu();
                 }
-                if ui.button("Reload Layout").clicked() {
-                    self.load_autosave();
+                if ui.button("Reload Workspace").clicked() {
+                    self.load_active_workspace();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -1032,6 +1102,38 @@ impl PluriviewApp {
                 }
                 if ui.button("Exit").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+
+            ui.menu_button("Workspace", |ui| {
+                ui.label(egui::RichText::new(format!("Current: {active_workspace_name}")).strong());
+                ui.separator();
+                for workspace in &workspace_entries {
+                    let selected = workspace.id == active_workspace_id;
+                    if ui.selectable_label(selected, &workspace.name).clicked() {
+                        workspace_action = Some(WorkspaceMenuAction::Switch(workspace.id.clone()));
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui.button("New Workspace...").clicked() {
+                    workspace_action = Some(WorkspaceMenuAction::OpenDialog(WorkspaceDialogKind::Create));
+                    ui.close_menu();
+                }
+                if ui.button("Duplicate Workspace...").clicked() {
+                    workspace_action = Some(WorkspaceMenuAction::OpenDialog(WorkspaceDialogKind::Duplicate));
+                    ui.close_menu();
+                }
+                if ui.button("Rename Workspace...").clicked() {
+                    workspace_action = Some(WorkspaceMenuAction::OpenDialog(WorkspaceDialogKind::Rename));
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(workspace_entries.len() > 1, egui::Button::new("Delete Workspace..."))
+                    .clicked()
+                {
+                    workspace_action = Some(WorkspaceMenuAction::ConfirmDelete);
+                    ui.close_menu();
                 }
             });
 
@@ -1061,7 +1163,9 @@ impl PluriviewApp {
                             if enabled {
                                 self.browser.start_extension_preparation();
                             }
-                            self.save_autosave();
+                            if let Err(error) = self.save_active_workspace() {
+                                self.workspace_error = Some(error);
+                            }
                         }
                         ui.close_menu();
                     }
@@ -1087,6 +1191,117 @@ impl PluriviewApp {
                 }
             });
         });
+
+        if let Some(action) = workspace_action {
+            match action {
+                WorkspaceMenuAction::Switch(id) => {
+                    if let Err(error) = self.switch_workspace(&id) {
+                        self.workspace_error = Some(error);
+                    }
+                }
+                WorkspaceMenuAction::OpenDialog(kind) => {
+                    let name = match kind {
+                        WorkspaceDialogKind::Create => "Untitled Workspace".to_owned(),
+                        WorkspaceDialogKind::Duplicate => format!("{active_workspace_name} Copy"),
+                        WorkspaceDialogKind::Rename => active_workspace_name,
+                    };
+                    self.workspace_dialog = Some(WorkspaceDialog {
+                        kind,
+                        name,
+                        focused: false,
+                    });
+                }
+                WorkspaceMenuAction::ConfirmDelete => self.confirm_workspace_delete = true,
+            }
+        }
+    }
+
+    fn workspace_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.workspace_dialog else { return; };
+        let (title, submit_label) = match dialog.kind {
+            WorkspaceDialogKind::Create => ("New Workspace", "Create"),
+            WorkspaceDialogKind::Duplicate => ("Duplicate Workspace", "Duplicate"),
+            WorkspaceDialogKind::Rename => ("Rename Workspace", "Rename"),
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Workspace name");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.name)
+                        .desired_width(300.0),
+                );
+                if !dialog.focused {
+                    response.request_focus();
+                    dialog.focused = true;
+                }
+                let enter = response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(submit_label).clicked() || enter {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            self.workspace_dialog = None;
+        } else if submit {
+            let dialog = self.workspace_dialog.take().expect("workspace dialog exists");
+            let result = match dialog.kind {
+                WorkspaceDialogKind::Create => self.create_workspace(&dialog.name, false),
+                WorkspaceDialogKind::Duplicate => self.create_workspace(&dialog.name, true),
+                WorkspaceDialogKind::Rename => self.rename_active_workspace(&dialog.name),
+            };
+            if let Err(error) = result {
+                self.workspace_error = Some(error);
+            }
+        }
+    }
+
+    fn workspace_delete_confirmation_ui(&mut self, ctx: &egui::Context) {
+        if !self.confirm_workspace_delete {
+            return;
+        }
+        let name = self
+            .workspaces
+            .active()
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| "this workspace".to_owned());
+        let mut delete = false;
+        let mut cancel = false;
+        egui::Window::new("Delete Workspace")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Delete “{name}”? This cannot be undone."));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        delete = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if delete {
+            self.confirm_workspace_delete = false;
+            if let Err(error) = self.delete_active_workspace() {
+                self.workspace_error = Some(error);
+            }
+        } else if cancel {
+            self.confirm_workspace_delete = false;
+        }
     }
 
     /// "Stream Audio Monitor" submenu: pick the output device that receives
@@ -1296,28 +1511,176 @@ impl PluriviewApp {
         }
     }
 
-    /// Load the autosave layout if it exists
-    fn load_autosave(&mut self) {
-        if let Some(storage) = &self.storage {
-            if let Ok(layout) = storage.load_autosave() {
+    /// Load the active named workspace if it has been saved before.
+    fn load_active_workspace(&mut self) {
+        let Some(storage) = &self.storage else { return; };
+        let id = self.workspaces.active_workspace_id.clone();
+        match storage.load_workspace(&id) {
+            Ok(layout) => {
                 self.apply_layout(&layout);
                 #[cfg(debug_assertions)]
-                println!("Loaded autosave with {} previews", layout.previews.len());
+                println!("Loaded workspace {id} with {} previews", layout.previews.len());
+            }
+            Err(error) if error.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => {
+                self.workspace_error = Some(format!("Could not load the active workspace: {error}"));
             }
         }
     }
 
-    /// Save the current layout to autosave
-    fn save_autosave(&self) {
+    /// Save the current workspace and mirror it to legacy autosave.json.
+    fn save_active_workspace(&self) -> Result<(), String> {
+        let Some(storage) = &self.storage else {
+            return Err("Workspace storage is unavailable.".to_owned());
+        };
+        let layout = self.create_layout();
+        storage
+            .save_active_workspace(&self.workspaces, &layout)
+            .map_err(|error| format!("Could not save workspace: {error}"))?;
+        #[cfg(debug_assertions)]
+        println!(
+            "Saved workspace {} with {} previews",
+            self.workspaces.active_workspace_id,
+            layout.previews.len()
+        );
+        Ok(())
+    }
+
+    fn blank_workspace_layout(&self) -> SavedLayout {
+        let mut layout = self.create_layout();
+        layout.canvas = CanvasLayout::default();
+        layout.previews.clear();
+        layout
+    }
+
+    fn switch_workspace(&mut self, id: &str) -> Result<(), String> {
+        if id == self.workspaces.active_workspace_id {
+            return Ok(());
+        }
+        if self.workspaces.workspaces.iter().all(|workspace| workspace.id != id) {
+            return Err("That workspace no longer exists.".to_owned());
+        }
+        self.save_active_workspace()?;
+
+        let layout = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "Workspace storage is unavailable.".to_owned())?
+            .load_workspace(id)
+            .map_err(|error| format!("Could not load workspace: {error}"))?;
+        let previous_id = std::mem::replace(&mut self.workspaces.active_workspace_id, id.to_owned());
         if let Some(storage) = &self.storage {
-            let layout = self.create_layout();
-            if let Err(e) = storage.save_autosave(&layout) {
-                eprintln!("Failed to save autosave: {}", e);
-            } else {
-                #[cfg(debug_assertions)]
-                println!("Saved autosave with {} previews", layout.previews.len());
+            if let Err(error) = storage.save_workspace_index(&self.workspaces) {
+                self.workspaces.active_workspace_id = previous_id;
+                return Err(format!("Could not select workspace: {error}"));
+            }
+            if let Err(error) = storage.save_autosave(&layout) {
+                self.workspaces.active_workspace_id = previous_id;
+                let _ = storage.save_workspace_index(&self.workspaces);
+                return Err(format!("Could not update the compatibility autosave: {error}"));
             }
         }
+        self.apply_layout(&layout);
+        Ok(())
+    }
+
+    fn create_workspace(&mut self, name: &str, duplicate: bool) -> Result<(), String> {
+        let name = self.valid_workspace_name(name, None)?;
+        self.save_active_workspace()?;
+        let layout = if duplicate {
+            self.create_layout()
+        } else {
+            self.blank_workspace_layout()
+        };
+        let previous_index = self.workspaces.clone();
+        let id = self.workspaces.add(name);
+        self.workspaces.active_workspace_id = id.clone();
+
+        let Some(storage) = &self.storage else {
+            self.workspaces = previous_index;
+            return Err("Workspace storage is unavailable.".to_owned());
+        };
+        if let Err(error) = storage.save_active_workspace(&self.workspaces, &layout) {
+            self.workspaces = previous_index;
+            return Err(format!("Could not create workspace: {error}"));
+        }
+        self.apply_layout(&layout);
+        Ok(())
+    }
+
+    fn rename_active_workspace(&mut self, name: &str) -> Result<(), String> {
+        let active_id = self.workspaces.active_workspace_id.clone();
+        let name = self.valid_workspace_name(name, Some(&active_id))?;
+        let previous_index = self.workspaces.clone();
+        if !self.workspaces.rename(&active_id, name) {
+            return Err("The active workspace no longer exists.".to_owned());
+        }
+        let result = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "Workspace storage is unavailable.".to_owned())?
+            .save_workspace_index(&self.workspaces);
+        if let Err(error) = result {
+            self.workspaces = previous_index;
+            return Err(format!("Could not rename workspace: {error}"));
+        }
+        Ok(())
+    }
+
+    fn delete_active_workspace(&mut self) -> Result<(), String> {
+        if self.workspaces.workspaces.len() <= 1 {
+            return Err("The only workspace cannot be deleted.".to_owned());
+        }
+        let deleted_id = self.workspaces.active_workspace_id.clone();
+        let previous_index = self.workspaces.clone();
+        if !self.workspaces.remove(&deleted_id) {
+            return Err("The active workspace could not be removed.".to_owned());
+        }
+        let next_id = self.workspaces.active_workspace_id.clone();
+        let Some(storage) = &self.storage else {
+            self.workspaces = previous_index;
+            return Err("Workspace storage is unavailable.".to_owned());
+        };
+        let layout = match storage.load_workspace(&next_id) {
+            Ok(layout) => layout,
+            Err(error) => {
+                self.workspaces = previous_index;
+                return Err(format!("Could not open the next workspace: {error}"));
+            }
+        };
+        if let Err(error) = storage.save_workspace_index(&self.workspaces) {
+            self.workspaces = previous_index;
+            return Err(format!("Could not update the workspace list: {error}"));
+        }
+        if let Err(error) = storage.save_autosave(&layout) {
+            self.workspaces = previous_index;
+            let _ = storage.save_workspace_index(&self.workspaces);
+            return Err(format!("Could not update the compatibility autosave: {error}"));
+        }
+        if let Err(error) = storage.delete_workspace(&deleted_id) {
+            self.workspace_error = Some(format!(
+                "The workspace was removed from the list, but its old file could not be deleted: {error}"
+            ));
+        }
+        self.apply_layout(&layout);
+        Ok(())
+    }
+
+    fn valid_workspace_name(&self, name: &str, except_id: Option<&str>) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Enter a workspace name.".to_owned());
+        }
+        if name.chars().count() > 60 {
+            return Err("Workspace names can contain at most 60 characters.".to_owned());
+        }
+        if self.workspaces.workspaces.iter().any(|workspace| {
+            Some(workspace.id.as_str()) != except_id && workspace.name.eq_ignore_ascii_case(name)
+        }) {
+            return Err("A workspace with that name already exists.".to_owned());
+        }
+        Ok(name.to_owned())
     }
 
     /// Mirror the window's geometry into [`Self::window_layout`]. Minimized
@@ -1531,8 +1894,10 @@ impl PluriviewApp {
 
 impl eframe::App for PluriviewApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Auto-save on exit
-        self.save_autosave();
+        // Auto-save the active named workspace on exit.
+        if let Err(error) = self.save_active_workspace() {
+            eprintln!("{error}");
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -1833,6 +2198,8 @@ impl eframe::App for PluriviewApp {
         self.quick_add_ui(ctx);
         #[cfg(windows)]
         self.add_browser_ui(ctx);
+        self.workspace_dialog_ui(ctx);
+        self.workspace_delete_confirmation_ui(ctx);
 
         if self.media_error.is_some() {
             let mut dismiss = false;
@@ -1851,6 +2218,24 @@ impl eframe::App for PluriviewApp {
                 });
             if dismiss {
                 self.media_error = None;
+            }
+        }
+
+        if let Some(error) = self.workspace_error.clone() {
+            let mut dismiss = false;
+            egui::Window::new("Workspace Error")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(error);
+                    ui.add_space(8.0);
+                    if ui.button("OK").clicked() {
+                        dismiss = true;
+                    }
+                });
+            if dismiss {
+                self.workspace_error = None;
             }
         }
 

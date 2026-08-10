@@ -1,5 +1,7 @@
 # Build artifacts
 /target/
+/dist/
+/pluriview_data/
 **/*.rs.bk
 
 # Cargo lock (optional for applications, usually included)

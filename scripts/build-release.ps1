@@ -83,7 +83,13 @@ try {
     }
 
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash
+    $distDirectory = Join-Path $workspace "dist"
+    $distExecutable = Join-Path $distDirectory "pluriview.exe"
+    New-Item -ItemType Directory -Path $distDirectory -Force | Out-Null
+    Copy-Item -LiteralPath $executable -Destination $distExecutable -Force
+
     Write-Host "Privacy-safe release executable: $executable"
+    Write-Host "Persistent release executable: $distExecutable"
     Write-Host "SHA-256: $hash"
     Write-Warning "Publish only pluriview.exe. Do not publish pluriview.pdb; debug symbols can contain local source paths."
 } finally {

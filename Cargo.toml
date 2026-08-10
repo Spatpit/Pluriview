@@ -1,6 +1,6 @@
 [package]
 name = "pluriview"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Live window preview application with infinite canvas"
 authors = ["Spatpit"]
@@ -76,3 +76,9 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 1
+debug = 1
+incremental = false
+
+[profile.test]
+debug = 1
+incremental = false

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-10
+
+### Added
+- Named workspaces with create, duplicate, rename, switch, and confirmed-delete actions
+- Backward-compatible migration of the existing autosave into a Default workspace
+
+### Changed
+- The active workspace is mirrored to the legacy `autosave.json` so older Pluriview builds can still open the latest canvas
+- Development builds keep `pluriview_data` at the repository root so Cargo cleanup cannot delete workspaces or imported media
+- Development and test profiles use smaller debug information without incremental caches to limit build-directory growth
+
 ## [0.4.0] - 2026-08-10
 
 ### Added

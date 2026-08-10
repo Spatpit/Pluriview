@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::fs;
-use super::SavedLayout;
+use super::{SavedLayout, WorkspaceIndex};
+use super::workspace::is_valid_workspace_id;
 
 /// File storage for layouts and config
 pub struct Storage {
@@ -11,6 +12,20 @@ pub struct Storage {
 impl Storage {
     /// Create a new storage instance
     pub fn new() -> Option<Self> {
+        // Development builds live under target/, which Cargo may erase at any
+        // time. Keep test workspaces and imported media in the repository's
+        // own ignored data folder instead.
+        #[cfg(debug_assertions)]
+        {
+            let development_dir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pluriview_data");
+            if fs::create_dir_all(&development_dir).is_ok() {
+                return Some(Self {
+                    data_dir: development_dir,
+                });
+            }
+        }
+
         // Try portable mode first (next to executable)
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
@@ -35,6 +50,26 @@ impl Storage {
     /// Get auto-save path
     pub fn autosave_path(&self) -> PathBuf {
         self.data_dir.join("autosave.json")
+    }
+
+    fn workspace_index_path(&self) -> PathBuf {
+        self.data_dir.join("workspaces.json")
+    }
+
+    fn workspaces_dir(&self) -> Result<PathBuf, std::io::Error> {
+        let path = self.data_dir.join("workspaces");
+        fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
+    fn workspace_path(&self, id: &str) -> Result<PathBuf, std::io::Error> {
+        if !is_valid_workspace_id(id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid workspace identifier",
+            ));
+        }
+        Ok(self.workspaces_dir()?.join(format!("{id}.json")))
     }
 
     /// Directory containing portable copies of user-imported tile media.
@@ -103,6 +138,67 @@ impl Storage {
         let layout: SavedLayout = serde_json::from_str(&json)?;
         Ok(layout)
     }
+
+    /// Load the workspace catalog. The first v0.5 launch copies the legacy
+    /// autosave into the Default workspace without removing the old file.
+    pub fn load_or_initialize_workspaces(
+        &self,
+    ) -> Result<WorkspaceIndex, Box<dyn std::error::Error>> {
+        let index_path = self.workspace_index_path();
+        if index_path.exists() {
+            let json = fs::read_to_string(index_path)?;
+            let mut index: WorkspaceIndex = serde_json::from_str(&json)?;
+            index.repair();
+            self.save_workspace_index(&index)?;
+            return Ok(index);
+        }
+
+        let index = WorkspaceIndex::default();
+        if self.autosave_path().exists() {
+            let legacy_layout = self.load_autosave()?;
+            self.save_workspace(&index.active_workspace_id, &legacy_layout)?;
+        }
+        self.save_workspace_index(&index)?;
+        Ok(index)
+    }
+
+    pub fn save_workspace_index(&self, index: &WorkspaceIndex) -> Result<(), std::io::Error> {
+        let json = serde_json::to_string_pretty(index)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        fs::write(self.workspace_index_path(), json)
+    }
+
+    pub fn save_workspace(&self, id: &str, layout: &SavedLayout) -> Result<(), std::io::Error> {
+        let json = serde_json::to_string_pretty(layout)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        fs::write(self.workspace_path(id)?, json)
+    }
+
+    pub fn load_workspace(&self, id: &str) -> Result<SavedLayout, Box<dyn std::error::Error>> {
+        let json = fs::read_to_string(self.workspace_path(id)?)?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Save the active workspace and keep autosave.json as a downgrade-safe
+    /// mirror for older Pluriview versions.
+    pub fn save_active_workspace(
+        &self,
+        index: &WorkspaceIndex,
+        layout: &SavedLayout,
+    ) -> Result<(), std::io::Error> {
+        self.save_workspace(&index.active_workspace_id, layout)?;
+        self.save_workspace_index(index)?;
+        self.save_autosave(layout)
+    }
+
+    pub fn delete_workspace(&self, id: &str) -> Result<(), std::io::Error> {
+        let path = self.workspace_path(id)?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl Default for Storage {
@@ -114,6 +210,7 @@ impl Default for Storage {
 #[cfg(test)]
 mod tests {
     use super::Storage;
+    use crate::persistence::{SavedLayout, WorkspaceIndex};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -136,5 +233,48 @@ mod tests {
         assert!(storage.resolve_media("folder/sample.png").is_none());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_autosave_is_copied_into_the_default_workspace() {
+        let root = temp_root("workspace-migration");
+        let storage = Storage { data_dir: root.clone() };
+        let mut legacy = SavedLayout::new();
+        legacy.canvas.zoom = 1.75;
+        storage.save_autosave(&legacy).unwrap();
+
+        let index = storage.load_or_initialize_workspaces().unwrap();
+        let migrated = storage.load_workspace(&index.active_workspace_id).unwrap();
+
+        assert_eq!(index.active().unwrap().name, "Default");
+        assert_eq!(migrated.canvas.zoom, 1.75);
+        assert!(storage.autosave_path().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_names_do_not_affect_layout_paths() {
+        let root = temp_root("workspace-paths");
+        let storage = Storage { data_dir: root.clone() };
+        let mut index = WorkspaceIndex::default();
+        let id = index.add("../../Research: Q3".to_owned());
+        storage.save_workspace(&id, &SavedLayout::new()).unwrap();
+
+        assert!(root.join("workspaces").join(format!("{id}.json")).exists());
+        assert!(storage.save_workspace("../outside", &SavedLayout::new()).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pluriview-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 }
