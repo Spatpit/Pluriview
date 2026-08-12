@@ -673,7 +673,7 @@ mod tests {
         let child_pid = child.id();
         std::thread::sleep(Duration::from_secs(2));
 
-        let monitor = AudioMonitor::start(child_pid, monitor_device.id.clone());
+        let monitor = AudioMonitor::start(child_pid, monitor_device.id);
         std::thread::sleep(Duration::from_secs(2));
 
         let format = MixFormat::for_default_device().expect("mix format");

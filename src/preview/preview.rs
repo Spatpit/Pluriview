@@ -74,9 +74,6 @@ pub struct Preview {
     /// Display title (cached from window)
     pub title: String,
 
-    /// Is capture currently active?
-    pub capture_active: bool,
-
     /// Is capture paused (e.g., for viewport culling)?
     pub capture_paused: bool,
 
@@ -153,7 +150,6 @@ impl Preview {
             size,
             window_handle: None,
             title,
-            capture_active: false,
             capture_paused: false,
             lock_aspect_ratio: true,
             source_aspect_ratio: aspect_ratio,

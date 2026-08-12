@@ -2,9 +2,9 @@ use crate::privacy;
 use crate::preview::{PreviewManager, PreviewId};
 use eframe::egui;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 /// Frame data sent from capture threads
 struct CapturedFrame {
@@ -30,10 +30,10 @@ struct CaptureSession {
     target_fps: Arc<AtomicU32>,
 
     /// Is capture active?
-    active: Arc<RwLock<bool>>,
+    active: Arc<AtomicBool>,
 
     /// Is capture paused? (shared with capture thread)
-    paused: Arc<RwLock<bool>>,
+    paused: Arc<AtomicBool>,
 
 }
 
@@ -50,21 +50,20 @@ impl CaptureCoordinator {
         // Stop existing capture for this preview if any
         self.stop_capture(preview_id);
 
-        let active = Arc::new(RwLock::new(true));
-        let paused = Arc::new(RwLock::new(false));
+        let active = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
         let fps = Arc::new(AtomicU32::new(target_fps.max(1)));
         let active_clone = active.clone();
         let paused_clone = paused.clone();
         let fps_clone = fps.clone();
         let latest_frames = self.latest_frames.clone();
-        let title_clone = window_title.clone();
 
         // Start capture in a new thread
         std::thread::spawn(move || {
             capture_window_loop(
                 preview_id,
                 hwnd,
-                title_clone,
+                window_title,
                 fps_clone,
                 active_clone,
                 paused_clone,
@@ -85,7 +84,7 @@ impl CaptureCoordinator {
     pub fn stop_capture(&mut self, preview_id: PreviewId) {
         if let Some(session) = self.sessions.remove(&preview_id) {
             // Signal the capture thread to stop
-            *session.active.write() = false;
+            session.active.store(false, Ordering::Relaxed);
         }
         self.latest_frames.lock().remove(&preview_id);
     }
@@ -122,21 +121,23 @@ impl CaptureCoordinator {
     /// Pause capturing for a preview (viewport culling)
     pub fn pause_capture(&mut self, preview_id: PreviewId) {
         if let Some(session) = self.sessions.get(&preview_id) {
-            *session.paused.write() = true;
+            session.paused.store(true, Ordering::Relaxed);
         }
     }
 
     /// Resume capturing for a preview
     pub fn resume_capture(&mut self, preview_id: PreviewId) {
         if let Some(session) = self.sessions.get(&preview_id) {
-            *session.paused.write() = false;
+            session.paused.store(false, Ordering::Relaxed);
         }
     }
 
     /// True if at least one capture session is active and not paused.
     /// Used to decide how aggressively the UI should repaint.
     pub fn has_live_capture(&self) -> bool {
-        self.sessions.values().any(|s| *s.active.read() && !*s.paused.read())
+        self.sessions.values().any(|session| {
+            session.active.load(Ordering::Relaxed) && !session.paused.load(Ordering::Relaxed)
+        })
     }
 }
 
@@ -162,8 +163,8 @@ fn capture_window_loop(
     hwnd: isize,
     window_title: String,
     target_fps: Arc<AtomicU32>,
-    active: Arc<RwLock<bool>>,
-    paused: Arc<RwLock<bool>>,
+    active: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
 ) {
     use windows_capture::{
@@ -181,16 +182,16 @@ fn capture_window_loop(
     struct CaptureFlags {
         preview_id: PreviewId,
         latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
-        active: Arc<RwLock<bool>>,
-        paused: Arc<RwLock<bool>>,
+        active: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
     }
 
     struct Capture {
         preview_id: PreviewId,
         latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
-        active: Arc<RwLock<bool>>,
-        paused: Arc<RwLock<bool>>,
+        active: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
         last_frame: std::time::Instant,
     }
@@ -216,13 +217,13 @@ fn capture_window_loop(
             capture_control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
             // Check if we should stop
-            if !*self.active.read() {
+            if !self.active.load(Ordering::Relaxed) {
                 capture_control.stop();
                 return Ok(());
             }
 
             // Check if we're paused (viewport culling)
-            if *self.paused.read() {
+            if self.paused.load(Ordering::Relaxed) {
                 return Ok(());
             }
 
@@ -273,8 +274,8 @@ fn capture_window_loop(
     let flags = CaptureFlags {
         preview_id,
         latest_frames,
-        active: active.clone(),
-        paused: paused.clone(),
+        active,
+        paused,
         fps: target_fps,
     };
 

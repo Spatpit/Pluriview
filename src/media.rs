@@ -116,7 +116,7 @@ pub fn pick_file(owner: Option<isize>) -> Option<PathBuf> {
         .collect();
     let mut dialog = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: owner.map_or(HWND::default(), |hwnd| HWND(hwnd as *mut _)),
+        hwndOwner: owner.map_or_else(HWND::default, |hwnd| HWND(hwnd as *mut _)),
         lpstrFilter: PCWSTR(filter.as_ptr()),
         lpstrFile: PWSTR(path.as_mut_ptr()),
         nMaxFile: path.len() as u32,

@@ -234,12 +234,6 @@ pub struct AnimationState {
     /// Spring animations for each preview's position
     pub preview_springs: HashMap<PreviewId, SpringVec2>,
 
-    /// Spring animation for canvas pan
-    pub pan_spring: Option<SpringVec2>,
-
-    /// Spring animation for canvas zoom
-    pub zoom_spring: Option<SpringValue>,
-
     /// Drag velocity tracker (for momentum)
     pub drag_tracker: DragTracker,
 
@@ -260,8 +254,6 @@ impl AnimationState {
     pub fn new() -> Self {
         Self {
             preview_springs: HashMap::new(),
-            pan_spring: None,
-            zoom_spring: None,
             drag_tracker: DragTracker::new(),
             momentum_active: false,
             momentum_velocity: Vec2::ZERO,
@@ -284,16 +276,6 @@ impl AnimationState {
             spring.update(dt);
         }
 
-        // Update pan spring
-        if let Some(ref mut pan) = self.pan_spring {
-            pan.update(dt);
-        }
-
-        // Update zoom spring
-        if let Some(ref mut zoom) = self.zoom_spring {
-            zoom.update(dt);
-        }
-
         // Apply momentum with friction
         if self.momentum_active {
             let friction = 0.85;  // Stronger friction = faster stop
@@ -311,8 +293,6 @@ impl AnimationState {
     pub fn is_animating(&self) -> bool {
         self.momentum_active
             || self.preview_springs.values().any(|s| s.is_animating())
-            || self.pan_spring.as_ref().map(|s| s.is_animating()).unwrap_or(false)
-            || self.zoom_spring.as_ref().map(|s| s.is_animating()).unwrap_or(false)
     }
 
     /// Start momentum with given velocity

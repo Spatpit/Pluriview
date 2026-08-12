@@ -34,6 +34,11 @@ use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 /// WebView has time to actually take the foreground.
 const BROWSER_FOCUS_GRACE: Duration = Duration::from_millis(300);
 
+/// Restored pages can be much heavier than their placeholder tiles. Spread
+/// WebView startup out so several media sites cannot saturate the UI at once.
+#[cfg(windows)]
+const RESTORED_BROWSER_START_INTERVAL: Duration = Duration::from_secs(2);
+
 /// How many recent browser URLs to keep for the Add Browser dialog.
 const MAX_RECENT_URLS: usize = 8;
 
@@ -101,6 +106,22 @@ struct PendingBrowserTile {
     fps: FpsPreset,
     muted: bool,
     shown_once: bool,
+    /// Layout restores wait for a visible viewport and are rate-limited.
+    /// Direct user additions and undo actions start immediately.
+    restore_deferred: bool,
+}
+
+#[cfg(windows)]
+fn restored_browser_ready(
+    pending: &PendingBrowserTile,
+    tile_rect: Option<egui::Rect>,
+    viewport: Option<egui::Rect>,
+) -> bool {
+    pending.shown_once
+        && pending.restore_deferred
+        && tile_rect
+            .zip(viewport)
+            .is_some_and(|(tile, viewport)| tile.intersects(viewport))
 }
 
 /// Main application state
@@ -180,6 +201,9 @@ pub struct PluriviewApp {
     browser: BrowserManager,
     #[cfg(windows)]
     pending_browser_tiles: HashMap<PreviewId, PendingBrowserTile>,
+    /// Last restored WebView startup, used to keep heavyweight pages staggered.
+    #[cfg(windows)]
+    last_restored_browser_start: Option<Instant>,
     #[cfg(windows)]
     add_browser: Option<AddBrowserDialog>,
     /// When the current browser interaction mode started (focus grace period).
@@ -264,6 +288,8 @@ impl PluriviewApp {
             #[cfg(windows)]
             pending_browser_tiles: HashMap::new(),
             #[cfg(windows)]
+            last_restored_browser_start: None,
+            #[cfg(windows)]
             add_browser: None,
             #[cfg(windows)]
             browser_activated_at: None,
@@ -314,6 +340,7 @@ impl PluriviewApp {
                 fps,
                 muted: false,
                 shown_once: false,
+                restore_deferred: false,
             },
         );
         Ok(id)
@@ -335,7 +362,6 @@ impl PluriviewApp {
                 hwnd,
                 process_id: std::process::id(),
             });
-            preview.capture_active = true;
             preview.browser_status = BrowserTileStatus::Ready;
             preview.set_fps_preset(fps);
         }
@@ -370,32 +396,62 @@ impl PluriviewApp {
         }
 
         if can_create {
-            let ready_ids: Vec<_> = self
+            let immediate_id = self
                 .pending_browser_tiles
                 .iter()
-                .filter_map(|(id, pending)| pending.shown_once.then_some(*id))
-                .collect();
-            // Creating WebView2 hosts still happens on the UI thread. Start
-            // one per frame so restoring several tiles cannot monopolize a
-            // single frame after preparation finishes.
-            for id in ready_ids.into_iter().take(1) {
-                let Some(pending) = self.pending_browser_tiles.remove(&id) else {
-                    continue;
-                };
-                if self.preview_manager.get(id).is_none() {
-                    continue;
-                }
-                match self.activate_browser_tile(id, &pending.url, pending.fps) {
-                    Ok(()) => self.apply_browser_mute(id, pending.muted),
-                    Err(error) => {
-                        log::error!("Failed to start browser tile: {error}");
-                        if let Some(preview) = self.preview_manager.get_mut(id) {
-                            preview.browser_status = BrowserTileStatus::Failed(error);
+                .find_map(|(id, pending)| {
+                    (pending.shown_once && !pending.restore_deferred).then_some(*id)
+                });
+            let restored_slot_available = self
+                .last_restored_browser_start
+                .is_none_or(|started| started.elapsed() >= RESTORED_BROWSER_START_INTERVAL);
+            let viewport = self
+                .canvas
+                .last_screen_rect
+                .map(|screen_rect| self.canvas.get_viewport(screen_rect));
+            let restored_id = restored_slot_available.then(|| {
+                self.pending_browser_tiles.iter().find_map(|(id, pending)| {
+                    let tile_rect = self.preview_manager.get(*id).map(|preview| preview.rect());
+                    restored_browser_ready(pending, tile_rect, viewport).then_some(*id)
+                })
+            }).flatten();
+
+            // User-created tiles start immediately. Restored tiles start only
+            // when visible and at a human-scale interval so media-heavy pages
+            // cannot all compete for WebView2, capture, CPU, and GPU at once.
+            if let Some(id) = immediate_id.or(restored_id) {
+                if let Some(pending) = self.pending_browser_tiles.remove(&id) {
+                    if self.preview_manager.get(id).is_some() {
+                        if pending.restore_deferred {
+                            self.last_restored_browser_start = Some(Instant::now());
+                        }
+                        match self.activate_browser_tile(id, &pending.url, pending.fps) {
+                            Ok(()) => self.apply_browser_mute(id, pending.muted),
+                            Err(error) => {
+                                log::error!("Failed to start browser tile: {error}");
+                                if let Some(preview) = self.preview_manager.get_mut(id) {
+                                    preview.browser_status = BrowserTileStatus::Failed(error);
+                                }
+                            }
                         }
                     }
                 }
             }
             self.browser.initialize_prepared_extension_for_existing_host();
+
+            let visible_restored_pending = self.pending_browser_tiles.iter().any(|(id, pending)| {
+                let tile_rect = self.preview_manager.get(*id).map(|preview| preview.rect());
+                restored_browser_ready(pending, tile_rect, viewport)
+            });
+            if visible_restored_pending {
+                let delay = self
+                    .last_restored_browser_start
+                    .map(|started| {
+                        RESTORED_BROWSER_START_INTERVAL.saturating_sub(started.elapsed())
+                    })
+                    .unwrap_or(Duration::ZERO);
+                ctx.request_repaint_after(delay);
+            }
         }
 
         self.browser.poll_adblock_settle();
@@ -1595,7 +1651,7 @@ impl PluriviewApp {
         };
         let previous_index = self.workspaces.clone();
         let id = self.workspaces.add(name);
-        self.workspaces.active_workspace_id = id.clone();
+        self.workspaces.active_workspace_id = id;
 
         let Some(storage) = &self.storage else {
             self.workspaces = previous_index;
@@ -1766,6 +1822,7 @@ impl PluriviewApp {
         {
             self.browser.clear();
             self.pending_browser_tiles.clear();
+            self.last_restored_browser_start = None;
         }
 
         // Restore canvas state
@@ -1815,6 +1872,9 @@ impl PluriviewApp {
                     preview_layout.fps_preset,
                 ) {
                     Ok(id) => {
+                        if let Some(pending) = self.pending_browser_tiles.get_mut(&id) {
+                            pending.restore_deferred = true;
+                        }
                         self.preview_manager.set_z_order(id, preview_layout.z_order);
                         if let Some(preview) = self.preview_manager.get_mut(id) {
                             // Restored tiles appear instantly, no spawn animation.
@@ -1889,6 +1949,50 @@ impl PluriviewApp {
                 println!("Window not found: {}", privacy::redact_title(&preview_layout.window_title));
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{restored_browser_ready, FpsPreset, PendingBrowserTile};
+    use eframe::egui::{Pos2, Rect, Vec2};
+
+    fn restored_pending(shown_once: bool) -> PendingBrowserTile {
+        PendingBrowserTile {
+            url: "https://example.com".to_owned(),
+            fps: FpsPreset::Medium,
+            muted: false,
+            shown_once,
+            restore_deferred: true,
+        }
+    }
+
+    #[test]
+    fn restored_browsers_wait_for_a_painted_visible_tile() {
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        let visible = Rect::from_min_size(Pos2::new(50.0, 50.0), Vec2::splat(100.0));
+        let offscreen = Rect::from_min_size(Pos2::new(800.0, 800.0), Vec2::splat(100.0));
+
+        assert!(!restored_browser_ready(
+            &restored_pending(false),
+            Some(visible),
+            Some(viewport)
+        ));
+        assert!(restored_browser_ready(
+            &restored_pending(true),
+            Some(visible),
+            Some(viewport)
+        ));
+        assert!(!restored_browser_ready(
+            &restored_pending(true),
+            Some(offscreen),
+            Some(viewport)
+        ));
+        assert!(!restored_browser_ready(
+            &restored_pending(true),
+            Some(visible),
+            None
+        ));
     }
 }
 

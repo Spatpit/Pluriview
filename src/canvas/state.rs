@@ -861,25 +861,24 @@ impl CanvasState {
         let viewport = self.get_viewport(canvas_rect);
 
         // Check each preview for visibility
-        for id in preview_manager.all_ids() {
-            if let Some(preview) = preview_manager.get_mut(id) {
-                let preview_rect = preview.rect();
-                let is_visible = viewport.intersects(preview_rect);
+        for preview in preview_manager.all_mut() {
+            let id = preview.id;
+            let preview_rect = preview.rect();
+            let is_visible = viewport.intersects(preview_rect);
 
-                // Update pause state based on visibility
-                if is_visible && preview.capture_paused {
-                    // Resume capture - preview is now visible
-                    capture_coordinator.resume_capture(id);
-                    preview.capture_paused = false;
-                    #[cfg(debug_assertions)]
-                    println!("Viewport culling: Resumed capture for '{}'", privacy::redact_title(&preview.title));
-                } else if !is_visible && !preview.capture_paused {
-                    // Pause capture - preview is now off-screen
-                    capture_coordinator.pause_capture(id);
-                    preview.capture_paused = true;
-                    #[cfg(debug_assertions)]
-                    println!("Viewport culling: Paused capture for '{}'", privacy::redact_title(&preview.title));
-                }
+            // Update pause state based on visibility
+            if is_visible && preview.capture_paused {
+                // Resume capture - preview is now visible
+                capture_coordinator.resume_capture(id);
+                preview.capture_paused = false;
+                #[cfg(debug_assertions)]
+                println!("Viewport culling: Resumed capture for '{}'", privacy::redact_title(&preview.title));
+            } else if !is_visible && !preview.capture_paused {
+                // Pause capture - preview is now off-screen
+                capture_coordinator.pause_capture(id);
+                preview.capture_paused = true;
+                #[cfg(debug_assertions)]
+                println!("Viewport culling: Paused capture for '{}'", privacy::redact_title(&preview.title));
             }
         }
     }
@@ -1761,13 +1760,14 @@ impl CanvasState {
         preview_manager: &mut PreviewManager,
         capture_coordinator: &mut CaptureCoordinator,
     ) {
-        let Some((removed_at, info)) = self.last_removed.clone() else { return; };
+        let Some((removed_at, _)) = self.last_removed.as_ref() else { return; };
 
         let age = removed_at.elapsed().as_secs_f32();
         if age >= UNDO_TOAST_SECS {
             self.last_removed = None;
             return;
         }
+        let info = &self.last_removed.as_ref().expect("removed preview is present").1;
 
         // Fade in quickly, fade out over the last half-second.
         let fade_in = (age / 0.15).clamp(0.0, 1.0);
@@ -1776,13 +1776,12 @@ impl CanvasState {
         let bg_alpha = (fade * 220.0) as u8;
         let text_alpha = (fade * 255.0) as u8;
 
-        let title = if info.title.chars().count() > 28 {
+        let label = if info.title.chars().count() > 28 {
             let truncated: String = info.title.chars().take(25).collect();
-            format!("{}...", truncated)
+            format!("Removed \"{}...\"", truncated)
         } else {
-            info.title.clone()
+            format!("Removed \"{}\"", info.title)
         };
-        let label = format!("Removed \"{}\"", title);
 
         let padding = 16.0;
         let toast_height = 32.0;
@@ -1825,28 +1824,28 @@ impl CanvasState {
         );
 
         if undo_response.clicked() {
+            let (_, info) = self.last_removed.take().expect("removed preview is present");
             if info.browser_url.is_some() {
                 // The browser's host window was destroyed with the tile, so
                 // the app must recreate the WebView from the saved URL.
-                self.pending_browser_restore = Some(info.clone());
+                self.pending_browser_restore = Some(info);
             } else if info.media_path.is_some() {
-                self.pending_media_restore = Some(info.clone());
+                self.pending_media_restore = Some(info);
             } else if let Some(handle) = info.window_handle {
+                let capture_title = info.title.clone();
                 let id = preview_manager.add_for_window(
                     handle.hwnd,
                     handle.process_id,
-                    info.title.clone(),
+                    info.title,
                     info.position,
                     info.size,
                 );
                 if let Some(preview) = preview_manager.get_mut(id) {
-                    preview.capture_active = true;
                     preview.set_fps_preset(info.fps_preset);
                     preview.crop_uv = info.crop_uv;
                 }
-                capture_coordinator.start_capture(id, handle.hwnd, info.title.clone(), info.fps_preset.as_u32());
+                capture_coordinator.start_capture(id, handle.hwnd, capture_title, info.fps_preset.as_u32());
             }
-            self.last_removed = None;
         }
 
         // Keep repainting while the toast is visible so it can fade out.

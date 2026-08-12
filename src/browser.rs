@@ -793,10 +793,9 @@ impl BrowserHost {
 
             let listed = Rc::new(RefCell::new(None));
             let completed_result = listed.clone();
-            let profile_for_call = profile.clone();
             ProfileGetBrowserExtensionsCompletedHandler::wait_for_async_operation(
                 Box::new(move |handler| unsafe {
-                    profile_for_call
+                    profile
                         .GetBrowserExtensions(&handler)
                         .map_err(webview2_com::Error::WindowsError)
                 }),
@@ -833,11 +832,10 @@ impl BrowserHost {
 
             let installed = Rc::new(RefCell::new(None));
             let completed_result = installed.clone();
-            let profile_for_call = profile.clone();
             let path = WebViewHString::from(extension_dir);
             ProfileAddBrowserExtensionCompletedHandler::wait_for_async_operation(
                 Box::new(move |handler| unsafe {
-                    profile_for_call
+                    profile
                         .AddBrowserExtension(&path, &handler)
                         .map_err(webview2_com::Error::WindowsError)
                 }),

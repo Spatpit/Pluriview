@@ -1,5 +1,4 @@
 use eframe::egui::{Pos2, Vec2, Rect};
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use super::{BrowserTileStatus, Preview, PreviewId, FpsPreset, WindowHandle};
@@ -213,15 +212,11 @@ impl PreviewManager {
 
     /// Get preview at a canvas position (topmost first)
     pub fn get_preview_at(&self, pos: Pos2) -> Option<PreviewId> {
-        let mut candidates: Vec<_> = self.previews
+        self.previews
             .values()
             .filter(|p| p.contains(pos))
-            .collect();
-
-        // Sort by z-order descending (topmost first)
-        candidates.sort_by_key(|preview| Reverse(preview.z_order));
-
-        candidates.first().map(|p| p.id)
+            .max_by_key(|preview| preview.z_order)
+            .map(|preview| preview.id)
     }
 
     /// Get all visible previews within the viewport, sorted by z-order
@@ -240,6 +235,11 @@ impl PreviewManager {
     /// Get all previews (immutable)
     pub fn all(&self) -> impl Iterator<Item = &Preview> {
         self.previews.values()
+    }
+
+    /// Get all previews mutably without allocating an intermediate ID list.
+    pub fn all_mut(&mut self) -> impl Iterator<Item = &mut Preview> {
+        self.previews.values_mut()
     }
 
     /// Translate a preview
@@ -298,5 +298,30 @@ impl PreviewManager {
 impl Default for PreviewManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PreviewManager;
+    use eframe::egui::{Pos2, Vec2};
+
+    #[test]
+    fn hit_testing_returns_the_topmost_preview_without_sorting() {
+        let mut previews = PreviewManager::new();
+        let lower = previews.add("lower".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let upper = previews.add("upper".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+
+        assert_eq!(
+            previews.get_preview_at(Pos2::new(50.0, 50.0)),
+            Some(upper)
+        );
+
+        previews.bring_to_front(lower);
+        assert_eq!(
+            previews.get_preview_at(Pos2::new(50.0, 50.0)),
+            Some(lower)
+        );
+        assert_eq!(previews.get_preview_at(Pos2::new(150.0, 150.0)), None);
     }
 }

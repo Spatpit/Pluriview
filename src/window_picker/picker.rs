@@ -309,10 +309,6 @@ pub fn spawn_preview(
         size,
     );
 
-    if let Some(preview) = preview_manager.get_mut(id) {
-        preview.capture_active = true;
-    }
-
     capture_coordinator.start_capture(id, window.hwnd, window.title.clone(), 30);
 }
 
