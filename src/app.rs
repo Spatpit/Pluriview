@@ -1499,9 +1499,7 @@ impl PluriviewApp {
 
                         let filter = popup.search.to_lowercase();
                         let matches = |w: &WindowInfo| {
-                            filter.is_empty()
-                                || w.title.to_lowercase().contains(&filter)
-                                || w.exe_name.to_lowercase().contains(&filter)
+                            w.matches_filter(&filter)
                         };
 
                         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
@@ -1818,6 +1816,7 @@ impl PluriviewApp {
         // Clear existing state
         self.preview_manager.clear();
         self.capture_coordinator.stop_all();
+        self.canvas.clear_preview_animations();
         #[cfg(windows)]
         {
             self.browser.clear();
@@ -2037,7 +2036,7 @@ impl eframe::App for PluriviewApp {
         }
 
         // Process any pending captured frames
-        self.capture_coordinator.process_frames(&mut self.preview_manager, ctx);
+        self.capture_coordinator.process_frames(&mut self.preview_manager);
 
         // Handle pending region selection request (from context menu in canvas)
         if let Some(preview_id) = self.canvas.pending_region_select.take() {
@@ -2525,15 +2524,15 @@ impl eframe::App for PluriviewApp {
         }
 
         // Schedule the next repaint instead of spinning at uncapped frame rate.
-        // When a capture is live we refresh at ~60 FPS so previews stay smooth;
-        // otherwise we tick slowly, which is still frequent enough to process
+        // When captures are live, match the fastest active preview's requested
+        // FPS; otherwise tick slowly, which is still frequent enough to process
         // tray events while keeping the app near-idle on the CPU.
         // (egui repaints immediately on input regardless of this hint.)
-        let repaint_after = if self.capture_coordinator.has_live_capture() {
-            std::time::Duration::from_millis(16)
-        } else {
-            std::time::Duration::from_millis(250)
-        };
+        let repaint_after = self
+            .capture_coordinator
+            .max_live_fps()
+            .map(|fps| Duration::from_secs_f64(1.0 / f64::from(fps)))
+            .unwrap_or_else(|| Duration::from_millis(250));
         ctx.request_repaint_after(repaint_after);
     }
 }

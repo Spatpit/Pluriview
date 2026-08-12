@@ -3,10 +3,11 @@ use std::time::Instant;
 #[cfg(debug_assertions)]
 use crate::privacy;
 use crate::preview::{
-    BrowserTileStatus, FpsPreset, PreviewId, PreviewManager, RemovedPreviewInfo,
+    BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager, RemovedPreviewInfo,
 };
 use crate::capture::CaptureCoordinator;
 use super::animation::{AnimationState, DragTracker};
+use std::borrow::Cow;
 
 /// How long the "Removed '...' · Undo" toast stays on screen.
 const UNDO_TOAST_SECS: f32 = 4.0;
@@ -61,6 +62,25 @@ mod tests {
     #[test]
     fn browser_add_request_starts_empty() {
         assert!(CanvasState::default().pending_browser_add.is_none());
+    }
+
+    #[test]
+    fn stale_preview_springs_are_pruned() {
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let live_id = previews.add("live".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
+        let stale_id = PreviewId(999);
+        canvas
+            .animation
+            .get_or_create_spring(live_id, Pos2::ZERO);
+        canvas
+            .animation
+            .get_or_create_spring(stale_id, Pos2::ZERO);
+
+        canvas.prune_preview_animations(&previews);
+
+        assert!(canvas.animation.preview_springs.contains_key(&live_id));
+        assert!(!canvas.animation.preview_springs.contains_key(&stale_id));
     }
 
     #[test]
@@ -323,8 +343,10 @@ struct FocusState {
 
 /// Per-tile data collected up front so the manager isn't borrowed during
 /// the interaction pass.
+#[derive(Clone)]
 struct TileInfo {
     id: PreviewId,
+    z_order: u32,
     rect: Rect,
     title: String,
     target_fps: u32,
@@ -337,6 +359,44 @@ struct TileInfo {
     is_media: bool,
     muted: bool,
     browser_status: BrowserTileStatus,
+}
+
+impl TileInfo {
+    fn from_preview(preview: &Preview) -> Self {
+        Self {
+            id: preview.id,
+            z_order: preview.z_order,
+            rect: preview.rect(),
+            title: preview.title.clone(),
+            target_fps: preview.target_fps,
+            fps_preset: preview.fps_preset,
+            has_crop: preview.crop_uv.is_some(),
+            is_removing: preview.removing.is_some(),
+            spawn_t: preview.spawn_progress(),
+            remove_t: preview.removal_progress(),
+            is_browser: preview.is_browser(),
+            is_media: preview.is_media(),
+            muted: preview.browser_muted,
+            browser_status: preview.browser_status.clone(),
+        }
+    }
+
+    fn update_from(&mut self, preview: &Preview) {
+        self.id = preview.id;
+        self.z_order = preview.z_order;
+        self.rect = preview.rect();
+        self.title.clone_from(&preview.title);
+        self.target_fps = preview.target_fps;
+        self.fps_preset = preview.fps_preset;
+        self.has_crop = preview.crop_uv.is_some();
+        self.is_removing = preview.removing.is_some();
+        self.spawn_t = preview.spawn_progress();
+        self.remove_t = preview.removal_progress();
+        self.is_browser = preview.is_browser();
+        self.is_media = preview.is_media();
+        self.muted = preview.browser_muted;
+        self.browser_status.clone_from(&preview.browser_status);
+    }
 }
 
 fn paint_browser_placeholder(
@@ -490,6 +550,9 @@ pub struct CanvasState {
     /// Animation state for smooth movements
     pub animation: AnimationState,
 
+    /// Reused visible-tile snapshot storage for the draw/interaction pass.
+    tile_scratch: Vec<TileInfo>,
+
     /// Is a preview currently being dragged?
     preview_dragging: bool,
 
@@ -558,6 +621,7 @@ impl Default for CanvasState {
             grid_size: 50.0,
             pending_fps_changes: Vec::new(),
             animation: AnimationState::new(),
+            tile_scratch: Vec::new(),
             preview_dragging: false,
             canvas_panning: false,
             pan_drag_tracker: DragTracker::new(),
@@ -585,6 +649,18 @@ impl CanvasState {
         self.zoom = 1.0;
         self.selection.clear();
         self.drag_state = None;
+        self.animation.preview_springs.clear();
+    }
+
+    /// Drop animation state belonging to previews from a previous layout.
+    pub fn clear_preview_animations(&mut self) {
+        self.animation.preview_springs.clear();
+    }
+
+    fn prune_preview_animations(&mut self, preview_manager: &PreviewManager) {
+        self.animation
+            .preview_springs
+            .retain(|id, _| preview_manager.get(*id).is_some());
     }
 
     /// Fit one tile in the current canvas without changing its saved geometry.
@@ -759,6 +835,9 @@ impl CanvasState {
         // Reap any previews whose fade/shrink-out animation has finished,
         // keeping the most recent one around briefly for the undo toast.
         let finished_removals = preview_manager.finalize_removals();
+        if !finished_removals.is_empty() {
+            self.prune_preview_animations(preview_manager);
+        }
         if let Some(info) = finished_removals.into_iter().last() {
             self.last_removed = Some((Instant::now(), info));
         }
@@ -1062,33 +1141,40 @@ impl CanvasState {
     ) {
         let viewport = self.get_viewport(canvas_rect);
 
-        // Collect preview info first
-        let preview_info: Vec<TileInfo> = {
-            let previews = preview_manager.get_visible_previews(&viewport);
-            previews.iter().map(|p| TileInfo {
-                id: p.id,
-                rect: p.rect(),
-                title: p.title.clone(),
-                target_fps: p.target_fps,
-                fps_preset: p.fps_preset,
-                has_crop: p.crop_uv.is_some(),
-                is_removing: p.removing.is_some(),
-                spawn_t: p.spawn_progress(),
-                remove_t: p.removal_progress(),
-                is_browser: p.is_browser(),
-                is_media: p.is_media(),
-                muted: p.browser_muted,
-                browser_status: p.browser_status.clone(),
-            }).collect()
-        };
+        // Reuse one allocation for the visible, z-sorted interaction snapshot.
+        // The snapshot releases the manager borrow before tiles mutate it.
+        let mut preview_info = std::mem::take(&mut self.tile_scratch);
+        let mut visible_count = 0;
+        for preview in preview_manager
+            .all()
+            .filter(|preview| preview.rect().intersects(viewport))
+        {
+            if let Some(info) = preview_info.get_mut(visible_count) {
+                info.update_from(preview);
+            } else {
+                preview_info.push(TileInfo::from_preview(preview));
+            }
+            visible_count += 1;
+        }
+        preview_info.truncate(visible_count);
+        preview_info.sort_by_key(|info| info.z_order);
 
         let mut any_spawn_or_remove_animating = false;
 
-        for info in preview_info {
-            let TileInfo {
-                id, rect, title, target_fps, fps_preset: current_preset, has_crop,
-                is_removing, spawn_t, remove_t, is_browser, is_media, muted, browser_status,
-            } = info;
+        for info in &preview_info {
+            let id = info.id;
+            let rect = info.rect;
+            let title = &info.title;
+            let target_fps = info.target_fps;
+            let current_preset = info.fps_preset;
+            let has_crop = info.has_crop;
+            let is_removing = info.is_removing;
+            let spawn_t = info.spawn_t;
+            let remove_t = info.remove_t;
+            let is_browser = info.is_browser;
+            let is_media = info.is_media;
+            let muted = info.muted;
+            let browser_status = &info.browser_status;
             let screen_rect = self.canvas_rect_to_screen(rect, canvas_rect);
 
             if !canvas_rect.intersects(screen_rect) {
@@ -1171,7 +1257,7 @@ impl CanvasState {
                     paint_browser_placeholder(
                         &painter,
                         anim_rect,
-                        &browser_status,
+                        browser_status,
                         input.time as f32,
                     );
                 } else {
@@ -1264,11 +1350,11 @@ impl CanvasState {
                 }
 
                 // Title (truncated, on the left) - handle UTF-8 properly
-                let title_text = if title.chars().count() > 25 {
+                let title_text: Cow<'_, str> = if title.chars().count() > 25 {
                     let truncated: String = title.chars().take(22).collect();
-                    format!("{}...", truncated)
+                    Cow::Owned(format!("{}...", truncated))
                 } else {
-                    title.clone()
+                    Cow::Borrowed(title)
                 };
                 let title_pos = if is_browser || is_media {
                     // Source badge marks browser/media tiles; shift the title right.
@@ -1286,13 +1372,13 @@ impl CanvasState {
                 painter.text(
                     title_pos,
                     egui::Align2::LEFT_CENTER,
-                    &title_text,
+                    title_text.as_ref(),
                     egui::FontId::proportional(11.0),
                     Color32::from_rgb(200, 200, 200),
                 );
 
                 // Browser tiles: navigation + audio controls along the bottom
-                if is_browser && browser_status == BrowserTileStatus::Ready {
+                if is_browser && *browser_status == BrowserTileStatus::Ready {
                     let bottom_overlay = Rect::from_min_size(
                         screen_rect.left_bottom() + Vec2::new(0.0, -42.0),
                         Vec2::new(screen_rect.width(), 42.0),
@@ -1516,7 +1602,7 @@ impl CanvasState {
 
             // Context menu for preview
             preview_response.context_menu(|ui| {
-                ui.label(egui::RichText::new(&title).strong());
+                ui.label(egui::RichText::new(title.clone()).strong());
                 ui.separator();
 
                 if !is_media {
@@ -1545,7 +1631,7 @@ impl CanvasState {
                 } else if is_browser {
                     // Browser tiles: navigation and audio instead of crop
                     // (a cropped page has ambiguous interactive coordinates).
-                    let browser_ready = browser_status == BrowserTileStatus::Ready;
+                    let browser_ready = *browser_status == BrowserTileStatus::Ready;
                     if !browser_ready {
                         ui.label(egui::RichText::new("Browser preview is starting…").weak());
                     }
@@ -1629,6 +1715,7 @@ impl CanvasState {
                 }
             });
         }
+        self.tile_scratch = preview_info;
 
         // Keep repainting while any preview is spawning in, fading out, or
         // still waiting on its first frame so the animations stay smooth.

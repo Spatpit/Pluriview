@@ -1,9 +1,9 @@
 use crate::privacy;
 use crate::preview::{PreviewManager, PreviewId};
-use eframe::egui;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use parking_lot::Mutex;
 
 /// Frame data sent from capture threads
@@ -18,9 +18,9 @@ pub struct CaptureCoordinator {
     /// Active capture sessions by preview ID
     sessions: HashMap<PreviewId, CaptureSession>,
 
-    /// At most one pending frame per preview. Capture threads replace stale
-    /// frames instead of building an unbounded queue when the UI is busy.
-    latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
+    /// Stopped/replaced workers are retained until they actually finish, then
+    /// joined during regular UI upkeep instead of being silently detached.
+    retired_workers: Vec<JoinHandle<()>>,
 }
 
 /// A single capture session
@@ -35,13 +35,18 @@ struct CaptureSession {
     /// Is capture paused? (shared with capture thread)
     paused: Arc<AtomicBool>,
 
+    /// Per-session latest-frame slot. Replacing a capture gives the new worker
+    /// a different slot, so an old worker can never publish a stale frame into it.
+    latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
+
+    worker: Option<JoinHandle<()>>,
 }
 
 impl CaptureCoordinator {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
-            latest_frames: Arc::new(Mutex::new(HashMap::new())),
+            retired_workers: Vec::new(),
         }
     }
 
@@ -53,13 +58,14 @@ impl CaptureCoordinator {
         let active = Arc::new(AtomicBool::new(true));
         let paused = Arc::new(AtomicBool::new(false));
         let fps = Arc::new(AtomicU32::new(target_fps.max(1)));
+        let latest_frame = Arc::new(Mutex::new(None));
         let active_clone = active.clone();
         let paused_clone = paused.clone();
         let fps_clone = fps.clone();
-        let latest_frames = self.latest_frames.clone();
+        let worker_frame = latest_frame.clone();
 
         // Start capture in a new thread
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             capture_window_loop(
                 preview_id,
                 hwnd,
@@ -67,7 +73,7 @@ impl CaptureCoordinator {
                 fps_clone,
                 active_clone,
                 paused_clone,
-                latest_frames,
+                worker_frame,
             );
         });
 
@@ -75,6 +81,8 @@ impl CaptureCoordinator {
             target_fps: fps,
             active,
             paused,
+            latest_frame,
+            worker: Some(worker),
         };
 
         self.sessions.insert(preview_id, session);
@@ -82,11 +90,15 @@ impl CaptureCoordinator {
 
     /// Stop capturing for a preview
     pub fn stop_capture(&mut self, preview_id: PreviewId) {
-        if let Some(session) = self.sessions.remove(&preview_id) {
+        if let Some(mut session) = self.sessions.remove(&preview_id) {
             // Signal the capture thread to stop
             session.active.store(false, Ordering::Relaxed);
+            session.latest_frame.lock().take();
+            if let Some(worker) = session.worker.take() {
+                self.retired_workers.push(worker);
+            }
         }
-        self.latest_frames.lock().remove(&preview_id);
+        self.reap_finished_workers();
     }
 
     /// Update target FPS for a capture session; applies live on the
@@ -98,24 +110,26 @@ impl CaptureCoordinator {
     }
 
     /// Process the newest pending frame for each preview.
-    pub fn process_frames(&mut self, preview_manager: &mut PreviewManager, _ctx: &egui::Context) {
-        let frames = {
-            let mut latest = self.latest_frames.lock();
-            std::mem::take(&mut *latest)
-        };
-        for (preview_id, frame) in frames {
-            if let Some(preview) = preview_manager.get_mut(preview_id) {
+    pub fn process_frames(&mut self, preview_manager: &mut PreviewManager) {
+        for (preview_id, session) in &self.sessions {
+            let frame = session.latest_frame.lock().take();
+            if let (Some(frame), Some(preview)) = (frame, preview_manager.get_mut(*preview_id)) {
                 preview.update_frame(frame.width, frame.height, frame.data);
             }
         }
+        self.reap_finished_workers();
     }
 
     /// Stop all captures
     pub fn stop_all(&mut self) {
-        let ids: Vec<_> = self.sessions.keys().copied().collect();
-        for id in ids {
-            self.stop_capture(id);
+        for (_, mut session) in self.sessions.drain() {
+            session.active.store(false, Ordering::Relaxed);
+            session.latest_frame.lock().take();
+            if let Some(worker) = session.worker.take() {
+                self.retired_workers.push(worker);
+            }
         }
+        self.reap_finished_workers();
     }
 
     /// Pause capturing for a preview (viewport culling)
@@ -132,12 +146,49 @@ impl CaptureCoordinator {
         }
     }
 
-    /// True if at least one capture session is active and not paused.
-    /// Used to decide how aggressively the UI should repaint.
-    pub fn has_live_capture(&self) -> bool {
-        self.sessions.values().any(|session| {
-            session.active.load(Ordering::Relaxed) && !session.paused.load(Ordering::Relaxed)
-        })
+    /// Highest requested FPS among capture sessions that are currently live.
+    /// The UI uses this to avoid repainting faster than its previews update.
+    pub fn max_live_fps(&self) -> Option<u32> {
+        self.sessions
+            .values()
+            .filter(|session| {
+                session.active.load(Ordering::Relaxed)
+                    && !session.paused.load(Ordering::Relaxed)
+            })
+            .map(|session| session.target_fps.load(Ordering::Relaxed).max(1))
+            .max()
+    }
+
+    fn reap_finished_workers(&mut self) {
+        for session in self.sessions.values_mut() {
+            let finished = session
+                .worker
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished);
+            if finished {
+                // A panic bypasses the capture loop's normal completion flag.
+                // Mark the session inactive before joining so repaint scheduling
+                // cannot keep treating a dead worker as live.
+                session.active.store(false, Ordering::Relaxed);
+                if let Some(worker) = session.worker.take() {
+                    if worker.join().is_err() {
+                        log::error!("Capture worker panicked");
+                    }
+                }
+            }
+        }
+
+        let mut index = 0;
+        while index < self.retired_workers.len() {
+            if self.retired_workers[index].is_finished() {
+                let worker = self.retired_workers.swap_remove(index);
+                if worker.join().is_err() {
+                    log::error!("Retired capture worker panicked");
+                }
+            } else {
+                index += 1;
+            }
+        }
     }
 }
 
@@ -165,7 +216,7 @@ fn capture_window_loop(
     target_fps: Arc<AtomicU32>,
     active: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
+    latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
 ) {
     use windows_capture::{
         capture::{Context, GraphicsCaptureApiHandler},
@@ -181,7 +232,7 @@ fn capture_window_loop(
     // Capture flags passed to the handler
     struct CaptureFlags {
         preview_id: PreviewId,
-        latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
+        latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
         active: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
@@ -189,7 +240,7 @@ fn capture_window_loop(
 
     struct Capture {
         preview_id: PreviewId,
-        latest_frames: Arc<Mutex<HashMap<PreviewId, CapturedFrame>>>,
+        latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
         active: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
@@ -203,7 +254,7 @@ fn capture_window_loop(
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
             Ok(Self {
                 preview_id: ctx.flags.preview_id,
-                latest_frames: ctx.flags.latest_frames,
+                latest_frame: ctx.flags.latest_frame,
                 active: ctx.flags.active,
                 paused: ctx.flags.paused,
                 fps: ctx.flags.fps,
@@ -250,9 +301,7 @@ fn capture_window_loop(
                 height,
                 data,
             };
-            self.latest_frames
-                .lock()
-                .insert(self.preview_id, captured_frame);
+            *self.latest_frame.lock() = Some(captured_frame);
 
             Ok(())
         }
@@ -271,9 +320,10 @@ fn capture_window_loop(
     let min_interval = MinimumUpdateIntervalSettings::Default;
 
     // Configure capture settings
+    let completion_active = active.clone();
     let flags = CaptureFlags {
         preview_id,
-        latest_frames,
+        latest_frame,
         active,
         paused,
         fps: target_fps,
@@ -294,12 +344,27 @@ fn capture_window_loop(
     if let Err(e) = Capture::start(settings) {
         log::error!("Failed to start capture: {}", e);
     }
+    completion_active.store(false, Ordering::Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_target_from_hwnd, CapturedFrame, CaptureCoordinator};
-    use crate::preview::PreviewId;
+    use super::{capture_target_from_hwnd, CapturedFrame, CaptureCoordinator, CaptureSession};
+    use crate::preview::{PreviewId, PreviewManager};
+    use eframe::egui::{Pos2, Vec2};
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::Arc;
+
+    fn session(fps: u32, active: bool, paused: bool) -> CaptureSession {
+        CaptureSession {
+            target_fps: Arc::new(AtomicU32::new(fps)),
+            active: Arc::new(AtomicBool::new(active)),
+            paused: Arc::new(AtomicBool::new(paused)),
+            latest_frame: Arc::new(Mutex::new(None)),
+            worker: None,
+        }
+    }
 
     #[test]
     fn capture_target_preserves_supplied_hwnd() {
@@ -310,28 +375,56 @@ mod tests {
 
     #[test]
     fn pending_frames_replace_stale_frames_per_preview() {
-        let coordinator = CaptureCoordinator::new();
-        let id = PreviewId(7);
-        let mut pending = coordinator.latest_frames.lock();
-        pending.insert(
-            id,
-            CapturedFrame {
-                width: 1,
-                height: 1,
-                data: vec![1; 4],
-            },
-        );
-        pending.insert(
-            id,
-            CapturedFrame {
-                width: 2,
-                height: 2,
-                data: vec![2; 16],
-            },
-        );
+        let pending = Mutex::new(None);
+        *pending.lock() = Some(CapturedFrame {
+            width: 1,
+            height: 1,
+            data: vec![1; 4],
+        });
+        *pending.lock() = Some(CapturedFrame {
+            width: 2,
+            height: 2,
+            data: vec![2; 16],
+        });
 
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[&id].width, 2);
-        assert_eq!(pending[&id].data, vec![2; 16]);
+        let latest = pending.lock().take().unwrap();
+        assert_eq!(latest.width, 2);
+        assert_eq!(latest.data, vec![2; 16]);
+    }
+
+    #[test]
+    fn repaint_rate_uses_only_live_unpaused_sessions() {
+        let mut coordinator = CaptureCoordinator::new();
+        coordinator.sessions.insert(PreviewId(1), session(15, true, false));
+        coordinator.sessions.insert(PreviewId(2), session(60, true, true));
+        coordinator.sessions.insert(PreviewId(3), session(30, true, false));
+        coordinator.sessions.insert(PreviewId(4), session(120, false, false));
+
+        assert_eq!(coordinator.max_live_fps(), Some(30));
+    }
+
+    #[test]
+    fn replaced_session_cannot_publish_into_the_new_session_slot() {
+        let mut previews = PreviewManager::new();
+        let preview_id = previews.add("test".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
+        let stale_slot = Arc::new(Mutex::new(None));
+        let current = session(30, true, false);
+
+        *stale_slot.lock() = Some(CapturedFrame {
+            width: 1,
+            height: 1,
+            data: vec![1; 4],
+        });
+        *current.latest_frame.lock() = Some(CapturedFrame {
+            width: 2,
+            height: 2,
+            data: vec![2; 16],
+        });
+        let mut coordinator = CaptureCoordinator::new();
+        coordinator.sessions.insert(preview_id, current);
+        coordinator.process_frames(&mut previews);
+
+        assert_eq!(previews.get(preview_id).unwrap().frame_size, Some((2, 2)));
+        assert_eq!(stale_slot.lock().as_ref().unwrap().width, 1);
     }
 }

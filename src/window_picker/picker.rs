@@ -3,6 +3,7 @@ use super::{WindowInfo, enumerate_windows};
 use crate::preview::PreviewManager;
 use crate::capture::CaptureCoordinator;
 use crate::canvas::CanvasState;
+use std::borrow::Cow;
 
 /// Window picker panel state
 pub struct WindowPicker {
@@ -17,6 +18,12 @@ pub struct WindowPicker {
 
     /// Auto-refresh interval
     refresh_interval: std::time::Duration,
+
+    /// Cached normalized filter and matching window indices. Rebuilt only
+    /// when the query or enumerated window list changes.
+    normalized_filter: String,
+    filtered_indices: Vec<usize>,
+    filter_dirty: bool,
 }
 
 impl WindowPicker {
@@ -26,6 +33,9 @@ impl WindowPicker {
             search_filter: String::new(),
             last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(10),
             refresh_interval: std::time::Duration::from_secs(2),
+            normalized_filter: String::new(),
+            filtered_indices: Vec::new(),
+            filter_dirty: true,
         }
     }
 
@@ -33,6 +43,7 @@ impl WindowPicker {
     pub fn refresh(&mut self) {
         self.windows = enumerate_windows();
         self.last_refresh = std::time::Instant::now();
+        self.filter_dirty = true;
     }
 
     /// UI for the window picker
@@ -80,26 +91,26 @@ impl WindowPicker {
                         .hint_text(RichText::new("Search windows...").color(text_secondary))
                         .frame(false)
                 );
+                if response.changed() {
+                    self.filter_dirty = true;
+                }
 
                 // Escape clears search
                 if !self.search_filter.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     self.search_filter.clear();
+                    self.filter_dirty = true;
                     response.request_focus();
                 }
             });
         });
 
         ui.add_space(8.0);
+        self.update_filter();
 
         // Window count and refresh indicator
         ui.horizontal(|ui| {
-            let filter_lower = self.search_filter.to_lowercase();
-            let count = self.windows.iter()
-                .filter(|w| Self::window_matches(w, &filter_lower))
-                .count();
-
             ui.label(
-                RichText::new(format!("{} windows", count))
+                RichText::new(format!("{} windows", self.filtered_indices.len()))
                     .size(12.0)
                     .color(text_secondary)
             );
@@ -123,23 +134,17 @@ impl WindowPicker {
         });
 
         ui.add_space(6.0);
+        self.update_filter();
 
-        // Precompute the filtered set once (avoids cloning the whole window
-        // list and re-filtering it several times every frame)
-        let filter_lower = self.search_filter.to_lowercase();
-        let filtered: Vec<usize> = self.windows.iter()
-            .enumerate()
-            .filter(|(_, w)| Self::window_matches(w, &filter_lower))
-            .map(|(i, _)| i)
-            .collect();
-
-        // Window list with card-style items
+        // Window list with fixed-height row virtualization, so only visible
+        // cards allocate egui widgets and text each frame.
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_rows(ui, 60.0, self.filtered_indices.len(), |ui, row_range| {
                 let available_width = ui.available_width();
 
-                for &idx in &filtered {
+                for row in row_range {
+                    let idx = self.filtered_indices[row];
                     let window = &self.windows[idx];
 
                     // Card frame
@@ -180,20 +185,20 @@ impl WindowPicker {
 
                     // Title (truncated, char-safe to avoid panics on multibyte titles)
                     let max_title_chars = ((text_rect.width() - 10.0) / 7.0) as usize;
-                    let title = if window.title.chars().count() > max_title_chars {
+                    let title: Cow<'_, str> = if window.title.chars().count() > max_title_chars {
                         let kept: String = window.title.chars()
                             .take(max_title_chars.saturating_sub(3))
                             .collect();
-                        format!("{}...", kept)
+                        Cow::Owned(format!("{}...", kept))
                     } else {
-                        window.title.clone()
+                        Cow::Borrowed(&window.title)
                     };
 
                     // Draw title
                     ui.painter().text(
                         egui::Pos2::new(text_rect.min.x, text_rect.min.y + 2.0),
                         egui::Align2::LEFT_TOP,
-                        &title,
+                        title.as_ref(),
                         egui::FontId::proportional(14.0),
                         egui::Color32::WHITE
                     );
@@ -234,7 +239,7 @@ impl WindowPicker {
 
                     // Handle add button click
                     if btn_response.clicked() {
-                        self.add_window_to_canvas(
+                        Self::add_window_to_canvas(
                             window,
                             preview_manager,
                             capture_coordinator,
@@ -244,32 +249,38 @@ impl WindowPicker {
 
                     ui.add_space(4.0);
                 }
-
-                // Empty state
-                if filtered.is_empty() && !filter_lower.is_empty() {
-                    ui.add_space(20.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new("No matching windows")
-                                .size(13.0)
-                                .color(text_secondary)
-                        );
-                    });
-                }
             });
+
+        if self.filtered_indices.is_empty() && !self.normalized_filter.is_empty() {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("No matching windows")
+                        .size(13.0)
+                        .color(text_secondary)
+                );
+            });
+        }
     }
 
-    /// Returns true if a window matches the (already lowercased) search filter.
-    /// An empty filter matches everything.
-    fn window_matches(w: &WindowInfo, filter_lower: &str) -> bool {
-        filter_lower.is_empty()
-            || w.title.to_lowercase().contains(filter_lower)
-            || w.exe_name.to_lowercase().contains(filter_lower)
+    fn update_filter(&mut self) {
+        if !self.filter_dirty {
+            return;
+        }
+        self.normalized_filter = self.search_filter.to_lowercase();
+        self.filtered_indices.clear();
+        self.filtered_indices.extend(
+            self.windows
+                .iter()
+                .enumerate()
+                .filter(|(_, window)| window.matches_filter(&self.normalized_filter))
+                .map(|(index, _)| index),
+        );
+        self.filter_dirty = false;
     }
 
     /// Add a window to the canvas
     fn add_window_to_canvas(
-        &self,
         window: &WindowInfo,
         preview_manager: &mut PreviewManager,
         capture_coordinator: &mut CaptureCoordinator,

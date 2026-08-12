@@ -122,6 +122,7 @@ pub struct Preview {
     /// Decoded frames for a managed image. A single frame is a static image.
     media_frames: Vec<MediaFrame>,
     media_frame_index: usize,
+    media_frame_dirty: bool,
     media_frame_started: Instant,
 
     /// When this preview was created (drives the spawn-in animation)
@@ -166,6 +167,7 @@ impl Preview {
             media_path: None,
             media_frames: Vec::new(),
             media_frame_index: 0,
+            media_frame_dirty: false,
             media_frame_started: Instant::now(),
             created_at: Instant::now(),
             removing: None,
@@ -187,13 +189,9 @@ impl Preview {
         self.media_path = Some(managed_path);
         self.media_frames = frames;
         self.media_frame_index = 0;
+        self.media_frame_dirty = true;
         self.media_frame_started = Instant::now();
         if let Some(frame) = self.media_frames.first() {
-            self.frame_buffer = Some(FrameData {
-                width: frame.width,
-                height: frame.height,
-                data: frame.rgba.clone(),
-            });
             self.frame_size = Some((frame.width, frame.height));
             self.source_aspect_ratio = frame.width as f32 / frame.height as f32;
         }
@@ -270,15 +268,27 @@ impl Preview {
     pub fn get_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         self.advance_media_animation(ctx);
 
-        // Check if we have a new frame to upload
-        let frame_data = self.frame_buffer.take();
-
-        if let Some(frame) = frame_data {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
+        // Media frames already own their RGBA bytes, so build the upload
+        // image directly from that slice instead of cloning a second buffer.
+        let media_image = if self.media_frame_dirty {
+            self.media_frame_dirty = false;
+            self.media_frames.get(self.media_frame_index).map(|frame| {
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width as usize, frame.height as usize],
+                    &frame.rgba,
+                )
+            })
+        } else {
+            None
+        };
+        let capture_image = self.frame_buffer.take().map(|frame| {
+            egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
                 &frame.data,
-            );
+            )
+        });
 
+        if let Some(image) = media_image.or(capture_image) {
             if let Some(texture) = self.texture.as_mut() {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
@@ -315,12 +325,7 @@ impl Preview {
         }
 
         if advanced {
-            let frame = &self.media_frames[self.media_frame_index];
-            self.frame_buffer = Some(FrameData {
-                width: frame.width,
-                height: frame.height,
-                data: frame.rgba.clone(),
-            });
+            self.media_frame_dirty = true;
         }
 
         let delay = self.media_frames[self.media_frame_index].duration;
@@ -410,7 +415,9 @@ impl From<&Preview> for PreviewLayout {
 #[cfg(test)]
 mod tests {
     use super::{Preview, PreviewId, PreviewLayout};
+    use crate::media::MediaFrame;
     use eframe::egui::{Context, Pos2, Vec2};
+    use std::time::Duration;
 
     #[test]
     fn frame_updates_reuse_the_texture() {
@@ -423,6 +430,27 @@ mod tests {
         let second = preview.get_texture(&context).unwrap().id();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn media_upload_does_not_stage_a_second_rgba_buffer() {
+        let context = Context::default();
+        let mut preview = Preview::new(PreviewId(1), "test".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        preview.set_media(
+            "test.gif".to_owned(),
+            vec![MediaFrame {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 0, 0, 255],
+                duration: Duration::from_millis(100),
+            }],
+        );
+
+        assert!(preview.frame_buffer.is_none());
+        assert!(preview.media_frame_dirty);
+        assert!(preview.get_texture(&context).is_some());
+        assert!(!preview.media_frame_dirty);
+        assert!(preview.frame_buffer.is_none());
     }
 
     #[test]

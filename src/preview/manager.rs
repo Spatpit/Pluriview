@@ -1,4 +1,4 @@
-use eframe::egui::{Pos2, Vec2, Rect};
+use eframe::egui::{Pos2, Vec2};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use super::{BrowserTileStatus, Preview, PreviewId, FpsPreset, WindowHandle};
@@ -217,19 +217,6 @@ impl PreviewManager {
             .filter(|p| p.contains(pos))
             .max_by_key(|preview| preview.z_order)
             .map(|preview| preview.id)
-    }
-
-    /// Get all visible previews within the viewport, sorted by z-order
-    pub fn get_visible_previews(&self, viewport: &Rect) -> Vec<&Preview> {
-        let mut visible: Vec<_> = self.previews
-            .values()
-            .filter(|p| p.rect().intersects(*viewport))
-            .collect();
-
-        // Sort by z-order ascending (draw bottom to top)
-        visible.sort_by_key(|preview| preview.z_order);
-
-        visible
     }
 
     /// Get all previews (immutable)

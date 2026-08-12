@@ -28,16 +28,13 @@ pub struct WindowInfo {
     /// Executable name
     pub exe_name: String,
 
+    /// Lowercased title + executable name, cached for per-frame filtering.
+    search_text: String,
 }
 
 impl WindowInfo {
-    /// Get a display name (title or exe name)
-    pub fn display_name(&self) -> &str {
-        if self.title.is_empty() {
-            &self.exe_name
-        } else {
-            &self.title
-        }
+    pub fn matches_filter(&self, normalized_filter: &str) -> bool {
+        normalized_filter.is_empty() || self.search_text.contains(normalized_filter)
     }
 }
 
@@ -52,8 +49,9 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
         );
     }
 
-    // Sort by title
-    windows.sort_by_key(|window| window.display_name().to_lowercase());
+    // The cached search text starts with the title, so it also provides a
+    // stable case-insensitive display order without allocating sort keys.
+    windows.sort_by(|left, right| left.search_text.cmp(&right.search_text));
 
     windows
 }
@@ -145,11 +143,13 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
         return BOOL(1);
     }
 
+    let search_text = format!("{}\n{}", title.to_lowercase(), exe_name.to_lowercase());
     windows.push(WindowInfo {
         hwnd: hwnd.0 as isize,
         title,
         process_id,
         exe_name,
+        search_text,
     });
 
     BOOL(1) // Continue enumeration
@@ -178,5 +178,26 @@ fn get_process_name(process_id: u32) -> String {
         };
         let _ = CloseHandle(handle);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowInfo;
+
+    #[test]
+    fn cached_search_text_matches_titles_and_executables() {
+        let window = WindowInfo {
+            hwnd: 1,
+            title: "Visual Studio Code".to_owned(),
+            process_id: 2,
+            exe_name: "Code.exe".to_owned(),
+            search_text: "visual studio code\ncode.exe".to_owned(),
+        };
+
+        assert!(window.matches_filter(""));
+        assert!(window.matches_filter("visual studio"));
+        assert!(window.matches_filter("code.exe"));
+        assert!(!window.matches_filter("chrome"));
     }
 }
