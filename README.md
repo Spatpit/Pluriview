@@ -46,6 +46,14 @@ executable and its data folder can be moved together without breaking tiles.
 You can also drag one or several supported image files from File Explorer (or
 another app that provides local files) and drop them directly onto the canvas.
 
+Local video files can also be dropped onto the canvas when MPV is configured.
+They start playing immediately and expose play/pause, seek, volume, mute, speed,
+loop, track, and reload controls. Hover the seek bar to preview a local or
+seekable on-demand frame at that time without moving the playing video.
+Streamlink tiles support the same playback controls, reload action, and previews
+when the source exposes a duration; live streams do not expose arbitrary
+timeline thumbnails.
+
 Development builds keep this folder at the repository root rather than under
 Cargo's disposable `target` directory. Release builds remain portable and keep
 `pluriview_data` beside the executable.
@@ -92,11 +100,12 @@ Download the latest `pluriview.exe` from [Releases](https://github.com/Spatpit/P
 ```powershell
 git clone https://github.com/Spatpit/Pluriview.git
 cd Pluriview
+.\scripts\prepare-libmpv.ps1
 .\scripts\build-release.ps1
 ```
-The privacy-safe executable will be at `target/release/pluriview.exe`. Publish only
-that file. Do not distribute `pluriview.pdb`; Windows debug symbols can contain
-local source paths.
+The privacy-safe executable and its required `libmpv-2.dll` runtime will be in
+`dist`. Keep both files together when running or publishing Pluriview. Do not
+distribute `pluriview.pdb`; Windows debug symbols can contain local source paths.
 
 ## Usage
 

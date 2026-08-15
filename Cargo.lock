@@ -2493,6 +2493,7 @@ dependencies = [
  "egui-phosphor",
  "env_logger",
  "image",
+ "libloading 0.8.9",
  "log",
  "parking_lot",
  "serde",

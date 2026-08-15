@@ -1,0 +1,1453 @@
+//! In-process libmpv playback and OpenGL rendering.
+//!
+//! The old player path embedded a separate `mpv.exe` window and copied that
+//! window back through Windows Graphics Capture. Besides an avoidable GPU to
+//! CPU round-trip, that left playback control and the displayed frame in two
+//! independent asynchronous systems. This module keeps decoding, audio,
+//! controls, and drawing in one libmpv core per tile.
+
+use std::{
+    ffi::{c_char, c_int, c_void, CStr, CString, OsString},
+    path::{Path, PathBuf},
+    ptr,
+    sync::{mpsc, Arc},
+    thread,
+};
+
+#[cfg(test)]
+use std::time::{Duration, Instant};
+
+use eframe::{egui, glow};
+use glow::HasContext as _;
+use libloading::Library;
+use parking_lot::Mutex;
+
+use crate::{
+    preview::PreviewId,
+    video::{
+        self, LoopMode, TrackInfo, TrackSelection, VideoLaunch, VideoProperty, VideoState,
+        VideoUpdate,
+    },
+};
+
+type MpvHandle = c_void;
+type MpvRenderContext = c_void;
+
+#[repr(C)]
+struct MpvEvent {
+    event_id: c_int,
+    error: c_int,
+    reply_userdata: u64,
+    data: *mut c_void,
+}
+
+#[repr(C)]
+struct MpvEventProperty {
+    name: *const c_char,
+    format: c_int,
+    data: *mut c_void,
+}
+
+#[repr(C)]
+union MpvNodeValue {
+    string: *mut c_char,
+    flag: c_int,
+    int64: i64,
+    double_value: f64,
+    list: *mut MpvNodeList,
+    byte_array: *mut c_void,
+}
+
+#[repr(C)]
+struct MpvNode {
+    value: MpvNodeValue,
+    format: c_int,
+}
+
+#[repr(C)]
+struct MpvNodeList {
+    count: c_int,
+    values: *mut MpvNode,
+    keys: *mut *mut c_char,
+}
+
+#[repr(C)]
+struct MpvRenderParam {
+    kind: c_int,
+    data: *mut c_void,
+}
+
+#[repr(C)]
+struct MpvOpenGlInitParams {
+    get_proc_address: Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void>,
+    get_proc_address_ctx: *mut c_void,
+}
+
+#[repr(C)]
+struct MpvOpenGlFbo {
+    fbo: c_int,
+    w: c_int,
+    h: c_int,
+    internal_format: c_int,
+}
+
+const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
+const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
+const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
+const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
+const MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
+const MPV_RENDER_PARAM_INVALID: c_int = 0;
+const MPV_RENDER_UPDATE_FRAME: u64 = 1;
+
+const MPV_EVENT_NONE: c_int = 0;
+const MPV_EVENT_SHUTDOWN: c_int = 1;
+const MPV_EVENT_START_FILE: c_int = 6;
+const MPV_EVENT_END_FILE: c_int = 7;
+const MPV_EVENT_FILE_LOADED: c_int = 8;
+const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
+
+const MPV_FORMAT_NONE: c_int = 0;
+const MPV_FORMAT_STRING: c_int = 1;
+const MPV_FORMAT_FLAG: c_int = 3;
+const MPV_FORMAT_INT64: c_int = 4;
+const MPV_FORMAT_DOUBLE: c_int = 5;
+const MPV_FORMAT_NODE: c_int = 6;
+const MPV_FORMAT_NODE_ARRAY: c_int = 7;
+const MPV_FORMAT_NODE_MAP: c_int = 8;
+
+const OBSERVED_PROPERTIES: [(&str, c_int); 14] = [
+    ("pause", MPV_FORMAT_FLAG),
+    ("time-pos", MPV_FORMAT_DOUBLE),
+    ("duration", MPV_FORMAT_DOUBLE),
+    ("volume", MPV_FORMAT_DOUBLE),
+    ("mute", MPV_FORMAT_FLAG),
+    ("speed", MPV_FORMAT_DOUBLE),
+    ("loop-file", MPV_FORMAT_STRING),
+    ("track-list", MPV_FORMAT_NODE),
+    ("aid", MPV_FORMAT_STRING),
+    ("sid", MPV_FORMAT_STRING),
+    ("media-title", MPV_FORMAT_STRING),
+    ("paused-for-cache", MPV_FORMAT_FLAG),
+    ("core-idle", MPV_FORMAT_FLAG),
+    ("eof-reached", MPV_FORMAT_FLAG),
+];
+
+struct MpvApi {
+    _library: Library,
+    create: unsafe extern "C" fn() -> *mut MpvHandle,
+    initialize: unsafe extern "C" fn(*mut MpvHandle) -> c_int,
+    terminate_destroy: unsafe extern "C" fn(*mut MpvHandle),
+    set_option_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
+    set_property_string:
+        unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
+    #[cfg(test)]
+    get_property_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char) -> *mut c_char,
+    command: unsafe extern "C" fn(*mut MpvHandle, *const *const c_char) -> c_int,
+    wait_event: unsafe extern "C" fn(*mut MpvHandle, f64) -> *mut MpvEvent,
+    observe_property: unsafe extern "C" fn(*mut MpvHandle, u64, *const c_char, c_int) -> c_int,
+    #[cfg(test)]
+    free: unsafe extern "C" fn(*mut c_void),
+    error_string: unsafe extern "C" fn(c_int) -> *const c_char,
+    render_context_create: unsafe extern "C" fn(
+        *mut *mut MpvRenderContext,
+        *mut MpvHandle,
+        *mut MpvRenderParam,
+    ) -> c_int,
+    render_context_update: unsafe extern "C" fn(*mut MpvRenderContext) -> u64,
+    render_context_render:
+        unsafe extern "C" fn(*mut MpvRenderContext, *mut MpvRenderParam) -> c_int,
+    render_context_free: unsafe extern "C" fn(*mut MpvRenderContext),
+}
+
+unsafe impl Send for MpvApi {}
+unsafe impl Sync for MpvApi {}
+
+impl MpvApi {
+    fn load(mpv_path: &Path) -> Result<Arc<Self>, String> {
+        let path = find_libmpv(mpv_path).ok_or_else(|| {
+            "libmpv-2.dll is missing. Reinstall Pluriview or place libmpv-2.dll beside pluriview.exe."
+                .to_owned()
+        })?;
+        let library = unsafe { Library::new(&path) }
+            .map_err(|error| format!("Could not load {}: {error}", path.display()))?;
+
+        unsafe fn symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, String> {
+            library
+                .get::<T>(name)
+                .map(|symbol| *symbol)
+                .map_err(|error| {
+                    format!(
+                        "The bundled libmpv runtime is missing {}: {error}",
+                        String::from_utf8_lossy(name).trim_end_matches('\0')
+                    )
+                })
+        }
+
+        // Load every entry point before moving the Library into the owner.
+        let create = unsafe { symbol(&library, b"mpv_create\0")? };
+        let initialize = unsafe { symbol(&library, b"mpv_initialize\0")? };
+        let terminate_destroy = unsafe { symbol(&library, b"mpv_terminate_destroy\0")? };
+        let set_option_string = unsafe { symbol(&library, b"mpv_set_option_string\0")? };
+        let set_property_string = unsafe { symbol(&library, b"mpv_set_property_string\0")? };
+        #[cfg(test)]
+        let get_property_string = unsafe { symbol(&library, b"mpv_get_property_string\0")? };
+        let command = unsafe { symbol(&library, b"mpv_command\0")? };
+        let wait_event = unsafe { symbol(&library, b"mpv_wait_event\0")? };
+        let observe_property = unsafe { symbol(&library, b"mpv_observe_property\0")? };
+        #[cfg(test)]
+        let free = unsafe { symbol(&library, b"mpv_free\0")? };
+        let error_string = unsafe { symbol(&library, b"mpv_error_string\0")? };
+        let render_context_create = unsafe { symbol(&library, b"mpv_render_context_create\0")? };
+        let render_context_update = unsafe { symbol(&library, b"mpv_render_context_update\0")? };
+        let render_context_render = unsafe { symbol(&library, b"mpv_render_context_render\0")? };
+        let render_context_free = unsafe { symbol(&library, b"mpv_render_context_free\0")? };
+
+        Ok(Arc::new(Self {
+            _library: library,
+            create,
+            initialize,
+            terminate_destroy,
+            set_option_string,
+            set_property_string,
+            #[cfg(test)]
+            get_property_string,
+            command,
+            wait_event,
+            observe_property,
+            #[cfg(test)]
+            free,
+            error_string,
+            render_context_create,
+            render_context_update,
+            render_context_render,
+            render_context_free,
+        }))
+    }
+
+    fn error(&self, code: c_int) -> String {
+        let text = unsafe { (self.error_string)(code) };
+        if text.is_null() {
+            format!("libmpv error {code}")
+        } else {
+            unsafe { CStr::from_ptr(text) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+}
+
+fn find_libmpv(mpv_path: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            candidates.push(directory.join("libmpv-2.dll"));
+        }
+    }
+    if let Ok(directory) = std::env::current_dir() {
+        candidates.push(directory.join("vendor").join("libmpv-2.dll"));
+        candidates.push(directory.join("libmpv-2.dll"));
+    }
+    if let Some(directory) = mpv_path.parent() {
+        candidates.push(directory.join("libmpv-2.dll"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[derive(Default)]
+struct EventChanges {
+    any: bool,
+    pause: bool,
+}
+
+unsafe fn apply_property_event(state: &mut VideoState, property: &MpvEventProperty) -> bool {
+    if property.name.is_null() {
+        return false;
+    }
+    let name = CStr::from_ptr(property.name).to_string_lossy();
+    if property.format == MPV_FORMAT_NONE || property.data.is_null() {
+        match name.as_ref() {
+            "time-pos" => state.time_pos = None,
+            "duration" => state.duration = None,
+            "media-title" => state.media_title = None,
+            "track-list" => state.track_list.clear(),
+            "aid" => state.audio_track = TrackSelection::Disabled,
+            "sid" => state.subtitle_track = TrackSelection::Disabled,
+            _ => return false,
+        }
+        return true;
+    }
+
+    match name.as_ref() {
+        "pause" => event_flag(property).map(|value| state.pause = value),
+        "time-pos" => event_double(property).map(|value| state.time_pos = Some(value)),
+        "duration" => event_double(property).map(|value| state.duration = Some(value)),
+        "volume" => event_double(property).map(|value| state.volume = value),
+        "mute" => event_flag(property).map(|value| state.mute = value),
+        "speed" => event_double(property).map(|value| state.speed = value),
+        "loop-file" => event_string(property).map(|value| {
+            state.loop_file = match value.as_str() {
+                "inf" | "yes" => LoopMode::Infinite,
+                _ => value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|count| *count > 0)
+                    .map(LoopMode::Count)
+                    .unwrap_or(LoopMode::Off),
+            }
+        }),
+        "track-list" => event_node(property).map(|node| {
+            state.track_list = parse_track_list_node(node);
+        }),
+        "aid" => event_string(property)
+            .map(|value| state.audio_track = parse_track_selection(Some(value))),
+        "sid" => event_string(property)
+            .map(|value| state.subtitle_track = parse_track_selection(Some(value))),
+        "media-title" => event_string(property).map(|value| state.media_title = Some(value)),
+        "paused-for-cache" => event_flag(property).map(|value| state.paused_for_cache = value),
+        "core-idle" => event_flag(property).map(|value| state.core_idle = value),
+        "eof-reached" => event_flag(property).map(|value| state.eof_reached = value),
+        _ => None,
+    }
+    .is_some()
+}
+
+unsafe fn event_flag(property: &MpvEventProperty) -> Option<bool> {
+    (property.format == MPV_FORMAT_FLAG).then(|| *property.data.cast::<c_int>() != 0)
+}
+
+unsafe fn event_double(property: &MpvEventProperty) -> Option<f64> {
+    (property.format == MPV_FORMAT_DOUBLE).then(|| *property.data.cast::<f64>())
+}
+
+unsafe fn event_string(property: &MpvEventProperty) -> Option<String> {
+    if property.format != MPV_FORMAT_STRING {
+        return None;
+    }
+    let value = *property.data.cast::<*mut c_char>();
+    (!value.is_null()).then(|| CStr::from_ptr(value).to_string_lossy().into_owned())
+}
+
+unsafe fn event_node(property: &MpvEventProperty) -> Option<&MpvNode> {
+    (property.format == MPV_FORMAT_NODE).then(|| &*property.data.cast::<MpvNode>())
+}
+
+unsafe fn parse_track_list_node(node: &MpvNode) -> Vec<TrackInfo> {
+    if node.format != MPV_FORMAT_NODE_ARRAY || node.value.list.is_null() {
+        return Vec::new();
+    }
+    let list = &*node.value.list;
+    if list.count <= 0 || list.values.is_null() {
+        return Vec::new();
+    }
+    (0..list.count.min(128) as usize)
+        .filter_map(|index| {
+            let track = &*list.values.add(index);
+            let id = node_map_value(track, "id").and_then(|node| node_i64(node))?;
+            Some(TrackInfo {
+                id,
+                kind: node_map_value(track, "type")
+                    .and_then(|node| node_string(node))
+                    .unwrap_or_default(),
+                title: node_map_value(track, "title").and_then(|node| node_string(node)),
+                lang: node_map_value(track, "lang").and_then(|node| node_string(node)),
+                selected: node_map_value(track, "selected")
+                    .and_then(|node| node_flag(node))
+                    .unwrap_or(false),
+                external: node_map_value(track, "external")
+                    .and_then(|node| node_flag(node))
+                    .unwrap_or(false),
+                codec: node_map_value(track, "codec").and_then(|node| node_string(node)),
+            })
+        })
+        .collect()
+}
+
+unsafe fn node_map_value<'a>(node: &'a MpvNode, key: &str) -> Option<&'a MpvNode> {
+    if node.format != MPV_FORMAT_NODE_MAP || node.value.list.is_null() {
+        return None;
+    }
+    let list = &*node.value.list;
+    if list.count <= 0 || list.values.is_null() || list.keys.is_null() {
+        return None;
+    }
+    for index in 0..list.count as usize {
+        let candidate = *list.keys.add(index);
+        if !candidate.is_null() && CStr::from_ptr(candidate).to_bytes() == key.as_bytes() {
+            return Some(&*list.values.add(index));
+        }
+    }
+    None
+}
+
+unsafe fn node_i64(node: &MpvNode) -> Option<i64> {
+    match node.format {
+        MPV_FORMAT_INT64 => Some(node.value.int64),
+        MPV_FORMAT_DOUBLE => Some(node.value.double_value as i64),
+        _ => None,
+    }
+}
+
+unsafe fn node_flag(node: &MpvNode) -> Option<bool> {
+    (node.format == MPV_FORMAT_FLAG).then(|| node.value.flag != 0)
+}
+
+unsafe fn node_string(node: &MpvNode) -> Option<String> {
+    if node.format != MPV_FORMAT_STRING || node.value.string.is_null() {
+        None
+    } else {
+        Some(
+            CStr::from_ptr(node.value.string)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+struct GlTarget {
+    framebuffer: glow::NativeFramebuffer,
+    texture: glow::NativeTexture,
+    width: i32,
+    height: i32,
+}
+
+struct MpvCore {
+    api: Arc<MpvApi>,
+    handle: *mut MpvHandle,
+    render_context: *mut MpvRenderContext,
+    target: Option<GlTarget>,
+    has_rendered_frame: bool,
+    pending_source: Option<OsString>,
+    source_loaded: bool,
+    destroyed: bool,
+    error: Option<String>,
+}
+
+// libmpv's client API is thread safe. Access to each handle and render context
+// is additionally serialized by VideoRenderer's mutex; all GL work is invoked
+// by egui on the one context-owning paint thread.
+unsafe impl Send for MpvCore {}
+
+impl MpvCore {
+    fn new(api: Arc<MpvApi>, start_paused: bool, network_source: bool) -> Result<Self, String> {
+        let handle = unsafe { (api.create)() };
+        if handle.is_null() {
+            return Err("libmpv could not create a playback core".to_owned());
+        }
+
+        let mut core = Self {
+            api,
+            handle,
+            render_context: ptr::null_mut(),
+            target: None,
+            has_rendered_frame: false,
+            pending_source: None,
+            source_loaded: false,
+            destroyed: false,
+            error: None,
+        };
+        for (name, value) in [
+            ("config", "no"),
+            ("terminal", "no"),
+            ("osc", "no"),
+            ("input-default-bindings", "no"),
+            ("keep-open", "yes"),
+            ("vo", "libmpv"),
+            // The WGL render context cannot directly import D3D11 surfaces,
+            // but copy-mode hardware decoding is compatible and substantially
+            // lowers CPU use compared with forcing software decoding.
+            ("hwdec", "auto-copy-safe"),
+        ] {
+            if let Err(error) = core.set_option(name, value) {
+                core.destroy_without_render_context();
+                return Err(error);
+            }
+        }
+        if network_source {
+            // Give network streams enough forward data to ride through normal
+            // HLS/CDN jitter. These limits are maxima, not eager allocations.
+            for (name, value) in [
+                ("cache", "yes"),
+                ("cache-secs", "30"),
+                ("demuxer-readahead-secs", "30"),
+                ("demuxer-max-bytes", "128MiB"),
+                ("demuxer-max-back-bytes", "16MiB"),
+                ("cache-pause", "yes"),
+                ("cache-pause-wait", "2"),
+                ("cache-pause-initial", "yes"),
+            ] {
+                if let Err(error) = core.set_option(name, value) {
+                    core.destroy_without_render_context();
+                    return Err(error);
+                }
+            }
+        }
+        let result = unsafe { (core.api.initialize)(core.handle) };
+        if result < 0 {
+            let error = core.api.error(result);
+            core.destroy_without_render_context();
+            return Err(format!("Could not initialize libmpv: {error}"));
+        }
+        if let Err(error) = core.observe_properties() {
+            core.destroy_without_render_context();
+            return Err(error);
+        }
+        core.set_property("pause", if start_paused { "yes" } else { "no" })?;
+        Ok(core)
+    }
+
+    fn observe_properties(&self) -> Result<(), String> {
+        for (name, format) in OBSERVED_PROPERTIES {
+            let name = cstring(name)?;
+            let result =
+                unsafe { (self.api.observe_property)(self.handle, 0, name.as_ptr(), format) };
+            self.check(result, "observe an mpv property")?;
+        }
+        Ok(())
+    }
+
+    fn set_option(&self, name: &str, value: &str) -> Result<(), String> {
+        let name = cstring(name)?;
+        let value = cstring(value)?;
+        let result =
+            unsafe { (self.api.set_option_string)(self.handle, name.as_ptr(), value.as_ptr()) };
+        self.check(result, "set an mpv option")
+    }
+
+    fn set_property(&self, name: &str, value: &str) -> Result<(), String> {
+        if self.destroyed {
+            return Err("The video session has already closed".to_owned());
+        }
+        let name = cstring(name)?;
+        let value = cstring(value)?;
+        let result =
+            unsafe { (self.api.set_property_string)(self.handle, name.as_ptr(), value.as_ptr()) };
+        self.check(result, "change an mpv property")
+    }
+
+    fn command(&self, arguments: &[String]) -> Result<(), String> {
+        if self.destroyed {
+            return Err("The video session has already closed".to_owned());
+        }
+        let strings = arguments
+            .iter()
+            .map(|argument| cstring(argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut pointers = strings
+            .iter()
+            .map(|argument| argument.as_ptr())
+            .collect::<Vec<_>>();
+        pointers.push(ptr::null());
+        let result = unsafe { (self.api.command)(self.handle, pointers.as_ptr()) };
+        self.check(result, "run an mpv command")
+    }
+
+    fn check(&self, result: c_int, action: &str) -> Result<(), String> {
+        if result < 0 {
+            Err(format!("Could not {action}: {}", self.api.error(result)))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn load_source(&mut self, source: OsString) -> Result<(), String> {
+        self.pending_source = Some(source);
+        self.source_loaded = false;
+        self.has_rendered_frame = false;
+        if !self.render_context.is_null() {
+            self.start_pending_source()?;
+        }
+        Ok(())
+    }
+
+    fn start_pending_source(&mut self) -> Result<(), String> {
+        let Some(source) = self.pending_source.take() else {
+            return Ok(());
+        };
+        let source = source.to_string_lossy().into_owned();
+        self.command(&["loadfile".to_owned(), source, "replace".to_owned()])?;
+        self.source_loaded = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn property(&self, name: &str) -> Option<String> {
+        if self.destroyed {
+            return None;
+        }
+        let name = CString::new(name).ok()?;
+        let value = unsafe { (self.api.get_property_string)(self.handle, name.as_ptr()) };
+        if value.is_null() {
+            return None;
+        }
+        let result = unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { (self.api.free)(value.cast()) };
+        Some(result)
+    }
+
+    fn drain_events(&mut self, state: &mut VideoState) -> EventChanges {
+        let mut changes = EventChanges::default();
+        for _ in 0..256 {
+            let event = unsafe { (self.api.wait_event)(self.handle, 0.0) };
+            if event.is_null() {
+                break;
+            }
+            match unsafe { (*event).event_id } {
+                MPV_EVENT_NONE => break,
+                MPV_EVENT_SHUTDOWN => {
+                    self.error = Some("The libmpv playback core shut down unexpectedly".to_owned());
+                    break;
+                }
+                MPV_EVENT_START_FILE | MPV_EVENT_END_FILE | MPV_EVENT_FILE_LOADED => {
+                    changes.any = true;
+                }
+                MPV_EVENT_PROPERTY_CHANGE => {
+                    let property = unsafe { (*event).data.cast::<MpvEventProperty>().as_ref() };
+                    if let Some(property) = property {
+                        if unsafe { apply_property_event(state, property) } {
+                            changes.any = true;
+                            changes.pause |= unsafe {
+                                !property.name.is_null()
+                                    && CStr::from_ptr(property.name).to_bytes() == b"pause"
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        changes
+    }
+
+    unsafe fn ensure_render_context(&mut self) -> Result<(), String> {
+        if !self.render_context.is_null() {
+            return Ok(());
+        }
+        let api_type = b"opengl\0";
+        let mut init = MpvOpenGlInitParams {
+            get_proc_address: Some(get_gl_proc_address),
+            get_proc_address_ctx: ptr::null_mut(),
+        };
+        let mut params = [
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_API_TYPE,
+                data: api_type.as_ptr() as *mut c_void,
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
+                data: (&mut init as *mut MpvOpenGlInitParams).cast(),
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
+        ];
+        let result = (self.api.render_context_create)(
+            &mut self.render_context,
+            self.handle,
+            params.as_mut_ptr(),
+        );
+        self.check(result, "create the libmpv OpenGL renderer")?;
+        self.start_pending_source()
+    }
+
+    unsafe fn ensure_target(
+        &mut self,
+        gl: &glow::Context,
+        width: i32,
+        height: i32,
+    ) -> Result<bool, String> {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.width == width && target.height == height)
+        {
+            return Ok(false);
+        }
+        if let Some(target) = self.target.take() {
+            gl.delete_framebuffer(target.framebuffer);
+            gl.delete_texture(target.texture);
+        }
+        let texture = gl
+            .create_texture()
+            .map_err(|error| format!("Could not create the video texture: {error}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA8 as i32,
+            width,
+            height,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            None,
+        );
+        let framebuffer = gl
+            .create_framebuffer()
+            .map_err(|error| format!("Could not create the video framebuffer: {error}"))?;
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(texture),
+            0,
+        );
+        if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+            gl.delete_framebuffer(framebuffer);
+            gl.delete_texture(texture);
+            return Err("The OpenGL video framebuffer is incomplete".to_owned());
+        }
+        self.target = Some(GlTarget {
+            framebuffer,
+            texture,
+            width,
+            height,
+        });
+        Ok(true)
+    }
+
+    unsafe fn paint(
+        &mut self,
+        info: egui::PaintCallbackInfo,
+        gl: &glow::Context,
+    ) -> Result<(), String> {
+        if self.destroyed {
+            return Ok(());
+        }
+        // PaintCallbackInfo's convenience viewport is clamped to the screen.
+        // Using it as the render-target size made the FBO resize for every
+        // pixel of movement across a screen edge. Keep a stable full-tile
+        // target instead and let OpenGL clip the destination blit.
+        let pixels_per_point = info.pixels_per_point;
+        let left_px = (info.viewport.min.x * pixels_per_point).round() as i32;
+        let top_px = (info.viewport.min.y * pixels_per_point).round() as i32;
+        let right_px = (info.viewport.max.x * pixels_per_point).round() as i32;
+        let bottom_px = (info.viewport.max.y * pixels_per_point).round() as i32;
+        let viewport_width = right_px - left_px;
+        let viewport_height = bottom_px - top_px;
+        if viewport_width <= 0 || viewport_height <= 0 {
+            return Ok(());
+        }
+        let from_bottom_px = info.screen_size_px[1] as i32 - bottom_px;
+
+        // During an interactive resize, only reallocate at 32-pixel steps.
+        // The final blit scales the cached frame to the exact tile rectangle.
+        let target_width = ((viewport_width + 31) / 32) * 32;
+        let target_height = ((viewport_height + 31) / 32) * 32;
+
+        let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
+        let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
+        self.ensure_render_context()?;
+        let target_changed = self.ensure_target(gl, target_width, target_height)?;
+        let target = self.target.as_ref().expect("target was just created");
+
+        let mut fbo = MpvOpenGlFbo {
+            fbo: target.framebuffer.0.get() as c_int,
+            w: target.width,
+            h: target.height,
+            internal_format: glow::RGBA8 as c_int,
+        };
+        // libmpv's image orientation is opposite to the texture orientation
+        // used when this off-screen FBO is blitted into egui's framebuffer.
+        let mut flip_y: c_int = 1;
+        // The UI thread owns this GL context. Let the app's repaint cadence
+        // handle presentation timing instead of allowing libmpv to sleep in
+        // the middle of an egui paint pass.
+        let mut block_for_target_time: c_int = 0;
+        let mut params = [
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_OPENGL_FBO,
+                data: (&mut fbo as *mut MpvOpenGlFbo).cast(),
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_FLIP_Y,
+                data: (&mut flip_y as *mut c_int).cast(),
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                data: (&mut block_for_target_time as *mut c_int).cast(),
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
+        ];
+        let update = (self.api.render_context_update)(self.render_context);
+        if target_changed || !self.has_rendered_frame || update & MPV_RENDER_UPDATE_FRAME != 0 {
+            let result = (self.api.render_context_render)(self.render_context, params.as_mut_ptr());
+            self.check(result, "render the video frame")?;
+            self.has_rendered_frame = true;
+        }
+
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(target.framebuffer));
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
+        let clip = info.clip_rect_in_pixels();
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(
+            clip.left_px,
+            clip.from_bottom_px,
+            clip.width_px,
+            clip.height_px,
+        );
+        gl.blit_framebuffer(
+            0,
+            0,
+            target.width,
+            target.height,
+            left_px,
+            from_bottom_px,
+            right_px,
+            from_bottom_px + viewport_height,
+            glow::COLOR_BUFFER_BIT,
+            glow::LINEAR,
+        );
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
+        Ok(())
+    }
+
+    unsafe fn cleanup(&mut self, gl: &glow::Context) {
+        if self.destroyed {
+            return;
+        }
+        if let Some(target) = self.target.take() {
+            gl.delete_framebuffer(target.framebuffer);
+            gl.delete_texture(target.texture);
+        }
+        if !self.render_context.is_null() {
+            (self.api.render_context_free)(self.render_context);
+            self.render_context = ptr::null_mut();
+        }
+        (self.api.terminate_destroy)(self.handle);
+        self.handle = ptr::null_mut();
+        self.destroyed = true;
+    }
+
+    fn destroy_without_render_context(&mut self) {
+        if !self.destroyed && self.render_context.is_null() && !self.handle.is_null() {
+            unsafe { (self.api.terminate_destroy)(self.handle) };
+            self.handle = ptr::null_mut();
+            self.destroyed = true;
+        }
+    }
+}
+
+/// Paintable handle retained by the Preview and its controlling session.
+pub struct VideoRenderer {
+    core: Mutex<MpvCore>,
+}
+
+impl VideoRenderer {
+    fn new(
+        api: Arc<MpvApi>,
+        start_paused: bool,
+        network_source: bool,
+    ) -> Result<Arc<Self>, String> {
+        Ok(Arc::new(Self {
+            core: Mutex::new(MpvCore::new(api, start_paused, network_source)?),
+        }))
+    }
+
+    pub fn paint(&self, info: egui::PaintCallbackInfo, gl: &glow::Context) {
+        let mut core = self.core.lock();
+        let result = unsafe { core.paint(info, gl) };
+        if let Err(error) = result {
+            if core.error.as_deref() != Some(&error) {
+                log::error!("Direct libmpv rendering failed: {error}");
+            }
+            core.error = Some(error);
+        }
+    }
+
+    fn load_source(&self, source: OsString) -> Result<(), String> {
+        self.core.lock().load_source(source)
+    }
+
+    fn stop(&self) {
+        let core = self.core.lock();
+        let _ = core.command(&["stop".to_owned()]);
+        let _ = core.set_property("pause", "yes");
+    }
+
+    fn cleanup(&self, gl: &glow::Context) {
+        unsafe { self.core.lock().cleanup(gl) };
+    }
+}
+
+pub struct VideoSession {
+    renderer: Arc<VideoRenderer>,
+    state: VideoState,
+    first_poll: bool,
+    stream_receiver: Option<mpsc::Receiver<Result<OsString, String>>>,
+}
+
+impl VideoSession {
+    fn new(renderer: Arc<VideoRenderer>, launch: &VideoLaunch) -> Result<Self, String> {
+        let stream_receiver = match &launch.source {
+            video::VideoSource::LocalFile(path) => {
+                renderer.load_source(path.as_os_str().to_owned())?;
+                None
+            }
+            video::VideoSource::Stream {
+                url,
+                quality,
+                streamlink_path,
+            } => {
+                let (sender, receiver) = mpsc::channel();
+                let url = url.clone();
+                let quality = quality.clone();
+                let streamlink_path = streamlink_path.clone();
+                thread::spawn(move || {
+                    let result = video::resolve_stream_url(&streamlink_path, &url, &quality);
+                    let _ = sender.send(result);
+                });
+                Some(receiver)
+            }
+        };
+        Ok(Self {
+            renderer,
+            state: VideoState {
+                connected: true,
+                pause: launch.start_paused,
+                volume: 100.0,
+                speed: 1.0,
+                core_idle: true,
+                ..Default::default()
+            },
+            first_poll: true,
+            stream_receiver,
+        })
+    }
+
+    pub fn state(&self) -> &VideoState {
+        &self.state
+    }
+
+    fn poll(&mut self) -> Vec<VideoUpdate> {
+        let mut updates = Vec::new();
+        if self.first_poll {
+            self.first_poll = false;
+            updates.push(VideoUpdate::Connected);
+        }
+        if let Some(receiver) = &self.stream_receiver {
+            match receiver.try_recv() {
+                Ok(Ok(source)) => {
+                    self.stream_receiver = None;
+                    if let Err(error) = self.renderer.load_source(source) {
+                        updates.push(VideoUpdate::Error(error));
+                    } else {
+                        updates.push(VideoUpdate::Event);
+                    }
+                }
+                Ok(Err(error)) => {
+                    self.stream_receiver = None;
+                    updates.push(VideoUpdate::Error(format!(
+                        "Streamlink could not resolve this stream: {error}"
+                    )));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.stream_receiver = None;
+                    updates.push(VideoUpdate::Error(
+                        "Streamlink stopped before returning a playable URL".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let mut core = self.renderer.core.lock();
+        let changes = core.drain_events(&mut self.state);
+        if let Some(error) = core.error.take() {
+            updates.push(VideoUpdate::Error(error));
+        }
+        if changes.pause {
+            updates.push(VideoUpdate::Property(VideoProperty::Pause));
+        }
+        if changes.any {
+            updates.push(VideoUpdate::Event);
+        }
+        updates
+    }
+
+    pub fn set_paused(&mut self, paused: bool) -> Result<(), String> {
+        self.renderer
+            .core
+            .lock()
+            .set_property("pause", if paused { "yes" } else { "no" })?;
+        self.state.pause = paused;
+        Ok(())
+    }
+
+    pub fn play(&mut self) -> Result<(), String> {
+        if self.state.eof_reached {
+            self.seek_absolute(0.0)?;
+        }
+        self.set_paused(false)
+    }
+
+    pub fn seek_absolute(&mut self, seconds: f64) -> Result<(), String> {
+        if !seconds.is_finite() {
+            return Err("Seek time must be finite".to_owned());
+        }
+        self.renderer.core.lock().command(&[
+            "seek".to_owned(),
+            seconds.max(0.0).to_string(),
+            "absolute+exact".to_owned(),
+        ])
+    }
+
+    pub fn set_volume(&mut self, volume: f64) -> Result<(), String> {
+        if !volume.is_finite() {
+            return Err("Volume must be finite".to_owned());
+        }
+        let volume = volume.clamp(0.0, 100.0);
+        self.renderer
+            .core
+            .lock()
+            .set_property("volume", &volume.to_string())?;
+        self.state.volume = volume;
+        Ok(())
+    }
+
+    pub fn set_muted(&mut self, muted: bool) -> Result<(), String> {
+        self.renderer
+            .core
+            .lock()
+            .set_property("mute", if muted { "yes" } else { "no" })?;
+        self.state.mute = muted;
+        Ok(())
+    }
+
+    pub fn set_speed(&mut self, speed: f64) -> Result<(), String> {
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err("Playback speed must be a positive finite number".to_owned());
+        }
+        self.renderer
+            .core
+            .lock()
+            .set_property("speed", &speed.to_string())?;
+        self.state.speed = speed;
+        Ok(())
+    }
+
+    pub fn set_looping(&mut self, enabled: bool) -> Result<(), String> {
+        self.renderer
+            .core
+            .lock()
+            .set_property("loop-file", if enabled { "inf" } else { "no" })?;
+        self.state.loop_file = if enabled {
+            LoopMode::Infinite
+        } else {
+            LoopMode::Off
+        };
+        Ok(())
+    }
+
+    pub fn select_audio_track(&mut self, id: i64) -> Result<(), String> {
+        self.renderer
+            .core
+            .lock()
+            .set_property("aid", &id.to_string())?;
+        self.state.audio_track = TrackSelection::Id(id);
+        Ok(())
+    }
+
+    pub fn select_subtitle_track(&mut self, id: i64) -> Result<(), String> {
+        self.renderer
+            .core
+            .lock()
+            .set_property("sid", &id.to_string())?;
+        self.state.subtitle_track = TrackSelection::Id(id);
+        Ok(())
+    }
+
+    pub fn disable_subtitles(&mut self) -> Result<(), String> {
+        self.renderer.core.lock().set_property("sid", "no")?;
+        self.state.subtitle_track = TrackSelection::Disabled;
+        Ok(())
+    }
+}
+
+pub struct VideoTile {
+    pub session: VideoSession,
+    target_fps: u32,
+}
+
+#[derive(Default)]
+pub struct VideoManager {
+    api: Option<Arc<MpvApi>>,
+    tiles: std::collections::HashMap<PreviewId, VideoTile>,
+    cleanup_queue: Arc<Mutex<Vec<Arc<VideoRenderer>>>>,
+}
+
+impl VideoManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn launch(
+        &mut self,
+        id: PreviewId,
+        launch: VideoLaunch,
+        target_fps: u32,
+    ) -> Result<Arc<VideoRenderer>, String> {
+        if self.tiles.contains_key(&id) {
+            return Err(format!("A video session already exists for {id:?}"));
+        }
+        if self.api.is_none() {
+            self.api = Some(MpvApi::load(&launch.mpv_path)?);
+        }
+        let renderer = VideoRenderer::new(
+            self.api.as_ref().expect("libmpv was loaded").clone(),
+            launch.start_paused,
+            matches!(&launch.source, video::VideoSource::Stream { .. }),
+        )?;
+        let session = VideoSession::new(renderer.clone(), &launch)?;
+        self.tiles.insert(
+            id,
+            VideoTile {
+                session,
+                target_fps: target_fps.clamp(1, 60),
+            },
+        );
+        Ok(renderer)
+    }
+
+    pub fn contains(&self, id: PreviewId) -> bool {
+        self.tiles.contains_key(&id)
+    }
+
+    pub fn repaint_fps(&self) -> Option<u32> {
+        if self.tiles.is_empty() {
+            None
+        } else {
+            self.tiles
+                .values()
+                .filter(|tile| tile.session.state.connected && !tile.session.state.pause)
+                .map(|tile| tile.target_fps)
+                .max()
+                .or(Some(10))
+        }
+    }
+
+    pub fn get(&self, id: PreviewId) -> Option<&VideoTile> {
+        self.tiles.get(&id)
+    }
+
+    pub fn get_mut(&mut self, id: PreviewId) -> Option<&mut VideoTile> {
+        self.tiles.get_mut(&id)
+    }
+
+    pub fn remove(&mut self, id: PreviewId) -> Option<VideoTile> {
+        let tile = self.tiles.remove(&id)?;
+        tile.session.renderer.stop();
+        self.cleanup_queue
+            .lock()
+            .push(tile.session.renderer.clone());
+        Some(tile)
+    }
+
+    pub fn clear(&mut self) {
+        let ids = self.tiles.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let _ = self.remove(id);
+        }
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = PreviewId> + '_ {
+        self.tiles.keys().copied()
+    }
+
+    pub fn poll(&mut self) -> Vec<(PreviewId, VideoUpdate)> {
+        let mut updates = Vec::new();
+        for (id, tile) in &mut self.tiles {
+            updates.extend(tile.session.poll().into_iter().map(|update| (*id, update)));
+        }
+        updates
+    }
+
+    /// Queue GL-safe destruction after paint callbacks for the current frame.
+    pub fn schedule_cleanup(&self, ctx: &egui::Context) {
+        if self.cleanup_queue.lock().is_empty() {
+            return;
+        }
+        let queue = self.cleanup_queue.clone();
+        let callback = egui::PaintCallback {
+            rect: ctx.screen_rect(),
+            callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_info, painter| {
+                let retired = std::mem::take(&mut *queue.lock());
+                for renderer in retired {
+                    renderer.cleanup(painter.gl());
+                }
+            })),
+        };
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("libmpv_cleanup"),
+        ))
+        .add(callback);
+    }
+
+    pub fn cleanup_all(&mut self, gl: &glow::Context) {
+        self.clear();
+        let retired = std::mem::take(&mut *self.cleanup_queue.lock());
+        for renderer in retired {
+            renderer.cleanup(gl);
+        }
+        self.api = None;
+    }
+}
+
+fn parse_track_selection(value: Option<String>) -> TrackSelection {
+    match value.as_deref() {
+        None | Some("no") => TrackSelection::Disabled,
+        Some(value) => value
+            .parse::<i64>()
+            .map(TrackSelection::Id)
+            .unwrap_or_else(|_| TrackSelection::Other(value.to_owned())),
+    }
+}
+
+fn cstring(value: &str) -> Result<CString, String> {
+    CString::new(value).map_err(|_| "A video value contained an embedded null byte".to_owned())
+}
+
+#[link(name = "opengl32")]
+extern "system" {
+    fn wglGetProcAddress(name: *const c_char) -> *mut c_void;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetModuleHandleA(name: *const c_char) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+}
+
+unsafe extern "C" fn get_gl_proc_address(
+    _context: *mut c_void,
+    name: *const c_char,
+) -> *mut c_void {
+    let address = wglGetProcAddress(name);
+    let invalid =
+        address.is_null() || matches!(address as usize, 1 | 2 | 3) || address as isize == -1;
+    if !invalid {
+        return address;
+    }
+    let module = GetModuleHandleA(b"opengl32.dll\0".as_ptr().cast());
+    if module.is_null() {
+        ptr::null_mut()
+    } else {
+        GetProcAddress(module, name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_runtime_initializes_and_accepts_immediate_controls() {
+        let api = MpvApi::load(Path::new("mpv.exe")).expect("load bundled libmpv");
+        let mut core = MpvCore::new(api, true, true).expect("initialize network-tuned libmpv");
+        core.set_property("pause", "no").expect("resume");
+        core.set_property("pause", "yes").expect("pause");
+        core.set_property("volume", "37").expect("set volume");
+        core.destroy_without_render_context();
+    }
+
+    #[test]
+    #[ignore = "requires PLURIVIEW_TEST_VIDEO and a desktop OpenGL context"]
+    fn direct_renderer_pause_then_resume_advances_a_real_video() {
+        use windows::Win32::{
+            Foundation::HWND,
+            Graphics::{
+                Gdi::{GetDC, ReleaseDC},
+                OpenGL::{
+                    wglCreateContext, wglDeleteContext, wglMakeCurrent, ChoosePixelFormat,
+                    SetPixelFormat, PFD_DOUBLEBUFFER, PFD_DRAW_TO_WINDOW, PFD_MAIN_PLANE,
+                    PFD_SUPPORT_OPENGL, PFD_TYPE_RGBA, PIXELFORMATDESCRIPTOR,
+                },
+            },
+        };
+
+        let media = PathBuf::from(
+            std::env::var_os("PLURIVIEW_TEST_VIDEO").expect("set PLURIVIEW_TEST_VIDEO"),
+        );
+        assert!(
+            media.is_file(),
+            "test video does not exist: {}",
+            media.display()
+        );
+
+        let host = crate::video::VideoHost::new(None, 320, 180).expect("create WGL test window");
+        let hwnd = HWND(host.hwnd() as *mut c_void);
+        let dc = unsafe { GetDC(hwnd) };
+        assert!(!dc.is_invalid(), "get window DC");
+        let descriptor = PIXELFORMATDESCRIPTOR {
+            nSize: std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u16,
+            nVersion: 1,
+            dwFlags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+            iPixelType: PFD_TYPE_RGBA,
+            cColorBits: 32,
+            cDepthBits: 24,
+            cStencilBits: 8,
+            iLayerType: PFD_MAIN_PLANE.0 as u8,
+            ..Default::default()
+        };
+        let format = unsafe { ChoosePixelFormat(dc, &descriptor) };
+        assert!(format > 0, "choose pixel format");
+        unsafe { SetPixelFormat(dc, format, &descriptor) }.expect("set pixel format");
+        let context = unsafe { wglCreateContext(dc) }.expect("create WGL context");
+        unsafe { wglMakeCurrent(dc, context) }.expect("make WGL context current");
+        let gl = unsafe {
+            glow::Context::from_loader_function(|name| {
+                let name = CString::new(name).expect("OpenGL symbol name");
+                get_gl_proc_address(ptr::null_mut(), name.as_ptr()).cast_const()
+            })
+        };
+
+        let api = MpvApi::load(Path::new("mpv.exe")).expect("load bundled libmpv");
+        let renderer = VideoRenderer::new(api, false, false).expect("create renderer");
+        let launch = VideoLaunch {
+            mpv_path: PathBuf::from("mpv.exe"),
+            source: video::VideoSource::LocalFile(media),
+            start_paused: false,
+        };
+        let mut session = VideoSession::new(renderer.clone(), &launch).expect("create session");
+        // Keep the diagnostic silent even when the supplied video has audio;
+        // libmpv still initializes and advances the audio pipeline.
+        session.set_volume(0.0).expect("mute diagnostic playback");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 180.0));
+        let info = || egui::PaintCallbackInfo {
+            viewport: rect,
+            clip_rect: rect,
+            pixels_per_point: 1.0,
+            screen_size_px: [320, 180],
+        };
+        let mut paint_samples = Vec::new();
+        let mut poll_samples = Vec::new();
+        macro_rules! timed {
+            ($samples:expr, $operation:expr) => {{
+                let started = Instant::now();
+                let result = $operation;
+                $samples.push(started.elapsed());
+                result
+            }};
+        }
+
+        let start_deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < start_deadline {
+            timed!(paint_samples, renderer.paint(info(), &gl));
+            let _ = timed!(poll_samples, session.poll());
+            if session.state.time_pos.is_some_and(|time| time > 0.2) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+        let before_pause = session.state.time_pos.expect("video did not start");
+        if std::env::var_os("PLURIVIEW_TEST_REQUIRE_HWDEC").is_some() {
+            let hwdec = renderer
+                .core
+                .lock()
+                .property("hwdec-current")
+                .unwrap_or_default();
+            assert!(
+                !hwdec.is_empty() && hwdec != "no",
+                "hardware decoding was not activated"
+            );
+        }
+        if std::env::var_os("PLURIVIEW_TEST_REQUIRE_AUDIO").is_some() {
+            assert!(
+                session
+                    .state
+                    .track_list
+                    .iter()
+                    .any(|track| track.kind == "audio"),
+                "the diagnostic media has no audio track"
+            );
+            assert!(
+                !matches!(session.state.audio_track, TrackSelection::Disabled),
+                "libmpv did not select the audio track"
+            );
+        }
+        session.set_paused(true).expect("pause video");
+        for _ in 0..20 {
+            timed!(paint_samples, renderer.paint(info(), &gl));
+            let _ = timed!(poll_samples, session.poll());
+            thread::sleep(Duration::from_millis(16));
+        }
+        let paused_at = session.state.time_pos.expect("paused position");
+        assert!(
+            (paused_at - before_pause).abs() < 0.12,
+            "pause was delayed: {before_pause:.3} -> {paused_at:.3}"
+        );
+
+        session.play().expect("resume video");
+        let resume_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < resume_deadline {
+            timed!(paint_samples, renderer.paint(info(), &gl));
+            let _ = timed!(poll_samples, session.poll());
+            if session
+                .state
+                .time_pos
+                .is_some_and(|time| time > paused_at + 0.2)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+        assert!(
+            session
+                .state
+                .time_pos
+                .is_some_and(|time| time > paused_at + 0.2),
+            "video did not advance after Play"
+        );
+
+        if std::env::var_os("PLURIVIEW_TEST_PROFILE").is_some() {
+            let summarize = |samples: &[Duration]| {
+                let total = samples.iter().copied().sum::<Duration>();
+                let average = total.as_secs_f64() * 1_000.0 / samples.len().max(1) as f64;
+                let max = samples.iter().copied().max().unwrap_or_default();
+                (samples.len(), average, max.as_secs_f64() * 1_000.0)
+            };
+            let (paint_count, paint_average, paint_max) = summarize(&paint_samples);
+            let (poll_count, poll_average, poll_max) = summarize(&poll_samples);
+            eprintln!(
+                "libmpv profile: paint n={paint_count} avg={paint_average:.3}ms max={paint_max:.3}ms; poll n={poll_count} avg={poll_average:.3}ms max={poll_max:.3}ms"
+            );
+        }
+
+        renderer.cleanup(&gl);
+        drop(gl);
+        unsafe {
+            wglMakeCurrent(None, None).expect("release WGL context");
+            wglDeleteContext(context).expect("delete WGL context");
+            let _ = ReleaseDC(hwnd, dc);
+        }
+        drop(host);
+    }
+}

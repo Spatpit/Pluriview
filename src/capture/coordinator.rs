@@ -1,6 +1,7 @@
 use crate::privacy;
 use crate::preview::{PreviewManager, PreviewId};
 use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -39,6 +40,10 @@ struct CaptureSession {
     /// a different slot, so an old worker can never publish a stale frame into it.
     latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
 
+    /// Stops Windows Graphics Capture directly, even when a static window is
+    /// no longer producing frame callbacks.
+    stop_sender: Sender<()>,
+
     worker: Option<JoinHandle<()>>,
 }
 
@@ -52,8 +57,11 @@ impl CaptureCoordinator {
 
     /// Start capturing a window for a preview
     pub fn start_capture(&mut self, preview_id: PreviewId, hwnd: isize, window_title: String, target_fps: u32) {
-        // Stop existing capture for this preview if any
-        self.stop_capture(preview_id);
+        // Windows Graphics Capture rejects a second session on the same HWND
+        // while the previous one is still shutting down. Replacing a live
+        // tile must wait for that release, or the new session fails and the
+        // preview stays on its last frame until the host is recreated.
+        self.retire_session(preview_id, true);
 
         let active = Arc::new(AtomicBool::new(true));
         let paused = Arc::new(AtomicBool::new(false));
@@ -63,6 +71,7 @@ impl CaptureCoordinator {
         let paused_clone = paused.clone();
         let fps_clone = fps.clone();
         let worker_frame = latest_frame.clone();
+        let (stop_sender, stop_receiver) = mpsc::channel();
 
         // Start capture in a new thread
         let worker = std::thread::spawn(move || {
@@ -74,6 +83,7 @@ impl CaptureCoordinator {
                 active_clone,
                 paused_clone,
                 worker_frame,
+                stop_receiver,
             );
         });
 
@@ -82,6 +92,7 @@ impl CaptureCoordinator {
             active,
             paused,
             latest_frame,
+            stop_sender,
             worker: Some(worker),
         };
 
@@ -90,12 +101,34 @@ impl CaptureCoordinator {
 
     /// Stop capturing for a preview
     pub fn stop_capture(&mut self, preview_id: PreviewId) {
+        self.retire_session(preview_id, false);
+    }
+
+    /// True while a capture worker is still attached and producing a session.
+    #[cfg(test)]
+    pub fn is_live(&self, preview_id: PreviewId) -> bool {
+        self.sessions.get(&preview_id).is_some_and(|session| {
+            session.active.load(Ordering::Relaxed)
+                && session
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished())
+        })
+    }
+
+    fn retire_session(&mut self, preview_id: PreviewId, join: bool) {
         if let Some(mut session) = self.sessions.remove(&preview_id) {
-            // Signal the capture thread to stop
             session.active.store(false, Ordering::Relaxed);
+            let _ = session.stop_sender.send(());
             session.latest_frame.lock().take();
             if let Some(worker) = session.worker.take() {
-                self.retired_workers.push(worker);
+                if join {
+                    if worker.join().is_err() {
+                        log::error!("Capture worker panicked");
+                    }
+                } else {
+                    self.retired_workers.push(worker);
+                }
             }
         }
         self.reap_finished_workers();
@@ -124,6 +157,7 @@ impl CaptureCoordinator {
     pub fn stop_all(&mut self) {
         for (_, mut session) in self.sessions.drain() {
             session.active.store(false, Ordering::Relaxed);
+            let _ = session.stop_sender.send(());
             session.latest_frame.lock().take();
             if let Some(worker) = session.worker.take() {
                 self.retired_workers.push(worker);
@@ -217,6 +251,7 @@ fn capture_window_loop(
     active: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
+    stop_receiver: Receiver<()>,
 ) {
     use windows_capture::{
         capture::{Context, GraphicsCaptureApiHandler},
@@ -307,6 +342,7 @@ fn capture_window_loop(
         }
 
         fn on_closed(&mut self) -> Result<(), Self::Error> {
+            self.active.store(false, Ordering::Relaxed);
             log::info!("Capture closed for preview {:?}", self.preview_id);
             Ok(())
         }
@@ -324,7 +360,7 @@ fn capture_window_loop(
     let flags = CaptureFlags {
         preview_id,
         latest_frame,
-        active,
+        active: active.clone(),
         paused,
         fps: target_fps,
     };
@@ -340,9 +376,23 @@ fn capture_window_loop(
         flags,
     );
 
-    // Start capture - this blocks until capture is stopped
-    if let Err(e) = Capture::start(settings) {
-        log::error!("Failed to start capture: {}", e);
+    // Keep an explicit CaptureControl so static/paused windows can be stopped
+    // without waiting for another frame callback to arrive.
+    match Capture::start_free_threaded(settings) {
+        Ok(control) => {
+            while active.load(Ordering::Relaxed) {
+                match stop_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+            if let Err(error) = control.stop() {
+                log::error!("Failed to stop capture: {error}");
+            }
+        }
+        Err(error) => {
+            log::error!("Failed to start capture: {error}");
+        }
     }
     completion_active.store(false, Ordering::Relaxed);
 }
@@ -353,15 +403,18 @@ mod tests {
     use crate::preview::{PreviewId, PreviewManager};
     use eframe::egui::{Pos2, Vec2};
     use parking_lot::Mutex;
+    use std::sync::mpsc;
     use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::sync::Arc;
 
     fn session(fps: u32, active: bool, paused: bool) -> CaptureSession {
+        let (stop_sender, _stop_receiver) = mpsc::channel();
         CaptureSession {
             target_fps: Arc::new(AtomicU32::new(fps)),
             active: Arc::new(AtomicBool::new(active)),
             paused: Arc::new(AtomicBool::new(paused)),
             latest_frame: Arc::new(Mutex::new(None)),
+            stop_sender,
             worker: None,
         }
     }
@@ -401,6 +454,8 @@ mod tests {
         coordinator.sessions.insert(PreviewId(4), session(120, false, false));
 
         assert_eq!(coordinator.max_live_fps(), Some(30));
+        assert!(!coordinator.is_live(PreviewId(1)));
+        assert!(!coordinator.is_live(PreviewId(4)));
     }
 
     #[test]
@@ -427,4 +482,56 @@ mod tests {
         assert_eq!(previews.get(preview_id).unwrap().frame_size, Some((2, 2)));
         assert_eq!(stale_slot.lock().as_ref().unwrap().width, 1);
     }
+
+    #[test]
+    fn replacing_a_session_joins_the_previous_worker() {
+        let preview_id = PreviewId(91);
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = stop_receiver.recv();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        });
+        let mut coordinator = CaptureCoordinator::new();
+        coordinator.sessions.insert(
+            preview_id,
+            CaptureSession {
+                target_fps: Arc::new(AtomicU32::new(30)),
+                active: Arc::new(AtomicBool::new(true)),
+                paused: Arc::new(AtomicBool::new(false)),
+                latest_frame: Arc::new(Mutex::new(None)),
+                stop_sender,
+                worker: Some(worker),
+            },
+        );
+
+        let started = std::time::Instant::now();
+        coordinator.retire_session(preview_id, true);
+
+        assert!(started.elapsed() >= std::time::Duration::from_millis(40));
+        assert!(!coordinator.sessions.contains_key(&preview_id));
+    }
+
+    #[test]
+    fn stopping_a_static_capture_signals_the_worker_directly() {
+        let preview_id = PreviewId(88);
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let mut coordinator = CaptureCoordinator::new();
+        coordinator.sessions.insert(
+            preview_id,
+            CaptureSession {
+                target_fps: Arc::new(AtomicU32::new(30)),
+                active: Arc::new(AtomicBool::new(true)),
+                paused: Arc::new(AtomicBool::new(false)),
+                latest_frame: Arc::new(Mutex::new(None)),
+                stop_sender,
+                worker: None,
+            },
+        );
+
+        coordinator.stop_capture(preview_id);
+
+        assert!(stop_receiver.try_recv().is_ok());
+        assert!(!coordinator.sessions.contains_key(&preview_id));
+    }
+
 }

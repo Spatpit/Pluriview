@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use std::fs;
-use super::{SavedLayout, WorkspaceIndex};
 use super::workspace::is_valid_workspace_id;
+use super::{AppConfig, SavedLayout, WorkspaceIndex};
+use std::fs;
+use std::path::PathBuf;
 
 /// File storage for layouts and config
 pub struct Storage {
@@ -17,8 +17,7 @@ impl Storage {
         // own ignored data folder instead.
         #[cfg(debug_assertions)]
         {
-            let development_dir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pluriview_data");
+            let development_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pluriview_data");
             if fs::create_dir_all(&development_dir).is_ok() {
                 return Some(Self {
                     data_dir: development_dir,
@@ -33,23 +32,48 @@ impl Storage {
 
                 // If portable directory exists or we can create it
                 if portable_dir.exists() || fs::create_dir_all(&portable_dir).is_ok() {
-                    return Some(Self { data_dir: portable_dir });
+                    return Some(Self {
+                        data_dir: portable_dir,
+                    });
                 }
             }
         }
 
         // Fallback to standard app data directory
-        directories::ProjectDirs::from("com", "pluriview", "Pluriview")
-            .map(|dirs| {
-                let data_dir = dirs.data_dir().to_path_buf();
-                let _ = fs::create_dir_all(&data_dir);
-                Self { data_dir }
-            })
+        directories::ProjectDirs::from("com", "pluriview", "Pluriview").map(|dirs| {
+            let data_dir = dirs.data_dir().to_path_buf();
+            let _ = fs::create_dir_all(&data_dir);
+            Self { data_dir }
+        })
     }
 
     /// Get auto-save path
     pub fn autosave_path(&self) -> PathBuf {
         self.data_dir.join("autosave.json")
+    }
+
+    /// App-global settings path (independent of the active workspace).
+    pub fn config_path(&self) -> PathBuf {
+        self.data_dir.join("config.json")
+    }
+
+    /// Save app-global settings.
+    pub fn save_config(&self, config: &AppConfig) -> Result<(), std::io::Error> {
+        let json = serde_json::to_string_pretty(config)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        fs::write(self.config_path(), json)
+    }
+
+    /// Load app-global settings. A first run without config.json uses defaults.
+    pub fn load_config(&self) -> Result<AppConfig, Box<dyn std::error::Error>> {
+        let path = self.config_path();
+        if !path.exists() {
+            let config = AppConfig::default();
+            self.save_config(&config)?;
+            return Ok(config);
+        }
+        let json = fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&json)?)
     }
 
     fn workspace_index_path(&self) -> PathBuf {
@@ -84,8 +108,12 @@ impl Storage {
     pub fn import_media(&self, source: &std::path::Path) -> Result<String, std::io::Error> {
         let media_dir = self.media_dir()?;
         let source = source.canonicalize()?;
-        let original_name = source.file_name().and_then(|name| name.to_str())
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid image filename"))?;
+        let original_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid image filename")
+            })?;
 
         if source.parent().is_some_and(|parent| {
             parent.canonicalize().ok().as_deref() == media_dir.canonicalize().ok().as_deref()
@@ -94,7 +122,10 @@ impl Storage {
         }
 
         let original_path = std::path::Path::new(original_name);
-        let stem = original_path.file_stem().and_then(|value| value.to_str()).unwrap_or("image");
+        let stem = original_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("image");
         let extension = original_path.extension().and_then(|value| value.to_str());
         let mut suffix = 1u32;
         let destination = loop {
@@ -210,7 +241,7 @@ impl Default for Storage {
 #[cfg(test)]
 mod tests {
     use super::Storage;
-    use crate::persistence::{SavedLayout, WorkspaceIndex};
+    use crate::persistence::{AppConfig, SavedLayout, WorkspaceIndex};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -220,11 +251,16 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("pluriview-storage-test-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "pluriview-storage-test-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).unwrap();
         let source = root.join("sample.png");
         fs::write(&source, b"test image bytes").unwrap();
-        let storage = Storage { data_dir: root.clone() };
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
 
         assert_eq!(storage.import_media(&source).unwrap(), "sample.png");
         assert_eq!(storage.import_media(&source).unwrap(), "sample_2.png");
@@ -236,9 +272,35 @@ mod tests {
     }
 
     #[test]
+    fn app_config_is_stored_at_the_data_root() {
+        let root = temp_root("app-config");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let defaults = storage.load_config().unwrap();
+        assert!(defaults.external_tools.mpv_path.is_none());
+        assert!(storage.config_path().exists());
+
+        let mut config = AppConfig::default();
+        config.external_tools.mpv_path = Some(std::path::PathBuf::from(r"C:\Tools\mpv.exe"));
+
+        storage.save_config(&config).unwrap();
+        let restored = storage.load_config().unwrap();
+
+        assert_eq!(storage.config_path(), root.join("config.json"));
+        assert_eq!(
+            restored.external_tools.mpv_path,
+            config.external_tools.mpv_path
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn legacy_autosave_is_copied_into_the_default_workspace() {
         let root = temp_root("workspace-migration");
-        let storage = Storage { data_dir: root.clone() };
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
         let mut legacy = SavedLayout::new();
         legacy.canvas.zoom = 1.75;
         storage.save_autosave(&legacy).unwrap();
@@ -255,13 +317,17 @@ mod tests {
     #[test]
     fn workspace_names_do_not_affect_layout_paths() {
         let root = temp_root("workspace-paths");
-        let storage = Storage { data_dir: root.clone() };
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
         let mut index = WorkspaceIndex::default();
         let id = index.add("../../Research: Q3".to_owned());
         storage.save_workspace(&id, &SavedLayout::new()).unwrap();
 
         assert!(root.join("workspaces").join(format!("{id}.json")).exists());
-        assert!(storage.save_workspace("../outside", &SavedLayout::new()).is_err());
+        assert!(storage
+            .save_workspace("../outside", &SavedLayout::new())
+            .is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -270,10 +336,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "pluriview-{label}-{}-{nonce}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("pluriview-{label}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         root
     }

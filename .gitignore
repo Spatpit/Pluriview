@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 /dist/
+/vendor/
 /pluriview_data/
 **/*.rs.bk
 

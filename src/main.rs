@@ -10,10 +10,15 @@ mod tray;
 mod overlay;
 mod privacy;
 mod media;
+mod external_tools;
 #[cfg(windows)]
 mod browser;
 #[cfg(windows)]
 mod audio;
+#[cfg(windows)]
+mod video;
+#[cfg(windows)]
+mod libmpv;
 
 use app::PluriviewApp;
 use eframe::egui;

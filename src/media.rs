@@ -8,6 +8,22 @@ use std::time::Duration;
 /// Avoid allowing a pathological animation to consume unbounded memory.
 const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
+const VIDEO_EXTENSIONS: [&str; 15] = [
+    "mp4", "mkv", "webm", "avi", "mov", "m4v", "wmv", "flv", "mpeg", "mpg", "ts", "m2ts",
+    "3gp", "ogv", "mts",
+];
+
+/// Whether a path has one of the video extensions exposed by the native file
+/// picker. MPV still performs the authoritative media validation at launch.
+pub fn is_supported_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            VIDEO_EXTENSIONS
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
 
 #[derive(Clone)]
 pub struct MediaFrame {
@@ -101,9 +117,8 @@ fn validate_frame_size(width: u32, height: u32, decoded_bytes: usize) -> Result<
     Ok(())
 }
 
-/// Show the native Windows image picker. Cancellation is not an error.
 #[cfg(windows)]
-pub fn pick_file(owner: Option<isize>) -> Option<PathBuf> {
+fn pick_file_with_filter(owner: Option<isize>, filter_text: &str, title_text: &str) -> Option<PathBuf> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Controls::Dialogs::{
@@ -111,15 +126,15 @@ pub fn pick_file(owner: Option<isize>) -> Option<PathBuf> {
     };
 
     let mut path = vec![0u16; 32_768];
-    let filter: Vec<u16> = "Images (*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp)\0*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp\0All files (*.*)\0*.*\0\0"
-        .encode_utf16()
-        .collect();
+    let filter: Vec<u16> = filter_text.encode_utf16().collect();
+    let title: Vec<u16> = format!("{title_text}\0").encode_utf16().collect();
     let mut dialog = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner.map_or_else(HWND::default, |hwnd| HWND(hwnd as *mut _)),
         lpstrFilter: PCWSTR(filter.as_ptr()),
         lpstrFile: PWSTR(path.as_mut_ptr()),
         nMaxFile: path.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
         Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
         ..Default::default()
     };
@@ -129,10 +144,35 @@ pub fn pick_file(owner: Option<isize>) -> Option<PathBuf> {
             .iter()
             .position(|unit| *unit == 0)
             .unwrap_or(path.len());
-        Some(PathBuf::from(String::from_utf16_lossy(&path[..length])))
+        let path = PathBuf::from(String::from_utf16_lossy(&path[..length]));
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            std::env::current_dir().ok().map(|directory| directory.join(path))
+        }
     } else {
         None
     }
+}
+
+/// Show the native Windows image picker. Cancellation is not an error.
+#[cfg(windows)]
+pub fn pick_file(owner: Option<isize>) -> Option<PathBuf> {
+    pick_file_with_filter(
+        owner,
+        "Images (*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp)\0*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp\0All files (*.*)\0*.*\0\0",
+        "Add Image",
+    )
+}
+
+/// Show the native Windows video picker without importing or copying the file.
+#[cfg(windows)]
+pub fn pick_video_file(owner: Option<isize>) -> Option<PathBuf> {
+    pick_file_with_filter(
+        owner,
+        "Videos (*.mp4;*.mkv;*.webm;*.avi;*.mov;*.m4v;*.wmv;*.flv;*.mpeg;*.mpg;*.ts;*.m2ts;*.3gp;*.ogv)\0*.mp4;*.mkv;*.webm;*.avi;*.mov;*.m4v;*.wmv;*.flv;*.mpeg;*.mpg;*.ts;*.m2ts;*.3gp;*.ogv\0All files (*.*)\0*.*\0\0",
+        "Add Video",
+    )
 }
 
 #[cfg(not(windows))]
@@ -140,13 +180,26 @@ pub fn pick_file(_owner: Option<isize>) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(windows))]
+pub fn pick_video_file(_owner: Option<isize>) -> Option<PathBuf> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::load;
+    use super::{is_supported_video_path, load};
     use image::codecs::gif::{GifEncoder, Repeat};
     use image::{Delay, Frame, Rgba, RgbaImage};
     use std::fs::{self, File};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn common_video_extensions_are_detected_case_insensitively() {
+        assert!(is_supported_video_path(std::path::Path::new("clip.MP4")));
+        assert!(is_supported_video_path(std::path::Path::new("recording.mkv")));
+        assert!(!is_supported_video_path(std::path::Path::new("poster.png")));
+        assert!(!is_supported_video_path(std::path::Path::new("extensionless")));
+    }
 
     #[test]
     fn animated_gif_keeps_frames_and_authored_timing() {

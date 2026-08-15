@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Local video files can be dropped onto the canvas and start in MPV immediately
+- Hovering a local or seekable on-demand video's seek bar shows a debounced frame preview without interrupting playback
+- MPV and Streamlink tiles have an in-place reload action for stopped or failed playback
+
+### Fixed
+- Play/pause and volume controls update immediately and ignore stale MPV acknowledgements instead of lagging or reversing the requested state
+- Play resumes the existing MPV process instead of recreating it, and leaves a healthy Windows capture session running so pause/play does not freeze or blank the tile
+
 ## [0.5.1] - 2026-08-10
 
 ### Fixed

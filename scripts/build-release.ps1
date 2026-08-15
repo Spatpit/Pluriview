@@ -85,13 +85,22 @@ try {
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash
     $distDirectory = Join-Path $workspace "dist"
     $distExecutable = Join-Path $distDirectory "pluriview.exe"
+    $libmpvSource = Join-Path $workspace "vendor\libmpv-2.dll"
+    $distLibmpv = Join-Path $distDirectory "libmpv-2.dll"
+    if (-not (Test-Path -LiteralPath $libmpvSource -PathType Leaf)) {
+        throw "The libmpv runtime is missing. Run .\scripts\prepare-libmpv.ps1, then build again."
+    }
     New-Item -ItemType Directory -Path $distDirectory -Force | Out-Null
     Copy-Item -LiteralPath $executable -Destination $distExecutable -Force
+    Copy-Item -LiteralPath $libmpvSource -Destination $distLibmpv -Force
+
+    $libmpvHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distLibmpv).Hash
 
     Write-Host "Privacy-safe release executable: $executable"
     Write-Host "Persistent release executable: $distExecutable"
-    Write-Host "SHA-256: $hash"
-    Write-Warning "Publish only pluriview.exe. Do not publish pluriview.pdb; debug symbols can contain local source paths."
+    Write-Host "Executable SHA-256: $hash"
+    Write-Host "libmpv SHA-256: $libmpvHash"
+    Write-Warning "Publish pluriview.exe together with libmpv-2.dll. Do not publish pluriview.pdb; debug symbols can contain local source paths."
 } finally {
     if ($null -eq $previousRustFlags) {
         Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue

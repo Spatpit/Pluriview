@@ -1,7 +1,9 @@
 use eframe::egui::{Pos2, Vec2};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use super::{BrowserTileStatus, Preview, PreviewId, FpsPreset, WindowHandle};
+use super::{
+    BrowserTileStatus, Preview, PreviewId, FpsPreset, VideoSource, VideoTileStatus, WindowHandle,
+};
 use crate::media::MediaFrame;
 
 /// Snapshot of a preview captured right before it's actually dropped from
@@ -21,6 +23,8 @@ pub struct RemovedPreviewInfo {
     pub browser_muted: bool,
     /// Set for managed image and GIF tiles.
     pub media_path: Option<String>,
+    /// Set for mpv-backed local video and Streamlink tiles.
+    pub video_source: Option<VideoSource>,
 }
 
 /// Manages all preview windows
@@ -122,6 +126,32 @@ impl PreviewManager {
         id
     }
 
+    /// Reserve a video tile before its mpv process and capture host are ready.
+    pub fn add_video_placeholder(
+        &mut self,
+        source: VideoSource,
+        title: String,
+        position: Pos2,
+        size: Vec2,
+        fps: FpsPreset,
+        paused_on_restore: bool,
+    ) -> PreviewId {
+        let id = self.generate_id();
+        self.max_z_order += 1;
+
+        let mut preview = Preview::new(id, title, position, size);
+        preview.z_order = self.max_z_order;
+        preview.video_source = Some(source);
+        preview.video_status = if paused_on_restore {
+            VideoTileStatus::PausedOnRestore
+        } else {
+            VideoTileStatus::Starting
+        };
+        preview.set_fps_preset(fps);
+        self.previews.insert(id, preview);
+        id
+    }
+
     /// Begin the fade/shrink-out animation for a preview. The preview stays
     /// in the manager (still rendered, but non-interactive) until its
     /// removal animation finishes and `finalize_removals` reaps it.
@@ -152,6 +182,7 @@ impl PreviewManager {
                     browser_url: preview.browser_url,
                     browser_muted: preview.browser_muted,
                     media_path: preview.media_path,
+                    video_source: preview.video_source,
                 });
             }
         }
@@ -290,8 +321,9 @@ impl Default for PreviewManager {
 
 #[cfg(test)]
 mod tests {
-    use super::PreviewManager;
+    use super::{FpsPreset, PreviewManager, VideoSource, VideoTileStatus};
     use eframe::egui::{Pos2, Vec2};
+    use std::path::PathBuf;
 
     #[test]
     fn hit_testing_returns_the_topmost_preview_without_sorting() {
@@ -310,5 +342,26 @@ mod tests {
             Some(lower)
         );
         assert_eq!(previews.get_preview_at(Pos2::new(150.0, 150.0)), None);
+    }
+
+    #[test]
+    fn restored_video_placeholder_keeps_source_and_paused_state() {
+        let mut previews = PreviewManager::new();
+        let source = VideoSource::LocalFile {
+            path: PathBuf::from(r"C:\media\saved.mp4"),
+        };
+        let id = previews.add_video_placeholder(
+            source.clone(),
+            "saved.mp4".to_owned(),
+            Pos2::new(10.0, 20.0),
+            Vec2::new(640.0, 360.0),
+            FpsPreset::High,
+            true,
+        );
+        let preview = previews.get(id).unwrap();
+
+        assert_eq!(preview.video_source.as_ref(), Some(&source));
+        assert_eq!(preview.video_status, VideoTileStatus::PausedOnRestore);
+        assert_eq!(preview.fps_preset, FpsPreset::High);
     }
 }

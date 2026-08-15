@@ -1,5 +1,6 @@
 use eframe::egui::{self, Pos2, Vec2, Rect, TextureHandle};
 use serde::{Serialize, Deserialize};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::media::MediaFrame;
@@ -25,6 +26,68 @@ pub enum BrowserTileStatus {
     PreparingAdblock { progress: f32 },
     Starting,
     Failed(String),
+}
+
+/// Persistent source for an optional mpv-backed video tile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VideoSource {
+    LocalFile { path: PathBuf },
+    Stream { url: String, quality: String },
+}
+
+/// Startup/runtime state rendered while an mpv tile has no captured frame.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VideoTileStatus {
+    Starting,
+    Ready,
+    PausedOnRestore,
+    Buffering,
+    Failed(String),
+}
+
+/// Track metadata mirrored from mpv's `track-list` property.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VideoTrack {
+    pub id: i64,
+    pub kind: String,
+    pub title: Option<String>,
+    pub language: Option<String>,
+    pub selected: bool,
+}
+
+/// Playback properties mirrored from mpv JSON IPC for canvas controls.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoPlaybackState {
+    pub connected: bool,
+    pub paused: bool,
+    pub time_pos: Option<f64>,
+    pub duration: Option<f64>,
+    pub volume: f64,
+    pub muted: bool,
+    pub speed: f64,
+    pub looping: bool,
+    pub tracks: Vec<VideoTrack>,
+    pub audio_track: Option<i64>,
+    pub subtitle_track: Option<i64>,
+}
+
+impl Default for VideoPlaybackState {
+    fn default() -> Self {
+        Self {
+            connected: false,
+            paused: true,
+            time_pos: None,
+            duration: None,
+            volume: 100.0,
+            muted: false,
+            speed: 1.0,
+            looping: false,
+            tracks: Vec::new(),
+            audio_track: None,
+            subtitle_track: None,
+        }
+    }
 }
 
 /// FPS presets for capture
@@ -119,6 +182,25 @@ pub struct Preview {
     /// Managed filename in `pluriview_data/media` for image and GIF tiles.
     pub media_path: Option<String>,
 
+    /// Local file or Streamlink URL when this is an mpv-backed video tile.
+    pub video_source: Option<VideoSource>,
+
+    /// Loading/error state for an mpv-backed video tile.
+    pub video_status: VideoTileStatus,
+
+    /// Last playback state received from mpv.
+    pub video_playback: VideoPlaybackState,
+
+    /// In-process libmpv renderer. Unlike a captured external mpv window,
+    /// this paints directly into Pluriview's OpenGL canvas.
+    #[cfg(windows)]
+    pub video_renderer: Option<std::sync::Arc<crate::libmpv::VideoRenderer>>,
+
+    /// Separately decoded frame shown while hovering a seekable video's seek bar.
+    seek_preview_time: Option<f64>,
+    seek_preview_texture: Option<TextureHandle>,
+    seek_preview_frame: Option<FrameData>,
+
     /// Decoded frames for a managed image. A single frame is a static image.
     media_frames: Vec<MediaFrame>,
     media_frame_index: usize,
@@ -165,6 +247,14 @@ impl Preview {
             browser_muted: false,
             browser_status: BrowserTileStatus::Ready,
             media_path: None,
+            video_source: None,
+            video_status: VideoTileStatus::Ready,
+            video_playback: VideoPlaybackState::default(),
+            #[cfg(windows)]
+            video_renderer: None,
+            seek_preview_time: None,
+            seek_preview_texture: None,
+            seek_preview_frame: None,
             media_frames: Vec::new(),
             media_frame_index: 0,
             media_frame_dirty: false,
@@ -182,6 +272,50 @@ impl Preview {
     /// Is this preview backed by a managed image or GIF?
     pub fn is_media(&self) -> bool {
         self.media_path.is_some()
+    }
+
+    /// Is this preview backed by an optional mpv session?
+    pub fn is_video(&self) -> bool {
+        self.video_source.is_some()
+    }
+
+    pub fn supports_seek_preview(&self) -> bool {
+        self.video_source.is_some()
+    }
+
+    pub fn update_seek_preview(&mut self, time: f64, width: u32, height: u32, data: Vec<u8>) {
+        self.seek_preview_time = Some(time);
+        self.seek_preview_frame = Some(FrameData {
+            width,
+            height,
+            data,
+        });
+    }
+
+    pub fn seek_preview_time(&self) -> Option<f64> {
+        self.seek_preview_time
+    }
+
+    pub fn get_seek_preview_texture(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<&TextureHandle> {
+        if let Some(frame) = self.seek_preview_frame.take() {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.data,
+            );
+            if let Some(texture) = self.seek_preview_texture.as_mut() {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.seek_preview_texture = Some(ctx.load_texture(
+                    format!("seek_preview_{}", self.id.0),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        self.seek_preview_texture.as_ref()
     }
 
     /// Attach decoded image data to this preview.
@@ -392,6 +526,9 @@ pub struct PreviewLayout {
     /// installs can be moved as a unit.
     #[serde(default)]
     pub media_path: Option<String>,
+    /// Optional mpv-backed local file or Streamlink source.
+    #[serde(default)]
+    pub video_source: Option<VideoSource>,
 }
 
 impl From<&Preview> for PreviewLayout {
@@ -408,13 +545,72 @@ impl From<&Preview> for PreviewLayout {
             browser_url: preview.browser_url.clone(),
             browser_muted: preview.browser_muted,
             media_path: preview.media_path.clone(),
+            video_source: preview.video_source.as_ref().map(scrub_video_source),
         }
     }
 }
 
+fn scrub_video_source(source: &VideoSource) -> VideoSource {
+    let VideoSource::Stream { url, quality } = source else {
+        return source.clone();
+    };
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return VideoSource::Stream {
+            url: String::new(),
+            quality: quality.clone(),
+        };
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_fragment(None);
+    let retained_query: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(name, _)| !is_sensitive_stream_parameter(name))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    parsed.set_query(None);
+    if !retained_query.is_empty() {
+        parsed.query_pairs_mut().extend_pairs(retained_query);
+    }
+    VideoSource::Stream {
+        url: parsed.into(),
+        quality: quality.clone(),
+    }
+}
+
+fn is_sensitive_stream_parameter(name: &str) -> bool {
+    let name = name
+        .to_ascii_lowercase()
+        .replace(['-', '.'], "_");
+    matches!(
+        name.as_str(),
+        "access_token"
+            | "api_key"
+            | "auth"
+            | "authorization"
+            | "credential"
+            | "expire"
+            | "expires"
+            | "exp"
+            | "jwt"
+            | "key"
+            | "password"
+            | "policy"
+            | "secret"
+            | "sig"
+            | "signature"
+            | "token"
+    ) || name.ends_with("_token")
+        || name.ends_with("_key")
+        || name.ends_with("_password")
+        || name.ends_with("_signature")
+        || name.contains("credential")
+        || name.starts_with("x_amz_")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Preview, PreviewId, PreviewLayout};
+    use super::{Preview, PreviewId, PreviewLayout, VideoSource};
     use crate::media::MediaFrame;
     use eframe::egui::{Context, Pos2, Vec2};
     use std::time::Duration;
@@ -461,5 +657,64 @@ mod tests {
 
         let restored: PreviewLayout = serde_json::from_value(value).unwrap();
         assert!(restored.media_path.is_none());
+    }
+
+    #[test]
+    fn older_saved_tiles_default_to_no_video() {
+        let preview = Preview::new(PreviewId(1), "test".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        value.as_object_mut().unwrap().remove("video_source");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.video_source.is_none());
+    }
+
+    #[test]
+    fn video_source_round_trips_through_layout() {
+        let mut preview = Preview::new(PreviewId(1), "stream".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        preview.video_source = Some(VideoSource::Stream {
+            url: "https://twitch.tv/example".to_owned(),
+            quality: "best".to_owned(),
+        });
+
+        let value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.video_source, preview.video_source);
+    }
+
+    #[test]
+    fn persisted_stream_urls_remove_credentials_and_tokens() {
+        let mut preview = Preview::new(PreviewId(1), "stream".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        preview.video_source = Some(VideoSource::Stream {
+            url: "https://user:password@youtube.com/watch?v=abc123&token=secret&sig=private&api_key=hidden&password=hidden&expire=1&X-Amz-Credential=hidden&X-Amz-Signature=hidden#chat".to_owned(),
+            quality: "best".to_owned(),
+        });
+
+        let layout = PreviewLayout::from(&preview);
+        assert_eq!(
+            layout.video_source,
+            Some(VideoSource::Stream {
+                url: "https://youtube.com/watch?v=abc123".to_owned(),
+                quality: "best".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn unparseable_stream_urls_are_not_persisted_verbatim() {
+        let mut preview = Preview::new(PreviewId(1), "stream".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        preview.video_source = Some(VideoSource::Stream {
+            url: "not a url with token=secret".to_owned(),
+            quality: "best".to_owned(),
+        });
+
+        let layout = PreviewLayout::from(&preview);
+        assert_eq!(
+            layout.video_source,
+            Some(VideoSource::Stream {
+                url: String::new(),
+                quality: "best".to_owned(),
+            })
+        );
     }
 }
