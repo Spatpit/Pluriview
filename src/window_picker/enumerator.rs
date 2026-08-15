@@ -2,15 +2,13 @@ use crate::privacy;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, GetWindowLongW, GWL_EXSTYLE,
-    WS_EX_TOOLWINDOW, WS_EX_APPWINDOW,
-    GetClassNameW, GetAncestor, GA_ROOTOWNER,
-};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetAncestor, GetClassNameW, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, GA_ROOTOWNER, GWL_EXSTYLE, WS_EX_APPWINDOW,
+    WS_EX_TOOLWINDOW,
 };
 
 /// Information about a window
@@ -123,9 +121,9 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
 
     // Skip certain system classes
     let skip_classes = [
-        "Progman",            // Program Manager
-        "WorkerW",            // Desktop background
-        "Shell_TrayWnd",      // Taskbar
+        "Progman",                    // Program Manager
+        "WorkerW",                    // Desktop background
+        "Shell_TrayWnd",              // Taskbar
         "Windows.UI.Core.CoreWindow", // Some UWP overlay windows
     ];
 
@@ -166,7 +164,14 @@ fn get_process_name(process_id: u32) -> String {
         let mut buffer: Vec<u16> = vec![0; 260];
         let mut size = buffer.len() as u32;
 
-        let result = if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, windows::core::PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
+        let result = if QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        )
+        .is_ok()
+        {
             let path = OsString::from_wide(&buffer[..size as usize])
                 .to_string_lossy()
                 .to_string();

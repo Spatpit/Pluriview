@@ -1,9 +1,8 @@
-use tray_icon::{
-    TrayIcon, TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    Icon,
-};
 use std::sync::OnceLock;
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    Icon, TrayIcon, TrayIconBuilder,
+};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, SetForegroundWindow, ShowWindow, SW_MINIMIZE, SW_RESTORE, WM_CLOSE,
@@ -81,7 +80,8 @@ impl TrayManager {
             &hide_item,
             &PredefinedMenuItem::separator(),
             &quit_item,
-        ]).ok()?;
+        ])
+        .ok()?;
 
         // Create a simple icon (blue square with P)
         let icon = create_default_icon()?;
@@ -126,8 +126,8 @@ pub(crate) fn create_leaf_rgba(size: u32) -> Vec<u8> {
     let sin_a = angle.sin();
 
     // Colors
-    let base_color = (107u8, 170u8, 75u8);  // Main green
-    let dark_color = (70u8, 125u8, 50u8);   // Vein color
+    let base_color = (107u8, 170u8, 75u8); // Main green
+    let dark_color = (70u8, 125u8, 50u8); // Vein color
 
     // Draw each pixel
     for y in 0..size {
@@ -154,7 +154,8 @@ pub(crate) fn create_leaf_rgba(size: u32) -> Vec<u8> {
 
                 if dist_from_center <= half_width {
                     // Inside leaf - check if on vein
-                    let on_main_vein = dist_from_center < size as f64 / 18.0 && t > 0.08 && t < 0.92;
+                    let on_main_vein =
+                        dist_from_center < size as f64 / 18.0 && t > 0.08 && t < 0.92;
 
                     // Check side veins
                     let mut on_side_vein = false;
@@ -172,7 +173,9 @@ pub(crate) fn create_leaf_rgba(size: u32) -> Vec<u8> {
                             let expected_y_offset = expected_x_offset * 0.35;
                             let actual_y = vein_y - expected_y_offset;
 
-                            if (uy - actual_y).abs() < size as f64 / 25.0 && expected_x_offset < vein_len {
+                            if (uy - actual_y).abs() < size as f64 / 25.0
+                                && expected_x_offset < vein_len
+                            {
                                 on_side_vein = true;
                                 break;
                             }
@@ -185,10 +188,10 @@ pub(crate) fn create_leaf_rgba(size: u32) -> Vec<u8> {
                         base_color
                     };
 
-                    rgba[idx] = color.0;     // R
+                    rgba[idx] = color.0; // R
                     rgba[idx + 1] = color.1; // G
                     rgba[idx + 2] = color.2; // B
-                    rgba[idx + 3] = 255;     // A
+                    rgba[idx + 3] = 255; // A
                 }
             }
         }

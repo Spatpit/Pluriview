@@ -1,5 +1,5 @@
 mod enumerator;
 mod picker;
 
-pub use enumerator::{WindowInfo, enumerate_windows};
-pub use picker::{WindowPicker, spawn_preview};
+pub use enumerator::{enumerate_windows, WindowInfo};
+pub use picker::{spawn_preview, WindowPicker};

@@ -1,8 +1,8 @@
-use eframe::egui::{self, Pos2, Vec2, Rounding, Stroke, RichText};
-use super::{WindowInfo, enumerate_windows};
-use crate::preview::PreviewManager;
-use crate::capture::CaptureCoordinator;
+use super::{enumerate_windows, WindowInfo};
 use crate::canvas::CanvasState;
+use crate::capture::CaptureCoordinator;
+use crate::preview::PreviewManager;
+use eframe::egui::{self, Pos2, RichText, Rounding, Stroke, Vec2};
 use std::borrow::Cow;
 
 /// Window picker panel state
@@ -80,7 +80,7 @@ impl WindowPicker {
                 ui.label(
                     RichText::new(egui_phosphor::regular::MAGNIFYING_GLASS)
                         .size(14.0)
-                        .color(text_secondary)
+                        .color(text_secondary),
                 );
                 ui.add_space(6.0);
 
@@ -89,14 +89,15 @@ impl WindowPicker {
                     egui::TextEdit::singleline(&mut self.search_filter)
                         .desired_width(ui.available_width())
                         .hint_text(RichText::new("Search windows...").color(text_secondary))
-                        .frame(false)
+                        .frame(false),
                 );
                 if response.changed() {
                     self.filter_dirty = true;
                 }
 
                 // Escape clears search
-                if !self.search_filter.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if !self.search_filter.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
                     self.search_filter.clear();
                     self.filter_dirty = true;
                     response.request_focus();
@@ -112,23 +113,29 @@ impl WindowPicker {
             ui.label(
                 RichText::new(format!("{} windows", self.filtered_indices.len()))
                     .size(12.0)
-                    .color(text_secondary)
+                    .color(text_secondary),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Refresh button (subtle, icon-based)
                 let refresh_btn = ui.add(
                     egui::Button::new(
-                        RichText::new(egui_phosphor::regular::ARROW_CLOCKWISE).size(14.0)
-                    ).frame(false)
+                        RichText::new(egui_phosphor::regular::ARROW_CLOCKWISE).size(14.0),
+                    )
+                    .frame(false),
                 );
                 if refresh_btn.clicked() {
                     self.refresh();
                 }
                 if refresh_btn.hovered() {
-                    egui::show_tooltip(ui.ctx(), ui.layer_id(), egui::Id::new("refresh_tooltip"), |ui| {
-                        ui.label("Refresh window list");
-                    });
+                    egui::show_tooltip(
+                        ui.ctx(),
+                        ui.layer_id(),
+                        egui::Id::new("refresh_tooltip"),
+                        |ui| {
+                            ui.label("Refresh window list");
+                        },
+                    );
                 }
             });
         });
@@ -150,25 +157,22 @@ impl WindowPicker {
                     // Card frame
                     let (rect, response) = ui.allocate_exact_size(
                         Vec2::new(available_width, 56.0),
-                        egui::Sense::click()
+                        egui::Sense::click(),
                     );
 
                     let is_hovered = response.hovered();
                     let bg_color = if is_hovered { card_hover } else { card_bg };
 
                     // Draw card background
-                    ui.painter().rect_filled(
-                        rect,
-                        Rounding::same(6.0),
-                        bg_color
-                    );
+                    ui.painter()
+                        .rect_filled(rect, Rounding::same(6.0), bg_color);
 
                     // Draw subtle border on hover
                     if is_hovered {
                         ui.painter().rect_stroke(
                             rect,
                             Rounding::same(6.0),
-                            Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58))
+                            Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)),
                         );
                     }
 
@@ -176,17 +180,19 @@ impl WindowPicker {
                     let inner_rect = rect.shrink(10.0);
                     let text_rect = egui::Rect::from_min_max(
                         inner_rect.min,
-                        egui::Pos2::new(inner_rect.max.x - 36.0, inner_rect.max.y)
+                        egui::Pos2::new(inner_rect.max.x - 36.0, inner_rect.max.y),
                     );
                     let button_rect = egui::Rect::from_min_max(
                         egui::Pos2::new(inner_rect.max.x - 30.0, inner_rect.min.y + 8.0),
-                        egui::Pos2::new(inner_rect.max.x, inner_rect.max.y - 8.0)
+                        egui::Pos2::new(inner_rect.max.x, inner_rect.max.y - 8.0),
                     );
 
                     // Title (truncated, char-safe to avoid panics on multibyte titles)
                     let max_title_chars = ((text_rect.width() - 10.0) / 7.0) as usize;
                     let title: Cow<'_, str> = if window.title.chars().count() > max_title_chars {
-                        let kept: String = window.title.chars()
+                        let kept: String = window
+                            .title
+                            .chars()
                             .take(max_title_chars.saturating_sub(3))
                             .collect();
                         Cow::Owned(format!("{}...", kept))
@@ -200,7 +206,7 @@ impl WindowPicker {
                         egui::Align2::LEFT_TOP,
                         title.as_ref(),
                         egui::FontId::proportional(14.0),
-                        egui::Color32::WHITE
+                        egui::Color32::WHITE,
                     );
 
                     // Draw exe name
@@ -209,32 +215,42 @@ impl WindowPicker {
                         egui::Align2::LEFT_TOP,
                         &window.exe_name,
                         egui::FontId::proportional(11.0),
-                        text_secondary
+                        text_secondary,
                     );
 
                     // Add button (+ icon)
                     let btn_center = button_rect.center();
                     let btn_radius = 14.0;
-                    let btn_rect = egui::Rect::from_center_size(btn_center, Vec2::splat(btn_radius * 2.0));
+                    let btn_rect =
+                        egui::Rect::from_center_size(btn_center, Vec2::splat(btn_radius * 2.0));
 
-                    let btn_response = ui.interact(btn_rect, response.id.with("add_btn"), egui::Sense::click());
+                    let btn_response =
+                        ui.interact(btn_rect, response.id.with("add_btn"), egui::Sense::click());
                     let btn_hovered = btn_response.hovered();
 
                     // Draw + button circle
                     ui.painter().circle_filled(
                         btn_center,
                         btn_radius,
-                        if btn_hovered { accent_color } else { egui::Color32::from_rgb(60, 60, 68) }
+                        if btn_hovered {
+                            accent_color
+                        } else {
+                            egui::Color32::from_rgb(60, 60, 68)
+                        },
                     );
 
                     // Draw + icon
-                    let plus_color = if btn_hovered { egui::Color32::WHITE } else { egui::Color32::from_rgb(180, 180, 190) };
+                    let plus_color = if btn_hovered {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_rgb(180, 180, 190)
+                    };
                     ui.painter().text(
                         btn_center,
                         egui::Align2::CENTER_CENTER,
                         egui_phosphor::regular::PLUS,
                         egui::FontId::proportional(14.0),
-                        plus_color
+                        plus_color,
                     );
 
                     // Handle add button click
@@ -243,7 +259,7 @@ impl WindowPicker {
                             window,
                             preview_manager,
                             capture_coordinator,
-                            canvas
+                            canvas,
                         );
                     }
 
@@ -257,7 +273,7 @@ impl WindowPicker {
                 ui.label(
                     RichText::new("No matching windows")
                         .size(13.0)
-                        .color(text_secondary)
+                        .color(text_secondary),
                 );
             });
         }
@@ -298,7 +314,13 @@ impl WindowPicker {
             -canvas.pan.y + 50.0 + offset.y,
         );
 
-        spawn_preview(window, preview_manager, capture_coordinator, position, Vec2::new(320.0, 240.0));
+        spawn_preview(
+            window,
+            preview_manager,
+            capture_coordinator,
+            position,
+            Vec2::new(320.0, 240.0),
+        );
     }
 }
 

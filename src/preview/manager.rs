@@ -1,10 +1,11 @@
+use super::{
+    BrowserTileStatus, FpsPreset, Preview, PreviewId, VideoSource, VideoTileStatus, WindowHandle,
+};
+use crate::media::MediaFrame;
+use crate::playlist::FolderPlaylist;
 use eframe::egui::{Pos2, Vec2};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use super::{
-    BrowserTileStatus, Preview, PreviewId, FpsPreset, VideoSource, VideoTileStatus, WindowHandle,
-};
-use crate::media::MediaFrame;
 
 /// Snapshot of a preview captured right before it's actually dropped from
 /// the manager, so the canvas can offer an "Undo" toast that restores it.
@@ -25,6 +26,8 @@ pub struct RemovedPreviewInfo {
     pub media_path: Option<String>,
     /// Set for mpv-backed local video and Streamlink tiles.
     pub video_source: Option<VideoSource>,
+    pub folder_playlist: Option<FolderPlaylist>,
+    pub playlist_group: Option<u64>,
 }
 
 /// Manages all preview windows
@@ -152,6 +155,29 @@ impl PreviewManager {
         id
     }
 
+    /// Add a folder playlist as a native canvas tile linked to one video tile.
+    pub fn add_folder_playlist(
+        &mut self,
+        playlist: FolderPlaylist,
+        title: String,
+        position: Pos2,
+        size: Vec2,
+        group: u64,
+        linked_video: Option<PreviewId>,
+    ) -> PreviewId {
+        let id = self.generate_id();
+        self.max_z_order += 1;
+
+        let mut preview = Preview::new(id, title, position, size);
+        preview.z_order = self.max_z_order;
+        preview.lock_aspect_ratio = false;
+        preview.folder_playlist = Some(playlist);
+        preview.playlist_group = Some(group);
+        preview.playlist_linked_video = linked_video;
+        self.previews.insert(id, preview);
+        id
+    }
+
     /// Begin the fade/shrink-out animation for a preview. The preview stays
     /// in the manager (still rendered, but non-interactive) until its
     /// removal animation finishes and `finalize_removals` reaps it.
@@ -164,7 +190,9 @@ impl PreviewManager {
     /// Drop any previews whose removal animation has finished, returning a
     /// snapshot of each one so the caller can offer an "Undo".
     pub fn finalize_removals(&mut self) -> Vec<RemovedPreviewInfo> {
-        let done: Vec<PreviewId> = self.previews.values()
+        let done: Vec<PreviewId> = self
+            .previews
+            .values()
             .filter(|p| p.is_removal_complete())
             .map(|p| p.id)
             .collect();
@@ -183,6 +211,8 @@ impl PreviewManager {
                     browser_muted: preview.browser_muted,
                     media_path: preview.media_path,
                     video_source: preview.video_source,
+                    folder_playlist: preview.folder_playlist,
+                    playlist_group: preview.playlist_group,
                 });
             }
         }
@@ -310,7 +340,6 @@ impl PreviewManager {
 
         self.max_z_order = self.previews.len() as u32;
     }
-
 }
 
 impl Default for PreviewManager {
@@ -331,16 +360,10 @@ mod tests {
         let lower = previews.add("lower".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
         let upper = previews.add("upper".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
 
-        assert_eq!(
-            previews.get_preview_at(Pos2::new(50.0, 50.0)),
-            Some(upper)
-        );
+        assert_eq!(previews.get_preview_at(Pos2::new(50.0, 50.0)), Some(upper));
 
         previews.bring_to_front(lower);
-        assert_eq!(
-            previews.get_preview_at(Pos2::new(50.0, 50.0)),
-            Some(lower)
-        );
+        assert_eq!(previews.get_preview_at(Pos2::new(50.0, 50.0)), Some(lower));
         assert_eq!(previews.get_preview_at(Pos2::new(150.0, 150.0)), None);
     }
 

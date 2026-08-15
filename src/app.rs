@@ -2,28 +2,29 @@
 use crate::browser::{
     self, normalize_url, scrub_url_for_storage, BrowserManager, ExtensionPreparationStatus,
 };
-use crate::canvas::{BrowserAction, CanvasState, VideoAction};
+use crate::canvas::{BrowserAction, CanvasState, PlaylistAction, VideoAction};
 use crate::capture::CaptureCoordinator;
 use crate::external_tools::{self, ExternalTools, ToolKind, ToolStatus};
+#[cfg(windows)]
+use crate::libmpv::VideoManager;
 use crate::media;
 use crate::overlay::RegionSelector;
 use crate::persistence::{
     AppConfig, CanvasLayout, SavedLayout, Storage, WindowLayout, WorkspaceIndex,
 };
+use crate::playlist::{FolderPlaylist, FolderPlaylistLayout, ThumbnailState};
 use crate::preview::{
     BrowserTileStatus, FpsPreset, PreviewId, PreviewLayout, PreviewManager, VideoPlaybackState,
     VideoSource, VideoTileStatus, VideoTrack, WindowHandle,
 };
-#[cfg(windows)]
-use crate::libmpv::VideoManager;
-use crate::video::{self, VideoLaunch, VideoUpdate};
 #[cfg(debug_assertions)]
 use crate::privacy;
 use crate::tray::TrayManager;
+use crate::video::{self, VideoLaunch, VideoUpdate};
 use crate::window_picker::{enumerate_windows, spawn_preview, WindowInfo, WindowPicker};
 use eframe::egui::{self, Pos2, Vec2};
 #[cfg(windows)]
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(windows)]
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
@@ -71,7 +72,10 @@ fn media_tile_size(width: u32, height: u32) -> Vec2 {
 }
 
 #[cfg(windows)]
-fn available_tool_path(status: &ToolStatus, name: &str) -> Result<Option<std::path::PathBuf>, String> {
+fn available_tool_path(
+    status: &ToolStatus,
+    name: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
     match status {
         ToolStatus::Checking => Ok(None),
         ToolStatus::Available { path, .. } => Ok(Some(path.clone())),
@@ -93,13 +97,15 @@ fn video_launch_for_source(
     let source = match source {
         VideoSource::LocalFile { path } => {
             if !path.is_file() {
-                return Err(format!("The video file no longer exists: {}", path.display()));
+                return Err(format!(
+                    "The video file no longer exists: {}",
+                    path.display()
+                ));
             }
             video::VideoSource::LocalFile(path.clone())
         }
         VideoSource::Stream { url, quality } => {
-            let Some(streamlink_path) =
-                available_tool_path(streamlink_status, "Streamlink")?
+            let Some(streamlink_path) = available_tool_path(streamlink_status, "Streamlink")?
             else {
                 return Ok(None);
             };
@@ -262,6 +268,13 @@ struct SeekPreviewJob {
 }
 
 #[cfg(windows)]
+struct PlaylistThumbnailJob {
+    playlist_id: PreviewId,
+    path: std::path::PathBuf,
+    receiver: video::VideoThumbnailReceiver,
+}
+
+#[cfg(windows)]
 fn restored_video_ready(
     pending: &PendingVideoTile,
     tile_rect: Option<egui::Rect>,
@@ -317,6 +330,14 @@ pub struct PluriviewApp {
     /// Debounced, background thumbnail decoders for seekable video tiles.
     #[cfg(windows)]
     seek_preview_jobs: HashMap<PreviewId, SeekPreviewJob>,
+    /// Lazy playlist poster decoding. Only two helper processes may run at once.
+    #[cfg(windows)]
+    playlist_thumbnail_queue: VecDeque<(PreviewId, std::path::PathBuf)>,
+    #[cfg(windows)]
+    playlist_thumbnail_jobs: Vec<PlaylistThumbnailJob>,
+    /// Persistent relationship key allocated to each folder/video pair.
+    #[cfg(windows)]
+    next_playlist_group: u64,
 
     /// Is the window picker panel open?
     pub picker_open: bool,
@@ -491,6 +512,12 @@ impl PluriviewApp {
             restored_paused_videos: HashSet::new(),
             #[cfg(windows)]
             seek_preview_jobs: HashMap::new(),
+            #[cfg(windows)]
+            playlist_thumbnail_queue: VecDeque::new(),
+            #[cfg(windows)]
+            playlist_thumbnail_jobs: Vec::new(),
+            #[cfg(windows)]
+            next_playlist_group: 1,
             picker_open: true,
             canvas_only: false,
             storage,
@@ -648,12 +675,72 @@ impl PluriviewApp {
         ))
     }
 
+    /// Create a linked video/player pair from a dropped folder. Scanning is
+    /// intentionally top-level so an unexpectedly deep media archive cannot
+    /// flood the canvas or thumbnail queue.
+    #[cfg(windows)]
+    fn add_video_folder(
+        &mut self,
+        folder: std::path::PathBuf,
+        position: Pos2,
+    ) -> Result<(PreviewId, PreviewId), String> {
+        self.required_tool_paths("Adding a video folder", &[ToolKind::Mpv])?;
+        let playlist = FolderPlaylist::scan(folder.clone(), None)?;
+        let first = playlist
+            .selected
+            .clone()
+            .ok_or_else(|| "The video folder is empty".to_owned())?;
+        let group = self.next_playlist_group;
+        self.next_playlist_group = self.next_playlist_group.saturating_add(1);
+
+        let video_id = self.add_local_video_path(first, position)?;
+        if let Some(preview) = self.preview_manager.get_mut(video_id) {
+            preview.playlist_group = Some(group);
+        }
+
+        let title = folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Video folder")
+            .to_owned();
+        let playlist_id = self.preview_manager.add_folder_playlist(
+            playlist,
+            title,
+            position + Vec2::new(664.0, 0.0),
+            Vec2::new(340.0, 360.0),
+            group,
+            Some(video_id),
+        );
+        Ok((video_id, playlist_id))
+    }
+
+    #[cfg(windows)]
+    fn restore_folder_playlist(
+        &mut self,
+        layout: &FolderPlaylistLayout,
+        title: String,
+        position: Pos2,
+        size: Vec2,
+        group: u64,
+        linked_video: Option<PreviewId>,
+    ) -> Result<PreviewId, String> {
+        let playlist = FolderPlaylist::from_layout(layout)?;
+        Ok(self.preview_manager.add_folder_playlist(
+            playlist,
+            title,
+            position,
+            size,
+            group,
+            linked_video,
+        ))
+    }
+
     #[cfg(windows)]
     fn open_add_stream(&mut self, position: Pos2) {
-        let paths = match self.required_tool_paths(
-            "Adding a stream",
-            &[ToolKind::Mpv, ToolKind::Streamlink],
-        ) {
+        let paths = match self
+            .required_tool_paths("Adding a stream", &[ToolKind::Mpv, ToolKind::Streamlink])
+        {
             Ok(paths) => paths,
             Err(error) => {
                 self.external_tool_error = Some(error);
@@ -700,7 +787,8 @@ impl PluriviewApp {
             self.external_tools.status(ToolKind::Mpv),
             self.external_tools.status(ToolKind::Streamlink),
             start_paused,
-        )? else {
+        )?
+        else {
             if let Some(preview) = self.preview_manager.get_mut(id) {
                 preview.video_status = if start_paused {
                     VideoTileStatus::PausedOnRestore
@@ -815,20 +903,19 @@ impl PluriviewApp {
         let slot_available = self
             .last_restored_video_start
             .is_none_or(|started| started.elapsed() >= RESTORED_VIDEO_START_INTERVAL);
-        let restored_id = slot_available.then(|| {
-            self.pending_video_tiles.iter().find_map(|(id, pending)| {
-                let preview = self.preview_manager.get(*id);
-                let eligible = preview
-                    .is_some_and(|preview| !matches!(preview.video_status, VideoTileStatus::Failed(_)));
-                restored_video_ready(
-                    pending,
-                    preview.map(|preview| preview.rect()),
-                    viewport,
-                )
-                .then_some(*id)
-                .filter(|_| eligible)
+        let restored_id = slot_available
+            .then(|| {
+                self.pending_video_tiles.iter().find_map(|(id, pending)| {
+                    let preview = self.preview_manager.get(*id);
+                    let eligible = preview.is_some_and(|preview| {
+                        !matches!(preview.video_status, VideoTileStatus::Failed(_))
+                    });
+                    restored_video_ready(pending, preview.map(|preview| preview.rect()), viewport)
+                        .then_some(*id)
+                        .filter(|_| eligible)
+                })
             })
-        }).flatten();
+            .flatten();
 
         if let Some(id) = restored_id {
             match self.try_activate_video_tile(id) {
@@ -848,9 +935,7 @@ impl PluriviewApp {
         if visible_restored_pending {
             let delay = self
                 .last_restored_video_start
-                .map(|started| {
-                    RESTORED_VIDEO_START_INTERVAL.saturating_sub(started.elapsed())
-                })
+                .map(|started| RESTORED_VIDEO_START_INTERVAL.saturating_sub(started.elapsed()))
                 .unwrap_or(Duration::ZERO);
             ctx.request_repaint_after(delay.max(Duration::from_millis(50)));
         }
@@ -896,12 +981,11 @@ impl PluriviewApp {
                         }
                     });
                 }
-                VideoUpdate::Connected
-                | VideoUpdate::Property(_)
-                | VideoUpdate::Event => {}
+                VideoUpdate::Connected | VideoUpdate::Property(_) | VideoUpdate::Event => {}
             }
         }
 
+        let mut auto_advance = Vec::new();
         for id in changed {
             let Some(state) = self
                 .video_manager
@@ -922,11 +1006,25 @@ impl PluriviewApp {
                     .remove(&id)
                     .map(VideoTileStatus::Failed)
                     .unwrap_or_else(|| {
-                        preview_video_status(
-                            &state,
-                            self.restored_paused_videos.contains(&id),
-                        )
+                        preview_video_status(&state, self.restored_paused_videos.contains(&id))
                     });
+            }
+            if state.eof_reached && matches!(state.loop_file, video::LoopMode::Off) {
+                if let Some((playlist_id, path)) = self.preview_manager.all().find_map(|preview| {
+                    let playlist = preview.folder_playlist.as_ref()?;
+                    (preview.playlist_linked_video == Some(id) && playlist.autoplay)
+                        .then(|| playlist.adjacent_path(1).map(|path| (preview.id, path)))
+                        .flatten()
+                }) {
+                    auto_advance.push((playlist_id, path));
+                }
+            }
+        }
+
+        for (playlist_id, path) in auto_advance {
+            if let Err(error) = self.play_playlist_path(playlist_id, path) {
+                log::error!("Playlist autoplay failed: {error}");
+                self.video_action_error = Some(format!("Playlist autoplay failed: {error}"));
             }
         }
 
@@ -1032,27 +1130,20 @@ impl PluriviewApp {
             let already_delivered = job
                 .delivered_time
                 .is_some_and(|time| (time - job.requested_time).abs() <= 0.01);
-            if !just_completed
-                && job.in_flight.is_none()
-                && !already_delivered
-                && now >= job.due
-            {
+            if !just_completed && job.in_flight.is_none() && !already_delivered && now >= job.due {
                 let time = job.requested_time;
                 job.in_flight = Some((
                     time,
-                    video::spawn_video_thumbnail(
-                        job.mpv_path.clone(),
-                        job.source.clone(),
-                        time,
-                    ),
+                    video::spawn_video_thumbnail(job.mpv_path.clone(), job.source.clone(), time),
                 ));
             }
         }
 
         for (id, completed_time, result) in completed {
-            let still_requested = self.seek_preview_jobs.get(&id).is_some_and(|job| {
-                (job.requested_time - completed_time).abs() <= 0.01
-            });
+            let still_requested = self
+                .seek_preview_jobs
+                .get(&id)
+                .is_some_and(|job| (job.requested_time - completed_time).abs() <= 0.01);
             match result {
                 Ok(thumbnail) if still_requested => {
                     if let Some(job) = self.seek_preview_jobs.get_mut(&id) {
@@ -1089,9 +1180,10 @@ impl PluriviewApp {
         });
         if self.seek_preview_jobs.values().any(|job| {
             job.in_flight.is_some()
-                || (!job.delivered_time.is_some_and(|time| {
-                    (time - job.requested_time).abs() <= 0.01
-                }) && now < job.due)
+                || (!job
+                    .delivered_time
+                    .is_some_and(|time| (time - job.requested_time).abs() <= 0.01)
+                    && now < job.due)
         }) {
             ctx.request_repaint_after(Duration::from_millis(40));
         }
@@ -1194,6 +1286,275 @@ impl PluriviewApp {
             self.video_action_error = Some(format!("Could not control this video: {error}"));
         }
         ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn handle_playlist_action(
+        &mut self,
+        ctx: &egui::Context,
+        id: PreviewId,
+        action: PlaylistAction,
+    ) {
+        match action {
+            PlaylistAction::RequestThumbnail(path) => {
+                let key_exists = self
+                    .playlist_thumbnail_queue
+                    .iter()
+                    .any(|queued| queued.0 == id && queued.1 == path)
+                    || self
+                        .playlist_thumbnail_jobs
+                        .iter()
+                        .any(|job| job.playlist_id == id && job.path == path);
+                if !key_exists {
+                    self.playlist_thumbnail_queue.push_back((id, path));
+                }
+            }
+            PlaylistAction::ToggleAutoplay
+            | PlaylistAction::ToggleShuffle
+            | PlaylistAction::ToggleRepeat => {
+                if let Some(playlist) = self
+                    .preview_manager
+                    .get_mut(id)
+                    .and_then(|preview| preview.folder_playlist.as_mut())
+                {
+                    match action {
+                        PlaylistAction::ToggleAutoplay => playlist.autoplay = !playlist.autoplay,
+                        PlaylistAction::ToggleShuffle => playlist.shuffle = !playlist.shuffle,
+                        PlaylistAction::ToggleRepeat => playlist.repeat = !playlist.repeat,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            PlaylistAction::Rescan => {
+                let layout = self
+                    .preview_manager
+                    .get(id)
+                    .and_then(|preview| preview.folder_playlist.as_ref())
+                    .map(FolderPlaylist::layout);
+                if let Some(layout) = layout {
+                    match FolderPlaylist::from_layout(&layout) {
+                        Ok(playlist) => {
+                            if let Some(preview) = self.preview_manager.get_mut(id) {
+                                preview.folder_playlist = Some(playlist);
+                            }
+                            self.playlist_thumbnail_queue
+                                .retain(|(playlist_id, _)| *playlist_id != id);
+                        }
+                        Err(error) => self.media_error = Some(error),
+                    }
+                }
+            }
+            PlaylistAction::Select(path) => {
+                if let Err(error) = self.play_playlist_path(id, path) {
+                    self.video_action_error =
+                        Some(format!("Could not play this folder video: {error}"));
+                }
+            }
+            PlaylistAction::Previous | PlaylistAction::Next => {
+                let direction = if action == PlaylistAction::Previous {
+                    -1
+                } else {
+                    1
+                };
+                let path = self
+                    .preview_manager
+                    .get(id)
+                    .and_then(|preview| preview.folder_playlist.as_ref())
+                    .and_then(|playlist| playlist.adjacent_path(direction));
+                if let Some(path) = path {
+                    if let Err(error) = self.play_playlist_path(id, path) {
+                        self.video_action_error =
+                            Some(format!("Could not change the folder video: {error}"));
+                    }
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn play_playlist_path(
+        &mut self,
+        playlist_id: PreviewId,
+        path: std::path::PathBuf,
+    ) -> Result<(), String> {
+        let (group, linked_video, playlist_position, valid_path) = self
+            .preview_manager
+            .get(playlist_id)
+            .and_then(|preview| {
+                preview.folder_playlist.as_ref().map(|playlist| {
+                    (
+                        preview.playlist_group,
+                        preview.playlist_linked_video,
+                        preview.position,
+                        playlist.contains(&path),
+                    )
+                })
+            })
+            .ok_or_else(|| "The folder playlist no longer exists".to_owned())?;
+        if !valid_path {
+            return Err("The selected file is not part of this folder playlist".to_owned());
+        }
+        if !path.is_file() {
+            return Err(format!(
+                "The video file no longer exists: {}",
+                path.display()
+            ));
+        }
+
+        let existing_video = linked_video.filter(|id| {
+            self.preview_manager
+                .get(*id)
+                .is_some_and(|preview| preview.is_video())
+        });
+        let video_id = if let Some(video_id) = existing_video {
+            if let Some(tile) = self.video_manager.get_mut(video_id) {
+                tile.session.load_local_file(&path)?;
+            } else {
+                if let Some(preview) = self.preview_manager.get_mut(video_id) {
+                    preview.video_source = Some(VideoSource::LocalFile { path: path.clone() });
+                    preview.video_status = VideoTileStatus::Starting;
+                }
+                self.pending_video_tiles.insert(
+                    video_id,
+                    PendingVideoTile {
+                        start_paused: false,
+                        shown_once: true,
+                        retry_ready: true,
+                    },
+                );
+                self.try_activate_video_tile(video_id)?;
+            }
+            video_id
+        } else {
+            let video_id =
+                self.add_local_video_path(path.clone(), playlist_position - Vec2::new(664.0, 0.0))?;
+            if let Some(preview) = self.preview_manager.get_mut(video_id) {
+                preview.playlist_group = group;
+            }
+            if let Some(preview) = self.preview_manager.get_mut(playlist_id) {
+                preview.playlist_linked_video = Some(video_id);
+            }
+            video_id
+        };
+
+        self.seek_preview_jobs.remove(&video_id);
+        let title = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Video")
+            .to_owned();
+        if let Some(preview) = self.preview_manager.get_mut(video_id) {
+            preview.video_source = Some(VideoSource::LocalFile { path: path.clone() });
+            preview.title = title;
+            preview.video_status = VideoTileStatus::Starting;
+            preview.video_playback.paused = false;
+            preview.video_playback.time_pos = None;
+            preview.video_playback.duration = None;
+        }
+        if let Some(playlist) = self
+            .preview_manager
+            .get_mut(playlist_id)
+            .and_then(|preview| preview.folder_playlist.as_mut())
+        {
+            playlist.selected = Some(path);
+            playlist.error = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn pump_playlist_thumbnails(&mut self, ctx: &egui::Context) {
+        let mut index = 0;
+        while index < self.playlist_thumbnail_jobs.len() {
+            let result = match self.playlist_thumbnail_jobs[index].receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("Thumbnail worker stopped".to_owned())),
+            };
+            let Some(result) = result else {
+                index += 1;
+                continue;
+            };
+            let job = self.playlist_thumbnail_jobs.swap_remove(index);
+            if let Some(entry) = self
+                .preview_manager
+                .get_mut(job.playlist_id)
+                .and_then(|preview| preview.folder_playlist.as_mut())
+                .and_then(|playlist| {
+                    playlist
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.path == job.path)
+                })
+            {
+                match result {
+                    Ok(thumbnail) => {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [thumbnail.width as usize, thumbnail.height as usize],
+                            &thumbnail.rgba,
+                        );
+                        entry.thumbnail = Some(ctx.load_texture(
+                            format!("playlist_{}_{}", job.playlist_id.0, entry.name),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                    Err(error) => {
+                        entry.thumbnail_state = ThumbnailState::Failed;
+                        log::debug!("Playlist thumbnail failed: {error}");
+                    }
+                }
+            }
+        }
+
+        while self.playlist_thumbnail_jobs.len() < 2 {
+            let Some((playlist_id, path)) = self.playlist_thumbnail_queue.pop_front() else {
+                break;
+            };
+            let still_needed = self
+                .preview_manager
+                .get(playlist_id)
+                .and_then(|preview| preview.folder_playlist.as_ref())
+                .is_some_and(|playlist| {
+                    playlist.entries.iter().any(|entry| {
+                        entry.path == path
+                            && entry.thumbnail.is_none()
+                            && entry.thumbnail_state == ThumbnailState::Loading
+                    })
+                });
+            if !still_needed {
+                continue;
+            }
+            let ToolStatus::Available { path: mpv_path, .. } =
+                self.external_tools.status(ToolKind::Mpv)
+            else {
+                if let Some(entry) = self
+                    .preview_manager
+                    .get_mut(playlist_id)
+                    .and_then(|preview| preview.folder_playlist.as_mut())
+                    .and_then(|playlist| {
+                        playlist.entries.iter_mut().find(|entry| entry.path == path)
+                    })
+                {
+                    entry.thumbnail_state = ThumbnailState::Failed;
+                }
+                continue;
+            };
+            self.playlist_thumbnail_jobs.push(PlaylistThumbnailJob {
+                playlist_id,
+                path: path.clone(),
+                receiver: video::spawn_video_thumbnail(
+                    mpv_path.clone(),
+                    video::VideoThumbnailSource::LocalFile(path),
+                    1.0,
+                ),
+            });
+        }
+
+        if !self.playlist_thumbnail_jobs.is_empty() || !self.playlist_thumbnail_queue.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
     }
 
     /// Drop video hosts only after their capture sessions have been stopped.
@@ -1498,20 +1859,31 @@ impl PluriviewApp {
             };
             let offset = Vec2::splat(index as f32 * 24.0 / self.canvas.zoom.max(0.1));
             let position = base_position + offset;
-            let result = if media::is_supported_video_path(&path) {
+            let result: Result<Vec<PreviewId>, String> = if path.is_dir() {
+                #[cfg(windows)]
+                {
+                    self.add_video_folder(path.clone(), position)
+                        .map(|(video, playlist)| vec![video, playlist])
+                }
+                #[cfg(not(windows))]
+                {
+                    Err("Video playback is currently available only on Windows".to_owned())
+                }
+            } else if media::is_supported_video_path(&path) {
                 #[cfg(windows)]
                 {
                     self.add_local_video_path(path.clone(), position)
+                        .map(|id| vec![id])
                 }
                 #[cfg(not(windows))]
                 {
                     Err("Video playback is currently available only on Windows".to_owned())
                 }
             } else {
-                self.import_media_tile(&path, position)
+                self.import_media_tile(&path, position).map(|id| vec![id])
             };
             match result {
-                Ok(id) => imported.push(id),
+                Ok(ids) => imported.extend(ids),
                 Err(error) => errors.push(format!("{}: {error}", path.display())),
             }
         }
@@ -1549,7 +1921,7 @@ impl PluriviewApp {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            "Drop images or videos onto the canvas",
+            "Drop images, videos, or a video folder onto the canvas",
             egui::FontId::proportional(18.0),
             egui::Color32::WHITE,
         );
@@ -1657,15 +2029,17 @@ impl PluriviewApp {
         let mut cancel = false;
 
         if let Some(dialog) = self.add_stream.as_mut() {
-            let probe_result = dialog.probe_receiver.as_ref().and_then(|receiver| {
-                match receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(TryRecvError::Disconnected) => {
-                        Some(Err("The quality probe stopped unexpectedly.".to_owned()))
-                    }
-                    Err(TryRecvError::Empty) => None,
-                }
-            });
+            let probe_result =
+                dialog
+                    .probe_receiver
+                    .as_ref()
+                    .and_then(|receiver| match receiver.try_recv() {
+                        Ok(result) => Some(result),
+                        Err(TryRecvError::Disconnected) => {
+                            Some(Err("The quality probe stopped unexpectedly.".to_owned()))
+                        }
+                        Err(TryRecvError::Empty) => None,
+                    });
             if let Some(result) = probe_result {
                 dialog.probe_receiver = None;
                 if dialog.probing_url == dialog.url.trim() {
@@ -1727,8 +2101,7 @@ impl PluriviewApp {
                             dialog.probing_url.clear();
                             dialog.qualities.clear();
                         } else {
-                            dialog.probe_due =
-                                Some(Instant::now() + Duration::from_millis(400));
+                            dialog.probe_due = Some(Instant::now() + Duration::from_millis(400));
                         }
                     }
 
@@ -3212,6 +3585,15 @@ impl PluriviewApp {
             self.last_restored_video_start = None;
             self.restored_paused_videos.clear();
             self.seek_preview_jobs.clear();
+            self.playlist_thumbnail_queue.clear();
+            self.playlist_thumbnail_jobs.clear();
+            self.next_playlist_group = layout
+                .previews
+                .iter()
+                .filter_map(|preview| preview.playlist_group)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
         }
         self.preview_manager.clear();
         self.canvas.clear_preview_animations();
@@ -3310,6 +3692,35 @@ impl PluriviewApp {
             }
 
             #[cfg(windows)]
+            if let Some(folder_playlist) = &preview_layout.folder_playlist {
+                let group = preview_layout.playlist_group.unwrap_or_else(|| {
+                    let group = self.next_playlist_group;
+                    self.next_playlist_group = self.next_playlist_group.saturating_add(1);
+                    group
+                });
+                match self.restore_folder_playlist(
+                    folder_playlist,
+                    preview_layout.window_title.clone(),
+                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
+                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
+                    group,
+                    None,
+                ) {
+                    Ok(id) => {
+                        self.preview_manager.set_z_order(id, preview_layout.z_order);
+                        if let Some(preview) = self.preview_manager.get_mut(id) {
+                            preview.created_at = Instant::now() - Duration::from_secs(1);
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Failed to restore folder playlist: {error}");
+                        self.media_error = Some(error);
+                    }
+                }
+                continue;
+            }
+
+            #[cfg(windows)]
             if let Some(source) = &preview_layout.video_source {
                 let id = self.create_video_tile(
                     source.clone(),
@@ -3323,6 +3734,7 @@ impl PluriviewApp {
                 if let Some(preview) = self.preview_manager.get_mut(id) {
                     preview.lock_aspect_ratio = preview_layout.lock_aspect_ratio;
                     preview.crop_uv = preview_layout.crop_uv;
+                    preview.playlist_group = preview_layout.playlist_group;
                     preview.created_at = Instant::now() - Duration::from_secs(1);
                 }
                 continue;
@@ -3370,6 +3782,27 @@ impl PluriviewApp {
                     "Window not found: {}",
                     privacy::redact_title(&preview_layout.window_title)
                 );
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let group_to_video = self
+                .preview_manager
+                .all()
+                .filter_map(|preview| {
+                    preview
+                        .playlist_group
+                        .filter(|_| preview.is_video())
+                        .map(|group| (group, preview.id))
+                })
+                .collect::<HashMap<_, _>>();
+            for preview in self.preview_manager.all_mut() {
+                if preview.is_playlist() {
+                    preview.playlist_linked_video = preview
+                        .playlist_group
+                        .and_then(|group| group_to_video.get(&group).copied());
+                }
             }
         }
     }
@@ -3902,6 +4335,11 @@ impl eframe::App for PluriviewApp {
                 self.handle_video_action(ctx, id, action);
             }
 
+            for (id, action) in std::mem::take(&mut self.canvas.pending_playlist_actions) {
+                self.handle_playlist_action(ctx, id, action);
+            }
+            self.pump_playlist_thumbnails(ctx);
+
             // "Undo" on a removed browser tile: recreate the WebView from
             // its saved URL (the original host window is already destroyed).
             if let Some(info) = self.canvas.pending_browser_restore.take() {
@@ -3944,6 +4382,30 @@ impl eframe::App for PluriviewApp {
                 );
                 if let Some(preview) = self.preview_manager.get_mut(id) {
                     preview.crop_uv = info.crop_uv;
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        if let Some(info) = self.canvas.pending_playlist_restore.take() {
+            if let (Some(playlist), Some(group)) =
+                (info.folder_playlist.as_ref(), info.playlist_group)
+            {
+                let layout = playlist.layout();
+                let linked = self.preview_manager.all().find_map(|preview| {
+                    (preview.playlist_group == Some(group) && preview.is_video())
+                        .then_some(preview.id)
+                });
+                match self.restore_folder_playlist(
+                    &layout,
+                    info.title,
+                    info.position,
+                    info.size,
+                    group,
+                    linked,
+                ) {
+                    Ok(id) => self.canvas.selection = vec![id],
+                    Err(error) => self.media_error = Some(error),
                 }
             }
         }

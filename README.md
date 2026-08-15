@@ -119,6 +119,16 @@ distribute `pluriview.pdb`; Windows debug symbols can contain local source paths
 8. **Focus** a tile with right-click → **Focus on This Tile**; press `Esc` to restore the canvas
 9. **Right-click** for other context menu options
 
+### Video folders and playlists
+
+Drag a folder onto the canvas to create a linked video tile and playlist tile.
+Pluriview scans supported videos directly inside that folder, sorts numbered
+filenames naturally, and starts the first video. Click any playlist row to
+replace the current file in the same player. The playlist header provides
+previous/next, shuffle, repeat, and autoplay controls; scroll over the playlist
+to browse longer folders without zooming the canvas. Folder playlists and their
+linked tile positions are restored with the workspace.
+
 Use the **Workspace** menu to create separate reusable setups. Existing installs
 are migrated into a workspace named **Default** the first time this version runs.
 

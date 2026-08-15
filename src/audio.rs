@@ -48,8 +48,8 @@ use windows::{
         },
         System::{
             Com::{
-                CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL,
-                COINIT_MULTITHREADED, STGM_READ,
+                CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
+                STGM_READ,
             },
             Threading::{CreateEventW, WaitForSingleObject},
         },
@@ -269,12 +269,14 @@ impl MixFormat {
     fn for_default_device() -> Result<Self, String> {
         unsafe {
             let enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|e| e.to_string())?;
             let device = enumerator
                 .GetDefaultAudioEndpoint(eRender, eConsole)
                 .map_err(|e| e.to_string())?;
-            let client: IAudioClient =
-                device.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
+            let client: IAudioClient = device
+                .Activate(CLSCTX_ALL, None)
+                .map_err(|e| e.to_string())?;
             let raw = client.GetMixFormat().map_err(|e| e.to_string())?;
             // WAVEFORMATEX is packed; copy the fields out before formatting.
             let head = *raw;
@@ -293,7 +295,8 @@ impl MixFormat {
             // WAVE_FORMAT_IEEE_FLOAT directly, or EXTENSIBLE whose SubFormat
             // GUID starts with 0x00000003.
             let is_float = bits == 32
-                && (tag == 3 || (tag == 0xFFFE && blob.len() >= 28 && blob[24..28] == [3, 0, 0, 0]));
+                && (tag == 3
+                    || (tag == 0xFFFE && blob.len() >= 28 && blob[24..28] == [3, 0, 0, 0]));
             if !is_float {
                 return Err(format!("unsupported mix format (tag {tag}, {bits} bit)"));
             }
@@ -422,7 +425,12 @@ impl Capture {
     fn read(&self, samples: &mut Vec<f32>, channels: u16) -> Result<usize, String> {
         samples.clear();
         unsafe {
-            if self.capture.GetNextPacketSize().map_err(|e| e.to_string())? == 0 {
+            if self
+                .capture
+                .GetNextPacketSize()
+                .map_err(|e| e.to_string())?
+                == 0
+            {
                 return Ok(0);
             }
             let mut data: *mut u8 = std::ptr::null_mut();
@@ -462,12 +470,14 @@ impl Render {
     fn start(device_id: &str, sample_rate: u32) -> Result<Self, String> {
         unsafe {
             let enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|e| e.to_string())?;
             let device: IMMDevice = enumerator
                 .GetDevice(&HSTRING::from(device_id))
                 .map_err(|e| format!("monitor device unavailable: {e}"))?;
-            let client: IAudioClient =
-                device.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
+            let client: IAudioClient = device
+                .Activate(CLSCTX_ALL, None)
+                .map_err(|e| e.to_string())?;
             let format = WAVEFORMATEX {
                 wFormatTag: 3, // WAVE_FORMAT_IEEE_FLOAT
                 nChannels: 2,
@@ -518,7 +528,9 @@ impl Render {
             }
             let data = self.render.GetBuffer(write).map_err(|e| e.to_string())?;
             std::ptr::copy_nonoverlapping(samples.as_ptr(), data as *mut f32, write as usize * 2);
-            self.render.ReleaseBuffer(write, 0).map_err(|e| e.to_string())?;
+            self.render
+                .ReleaseBuffer(write, 0)
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -536,6 +548,7 @@ impl Drop for Render {
 mod tests {
     use super::{fold_to_stereo, render_devices, AudioMonitor, Capture, MixFormat};
     use std::time::{Duration, Instant};
+    use windows::core::HSTRING;
     use windows::Win32::{
         Media::Audio::{
             eConsole, eRender, Endpoints::IAudioEndpointVolume, IMMDevice, IMMDeviceEnumerator,
@@ -543,7 +556,6 @@ mod tests {
         },
         System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
     };
-    use windows::core::HSTRING;
 
     #[test]
     fn fold_passes_stereo_through() {
@@ -591,7 +603,10 @@ mod tests {
                 let endpoint: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
                 let was_muted = endpoint.GetMute()?.as_bool();
                 endpoint.SetMute(true, std::ptr::null())?;
-                Ok(Self { endpoint, was_muted })
+                Ok(Self {
+                    endpoint,
+                    was_muted,
+                })
             }
         }
     }
@@ -616,7 +631,9 @@ mod tests {
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).unwrap();
-            enumerator.GetDefaultAudioEndpoint(eRender, eConsole).unwrap()
+            enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .unwrap()
         }
     }
 
@@ -629,7 +646,10 @@ mod tests {
             match capture.read(&mut samples, channels) {
                 Ok(0) => std::thread::sleep(Duration::from_millis(5)),
                 Ok(n) => {
-                    sum_sq += samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
+                    sum_sq += samples
+                        .iter()
+                        .map(|s| (*s as f64) * (*s as f64))
+                        .sum::<f64>();
                     count += n as u64;
                 }
                 Err(error) => panic!("capture failed: {error}"),
@@ -728,6 +748,9 @@ mod tests {
             let s = (0.3 * (t * 440.0 * std::f32::consts::TAU).sin() * i16::MAX as f32) as i16;
             buf.extend_from_slice(&s.to_le_bytes());
         }
-        std::fs::File::create(path).unwrap().write_all(&buf).unwrap();
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
     }
 }

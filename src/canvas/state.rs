@@ -1,22 +1,23 @@
-use eframe::egui::{self, Pos2, Vec2, Rect, Color32, Stroke, Sense, CursorIcon};
-use std::time::Instant;
-#[cfg(debug_assertions)]
-use crate::privacy;
+use super::animation::{AnimationState, DragTracker};
+use crate::capture::CaptureCoordinator;
 use crate::preview::{
     BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager, RemovedPreviewInfo,
     VideoPlaybackState, VideoTileStatus,
 };
-use crate::capture::CaptureCoordinator;
-use super::animation::{AnimationState, DragTracker};
+#[cfg(debug_assertions)]
+use crate::privacy;
+use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
 use std::borrow::Cow;
+use std::path::PathBuf;
+use std::time::Instant;
 
 /// How long the "Removed '...' · Undo" toast stays on screen.
 const UNDO_TOAST_SECS: f32 = 4.0;
 
 #[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SetForegroundWindow, SW_RESTORE};
-#[cfg(windows)]
 use windows::Win32::Foundation::HWND;
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE};
 
 /// Represents the current drag operation
 #[derive(Clone, Debug)]
@@ -43,13 +44,15 @@ pub enum DragState {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_time, video_placeholder_content, CanvasState, DragState, ResizeHandle, VideoAction,
+        format_time, video_placeholder_content, CanvasState, DragState, PlaylistAction,
+        ResizeHandle, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::preview::{FpsPreset, PreviewId, PreviewManager, VideoSource, VideoTileStatus};
+    use crate::playlist::FolderPlaylist;
     use eframe::egui::{
-        CentralPanel, Context, CursorIcon, Event, Modifiers, PointerButton, Pos2, RawInput,
-        Rect, Shape, Vec2,
+        CentralPanel, Context, CursorIcon, Event, Modifiers, PointerButton, Pos2, RawInput, Rect,
+        Shape, Vec2,
     };
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -101,12 +104,8 @@ mod tests {
         let mut previews = PreviewManager::new();
         let live_id = previews.add("live".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
         let stale_id = PreviewId(999);
-        canvas
-            .animation
-            .get_or_create_spring(live_id, Pos2::ZERO);
-        canvas
-            .animation
-            .get_or_create_spring(stale_id, Pos2::ZERO);
+        canvas.animation.get_or_create_spring(live_id, Pos2::ZERO);
+        canvas.animation.get_or_create_spring(stale_id, Pos2::ZERO);
 
         canvas.prune_preview_animations(&previews);
 
@@ -132,9 +131,10 @@ mod tests {
             },
         );
 
-        assert!(!output.shapes.iter().any(|shape| {
-            matches!(shape.shape, Shape::Text(_) | Shape::LineSegment { .. })
-        }));
+        assert!(!output
+            .shapes
+            .iter()
+            .any(|shape| { matches!(shape.shape, Shape::Text(_) | Shape::LineSegment { .. }) }));
     }
 
     #[test]
@@ -300,6 +300,69 @@ mod tests {
     }
 
     #[test]
+    fn playlist_row_queues_file_selection() {
+        let root = std::env::temp_dir().join(format!(
+            "pluriview-canvas-playlist-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let video = root.join("01 opening.mp4");
+        std::fs::write(&video, b"").unwrap();
+
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let playlist = FolderPlaylist::scan(root.clone(), None).unwrap();
+        let id = previews.add_folder_playlist(
+            playlist,
+            "Test folder".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(340.0, 360.0),
+            1,
+            None,
+        );
+        previews.get_mut(id).unwrap().created_at = Instant::now() - Duration::from_secs(1);
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 550.0));
+        let mut run_frame = |events| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            );
+        };
+
+        let row_center = Pos2::new(300.0, 204.0);
+        run_frame(vec![Event::PointerMoved(row_center)]);
+        run_frame(vec![Event::PointerButton {
+            pos: row_center,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerButton {
+            pos: row_center,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        assert!(canvas
+            .pending_playlist_actions
+            .contains(&(id, PlaylistAction::Select(video))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn focus_fits_tile_and_restores_canvas_view() {
         let mut canvas = CanvasState::default();
         canvas.pan = Vec2::new(21.0, -8.0);
@@ -307,14 +370,8 @@ mod tests {
         canvas.selection = vec![PreviewId(9)];
         canvas.animation.momentum_active = true;
         canvas.animation.momentum_velocity = Vec2::splat(10.0);
-        let viewport = Rect::from_min_size(
-            Pos2::new(40.0, 30.0),
-            Vec2::new(1200.0, 700.0),
-        );
-        let tile = Rect::from_min_size(
-            Pos2::new(300.0, 150.0),
-            Vec2::new(800.0, 450.0),
-        );
+        let viewport = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(1200.0, 700.0));
+        let tile = Rect::from_min_size(Pos2::new(300.0, 150.0), Vec2::new(800.0, 450.0));
 
         canvas.focus_on_tile(PreviewId(2), tile, viewport);
         let focused = canvas.canvas_rect_to_screen(tile, viewport);
@@ -370,9 +427,14 @@ mod tests {
 /// Resize handle positions
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResizeHandle {
-    TopLeft, Top, TopRight,
-    Left, Right,
-    BottomLeft, Bottom, BottomRight,
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
 }
 
 impl ResizeHandle {
@@ -425,6 +487,19 @@ pub enum VideoAction {
     OpenSettings,
 }
 
+/// Actions requested by a folder playlist tile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlaylistAction {
+    Select(PathBuf),
+    Previous,
+    Next,
+    ToggleAutoplay,
+    ToggleShuffle,
+    ToggleRepeat,
+    Rescan,
+    RequestThumbnail(PathBuf),
+}
+
 /// Snapshot of the input state the canvas actually needs, gathered once per
 /// frame instead of cloning the entire egui `InputState` several times.
 struct FrameInput {
@@ -467,6 +542,7 @@ struct TileInfo {
     is_browser: bool,
     is_media: bool,
     is_video: bool,
+    is_playlist: bool,
     muted: bool,
     browser_status: BrowserTileStatus,
     video_status: VideoTileStatus,
@@ -490,6 +566,7 @@ impl TileInfo {
             is_browser: preview.is_browser(),
             is_media: preview.is_media(),
             is_video: preview.is_video(),
+            is_playlist: preview.is_playlist(),
             muted: preview.browser_muted,
             browser_status: preview.browser_status.clone(),
             video_status: preview.video_status.clone(),
@@ -512,6 +589,7 @@ impl TileInfo {
         self.is_browser = preview.is_browser();
         self.is_media = preview.is_media();
         self.is_video = preview.is_video();
+        self.is_playlist = preview.is_playlist();
         self.muted = preview.browser_muted;
         self.browser_status.clone_from(&preview.browser_status);
         self.video_status.clone_from(&preview.video_status);
@@ -521,7 +599,10 @@ impl TileInfo {
 }
 
 fn format_time(seconds: Option<f64>) -> String {
-    let seconds = seconds.filter(|value| value.is_finite()).unwrap_or(0.0).max(0.0) as u64;
+    let seconds = seconds
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0) as u64;
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
     let seconds = seconds % 60;
@@ -529,6 +610,15 @@ fn format_time(seconds: Option<f64>) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn ellipsize(text: &str, max_chars: usize) -> Cow<'_, str> {
+    if text.chars().count() <= max_chars {
+        Cow::Borrowed(text)
+    } else {
+        let keep = max_chars.saturating_sub(1);
+        Cow::Owned(format!("{}…", text.chars().take(keep).collect::<String>()))
     }
 }
 
@@ -547,15 +637,13 @@ fn video_placeholder_content(status: &VideoTileStatus) -> (&'static str, &'stati
         VideoTileStatus::Starting | VideoTileStatus::Ready => {
             ("Starting video", "Waiting for the first frame", true)
         }
-        VideoTileStatus::PausedOnRestore => {
-            ("Video paused", "Press play to resume", false)
-        }
-        VideoTileStatus::Buffering => {
-            ("Buffering video", "Waiting for the stream", true)
-        }
-        VideoTileStatus::Failed(_) if video_status_needs_settings(status) => {
-            ("Video tools unavailable", "Open Settings to configure playback", false)
-        }
+        VideoTileStatus::PausedOnRestore => ("Video paused", "Press play to resume", false),
+        VideoTileStatus::Buffering => ("Buffering video", "Waiting for the stream", true),
+        VideoTileStatus::Failed(_) if video_status_needs_settings(status) => (
+            "Video tools unavailable",
+            "Open Settings to configure playback",
+            false,
+        ),
         VideoTileStatus::Failed(_) => {
             ("Video unavailable", "Check the source and try again", false)
         }
@@ -581,23 +669,24 @@ fn paint_video_placeholder(
         painter.circle_stroke(
             rect.center() + Vec2::new(0.0, -28.0),
             22.0 + pulse * 2.0,
-            Stroke::new(2.0, Color32::from_rgba_unmultiplied(
-                accent.r(),
-                accent.g(),
-                accent.b(),
-                (90.0 + pulse * 80.0) as u8,
-            )),
+            Stroke::new(
+                2.0,
+                Color32::from_rgba_unmultiplied(
+                    accent.r(),
+                    accent.g(),
+                    accent.b(),
+                    (90.0 + pulse * 80.0) as u8,
+                ),
+            ),
         );
     } else {
         painter.circle_stroke(
             rect.center() + Vec2::new(0.0, -28.0),
             22.0,
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(
-                accent.r(),
-                accent.g(),
-                accent.b(),
-                110,
-            )),
+            Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 110),
+            ),
         );
     }
     painter.text(
@@ -697,7 +786,10 @@ fn paint_browser_placeholder(
     painter.circle_stroke(
         Pos2::new(center.x, icon_y),
         if compact { 18.0 } else { 23.0 },
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 75)),
+        Stroke::new(
+            1.0,
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 75),
+        ),
     );
     painter.text(
         Pos2::new(center.x, icon_y),
@@ -829,6 +921,9 @@ pub struct CanvasState {
     /// Video tile actions queued by hover controls / context menus.
     pub pending_video_actions: Vec<(PreviewId, VideoAction)>,
 
+    /// Folder playlist actions queued by its rows and header controls.
+    pub pending_playlist_actions: Vec<(PreviewId, PlaylistAction)>,
+
     /// A removed browser tile whose "Undo" was clicked; the app recreates
     /// the WebView from its saved URL (the original host is already gone).
     pub pending_browser_restore: Option<RemovedPreviewInfo>,
@@ -838,6 +933,9 @@ pub struct CanvasState {
 
     /// A removed video tile whose mpv host should be recreated by the app.
     pub pending_video_restore: Option<RemovedPreviewInfo>,
+
+    /// A removed folder playlist whose directory should be rescanned.
+    pub pending_playlist_restore: Option<RemovedPreviewInfo>,
 
     /// The browser tile currently in interaction mode, set by the app each
     /// frame so the canvas can outline it in the accent color.
@@ -880,9 +978,11 @@ impl Default for CanvasState {
             pending_stream_add: None,
             pending_browser_actions: Vec::new(),
             pending_video_actions: Vec::new(),
+            pending_playlist_actions: Vec::new(),
             pending_browser_restore: None,
             pending_media_restore: None,
             pending_video_restore: None,
+            pending_playlist_restore: None,
             interactive_browser: None,
             last_screen_rect: None,
             last_double_clicked: None,
@@ -930,8 +1030,8 @@ impl CanvasState {
         self.zoom = (available.x / tile_size.x)
             .min(available.y / tile_size.y)
             .clamp(self.zoom_min, self.zoom_max);
-        self.pan = (canvas_rect.center() - canvas_rect.min) / self.zoom
-            - tile_rect.center().to_vec2();
+        self.pan =
+            (canvas_rect.center() - canvas_rect.min) / self.zoom - tile_rect.center().to_vec2();
         self.selection = vec![id];
         self.animation.momentum_active = false;
         self.animation.momentum_velocity = Vec2::ZERO;
@@ -996,7 +1096,12 @@ impl CanvasState {
     }
 
     /// Check if mouse is over a resize handle, returns (preview_id, handle)
-    fn get_handle_at(&self, screen_pos: Pos2, canvas_rect: Rect, preview_manager: &PreviewManager) -> Option<(PreviewId, ResizeHandle)> {
+    fn get_handle_at(
+        &self,
+        screen_pos: Pos2,
+        canvas_rect: Rect,
+        preview_manager: &PreviewManager,
+    ) -> Option<(PreviewId, ResizeHandle)> {
         let handle_size = 12.0; // Slightly larger hit area
 
         for id in &self.selection {
@@ -1200,13 +1305,19 @@ impl CanvasState {
                 capture_coordinator.resume_capture(id);
                 preview.capture_paused = false;
                 #[cfg(debug_assertions)]
-                println!("Viewport culling: Resumed capture for '{}'", privacy::redact_title(&preview.title));
+                println!(
+                    "Viewport culling: Resumed capture for '{}'",
+                    privacy::redact_title(&preview.title)
+                );
             } else if !is_visible && !preview.capture_paused {
                 // Pause capture - preview is now off-screen
                 capture_coordinator.pause_capture(id);
                 preview.capture_paused = true;
                 #[cfg(debug_assertions)]
-                println!("Viewport culling: Paused capture for '{}'", privacy::redact_title(&preview.title));
+                println!(
+                    "Viewport culling: Paused capture for '{}'",
+                    privacy::redact_title(&preview.title)
+                );
             }
         }
     }
@@ -1248,7 +1359,9 @@ impl CanvasState {
         if show_overlays {
             if let Some(mouse_pos) = input.hover_pos {
                 if canvas_rect.contains(mouse_pos) {
-                    if let Some((_, handle)) = self.get_handle_at(mouse_pos, canvas_rect, preview_manager) {
+                    if let Some((_, handle)) =
+                        self.get_handle_at(mouse_pos, canvas_rect, preview_manager)
+                    {
                         ui.ctx().set_cursor_icon(handle.cursor());
                     }
                 }
@@ -1262,13 +1375,26 @@ impl CanvasState {
             if canvas_rect.contains(mouse_pos) {
                 let scroll_delta = input.scroll_y;
                 if scroll_delta != 0.0 {
-                    let zoom_factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
-                    let new_zoom = (self.zoom * zoom_factor).clamp(self.zoom_min, self.zoom_max);
-
                     let canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
-                    self.zoom = new_zoom;
-                    let new_canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
-                    self.pan += new_canvas_pos.to_vec2() - canvas_pos.to_vec2();
+                    let playlist_id = preview_manager
+                        .get_preview_at(canvas_pos)
+                        .filter(|id| preview_manager.get(*id).is_some_and(Preview::is_playlist));
+                    if let Some(id) = playlist_id {
+                        if let Some(playlist) = preview_manager
+                            .get_mut(id)
+                            .and_then(|preview| preview.folder_playlist.as_mut())
+                        {
+                            playlist.scroll_offset =
+                                (playlist.scroll_offset - scroll_delta).max(0.0);
+                        }
+                    } else {
+                        let zoom_factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
+                        let new_zoom =
+                            (self.zoom * zoom_factor).clamp(self.zoom_min, self.zoom_max);
+                        self.zoom = new_zoom;
+                        let new_canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
+                        self.pan += new_canvas_pos.to_vec2() - canvas_pos.to_vec2();
+                    }
                 }
             }
         }
@@ -1435,6 +1561,7 @@ impl CanvasState {
             let is_browser = info.is_browser;
             let is_media = info.is_media;
             let is_video = info.is_video;
+            let is_playlist = info.is_playlist;
             let muted = if is_video {
                 info.video_playback.muted
             } else {
@@ -1474,7 +1601,12 @@ impl CanvasState {
                 if let Some(preview) = preview_manager.get_mut(id) {
                     let uv_rect = preview.get_uv_rect();
                     if let Some(texture) = preview.get_texture(ctx) {
-                        painter.image(texture.id(), anim_rect, uv_rect, Color32::from_white_alpha(alpha_u8));
+                        painter.image(
+                            texture.id(),
+                            anim_rect,
+                            uv_rect,
+                            Color32::from_white_alpha(alpha_u8),
+                        );
                     }
                 }
                 continue;
@@ -1492,7 +1624,11 @@ impl CanvasState {
             if show_overlays {
                 // Soft drop shadow underneath the preview, stronger when selected/dragged.
                 let shadow_alpha = ((if is_active { 90.0 } else { 40.0 }) * alpha) as u8;
-                let shadow_offset = if is_active { Vec2::new(0.0, 6.0) } else { Vec2::new(0.0, 3.0) };
+                let shadow_offset = if is_active {
+                    Vec2::new(0.0, 6.0)
+                } else {
+                    Vec2::new(0.0, 3.0)
+                };
                 painter.rect_filled(
                     anim_rect.translate(shadow_offset),
                     8.0,
@@ -1512,11 +1648,11 @@ impl CanvasState {
                     .map(|renderer| {
                         painter.add(egui::PaintCallback {
                             rect: anim_rect,
-                            callback: std::sync::Arc::new(
-                                eframe::egui_glow::CallbackFn::new(move |info, painter| {
+                            callback: std::sync::Arc::new(eframe::egui_glow::CallbackFn::new(
+                                move |info, painter| {
                                     renderer.paint(info, painter.gl());
-                                }),
-                            ),
+                                },
+                            )),
                         });
                         true
                     })
@@ -1525,7 +1661,14 @@ impl CanvasState {
             #[cfg(not(windows))]
             let has_direct_video = false;
 
-            let has_texture = if has_direct_video {
+            let has_playlist_content = if is_playlist {
+                self.paint_folder_playlist(ui, &painter, anim_rect, preview_manager, id, alpha_u8);
+                true
+            } else {
+                false
+            };
+
+            let has_texture = if has_playlist_content || has_direct_video {
                 true
             } else if let Some(preview) = preview_manager.get_mut(id) {
                 // Get UV rect first (immutable borrow ends before get_texture)
@@ -1589,19 +1732,22 @@ impl CanvasState {
             // controls to the topmost tile under the pointer.
             let pointer_over_tile = input.hover_pos.is_some_and(|pointer_pos| {
                 screen_rect.contains(pointer_pos)
-                    && preview_manager.get_preview_at(
-                        self.screen_to_canvas(pointer_pos, canvas_rect),
-                    ) == Some(id)
+                    && preview_manager
+                        .get_preview_at(self.screen_to_canvas(pointer_pos, canvas_rect))
+                        == Some(id)
             });
             if show_overlays && pointer_over_tile {
                 // Semi-transparent overlay gradient at top for controls
-                let overlay_rect = Rect::from_min_size(
-                    screen_rect.min,
-                    Vec2::new(screen_rect.width(), 40.0),
-                );
+                let overlay_rect =
+                    Rect::from_min_size(screen_rect.min, Vec2::new(screen_rect.width(), 40.0));
                 painter.rect_filled(
                     overlay_rect,
-                    egui::Rounding { nw: 8.0, ne: 8.0, sw: 0.0, se: 0.0 },
+                    egui::Rounding {
+                        nw: 8.0,
+                        ne: 8.0,
+                        sw: 0.0,
+                        se: 0.0,
+                    },
                     Color32::from_rgba_unmultiplied(0, 0, 0, 120),
                 );
 
@@ -1635,13 +1781,17 @@ impl CanvasState {
                 }
 
                 // Capture FPS does not apply to file-backed image tiles.
-                if !is_media {
+                if !is_media && !is_playlist {
                     let fps_text = format!("{}", target_fps);
                     let fps_rect = Rect::from_min_size(
                         screen_rect.right_top() + Vec2::new(-72.0, 10.0),
                         Vec2::new(36.0, 20.0),
                     );
-                    painter.rect_filled(fps_rect, 10.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
+                    painter.rect_filled(
+                        fps_rect,
+                        10.0,
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                    );
                     painter.text(
                         fps_rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -1658,13 +1808,15 @@ impl CanvasState {
                 } else {
                     Cow::Borrowed(title)
                 };
-                let title_pos = if is_browser || is_media || is_video {
-                    // Source badge marks browser/media/video tiles; shift the title right.
+                let title_pos = if is_browser || is_media || is_video || is_playlist {
+                    // Source badge marks app-owned tiles; shift the title right.
                     painter.text(
                         screen_rect.left_top() + Vec2::new(12.0, 20.0),
                         egui::Align2::LEFT_CENTER,
                         if is_browser {
                             egui_phosphor::regular::GLOBE
+                        } else if is_playlist {
+                            egui_phosphor::regular::PLAYLIST
                         } else if is_video {
                             egui_phosphor::regular::VIDEO
                         } else {
@@ -1693,20 +1845,45 @@ impl CanvasState {
                     );
                     painter.rect_filled(
                         bottom_overlay,
-                        egui::Rounding { nw: 0.0, ne: 0.0, sw: 8.0, se: 8.0 },
+                        egui::Rounding {
+                            nw: 0.0,
+                            ne: 0.0,
+                            sw: 8.0,
+                            se: 8.0,
+                        },
                         Color32::from_rgba_unmultiplied(0, 0, 0, 120),
                     );
 
                     let buttons: [(&str, BrowserAction, &str); 5] = [
-                        (egui_phosphor::regular::CARET_LEFT, BrowserAction::Back, "Back"),
-                        (egui_phosphor::regular::CARET_RIGHT, BrowserAction::Forward, "Forward"),
-                        (egui_phosphor::regular::ARROW_CLOCKWISE, BrowserAction::Reload, "Reload"),
                         (
-                            if muted { egui_phosphor::regular::SPEAKER_SLASH } else { egui_phosphor::regular::SPEAKER_HIGH },
+                            egui_phosphor::regular::CARET_LEFT,
+                            BrowserAction::Back,
+                            "Back",
+                        ),
+                        (
+                            egui_phosphor::regular::CARET_RIGHT,
+                            BrowserAction::Forward,
+                            "Forward",
+                        ),
+                        (
+                            egui_phosphor::regular::ARROW_CLOCKWISE,
+                            BrowserAction::Reload,
+                            "Reload",
+                        ),
+                        (
+                            if muted {
+                                egui_phosphor::regular::SPEAKER_SLASH
+                            } else {
+                                egui_phosphor::regular::SPEAKER_HIGH
+                            },
                             BrowserAction::ToggleMute,
                             if muted { "Unmute" } else { "Mute" },
                         ),
-                        (egui_phosphor::regular::ARROW_SQUARE_OUT, BrowserAction::OpenExternal, "Open in browser"),
+                        (
+                            egui_phosphor::regular::ARROW_SQUARE_OUT,
+                            BrowserAction::OpenExternal,
+                            "Open in browser",
+                        ),
                     ];
                     for (idx, (icon, action, tip)) in buttons.iter().enumerate() {
                         let btn_rect = Rect::from_min_size(
@@ -1721,7 +1898,11 @@ impl CanvasState {
                             )
                             .on_hover_text(*tip);
                         if resp.hovered() {
-                            painter.rect_filled(btn_rect, 6.0, Color32::from_rgba_unmultiplied(255, 255, 255, 35));
+                            painter.rect_filled(
+                                btn_rect,
+                                6.0,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 35),
+                            );
                         }
                         let icon_color = if *action == BrowserAction::ToggleMute && muted {
                             Color32::from_rgb(255, 150, 100)
@@ -1748,7 +1929,12 @@ impl CanvasState {
                     );
                     painter.rect_filled(
                         bottom_overlay,
-                        egui::Rounding { nw: 0.0, ne: 0.0, sw: 8.0, se: 8.0 },
+                        egui::Rounding {
+                            nw: 0.0,
+                            ne: 0.0,
+                            sw: 8.0,
+                            se: 8.0,
+                        },
                         Color32::from_rgba_unmultiplied(0, 0, 0, 155),
                     );
 
@@ -1764,7 +1950,11 @@ impl CanvasState {
                             ui.id().with(("video_play", id.0)),
                             Sense::click(),
                         )
-                        .on_hover_text(if video_playback.paused { "Play" } else { "Pause" });
+                        .on_hover_text(if video_playback.paused {
+                            "Play"
+                        } else {
+                            "Pause"
+                        });
                     if play_response.hovered() || play_response.is_pointer_button_down_on() {
                         painter.rect_filled(
                             play_rect,
@@ -1773,7 +1963,11 @@ impl CanvasState {
                                 255,
                                 255,
                                 255,
-                                if play_response.is_pointer_button_down_on() { 65 } else { 35 },
+                                if play_response.is_pointer_button_down_on() {
+                                    65
+                                } else {
+                                    35
+                                },
                             ),
                         );
                     }
@@ -1855,7 +2049,8 @@ impl CanvasState {
                         },
                     );
                     if controls_enabled && mute_response.clicked() {
-                        self.pending_video_actions.push((id, VideoAction::ToggleMute));
+                        self.pending_video_actions
+                            .push((id, VideoAction::ToggleMute));
                     }
 
                     let time_text = format!(
@@ -1863,16 +2058,27 @@ impl CanvasState {
                         format_time(video_playback.time_pos),
                         format_time(video_playback.duration),
                     );
-                    let time_width = if screen_rect.width() >= 360.0 { 94.0 } else { 72.0 };
+                    let time_width = if screen_rect.width() >= 360.0 {
+                        94.0
+                    } else {
+                        72.0
+                    };
                     let time_rect = Rect::from_min_size(
-                        Pos2::new(mute_rect.left() - time_width - 4.0, bottom_overlay.top() + 15.0),
+                        Pos2::new(
+                            mute_rect.left() - time_width - 4.0,
+                            bottom_overlay.top() + 15.0,
+                        ),
                         Vec2::new(time_width, 22.0),
                     );
                     painter.text(
                         time_rect.center(),
                         egui::Align2::CENTER_CENTER,
                         time_text,
-                        egui::FontId::monospace(if screen_rect.width() >= 360.0 { 10.0 } else { 8.5 }),
+                        egui::FontId::monospace(if screen_rect.width() >= 360.0 {
+                            10.0
+                        } else {
+                            8.5
+                        }),
                         Color32::from_rgb(190, 190, 198),
                     );
 
@@ -1890,7 +2096,10 @@ impl CanvasState {
                         };
                         let filled = Rect::from_min_size(
                             progress_rect.min,
-                            Vec2::new(progress_rect.width() * progress as f32, progress_rect.height()),
+                            Vec2::new(
+                                progress_rect.width() * progress as f32,
+                                progress_rect.height(),
+                            ),
                         );
                         painter.rect_filled(filled, 4.0, Color32::from_rgb(74, 158, 255));
                         let seek_response = ui
@@ -1907,9 +2116,9 @@ impl CanvasState {
                             && seek_response.hovered()
                         {
                             if let Some(pointer) = input.hover_pos {
-                                let fraction =
-                                    ((pointer.x - progress_rect.left()) / progress_rect.width())
-                                        .clamp(0.0, 1.0);
+                                let fraction = ((pointer.x - progress_rect.left())
+                                    / progress_rect.width())
+                                .clamp(0.0, 1.0);
                                 let hover_time = duration * fraction as f64;
                                 self.pending_video_actions
                                     .push((id, VideoAction::RequestSeekPreview(hover_time)));
@@ -1925,15 +2134,9 @@ impl CanvasState {
                                 );
                                 let popup_y = (progress_rect.top() - popup_size.y - 8.0)
                                     .max(screen_rect.top() + 44.0);
-                                let popup_rect = Rect::from_min_size(
-                                    Pos2::new(popup_x, popup_y),
-                                    popup_size,
-                                );
-                                painter.rect_filled(
-                                    popup_rect,
-                                    6.0,
-                                    Color32::from_rgb(20, 20, 24),
-                                );
+                                let popup_rect =
+                                    Rect::from_min_size(Pos2::new(popup_x, popup_y), popup_size);
+                                painter.rect_filled(popup_rect, 6.0, Color32::from_rgb(20, 20, 24));
                                 painter.rect_stroke(
                                     popup_rect,
                                     6.0,
@@ -1945,9 +2148,9 @@ impl CanvasState {
                                     Pos2::new(popup_rect.right() - 4.0, popup_rect.bottom() - 22.0),
                                 );
                                 let texture_id = preview_manager.get_mut(id).and_then(|preview| {
-                                    let matches_time = preview.seek_preview_time().is_some_and(
-                                        |time| (time - hover_time).abs() <= 1.0,
-                                    );
+                                    let matches_time = preview
+                                        .seek_preview_time()
+                                        .is_some_and(|time| (time - hover_time).abs() <= 1.0);
                                     matches_time
                                         .then(|| preview.get_seek_preview_texture(ctx))
                                         .flatten()
@@ -1984,9 +2187,9 @@ impl CanvasState {
                             && (seek_response.clicked() || seek_response.dragged())
                         {
                             if let Some(pointer) = seek_response.interact_pointer_pos() {
-                                let fraction =
-                                    ((pointer.x - progress_rect.left()) / progress_rect.width())
-                                        .clamp(0.0, 1.0);
+                                let fraction = ((pointer.x - progress_rect.left())
+                                    / progress_rect.width())
+                                .clamp(0.0, 1.0);
                                 self.pending_video_actions.push((
                                     id,
                                     VideoAction::SeekAbsolute(duration * fraction as f64),
@@ -2002,7 +2205,11 @@ impl CanvasState {
                         screen_rect.left_bottom() + Vec2::new(8.0, -28.0),
                         Vec2::new(50.0, 20.0),
                     );
-                    painter.rect_filled(crop_rect, 10.0, Color32::from_rgba_unmultiplied(255, 150, 100, 180));
+                    painter.rect_filled(
+                        crop_rect,
+                        10.0,
+                        Color32::from_rgba_unmultiplied(255, 150, 100, 180),
+                    );
                     painter.text(
                         crop_rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -2015,13 +2222,25 @@ impl CanvasState {
 
             // Muted badge stays visible even without hover so silent tiles
             // are recognizable at a glance.
-            if show_overlays && ((is_browser && muted && !pointer_over_tile) || (is_video && muted)) {
+            if show_overlays && ((is_browser && muted && !pointer_over_tile) || (is_video && muted))
+            {
                 let badge_rect = Rect::from_min_size(
                     screen_rect.right_top()
-                        + Vec2::new(if is_video && pointer_over_tile { -58.0 } else { -30.0 }, 8.0),
+                        + Vec2::new(
+                            if is_video && pointer_over_tile {
+                                -58.0
+                            } else {
+                                -30.0
+                            },
+                            8.0,
+                        ),
                     Vec2::splat(22.0),
                 );
-                painter.rect_filled(badge_rect, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+                painter.rect_filled(
+                    badge_rect,
+                    6.0,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                );
                 painter.text(
                     badge_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -2035,9 +2254,17 @@ impl CanvasState {
             // green accent marks the browser tile currently in interaction mode.
             if show_overlays {
                 if self.interactive_browser == Some(id) {
-                    painter.rect_stroke(screen_rect, 8.0, Stroke::new(2.0, Color32::from_rgb(107, 170, 75)));
+                    painter.rect_stroke(
+                        screen_rect,
+                        8.0,
+                        Stroke::new(2.0, Color32::from_rgb(107, 170, 75)),
+                    );
                 } else if self.selection.contains(&id) {
-                    painter.rect_stroke(screen_rect, 8.0, Stroke::new(2.0, Color32::from_rgb(74, 158, 255)));
+                    painter.rect_stroke(
+                        screen_rect,
+                        8.0,
+                        Stroke::new(2.0, Color32::from_rgb(74, 158, 255)),
+                    );
                 }
             }
 
@@ -2061,10 +2288,10 @@ impl CanvasState {
                 if is_video {
                     self.pending_video_actions
                         .push((id, VideoAction::SetPaused(!video_playback.paused)));
-                } else {
+                } else if !is_playlist {
                     self.last_double_clicked = Some(id);
                 }
-                if !is_browser && !is_video {
+                if !is_browser && !is_video && !is_playlist {
                     if let Some(preview) = preview_manager.get(id) {
                         if let Some(ref handle) = preview.window_handle {
                             #[cfg(windows)]
@@ -2092,7 +2319,9 @@ impl CanvasState {
 
                 for sel_id in ids_to_init {
                     if let Some(preview) = preview_manager.get(sel_id) {
-                        let spring = self.animation.get_or_create_spring(sel_id, preview.position);
+                        let spring = self
+                            .animation
+                            .get_or_create_spring(sel_id, preview.position);
                         spring.set_immediate_pos(preview.position);
                     }
                 }
@@ -2116,7 +2345,8 @@ impl CanvasState {
                             preview_manager.translate(*sel_id, delta);
                             // Keep spring in sync during drag
                             if let Some(preview) = preview_manager.get(*sel_id) {
-                                if let Some(spring) = self.animation.preview_springs.get_mut(sel_id) {
+                                if let Some(spring) = self.animation.preview_springs.get_mut(sel_id)
+                                {
                                     spring.set_immediate_pos(preview.position);
                                 }
                             }
@@ -2160,7 +2390,9 @@ impl CanvasState {
                         };
 
                         // Set spring target for smooth animation to final position
-                        let spring = self.animation.get_or_create_spring(sel_id, preview.position);
+                        let spring = self
+                            .animation
+                            .get_or_create_spring(sel_id, preview.position);
                         spring.set_target_pos(final_target);
 
                         // Add minimal velocity for subtle ease-out
@@ -2174,7 +2406,7 @@ impl CanvasState {
                 ui.label(egui::RichText::new(title.clone()).strong());
                 ui.separator();
 
-                if !is_media {
+                if !is_media && !is_playlist {
                     ui.label("Frame Rate:");
                     for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
                         let is_current = current_preset == preset;
@@ -2195,7 +2427,44 @@ impl CanvasState {
                     ui.separator();
                 }
 
-                if is_media {
+                if is_playlist {
+                    ui.label(egui::RichText::new("Folder playlist tile").weak());
+                    if ui.button("Previous video").clicked() {
+                        self.pending_playlist_actions
+                            .push((id, PlaylistAction::Previous));
+                        ui.close_menu();
+                    }
+                    if ui.button("Next video").clicked() {
+                        self.pending_playlist_actions
+                            .push((id, PlaylistAction::Next));
+                        ui.close_menu();
+                    }
+                    if ui.button("Rescan folder").clicked() {
+                        self.pending_playlist_actions
+                            .push((id, PlaylistAction::Rescan));
+                        ui.close_menu();
+                    }
+                    let (autoplay, shuffle, repeat) = preview_manager
+                        .get(id)
+                        .and_then(|preview| preview.folder_playlist.as_ref())
+                        .map(|playlist| (playlist.autoplay, playlist.shuffle, playlist.repeat))
+                        .unwrap_or((true, false, false));
+                    if ui.selectable_label(autoplay, "Autoplay next").clicked() {
+                        self.pending_playlist_actions
+                            .push((id, PlaylistAction::ToggleAutoplay));
+                        ui.close_menu();
+                    }
+                    if ui.selectable_label(shuffle, "Shuffle").clicked() {
+                        self.pending_playlist_actions
+                            .push((id, PlaylistAction::ToggleShuffle));
+                        ui.close_menu();
+                    }
+                    if ui.selectable_label(repeat, "Repeat playlist").clicked() {
+                        self.pending_playlist_actions
+                            .push((id, PlaylistAction::ToggleRepeat));
+                        ui.close_menu();
+                    }
+                } else if is_media {
                     ui.label(egui::RichText::new("Image / animated GIF tile").weak());
                 } else if is_browser {
                     // Browser tiles: navigation and audio instead of crop
@@ -2204,34 +2473,51 @@ impl CanvasState {
                     if !browser_ready {
                         ui.label(egui::RichText::new("Browser preview is starting…").weak());
                     }
-                    if ui.add_enabled(browser_ready, egui::Button::new("Interact")).clicked() {
+                    if ui
+                        .add_enabled(browser_ready, egui::Button::new("Interact"))
+                        .clicked()
+                    {
                         self.last_double_clicked = Some(id);
                         ui.close_menu();
                     }
                     if ui
-                        .add_enabled(browser_ready, egui::Button::new(if muted { "Unmute" } else { "Mute" }))
+                        .add_enabled(
+                            browser_ready,
+                            egui::Button::new(if muted { "Unmute" } else { "Mute" }),
+                        )
                         .clicked()
                     {
-                        self.pending_browser_actions.push((id, BrowserAction::ToggleMute));
+                        self.pending_browser_actions
+                            .push((id, BrowserAction::ToggleMute));
                         ui.close_menu();
                     }
-                    if ui.add_enabled(browser_ready, egui::Button::new("Reload")).clicked() {
-                        self.pending_browser_actions.push((id, BrowserAction::Reload));
+                    if ui
+                        .add_enabled(browser_ready, egui::Button::new("Reload"))
+                        .clicked()
+                    {
+                        self.pending_browser_actions
+                            .push((id, BrowserAction::Reload));
                         ui.close_menu();
                     }
                     if ui.button("Change URL...").clicked() {
-                        self.pending_browser_actions.push((id, BrowserAction::EditUrl));
+                        self.pending_browser_actions
+                            .push((id, BrowserAction::EditUrl));
                         ui.close_menu();
                     }
-                    if ui.add_enabled(browser_ready, egui::Button::new("Copy URL")).clicked() {
-                        self.pending_browser_actions.push((id, BrowserAction::CopyUrl));
+                    if ui
+                        .add_enabled(browser_ready, egui::Button::new("Copy URL"))
+                        .clicked()
+                    {
+                        self.pending_browser_actions
+                            .push((id, BrowserAction::CopyUrl));
                         ui.close_menu();
                     }
                     if ui
                         .add_enabled(browser_ready, egui::Button::new("Open in Default Browser"))
                         .clicked()
                     {
-                        self.pending_browser_actions.push((id, BrowserAction::OpenExternal));
+                        self.pending_browser_actions
+                            .push((id, BrowserAction::OpenExternal));
                         ui.close_menu();
                     }
                 } else if is_video {
@@ -2246,7 +2532,11 @@ impl CanvasState {
                     }
                     ui.add_enabled_ui(controls_enabled, |ui| {
                         if ui
-                            .button(if video_playback.paused { "Play" } else { "Pause" })
+                            .button(if video_playback.paused {
+                                "Play"
+                            } else {
+                                "Pause"
+                            })
                             .clicked()
                         {
                             self.pending_video_actions
@@ -2254,7 +2544,8 @@ impl CanvasState {
                             ui.close_menu();
                         }
                         if ui.button(if muted { "Unmute" } else { "Mute" }).clicked() {
-                            self.pending_video_actions.push((id, VideoAction::ToggleMute));
+                            self.pending_video_actions
+                                .push((id, VideoAction::ToggleMute));
                             ui.close_menu();
                         }
 
@@ -2263,24 +2554,23 @@ impl CanvasState {
                             .add(egui::Slider::new(&mut volume, 0.0..=100.0).text("Volume"))
                             .changed()
                         {
-                            self.pending_video_actions.push((id, VideoAction::SetVolume(volume)));
+                            self.pending_video_actions
+                                .push((id, VideoAction::SetVolume(volume)));
                         }
 
                         if ui
                             .selectable_label(video_playback.looping, "Loop")
                             .clicked()
                         {
-                            self.pending_video_actions.push((id, VideoAction::ToggleLoop));
+                            self.pending_video_actions
+                                .push((id, VideoAction::ToggleLoop));
                             ui.close_menu();
                         }
 
                         ui.menu_button(format!("Speed: {}×", video_playback.speed), |ui| {
                             for speed in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
                                 let selected = (video_playback.speed - speed).abs() < 0.001;
-                                if ui
-                                    .selectable_label(selected, format!("{speed}×"))
-                                    .clicked()
-                                {
+                                if ui.selectable_label(selected, format!("{speed}×")).clicked() {
                                     self.pending_video_actions
                                         .push((id, VideoAction::SetSpeed(speed)));
                                     ui.close_menu();
@@ -2310,10 +2600,8 @@ impl CanvasState {
                                     )
                                     .clicked()
                                 {
-                                    self.pending_video_actions.push((
-                                        id,
-                                        VideoAction::SelectAudioTrack(track.id),
-                                    ));
+                                    self.pending_video_actions
+                                        .push((id, VideoAction::SelectAudioTrack(track.id)));
                                     ui.close_menu();
                                 }
                             }
@@ -2324,10 +2612,8 @@ impl CanvasState {
                                 .selectable_label(video_playback.subtitle_track.is_none(), "Off")
                                 .clicked()
                             {
-                                self.pending_video_actions.push((
-                                    id,
-                                    VideoAction::SelectSubtitleTrack(None),
-                                ));
+                                self.pending_video_actions
+                                    .push((id, VideoAction::SelectSubtitleTrack(None)));
                                 ui.close_menu();
                             }
                             for track in video_playback
@@ -2360,7 +2646,8 @@ impl CanvasState {
                     if video_status_needs_settings(video_status)
                         && ui.button("Open Settings").clicked()
                     {
-                        self.pending_video_actions.push((id, VideoAction::OpenSettings));
+                        self.pending_video_actions
+                            .push((id, VideoAction::OpenSettings));
                         ui.close_menu();
                     }
 
@@ -2396,7 +2683,11 @@ impl CanvasState {
                         }
 
                         ui.separator();
-                        ui.label(egui::RichText::new("Tip: Alt+drag corners to fine-tune").weak().small());
+                        ui.label(
+                            egui::RichText::new("Tip: Alt+drag corners to fine-tune")
+                                .weak()
+                                .small(),
+                        );
                     });
                 }
 
@@ -2436,6 +2727,275 @@ impl CanvasState {
         }
     }
 
+    fn paint_folder_playlist(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        preview_manager: &mut PreviewManager,
+        id: PreviewId,
+        alpha: u8,
+    ) {
+        let clipped = painter.with_clip_rect(rect);
+        clipped.rect_filled(
+            rect,
+            8.0,
+            Color32::from_rgba_unmultiplied(19, 20, 24, alpha),
+        );
+        let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 72.0));
+        clipped.rect_filled(
+            header,
+            egui::Rounding {
+                nw: 8.0,
+                ne: 8.0,
+                sw: 0.0,
+                se: 0.0,
+            },
+            Color32::from_rgba_unmultiplied(27, 29, 35, alpha),
+        );
+
+        let Some(preview) = preview_manager.get_mut(id) else {
+            return;
+        };
+        let Some(playlist) = preview.folder_playlist.as_mut() else {
+            return;
+        };
+
+        let count_text = format!(
+            "{} video{}",
+            playlist.entries.len(),
+            if playlist.entries.len() == 1 { "" } else { "s" }
+        );
+        clipped.text(
+            header.left_top() + Vec2::new(14.0, 18.0),
+            egui::Align2::LEFT_CENTER,
+            egui_phosphor::regular::FOLDER_OPEN,
+            egui::FontId::proportional(18.0),
+            Color32::from_rgb(107, 170, 75),
+        );
+        clipped.text(
+            header.left_top() + Vec2::new(40.0, 16.0),
+            egui::Align2::LEFT_CENTER,
+            ellipsize(
+                &preview.title,
+                ((rect.width() - 90.0) / 7.0).max(6.0) as usize,
+            ),
+            egui::FontId::proportional(13.0),
+            Color32::from_rgb(232, 232, 237),
+        );
+        clipped.text(
+            header.left_top() + Vec2::new(40.0, 35.0),
+            egui::Align2::LEFT_CENTER,
+            count_text,
+            egui::FontId::proportional(10.0),
+            Color32::from_rgb(135, 137, 146),
+        );
+
+        let controls = [
+            (
+                egui_phosphor::regular::SKIP_BACK,
+                PlaylistAction::Previous,
+                false,
+                "Previous",
+            ),
+            (
+                egui_phosphor::regular::SKIP_FORWARD,
+                PlaylistAction::Next,
+                false,
+                "Next",
+            ),
+            (
+                egui_phosphor::regular::SHUFFLE,
+                PlaylistAction::ToggleShuffle,
+                playlist.shuffle,
+                "Shuffle",
+            ),
+            (
+                egui_phosphor::regular::REPEAT,
+                PlaylistAction::ToggleRepeat,
+                playlist.repeat,
+                "Repeat playlist",
+            ),
+            (
+                egui_phosphor::regular::PLAY,
+                PlaylistAction::ToggleAutoplay,
+                playlist.autoplay,
+                "Autoplay next",
+            ),
+        ];
+        for (index, (icon, action, active, tip)) in controls.into_iter().enumerate() {
+            let button = Rect::from_min_size(
+                header.left_bottom() + Vec2::new(12.0 + index as f32 * 30.0, -29.0),
+                Vec2::splat(24.0),
+            );
+            let response = ui
+                .interact(
+                    button,
+                    ui.id().with(("playlist_control", id.0, index)),
+                    Sense::click(),
+                )
+                .on_hover_text(tip);
+            if response.hovered() || active {
+                clipped.rect_filled(
+                    button,
+                    5.0,
+                    if active {
+                        Color32::from_rgba_unmultiplied(74, 158, 255, 70)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+                    },
+                );
+            }
+            clipped.text(
+                button.center(),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(13.0),
+                if active {
+                    Color32::from_rgb(125, 190, 255)
+                } else {
+                    Color32::from_rgb(190, 192, 200)
+                },
+            );
+            if response.clicked() {
+                self.pending_playlist_actions.push((id, action));
+            }
+        }
+
+        let row_height = 64.0;
+        let list_rect = Rect::from_min_max(Pos2::new(rect.left(), header.bottom()), rect.max);
+        let max_scroll = (playlist.entries.len() as f32 * row_height - list_rect.height()).max(0.0);
+        playlist.scroll_offset = playlist.scroll_offset.clamp(0.0, max_scroll);
+        let first = (playlist.scroll_offset / row_height).floor() as usize;
+        let y_remainder = playlist.scroll_offset % row_height;
+        let selected = playlist.selected.as_ref();
+
+        if let Some(error) = playlist.error.as_ref() {
+            clipped.text(
+                list_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                ellipsize(error, 52),
+                egui::FontId::proportional(11.0),
+                Color32::from_rgb(220, 140, 125),
+            );
+        }
+
+        for (index, entry) in playlist.entries.iter_mut().enumerate().skip(first) {
+            let top = list_rect.top() + (index - first) as f32 * row_height - y_remainder;
+            let row = Rect::from_min_size(
+                Pos2::new(list_rect.left(), top),
+                Vec2::new(list_rect.width(), row_height),
+            );
+            if row.top() >= list_rect.bottom() {
+                break;
+            }
+            if row.bottom() <= list_rect.top() {
+                continue;
+            }
+
+            let active = selected.is_some_and(|path| path == &entry.path);
+            let response = ui
+                .interact(
+                    row.intersect(list_rect),
+                    ui.id().with(("playlist_row", id.0, index)),
+                    Sense::click(),
+                )
+                .on_hover_text(&entry.name);
+            if active || response.hovered() {
+                clipped.rect_filled(
+                    row,
+                    0.0,
+                    if active {
+                        Color32::from_rgba_unmultiplied(74, 158, 255, 42)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+                    },
+                );
+            }
+            if active {
+                clipped.rect_filled(
+                    Rect::from_min_size(row.min, Vec2::new(3.0, row.height())),
+                    0.0,
+                    Color32::from_rgb(74, 158, 255),
+                );
+            }
+
+            let thumb = Rect::from_min_size(row.min + Vec2::new(10.0, 8.0), Vec2::new(80.0, 45.0));
+            clipped.rect_filled(thumb, 5.0, Color32::from_rgb(31, 33, 39));
+            if let Some(texture) = &entry.thumbnail {
+                clipped.image(
+                    texture.id(),
+                    thumb,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            } else {
+                clipped.text(
+                    thumb.center(),
+                    egui::Align2::CENTER_CENTER,
+                    egui_phosphor::regular::VIDEO,
+                    egui::FontId::proportional(18.0),
+                    Color32::from_rgb(92, 95, 105),
+                );
+                if entry.thumbnail_state == crate::playlist::ThumbnailState::Idle {
+                    entry.thumbnail_state = crate::playlist::ThumbnailState::Loading;
+                    self.pending_playlist_actions
+                        .push((id, PlaylistAction::RequestThumbnail(entry.path.clone())));
+                }
+            }
+
+            clipped.text(
+                Pos2::new(thumb.right() + 10.0, row.center().y - 8.0),
+                egui::Align2::LEFT_CENTER,
+                ellipsize(&entry.name, ((row.width() - 112.0) / 6.5).max(5.0) as usize),
+                egui::FontId::proportional(11.5),
+                if active {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(205, 206, 213)
+                },
+            );
+            clipped.text(
+                Pos2::new(thumb.right() + 10.0, row.center().y + 10.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{:02}", index + 1),
+                egui::FontId::monospace(9.5),
+                Color32::from_rgb(110, 112, 122),
+            );
+            clipped.line_segment(
+                [
+                    Pos2::new(row.left() + 10.0, row.bottom()),
+                    Pos2::new(row.right() - 10.0, row.bottom()),
+                ],
+                Stroke::new(1.0, Color32::from_rgb(35, 37, 43)),
+            );
+            if response.clicked() {
+                self.pending_playlist_actions
+                    .push((id, PlaylistAction::Select(entry.path.clone())));
+            }
+        }
+
+        if max_scroll > 0.0 {
+            let fraction = (list_rect.height() / (playlist.entries.len() as f32 * row_height))
+                .clamp(0.08, 1.0);
+            let track = Rect::from_min_max(
+                Pos2::new(rect.right() - 4.0, list_rect.top() + 4.0),
+                Pos2::new(rect.right() - 2.0, list_rect.bottom() - 4.0),
+            );
+            let thumb_height = track.height() * fraction;
+            let thumb_top = track.top()
+                + (track.height() - thumb_height) * (playlist.scroll_offset / max_scroll);
+            clipped.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(track.left(), thumb_top),
+                    Vec2::new(track.width(), thumb_height),
+                ),
+                1.0,
+                Color32::from_rgb(82, 85, 94),
+            );
+        }
+    }
+
     /// Draw the background grid - Minimal Void: very subtle
     fn draw_grid(&self, painter: &egui::Painter, canvas_rect: Rect) {
         let viewport = self.get_viewport(canvas_rect);
@@ -2456,7 +3016,10 @@ impl CanvasState {
             let screen_x = self.canvas_to_screen(Pos2::new(x, 0.0), canvas_rect).x;
             if screen_x >= canvas_rect.min.x && screen_x <= canvas_rect.max.x {
                 painter.line_segment(
-                    [Pos2::new(screen_x, canvas_rect.min.y), Pos2::new(screen_x, canvas_rect.max.y)],
+                    [
+                        Pos2::new(screen_x, canvas_rect.min.y),
+                        Pos2::new(screen_x, canvas_rect.max.y),
+                    ],
                     Stroke::new(1.0, grid_color),
                 );
             }
@@ -2468,7 +3031,10 @@ impl CanvasState {
             let screen_y = self.canvas_to_screen(Pos2::new(0.0, y), canvas_rect).y;
             if screen_y >= canvas_rect.min.y && screen_y <= canvas_rect.max.y {
                 painter.line_segment(
-                    [Pos2::new(canvas_rect.min.x, screen_y), Pos2::new(canvas_rect.max.x, screen_y)],
+                    [
+                        Pos2::new(canvas_rect.min.x, screen_y),
+                        Pos2::new(canvas_rect.max.x, screen_y),
+                    ],
                     Stroke::new(1.0, grid_color),
                 );
             }
@@ -2480,18 +3046,29 @@ impl CanvasState {
         if canvas_rect.contains(origin_screen) {
             let origin_color = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
             painter.line_segment(
-                [Pos2::new(origin_screen.x, canvas_rect.min.y), Pos2::new(origin_screen.x, canvas_rect.max.y)],
+                [
+                    Pos2::new(origin_screen.x, canvas_rect.min.y),
+                    Pos2::new(origin_screen.x, canvas_rect.max.y),
+                ],
                 Stroke::new(1.0, origin_color),
             );
             painter.line_segment(
-                [Pos2::new(canvas_rect.min.x, origin_screen.y), Pos2::new(canvas_rect.max.x, origin_screen.y)],
+                [
+                    Pos2::new(canvas_rect.min.x, origin_screen.y),
+                    Pos2::new(canvas_rect.max.x, origin_screen.y),
+                ],
                 Stroke::new(1.0, origin_color),
             );
         }
     }
 
     /// Minimal Void: Draw floating status indicator in bottom-right corner
-    fn draw_floating_status(&self, painter: &egui::Painter, canvas_rect: Rect, preview_count: usize) {
+    fn draw_floating_status(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        preview_count: usize,
+    ) {
         let status_text = format!("{}%  {}⬚", (self.zoom * 100.0) as i32, preview_count);
 
         // Position in bottom-right with padding
@@ -2559,14 +3136,20 @@ impl CanvasState {
         preview_manager: &mut PreviewManager,
         capture_coordinator: &mut CaptureCoordinator,
     ) {
-        let Some((removed_at, _)) = self.last_removed.as_ref() else { return; };
+        let Some((removed_at, _)) = self.last_removed.as_ref() else {
+            return;
+        };
 
         let age = removed_at.elapsed().as_secs_f32();
         if age >= UNDO_TOAST_SECS {
             self.last_removed = None;
             return;
         }
-        let info = &self.last_removed.as_ref().expect("removed preview is present").1;
+        let info = &self
+            .last_removed
+            .as_ref()
+            .expect("removed preview is present")
+            .1;
 
         // Fade in quickly, fade out over the last half-second.
         let fade_in = (age / 0.15).clamp(0.0, 1.0);
@@ -2586,7 +3169,10 @@ impl CanvasState {
         let toast_height = 32.0;
         let toast_width = 230.0;
         let toast_rect = Rect::from_min_size(
-            Pos2::new(canvas_rect.min.x + padding, canvas_rect.max.y - toast_height - padding),
+            Pos2::new(
+                canvas_rect.min.x + padding,
+                canvas_rect.max.y - toast_height - padding,
+            ),
             Vec2::new(toast_width, toast_height),
         );
 
@@ -2623,8 +3209,13 @@ impl CanvasState {
         );
 
         if undo_response.clicked() {
-            let (_, info) = self.last_removed.take().expect("removed preview is present");
-            if info.browser_url.is_some() {
+            let (_, info) = self
+                .last_removed
+                .take()
+                .expect("removed preview is present");
+            if info.folder_playlist.is_some() {
+                self.pending_playlist_restore = Some(info);
+            } else if info.browser_url.is_some() {
                 // The browser's host window was destroyed with the tile, so
                 // the app must recreate the WebView from the saved URL.
                 self.pending_browser_restore = Some(info);
@@ -2645,7 +3236,12 @@ impl CanvasState {
                     preview.set_fps_preset(info.fps_preset);
                     preview.crop_uv = info.crop_uv;
                 }
-                capture_coordinator.start_capture(id, handle.hwnd, capture_title, info.fps_preset.as_u32());
+                capture_coordinator.start_capture(
+                    id,
+                    handle.hwnd,
+                    capture_title,
+                    info.fps_preset.as_u32(),
+                );
             }
         }
 
@@ -2665,20 +3261,34 @@ impl CanvasState {
         let alt_held = input.alt;
 
         // Collect selection info to avoid borrow issues
-        let selection_info: Vec<_> = self.selection.iter()
-            .filter_map(|id| preview_manager.get(*id).map(|p| {
-                (*id, p.rect(), p.source_aspect_ratio, p.crop_uv, p.frame_size, p.is_browser())
-            }))
+        let selection_info: Vec<_> = self
+            .selection
+            .iter()
+            .filter_map(|id| {
+                preview_manager.get(*id).map(|p| {
+                    (
+                        *id,
+                        p.rect(),
+                        p.source_aspect_ratio,
+                        p.crop_uv,
+                        p.frame_size,
+                        p.is_browser(),
+                        p.is_playlist(),
+                    )
+                })
+            })
             .collect();
 
-        for (id, preview_rect, aspect_ratio, crop_uv, frame_size, is_browser) in selection_info {
+        for (id, preview_rect, aspect_ratio, crop_uv, frame_size, is_browser, is_playlist) in
+            selection_info
+        {
             let screen_rect = self.canvas_rect_to_screen(preview_rect, canvas_rect);
 
             // Minimal Void: Selection border with accent color
             // (browsers can't be cropped, so no orange crop hint for them)
             let border_color = if self.interactive_browser == Some(id) {
                 Color32::from_rgb(107, 170, 75) // Green: live interaction mode
-            } else if alt_held && !is_browser {
+            } else if alt_held && !is_browser && !is_playlist {
                 Color32::from_rgb(255, 150, 100) // Orange for crop mode
             } else {
                 Color32::from_rgb(74, 158, 255) // #4a9eff blue accent
@@ -2695,7 +3305,11 @@ impl CanvasState {
                     screen_rect.left_bottom() + Vec2::new(8.0, -28.0),
                     Vec2::new(50.0, 20.0),
                 );
-                painter.rect_filled(crop_badge_rect, 10.0, Color32::from_rgba_unmultiplied(255, 150, 100, 200));
+                painter.rect_filled(
+                    crop_badge_rect,
+                    10.0,
+                    Color32::from_rgba_unmultiplied(255, 150, 100, 200),
+                );
                 painter.text(
                     crop_badge_rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -2724,7 +3338,7 @@ impl CanvasState {
                 let hit_rect = Rect::from_center_size(handle_pos, Vec2::splat(handle_hit_size));
 
                 // Minimal Void: Clean handles matching selection color
-                let handle_fill = if alt_held && !is_browser {
+                let handle_fill = if alt_held && !is_browser && !is_playlist {
                     Color32::from_rgb(255, 150, 100) // Orange for crop mode
                 } else {
                     Color32::from_rgb(74, 158, 255) // Match accent color
@@ -2748,7 +3362,7 @@ impl CanvasState {
                 // (browser tiles never crop: interactive coordinates would
                 // no longer match the page)
                 if handle_response.drag_started() {
-                    if alt_held && frame_size.is_some() && !is_browser {
+                    if alt_held && frame_size.is_some() && !is_browser && !is_playlist {
                         // Start crop mode
                         let current_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
                         self.drag_state = Some(DragState::Cropping {
@@ -2772,7 +3386,14 @@ impl CanvasState {
                 // Handle dragging
                 if handle_response.dragged() {
                     // Handle resize mode
-                    if let Some(DragState::Resizing { id: resize_id, handle, start_rect, start_mouse, aspect_ratio: ar }) = &self.drag_state {
+                    if let Some(DragState::Resizing {
+                        id: resize_id,
+                        handle,
+                        start_rect,
+                        start_mouse,
+                        aspect_ratio: ar,
+                    }) = &self.drag_state
+                    {
                         if *resize_id == id && *handle == handle_type {
                             if let Some(current_pos) = input.interact_pos {
                                 let delta = (current_pos - *start_mouse) / self.zoom;
@@ -2791,7 +3412,13 @@ impl CanvasState {
                     }
 
                     // Handle crop mode
-                    if let Some(DragState::Cropping { id: crop_id, handle, start_mouse, start_crop_uv }) = &self.drag_state {
+                    if let Some(DragState::Cropping {
+                        id: crop_id,
+                        handle,
+                        start_mouse,
+                        start_crop_uv,
+                    }) = &self.drag_state
+                    {
                         if *crop_id == id && *handle == handle_type {
                             if let Some(current_pos) = input.interact_pos {
                                 // Calculate delta in screen space, then convert to UV delta
@@ -2809,32 +3436,44 @@ impl CanvasState {
 
                                 match handle {
                                     ResizeHandle::TopLeft => {
-                                        new_crop.0 = (min_u + uv_delta_x).clamp(0.0, new_crop.2 - 0.1);
-                                        new_crop.1 = (min_v + uv_delta_y).clamp(0.0, new_crop.3 - 0.1);
+                                        new_crop.0 =
+                                            (min_u + uv_delta_x).clamp(0.0, new_crop.2 - 0.1);
+                                        new_crop.1 =
+                                            (min_v + uv_delta_y).clamp(0.0, new_crop.3 - 0.1);
                                     }
                                     ResizeHandle::Top => {
-                                        new_crop.1 = (min_v + uv_delta_y).clamp(0.0, new_crop.3 - 0.1);
+                                        new_crop.1 =
+                                            (min_v + uv_delta_y).clamp(0.0, new_crop.3 - 0.1);
                                     }
                                     ResizeHandle::TopRight => {
-                                        new_crop.2 = (max_u + uv_delta_x).clamp(new_crop.0 + 0.1, 1.0);
-                                        new_crop.1 = (min_v + uv_delta_y).clamp(0.0, new_crop.3 - 0.1);
+                                        new_crop.2 =
+                                            (max_u + uv_delta_x).clamp(new_crop.0 + 0.1, 1.0);
+                                        new_crop.1 =
+                                            (min_v + uv_delta_y).clamp(0.0, new_crop.3 - 0.1);
                                     }
                                     ResizeHandle::Left => {
-                                        new_crop.0 = (min_u + uv_delta_x).clamp(0.0, new_crop.2 - 0.1);
+                                        new_crop.0 =
+                                            (min_u + uv_delta_x).clamp(0.0, new_crop.2 - 0.1);
                                     }
                                     ResizeHandle::Right => {
-                                        new_crop.2 = (max_u + uv_delta_x).clamp(new_crop.0 + 0.1, 1.0);
+                                        new_crop.2 =
+                                            (max_u + uv_delta_x).clamp(new_crop.0 + 0.1, 1.0);
                                     }
                                     ResizeHandle::BottomLeft => {
-                                        new_crop.0 = (min_u + uv_delta_x).clamp(0.0, new_crop.2 - 0.1);
-                                        new_crop.3 = (max_v + uv_delta_y).clamp(new_crop.1 + 0.1, 1.0);
+                                        new_crop.0 =
+                                            (min_u + uv_delta_x).clamp(0.0, new_crop.2 - 0.1);
+                                        new_crop.3 =
+                                            (max_v + uv_delta_y).clamp(new_crop.1 + 0.1, 1.0);
                                     }
                                     ResizeHandle::Bottom => {
-                                        new_crop.3 = (max_v + uv_delta_y).clamp(new_crop.1 + 0.1, 1.0);
+                                        new_crop.3 =
+                                            (max_v + uv_delta_y).clamp(new_crop.1 + 0.1, 1.0);
                                     }
                                     ResizeHandle::BottomRight => {
-                                        new_crop.2 = (max_u + uv_delta_x).clamp(new_crop.0 + 0.1, 1.0);
-                                        new_crop.3 = (max_v + uv_delta_y).clamp(new_crop.1 + 0.1, 1.0);
+                                        new_crop.2 =
+                                            (max_u + uv_delta_x).clamp(new_crop.0 + 0.1, 1.0);
+                                        new_crop.3 =
+                                            (max_v + uv_delta_y).clamp(new_crop.1 + 0.1, 1.0);
                                     }
                                 }
 
@@ -2857,12 +3496,22 @@ impl CanvasState {
 
                 // Clear drag state on release
                 if handle_response.drag_stopped() {
-                    if let Some(DragState::Resizing { id: resize_id, handle, .. }) = &self.drag_state {
+                    if let Some(DragState::Resizing {
+                        id: resize_id,
+                        handle,
+                        ..
+                    }) = &self.drag_state
+                    {
                         if *resize_id == id && *handle == handle_type {
                             self.drag_state = None;
                         }
                     }
-                    if let Some(DragState::Cropping { id: crop_id, handle, .. }) = &self.drag_state {
+                    if let Some(DragState::Cropping {
+                        id: crop_id,
+                        handle,
+                        ..
+                    }) = &self.drag_state
+                    {
                         if *crop_id == id && *handle == handle_type {
                             self.drag_state = None;
                         }
@@ -2874,7 +3523,12 @@ impl CanvasState {
 }
 
 /// Apply resize delta based on handle position, optionally maintaining aspect ratio
-fn apply_resize(handle: ResizeHandle, start_rect: Rect, delta: Vec2, aspect_ratio: Option<f32>) -> Rect {
+fn apply_resize(
+    handle: ResizeHandle,
+    start_rect: Rect,
+    delta: Vec2,
+    aspect_ratio: Option<f32>,
+) -> Rect {
     let mut min = start_rect.min;
     let mut max = start_rect.max;
 
@@ -2928,8 +3582,10 @@ fn apply_resize(handle: ResizeHandle, start_rect: Rect, delta: Vec2, aspect_rati
         // Determine which dimension to adjust based on handle and direction
         match handle {
             // Corner handles - use the dominant movement direction
-            ResizeHandle::TopLeft | ResizeHandle::TopRight |
-            ResizeHandle::BottomLeft | ResizeHandle::BottomRight => {
+            ResizeHandle::TopLeft
+            | ResizeHandle::TopRight
+            | ResizeHandle::BottomLeft
+            | ResizeHandle::BottomRight => {
                 if current_ar > ar {
                     // Too wide - adjust width to match height
                     let new_width = height * ar;
@@ -2941,10 +3597,7 @@ fn apply_resize(handle: ResizeHandle, start_rect: Rect, delta: Vec2, aspect_rati
                             );
                         }
                         _ => {
-                            result = Rect::from_min_size(
-                                result.min,
-                                Vec2::new(new_width, height),
-                            );
+                            result = Rect::from_min_size(result.min, Vec2::new(new_width, height));
                         }
                     }
                 } else {
@@ -2958,10 +3611,7 @@ fn apply_resize(handle: ResizeHandle, start_rect: Rect, delta: Vec2, aspect_rati
                             );
                         }
                         _ => {
-                            result = Rect::from_min_size(
-                                result.min,
-                                Vec2::new(width, new_height),
-                            );
+                            result = Rect::from_min_size(result.min, Vec2::new(width, new_height));
                         }
                     }
                 }

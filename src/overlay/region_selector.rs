@@ -6,23 +6,22 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM, RECT, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, CreateSolidBrush, CreatePen, SelectObject, DeleteObject,
-    FillRect, Rectangle, SetBkMode, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
-    GetStockObject, NULL_BRUSH, InvalidateRect,
+    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject,
+    InvalidateRect, Rectangle, SelectObject, SetBkMode, NULL_BRUSH, PAINTSTRUCT, PS_SOLID,
+    TRANSPARENT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, RegisterClassW, DestroyWindow, PostQuitMessage,
-    GetMessageW, TranslateMessage, DispatchMessageW, SetWindowPos, ShowWindow,
-    GetWindowRect, GetClientRect, LoadCursorW, SetCursor, SetLayeredWindowAttributes,
-    WNDCLASSW, MSG, HWND_TOPMOST, SWP_SHOWWINDOW, SW_SHOW,
-    WS_EX_TOPMOST, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
-    WM_PAINT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_KEYDOWN, WM_DESTROY,
-    WM_CREATE, WM_SETCURSOR, CS_HREDRAW, CS_VREDRAW, IDC_CROSS, LAYERED_WINDOW_ATTRIBUTES_FLAGS,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetCapture, ReleaseCapture, VK_ESCAPE};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
+    GetWindowRect, LoadCursorW, PostQuitMessage, RegisterClassW, SetCursor,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    HWND_TOPMOST, IDC_CROSS, LAYERED_WINDOW_ATTRIBUTES_FLAGS, MSG, SWP_SHOWWINDOW, SW_SHOW,
+    WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
 
 /// Result of a region selection
 #[derive(Debug, Clone, Copy)]
@@ -103,9 +102,7 @@ impl RegionSelector {
 
         // Spawn overlay window in a separate thread
         let state_clone = Arc::clone(&state);
-        let thread_handle = thread::spawn(move || {
-            run_overlay_window(source_rect, state_clone)
-        });
+        let thread_handle = thread::spawn(move || run_overlay_window(source_rect, state_clone));
 
         Some(Self {
             thread_handle: Some(thread_handle),
@@ -141,7 +138,10 @@ impl RegionSelector {
 }
 
 /// Run the overlay window message loop
-fn run_overlay_window(source_rect: RECT, state: Arc<Mutex<OverlayState>>) -> Option<RegionSelection> {
+fn run_overlay_window(
+    source_rect: RECT,
+    state: Arc<Mutex<OverlayState>>,
+) -> Option<RegionSelection> {
     unsafe {
         // Register window class
         let class_name = w!("PluriviewRegionSelector");
@@ -175,7 +175,8 @@ fn run_overlay_window(source_rect: RECT, state: Arc<Mutex<OverlayState>>) -> Opt
             None,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Set window transparency (semi-transparent overlay)
         let _ = SetLayeredWindowAttributes(hwnd, None, 200, LAYERED_WINDOW_ATTRIBUTES_FLAGS(2)); // LWA_ALPHA = 2
@@ -252,17 +253,28 @@ unsafe extern "system" fn overlay_window_proc(
                     let sel_rect = normalize_rect(state.start_point, state.current_point);
 
                     // Clear the selection area (make it "transparent" by filling with lighter color)
-                    let clear_brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00606060));
+                    let clear_brush =
+                        CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00606060));
                     FillRect(hdc, &sel_rect, clear_brush);
                     let _ = DeleteObject(clear_brush);
 
                     // Draw cyan border around selection
-                    let pen = CreatePen(PS_SOLID, 2, windows::Win32::Foundation::COLORREF(0x00FFFF00)); // Cyan in BGR
+                    let pen = CreatePen(
+                        PS_SOLID,
+                        2,
+                        windows::Win32::Foundation::COLORREF(0x00FFFF00),
+                    ); // Cyan in BGR
                     let old_pen = SelectObject(hdc, pen);
                     let null_brush = GetStockObject(NULL_BRUSH);
                     let old_brush = SelectObject(hdc, null_brush);
 
-                    let _ = Rectangle(hdc, sel_rect.left, sel_rect.top, sel_rect.right, sel_rect.bottom);
+                    let _ = Rectangle(
+                        hdc,
+                        sel_rect.left,
+                        sel_rect.top,
+                        sel_rect.right,
+                        sel_rect.bottom,
+                    );
 
                     SelectObject(hdc, old_pen);
                     SelectObject(hdc, old_brush);
@@ -276,11 +288,19 @@ unsafe extern "system" fn overlay_window_proc(
                         let text_wide: Vec<u16> = text.encode_utf16().collect();
 
                         SetBkMode(hdc, TRANSPARENT);
-                        windows::Win32::Graphics::Gdi::SetTextColor(hdc, windows::Win32::Foundation::COLORREF(0x0000FFFF)); // Cyan
+                        windows::Win32::Graphics::Gdi::SetTextColor(
+                            hdc,
+                            windows::Win32::Foundation::COLORREF(0x0000FFFF),
+                        ); // Cyan
 
                         let text_x = sel_rect.left + 5;
                         let text_y = sel_rect.top + 5;
-                        let _ = windows::Win32::Graphics::Gdi::TextOutW(hdc, text_x, text_y, &text_wide[..text_wide.len()-1]);
+                        let _ = windows::Win32::Graphics::Gdi::TextOutW(
+                            hdc,
+                            text_x,
+                            text_y,
+                            &text_wide[..text_wide.len() - 1],
+                        );
                     }
                 }
             }

@@ -1,4 +1,4 @@
-mod state;
 mod animation;
+mod state;
 
-pub use state::{BrowserAction, CanvasState, VideoAction};
+pub use state::{BrowserAction, CanvasState, PlaylistAction, VideoAction};

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Added drag-and-drop video folders, creating a linked libmpv player and a
+  resizable canvas playlist with lazy thumbnails, natural filename sorting,
+  previous/next, autoplay, shuffle, repeat, scrolling, and workspace restore.
+
 ### Added
 - Local video files can be dropped onto the canvas and start in MPV immediately
 - Hovering a local or seekable on-demand video's seek bar shows a debounced frame preview without interrupting playback

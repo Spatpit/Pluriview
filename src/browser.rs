@@ -185,8 +185,7 @@ fn validate_web_url_credentials(url: &url::Url) -> Result<(), &'static str> {
 }
 
 fn is_web_url(url: &str) -> bool {
-    url::Url::parse(url)
-        .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+    url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 /// Remove values that should not be written to the plaintext layout file.
@@ -217,28 +216,29 @@ pub fn scrub_url_for_storage(input: &str) -> Option<String> {
 
 fn is_sensitive_query_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    matches!(key.as_str(), "code" | "state" | "key" | "sig" | "session" | "sessionid")
-        || [
-            "token",
-            "secret",
-            "password",
-            "passwd",
-            "authorization",
-            "credential",
-            "signature",
-            "api_key",
-            "apikey",
-        ]
-        .iter()
-        .any(|marker| key.contains(marker))
+    matches!(
+        key.as_str(),
+        "code" | "state" | "key" | "sig" | "session" | "sessionid"
+    ) || [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "credential",
+        "signature",
+        "api_key",
+        "apikey",
+    ]
+    .iter()
+    .any(|marker| key.contains(marker))
 }
 
 /// Schemes a page may navigate to while staying inside the tile. `about:` is
 /// needed because sites navigate iframes/blank targets through it.
 fn is_allowed_navigation(url: &str) -> bool {
-    url::Url::parse(url).is_ok_and(|url| {
-        matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data")
-    })
+    url::Url::parse(url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data"))
 }
 
 /// True while the virtual key is held. Once the WebView has focus, egui never
@@ -333,8 +333,7 @@ pub fn capture_size_for_tile(width: i32, height: i32) -> (i32, i32) {
     let width = width.max(1) as f64;
     let height = height.max(1) as f64;
     let upscale = (MIN_CAPTURE_WIDTH as f64 / width).max(1.0);
-    let cap = (MAX_CAPTURE_WIDTH as f64 / width)
-        .min(MAX_CAPTURE_HEIGHT as f64 / height);
+    let cap = (MAX_CAPTURE_WIDTH as f64 / width).min(MAX_CAPTURE_HEIGHT as f64 / height);
     let scale = upscale.min(cap).max(f64::MIN_POSITIVE);
     (
         (width * scale).round().max(1.0) as i32,
@@ -595,8 +594,8 @@ impl BrowserHost {
             });
             // Keep the page's apparent scale identical to the captured
             // texture: layout width stays WIDTH/dpi CSS px in both modes.
-            let _ = webview
-                .zoom((geometry.page_width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
+            let _ =
+                webview.zoom((geometry.page_width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
         };
 
         if take_focus {
@@ -970,9 +969,8 @@ impl BrowserManager {
             return;
         }
         let Some(extension_dir) = self.extension_dir.clone() else {
-            self.adblock_error = Some(
-                "Pluriview could not determine its application data directory".to_owned(),
-            );
+            self.adblock_error =
+                Some("Pluriview could not determine its application data directory".to_owned());
             return;
         };
 
@@ -981,8 +979,8 @@ impl BrowserManager {
         let worker_progress = progress.clone();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = prepare_ubol_with_progress(&extension_dir, &worker_progress)
-                .map(|_| extension_dir);
+            let result =
+                prepare_ubol_with_progress(&extension_dir, &worker_progress).map(|_| extension_dir);
             let _ = sender.send(result);
         });
         self.extension_preparation = Some(ExtensionPreparationTask { progress, receiver });
@@ -990,15 +988,16 @@ impl BrowserManager {
 
     /// Poll the worker without blocking the UI thread.
     pub fn poll_extension_preparation(&mut self) -> ExtensionPreparationStatus {
-        let completed = self.extension_preparation.as_ref().and_then(|task| {
-            match task.receiver.try_recv() {
-                Ok(result) => Some(result),
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("The ad blocker preparation worker stopped unexpectedly".to_owned()))
-                }
-                Err(TryRecvError::Empty) => None,
-            }
-        });
+        let completed =
+            self.extension_preparation
+                .as_ref()
+                .and_then(|task| match task.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => Some(Err(
+                        "The ad blocker preparation worker stopped unexpectedly".to_owned(),
+                    )),
+                    Err(TryRecvError::Empty) => None,
+                });
 
         if let Some(result) = completed {
             self.extension_preparation = None;
@@ -1015,8 +1014,8 @@ impl BrowserManager {
         }
 
         if let Some(task) = &self.extension_preparation {
-            let progress = task.progress.load(Ordering::Relaxed) as f32
-                / PREPARATION_PROGRESS_SCALE as f32;
+            let progress =
+                task.progress.load(Ordering::Relaxed) as f32 / PREPARATION_PROGRESS_SCALE as f32;
             ExtensionPreparationStatus::Preparing(progress.clamp(0.0, 1.0))
         } else if self.prepared_extension.is_some() || self.extension_initialized {
             ExtensionPreparationStatus::Ready
@@ -1339,10 +1338,7 @@ fn set_preparation_progress(progress: &AtomicU32, value: f32) {
     );
 }
 
-fn prepare_ubol_with_progress(
-    extension_dir: &Path,
-    progress: &AtomicU32,
-) -> Result<(), String> {
+fn prepare_ubol_with_progress(extension_dir: &Path, progress: &AtomicU32) -> Result<(), String> {
     set_preparation_progress(progress, 0.02);
     if installed_ubol_has_current_marker(extension_dir) {
         set_preparation_progress(progress, 1.0);
@@ -1577,11 +1573,11 @@ unsafe extern "system" fn browser_window_proc(
 mod tests {
     use super::{
         browser_geometry, capture_size_for_tile, extract_ubol_archive_with_progress,
-        installed_ubol_has_current_marker, installed_ubol_matches_embedded,
-        is_allowed_navigation, normalize_url, parked_bounds, profile_install_marker_path,
-        read_profile_install_marker, scrub_url_for_storage, ubol_verification_marker_path,
-        write_profile_install_marker, write_ubol_verification_marker, NativeWindow,
-        PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE, UBOL_VERSION,
+        installed_ubol_has_current_marker, installed_ubol_matches_embedded, is_allowed_navigation,
+        normalize_url, parked_bounds, profile_install_marker_path, read_profile_install_marker,
+        scrub_url_for_storage, ubol_verification_marker_path, write_profile_install_marker,
+        write_ubol_verification_marker, NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE,
+        UBOL_VERSION,
     };
     use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1610,10 +1606,7 @@ mod tests {
 
     #[test]
     fn oversized_page_is_clipped_to_canvas_without_changing_page_size() {
-        let page = egui::Rect::from_min_max(
-            egui::pos2(-100.0, -50.0),
-            egui::pos2(1500.0, 900.0),
-        );
+        let page = egui::Rect::from_min_max(egui::pos2(-100.0, -50.0), egui::pos2(1500.0, 900.0));
         let visible = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(800.0, 600.0));
 
         let geometry = browser_geometry(page, visible, 1.0, (200, 300));

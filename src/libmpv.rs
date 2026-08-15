@@ -1008,6 +1008,28 @@ impl VideoSession {
         self.set_paused(false)
     }
 
+    /// Replace the current local file without recreating the libmpv core.
+    /// Playback properties such as volume, speed, tracks, and the renderer
+    /// remain attached to the same canvas tile.
+    pub fn load_local_file(&mut self, path: &Path) -> Result<(), String> {
+        if !path.is_file() {
+            return Err(format!(
+                "The video file no longer exists: {}",
+                path.display()
+            ));
+        }
+        self.renderer
+            .core
+            .lock()
+            .load_source(path.as_os_str().to_os_string())?;
+        self.state.time_pos = None;
+        self.state.duration = None;
+        self.state.eof_reached = false;
+        self.state.core_idle = false;
+        self.state.paused_for_cache = false;
+        self.set_paused(false)
+    }
+
     pub fn seek_absolute(&mut self, seconds: f64) -> Result<(), String> {
         if !seconds.is_finite() {
             return Err("Seek time must be finite".to_owned());
@@ -1333,7 +1355,7 @@ mod tests {
         let renderer = VideoRenderer::new(api, false, false).expect("create renderer");
         let launch = VideoLaunch {
             mpv_path: PathBuf::from("mpv.exe"),
-            source: video::VideoSource::LocalFile(media),
+            source: video::VideoSource::LocalFile(media.clone()),
             start_paused: false,
         };
         let mut session = VideoSession::new(renderer.clone(), &launch).expect("create session");
@@ -1425,6 +1447,25 @@ mod tests {
                 .time_pos
                 .is_some_and(|time| time > paused_at + 0.2),
             "video did not advance after Play"
+        );
+
+        // Folder playlists use this exact path: replace the media in the
+        // existing renderer/session and immediately continue playback.
+        session
+            .load_local_file(&media)
+            .expect("replace playlist video");
+        let replacement_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < replacement_deadline {
+            timed!(paint_samples, renderer.paint(info(), &gl));
+            let _ = timed!(poll_samples, session.poll());
+            if session.state.time_pos.is_some_and(|time| time > 0.15) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+        assert!(
+            session.state.time_pos.is_some_and(|time| time > 0.15),
+            "replacement video did not begin in the existing libmpv session"
         );
 
         if std::env::var_os("PLURIVIEW_TEST_PROFILE").is_some() {

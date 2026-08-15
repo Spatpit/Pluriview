@@ -32,8 +32,8 @@ use windows::{
         Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
         System::{
             Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32,
-                TH32CS_SNAPTHREAD,
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                THREADENTRY32,
             },
             JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -107,7 +107,6 @@ impl VideoHost {
     pub fn hwnd(&self) -> isize {
         self.hwnd.0 as isize
     }
-
 }
 
 impl Drop for VideoHost {
@@ -363,9 +362,10 @@ impl VideoSession {
                 WorkerEvent::Line(line) => {
                     let update_start = updates.len();
                     parse_ipc_line(&line, &mut self.state, &mut updates);
-                    if updates[update_start..].iter().any(|update| {
-                        matches!(update, VideoUpdate::Property(VideoProperty::Pause))
-                    }) {
+                    if updates[update_start..]
+                        .iter()
+                        .any(|update| matches!(update, VideoUpdate::Property(VideoProperty::Pause)))
+                    {
                         if let Some(requested) = self.pending_pause {
                             if self.state.pause == requested {
                                 self.pending_pause = None;
@@ -1262,10 +1262,11 @@ fn resume_process(process_id: u32) -> Result<(), String> {
             .map_err(|error| format!("Could not inspect the video process thread: {error}"))?;
         loop {
             if entry.th32OwnerProcessID == process_id {
-                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
-                    .map_err(|error| {
-                        format!("Could not open the suspended video process thread: {error}")
-                    })?;
+                let thread =
+                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
+                        .map_err(|error| {
+                            format!("Could not open the suspended video process thread: {error}")
+                        })?;
                 let previous_count = unsafe { ResumeThread(thread) };
                 unsafe {
                     let _ = CloseHandle(thread);
@@ -1337,19 +1338,19 @@ mod tests {
     };
     use crate::preview::PreviewId;
     use serde_json::json;
-    use windows::Win32::{
-        Foundation::CloseHandle,
-        System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-            TH32CS_SNAPPROCESS,
-        },
-    };
     use std::{
         ffi::OsString,
         path::{Path, PathBuf},
         sync::mpsc,
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
     };
 
     fn strings(args: Vec<OsString>) -> Vec<String> {
@@ -1413,7 +1414,10 @@ mod tests {
             .map(|(pid, _)| pid)
             .filter(|pid| processes.contains(pid))
             .collect();
-        assert!(running.is_empty(), "video processes still running: {running:?}");
+        assert!(
+            running.is_empty(),
+            "video processes still running: {running:?}"
+        );
     }
 
     #[test]
@@ -1553,8 +1557,7 @@ mod tests {
             .unwrap();
         sender.send(VideoCommand::SetVolume(30.0)).unwrap();
 
-        let commands =
-            coalesce_pending_commands(VideoCommand::SetVolume(10.0), &receiver);
+        let commands = coalesce_pending_commands(VideoCommand::SetVolume(10.0), &receiver);
 
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0], json!({ "command": ["cycle", "pause"] }));
@@ -1629,14 +1632,14 @@ mod tests {
                 .is_some_and(|tile| !tile.session.state().pause)
         }));
 
-        let thumbnail = extract_video_thumbnail(
-            &mpv,
-            &VideoThumbnailSource::LocalFile(media.clone()),
-            0.0,
-        )
-        .unwrap();
+        let thumbnail =
+            extract_video_thumbnail(&mpv, &VideoThumbnailSource::LocalFile(media.clone()), 0.0)
+                .unwrap();
         assert!(thumbnail.width > 0 && thumbnail.height > 0);
-        assert_eq!(thumbnail.rgba.len(), (thumbnail.width * thumbnail.height * 4) as usize);
+        assert_eq!(
+            thumbnail.rgba.len(),
+            (thumbnail.width * thumbnail.height * 4) as usize
+        );
         let processes: Vec<_> = [PreviewId(7001), PreviewId(7002)]
             .into_iter()
             .flat_map(|id| process_tree(manager.get(id).unwrap().session.child.id()))
@@ -1669,18 +1672,30 @@ mod tests {
             let _ = manager.poll();
             if manager.get(id).is_some_and(|tile| {
                 tile.session.state().connected
-                    && tile.session.state().time_pos.is_some_and(|time| time > 0.25)
+                    && tile
+                        .session
+                        .state()
+                        .time_pos
+                        .is_some_and(|time| time > 0.25)
             }) {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
 
-        manager.get_mut(id).unwrap().session.set_paused(true).unwrap();
+        manager
+            .get_mut(id)
+            .unwrap()
+            .session
+            .set_paused(true)
+            .unwrap();
         let pause_deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < pause_deadline {
             let _ = manager.poll();
-            if manager.get(id).is_some_and(|tile| tile.session.state().pause) {
+            if manager
+                .get(id)
+                .is_some_and(|tile| tile.session.state().pause)
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1716,11 +1731,19 @@ mod tests {
             state.time_pos
         );
 
-        manager.get_mut(id).unwrap().session.set_paused(true).unwrap();
+        manager
+            .get_mut(id)
+            .unwrap()
+            .session
+            .set_paused(true)
+            .unwrap();
         let second_pause_deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < second_pause_deadline {
             let _ = manager.poll();
-            if manager.get(id).is_some_and(|tile| tile.session.state().pause) {
+            if manager
+                .get(id)
+                .is_some_and(|tile| tile.session.state().pause)
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1730,9 +1753,7 @@ mod tests {
             .and_then(|tile| tile.session.state().time_pos)
             .expect("real video did not report the second paused position");
         manager.remove(id);
-        manager
-            .launch_local(id, None, mpv, media, false)
-            .unwrap();
+        manager.launch_local(id, None, mpv, media, false).unwrap();
         manager
             .get(id)
             .unwrap()
@@ -1752,12 +1773,15 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(manager.get(id).is_some_and(|tile| {
-            tile.session
-                .state()
-                .time_pos
-                .is_some_and(|time| time > restart_at + 0.2)
-        }), "restarted playback did not continue after the paused timestamp");
+        assert!(
+            manager.get(id).is_some_and(|tile| {
+                tile.session
+                    .state()
+                    .time_pos
+                    .is_some_and(|time| time > restart_at + 0.2)
+            }),
+            "restarted playback did not continue after the paused timestamp"
+        );
     }
 
     #[test]
@@ -1776,15 +1800,7 @@ mod tests {
         let id = PreviewId(7101);
         let mut manager = VideoManager::new();
         manager
-            .launch_stream(
-                id,
-                None,
-                streamlink,
-                mpv,
-                url,
-                "best".to_owned(),
-                true,
-            )
+            .launch_stream(id, None, streamlink, mpv, url, "best".to_owned(), true)
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(35);

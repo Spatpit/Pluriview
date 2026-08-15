@@ -43,7 +43,7 @@ pub fn is_sensitive_window(exe_name: &str, title: &str) -> bool {
     // Check for sensitive keywords in title
     let sensitive_keywords = ["password", "private", "incognito", "secret"];
     let lower_title = title.to_lowercase();
-    
+
     sensitive_keywords.iter().any(|&k| lower_title.contains(k))
 }
 

@@ -1,6 +1,6 @@
+use crate::preview::PreviewId;
 use eframe::egui::{Pos2, Vec2};
 use std::collections::HashMap;
-use crate::preview::PreviewId;
 
 /// A single spring-animated value with smooth easing
 #[derive(Clone, Debug)]
@@ -23,8 +23,8 @@ impl SpringValue {
             current: initial,
             target: initial,
             velocity: 0.0,
-            stiffness: 0.08,  // Very smooth, subtle movement
-            damping: 0.65,    // Heavy damping, almost no bounce
+            stiffness: 0.08, // Very smooth, subtle movement
+            damping: 0.65,   // Heavy damping, almost no bounce
         }
     }
 
@@ -122,7 +122,7 @@ impl SpringVec2 {
 #[derive(Clone, Debug)]
 pub struct DragTracker {
     /// History of positions for velocity calculation
-    positions: Vec<(Pos2, f64)>,  // (position, time)
+    positions: Vec<(Pos2, f64)>, // (position, time)
     /// Maximum number of samples to keep
     max_samples: usize,
 }
@@ -201,7 +201,7 @@ impl Default for SnapConfig {
         Self {
             enabled: true,
             grid_size: 50.0,
-            snap_threshold: 15.0,  // Weaker snap - only very close to grid
+            snap_threshold: 15.0, // Weaker snap - only very close to grid
         }
     }
 }
@@ -225,7 +225,6 @@ impl SnapConfig {
             pos
         }
     }
-
 }
 
 /// Animation state for the canvas
@@ -264,9 +263,9 @@ impl AnimationState {
 
     /// Get or create a spring for a preview
     pub fn get_or_create_spring(&mut self, id: PreviewId, initial_pos: Pos2) -> &mut SpringVec2 {
-        self.preview_springs.entry(id).or_insert_with(|| {
-            SpringVec2::new(initial_pos.to_vec2())
-        })
+        self.preview_springs
+            .entry(id)
+            .or_insert_with(|| SpringVec2::new(initial_pos.to_vec2()))
     }
 
     /// Update all animations (call each frame)
@@ -278,7 +277,7 @@ impl AnimationState {
 
         // Apply momentum with friction
         if self.momentum_active {
-            let friction = 0.85;  // Stronger friction = faster stop
+            let friction = 0.85; // Stronger friction = faster stop
             self.momentum_velocity *= friction;
 
             // Stop momentum when slow enough
@@ -291,14 +290,13 @@ impl AnimationState {
 
     /// Check if any animations are currently running
     pub fn is_animating(&self) -> bool {
-        self.momentum_active
-            || self.preview_springs.values().any(|s| s.is_animating())
+        self.momentum_active || self.preview_springs.values().any(|s| s.is_animating())
     }
 
     /// Start momentum with given velocity
     pub fn start_momentum(&mut self, velocity: Vec2) {
         // Scale down velocity for subtle momentum
-        self.momentum_velocity = velocity * 0.008;  // Much less momentum
+        self.momentum_velocity = velocity * 0.008; // Much less momentum
         self.momentum_active = self.momentum_velocity.length() > 0.5;
     }
 

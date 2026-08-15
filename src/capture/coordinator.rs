@@ -1,11 +1,11 @@
+use crate::preview::{PreviewId, PreviewManager};
 use crate::privacy;
-use crate::preview::{PreviewManager, PreviewId};
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use parking_lot::Mutex;
 
 /// Frame data sent from capture threads
 struct CapturedFrame {
@@ -56,7 +56,13 @@ impl CaptureCoordinator {
     }
 
     /// Start capturing a window for a preview
-    pub fn start_capture(&mut self, preview_id: PreviewId, hwnd: isize, window_title: String, target_fps: u32) {
+    pub fn start_capture(
+        &mut self,
+        preview_id: PreviewId,
+        hwnd: isize,
+        window_title: String,
+        target_fps: u32,
+    ) {
         // Windows Graphics Capture rejects a second session on the same HWND
         // while the previous one is still shutting down. Replacing a live
         // tile must wait for that release, or the new session fails and the
@@ -186,8 +192,7 @@ impl CaptureCoordinator {
         self.sessions
             .values()
             .filter(|session| {
-                session.active.load(Ordering::Relaxed)
-                    && !session.paused.load(Ordering::Relaxed)
+                session.active.load(Ordering::Relaxed) && !session.paused.load(Ordering::Relaxed)
             })
             .map(|session| session.target_fps.load(Ordering::Relaxed).max(1))
             .max()
@@ -195,10 +200,7 @@ impl CaptureCoordinator {
 
     fn reap_finished_workers(&mut self) {
         for session in self.sessions.values_mut() {
-            let finished = session
-                .worker
-                .as_ref()
-                .is_some_and(JoinHandle::is_finished);
+            let finished = session.worker.as_ref().is_some_and(JoinHandle::is_finished);
             if finished {
                 // A panic bypasses the capture loop's normal completion flag.
                 // Mark the session inactive before joining so repaint scheduling
@@ -258,9 +260,8 @@ fn capture_window_loop(
         frame::Frame,
         graphics_capture_api::InternalCaptureControl,
         settings::{
-            ColorFormat, CursorCaptureSettings, DrawBorderSettings,
-            SecondaryWindowSettings, MinimumUpdateIntervalSettings,
-            DirtyRegionSettings, Settings,
+            ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+            MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
         },
     };
 
@@ -349,7 +350,10 @@ fn capture_window_loop(
     }
 
     let window = capture_target_from_hwnd(hwnd);
-    log::info!("Capturing HWND for {}", privacy::redact_title(&window_title));
+    log::info!(
+        "Capturing HWND for {}",
+        privacy::redact_title(&window_title)
+    );
 
     // Use default minimum update interval (windows-capture handles FPS internally)
     // We do our own throttling in on_frame_arrived
@@ -399,12 +403,12 @@ fn capture_window_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_target_from_hwnd, CapturedFrame, CaptureCoordinator, CaptureSession};
+    use super::{capture_target_from_hwnd, CaptureCoordinator, CaptureSession, CapturedFrame};
     use crate::preview::{PreviewId, PreviewManager};
     use eframe::egui::{Pos2, Vec2};
     use parking_lot::Mutex;
-    use std::sync::mpsc;
     use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::mpsc;
     use std::sync::Arc;
 
     fn session(fps: u32, active: bool, paused: bool) -> CaptureSession {
@@ -448,10 +452,18 @@ mod tests {
     #[test]
     fn repaint_rate_uses_only_live_unpaused_sessions() {
         let mut coordinator = CaptureCoordinator::new();
-        coordinator.sessions.insert(PreviewId(1), session(15, true, false));
-        coordinator.sessions.insert(PreviewId(2), session(60, true, true));
-        coordinator.sessions.insert(PreviewId(3), session(30, true, false));
-        coordinator.sessions.insert(PreviewId(4), session(120, false, false));
+        coordinator
+            .sessions
+            .insert(PreviewId(1), session(15, true, false));
+        coordinator
+            .sessions
+            .insert(PreviewId(2), session(60, true, true));
+        coordinator
+            .sessions
+            .insert(PreviewId(3), session(30, true, false));
+        coordinator
+            .sessions
+            .insert(PreviewId(4), session(120, false, false));
 
         assert_eq!(coordinator.max_live_fps(), Some(30));
         assert!(!coordinator.is_live(PreviewId(1)));
@@ -533,5 +545,4 @@ mod tests {
         assert!(stop_receiver.try_recv().is_ok());
         assert!(!coordinator.sessions.contains_key(&preview_id));
     }
-
 }

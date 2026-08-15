@@ -225,10 +225,7 @@ impl Drop for StreamQualityProbe {
 }
 
 /// Start a non-blocking Streamlink quality probe for a URL.
-pub fn probe_stream_qualities(
-    streamlink_path: PathBuf,
-    url: String,
-) -> StreamQualityProbe {
+pub fn probe_stream_qualities(streamlink_path: PathBuf, url: String) -> StreamQualityProbe {
     let (sender, receiver) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
@@ -245,17 +242,17 @@ pub fn probe_stream_qualities(
             command_output_with_timeout(command, QUALITY_PROBE_TIMEOUT, Some(&worker_cancelled))
                 .map_err(|error| format!("Could not run Streamlink: {error}"))
                 .and_then(|output| {
-                if output.status.success() {
-                    parse_stream_qualities(&String::from_utf8_lossy(&output.stdout))
-                } else {
-                    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                    if detail.is_empty() {
-                        Err(format!("Streamlink exited with {}.", output.status))
+                    if output.status.success() {
+                        parse_stream_qualities(&String::from_utf8_lossy(&output.stdout))
                     } else {
-                        Err(detail)
+                        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                        if detail.is_empty() {
+                            Err(format!("Streamlink exited with {}.", output.status))
+                        } else {
+                            Err(detail)
+                        }
                     }
-                }
-            });
+                });
         if !worker_cancelled.load(AtomicOrdering::Acquire) {
             let _ = sender.send(result);
         }
@@ -319,7 +316,10 @@ fn command_output_with_timeout(
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(format!("process timed out after {} seconds", timeout.as_secs()));
+                return Err(format!(
+                    "process timed out after {} seconds",
+                    timeout.as_secs()
+                ));
             }
             Err(error) => {
                 let _ = child.kill();
@@ -695,8 +695,7 @@ fn registry_install_locations(kind: ToolKind) -> Vec<PathBuf> {
             None,
             Some(&mut bytes),
         )
-        .0
-            != 0
+        .0 != 0
             || bytes < 2
         {
             return None;
@@ -711,12 +710,14 @@ fn registry_install_locations(kind: ToolKind) -> Vec<PathBuf> {
             Some(buffer.as_mut_ptr().cast()),
             Some(&mut bytes),
         )
-        .0
-            != 0
+        .0 != 0
         {
             return None;
         }
-        let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+        let length = buffer
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(buffer.len());
         Some(String::from_utf16_lossy(&buffer[..length]))
     }
 
@@ -727,16 +728,7 @@ fn registry_install_locations(kind: ToolKind) -> Vec<PathBuf> {
     for (root, uninstall_path) in UNINSTALL_KEYS {
         let path = wide(uninstall_path);
         let mut uninstall_key = HKEY::default();
-        if unsafe {
-            RegOpenKeyExW(
-                root,
-                PCWSTR(path.as_ptr()),
-                0,
-                KEY_READ,
-                &mut uninstall_key,
-            )
-        }
-        .0
+        if unsafe { RegOpenKeyExW(root, PCWSTR(path.as_ptr()), 0, KEY_READ, &mut uninstall_key) }.0
             != 0
         {
             continue;
@@ -775,8 +767,7 @@ fn registry_install_locations(kind: ToolKind) -> Vec<PathBuf> {
                     &mut app_key,
                 )
             }
-            .0
-                != 0
+            .0 != 0
             {
                 continue;
             }
@@ -802,9 +793,10 @@ fn registry_install_locations(kind: ToolKind) -> Vec<PathBuf> {
                         .trim()
                         .trim_matches('"');
                     let icon = PathBuf::from(icon);
-                    if icon.file_name().is_some_and(|name| {
-                        name.to_string_lossy().eq_ignore_ascii_case(executable)
-                    }) {
+                    if icon
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(executable))
+                    {
                         locations.push(icon);
                     }
                 }

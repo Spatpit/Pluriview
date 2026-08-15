@@ -57,7 +57,11 @@ impl WorkspaceIndex {
     }
 
     pub fn rename(&mut self, id: &str, name: String) -> bool {
-        let Some(workspace) = self.workspaces.iter_mut().find(|workspace| workspace.id == id) else {
+        let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == id)
+        else {
             return false;
         };
         workspace.name = name;
@@ -110,8 +114,9 @@ impl WorkspaceIndex {
 }
 
 pub fn is_valid_workspace_id(id: &str) -> bool {
-    id.strip_prefix("workspace-")
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    id.strip_prefix("workspace-").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn default_next_workspace_id() -> u64 {

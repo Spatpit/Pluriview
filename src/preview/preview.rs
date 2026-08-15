@@ -1,9 +1,10 @@
-use eframe::egui::{self, Pos2, Vec2, Rect, TextureHandle};
-use serde::{Serialize, Deserialize};
+use eframe::egui::{self, Pos2, Rect, TextureHandle, Vec2};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::media::MediaFrame;
+use crate::playlist::{FolderPlaylist, FolderPlaylistLayout};
 
 /// How long the spawn-in / fade-out animations take.
 const SPAWN_DURATION_SECS: f32 = 0.22;
@@ -185,6 +186,16 @@ pub struct Preview {
     /// Local file or Streamlink URL when this is an mpv-backed video tile.
     pub video_source: Option<VideoSource>,
 
+    /// Folder-backed playlist displayed as its own canvas tile.
+    pub folder_playlist: Option<FolderPlaylist>,
+
+    /// Persistent relationship shared by a folder playlist and its video tile.
+    pub playlist_group: Option<u64>,
+
+    /// Runtime target for playlist selections. Rebuilt from `playlist_group`
+    /// when a workspace is restored.
+    pub playlist_linked_video: Option<PreviewId>,
+
     /// Loading/error state for an mpv-backed video tile.
     pub video_status: VideoTileStatus,
 
@@ -248,6 +259,9 @@ impl Preview {
             browser_status: BrowserTileStatus::Ready,
             media_path: None,
             video_source: None,
+            folder_playlist: None,
+            playlist_group: None,
+            playlist_linked_video: None,
             video_status: VideoTileStatus::Ready,
             video_playback: VideoPlaybackState::default(),
             #[cfg(windows)]
@@ -279,6 +293,10 @@ impl Preview {
         self.video_source.is_some()
     }
 
+    pub fn is_playlist(&self) -> bool {
+        self.folder_playlist.is_some()
+    }
+
     pub fn supports_seek_preview(&self) -> bool {
         self.video_source.is_some()
     }
@@ -296,10 +314,7 @@ impl Preview {
         self.seek_preview_time
     }
 
-    pub fn get_seek_preview_texture(
-        &mut self,
-        ctx: &egui::Context,
-    ) -> Option<&TextureHandle> {
+    pub fn get_seek_preview_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         if let Some(frame) = self.seek_preview_frame.take() {
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
@@ -372,16 +387,17 @@ impl Preview {
             }
         }
 
-        self.frame_buffer = Some(FrameData { width, height, data });
+        self.frame_buffer = Some(FrameData {
+            width,
+            height,
+            data,
+        });
     }
 
     /// Get UV coordinates for rendering (either crop region or full frame)
     pub fn get_uv_rect(&self) -> Rect {
         if let Some(crop) = self.crop_uv {
-            Rect::from_min_max(
-                Pos2::new(crop.0, crop.1),
-                Pos2::new(crop.2, crop.3),
-            )
+            Rect::from_min_max(Pos2::new(crop.0, crop.1), Pos2::new(crop.2, crop.3))
         } else {
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
         }
@@ -529,6 +545,12 @@ pub struct PreviewLayout {
     /// Optional mpv-backed local file or Streamlink source.
     #[serde(default)]
     pub video_source: Option<VideoSource>,
+    /// Relationship shared by a folder playlist and its linked video.
+    #[serde(default)]
+    pub playlist_group: Option<u64>,
+    /// Persisted folder playlist state; entries are rescanned on restore.
+    #[serde(default)]
+    pub folder_playlist: Option<FolderPlaylistLayout>,
 }
 
 impl From<&Preview> for PreviewLayout {
@@ -546,6 +568,8 @@ impl From<&Preview> for PreviewLayout {
             browser_muted: preview.browser_muted,
             media_path: preview.media_path.clone(),
             video_source: preview.video_source.as_ref().map(scrub_video_source),
+            playlist_group: preview.playlist_group,
+            folder_playlist: preview.folder_playlist.as_ref().map(FolderPlaylist::layout),
         }
     }
 }
@@ -579,9 +603,7 @@ fn scrub_video_source(source: &VideoSource) -> VideoSource {
 }
 
 fn is_sensitive_stream_parameter(name: &str) -> bool {
-    let name = name
-        .to_ascii_lowercase()
-        .replace(['-', '.'], "_");
+    let name = name.to_ascii_lowercase().replace(['-', '.'], "_");
     matches!(
         name.as_str(),
         "access_token"
@@ -618,7 +640,12 @@ mod tests {
     #[test]
     fn frame_updates_reuse_the_texture() {
         let context = Context::default();
-        let mut preview = Preview::new(PreviewId(1), "test".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
 
         preview.update_frame(1, 1, vec![255, 0, 0, 255]);
         let first = preview.get_texture(&context).unwrap().id();
@@ -631,7 +658,12 @@ mod tests {
     #[test]
     fn media_upload_does_not_stage_a_second_rgba_buffer() {
         let context = Context::default();
-        let mut preview = Preview::new(PreviewId(1), "test".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
         preview.set_media(
             "test.gif".to_owned(),
             vec![MediaFrame {
@@ -651,7 +683,12 @@ mod tests {
 
     #[test]
     fn older_saved_tiles_default_to_no_media() {
-        let preview = Preview::new(PreviewId(1), "test".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        let preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
         let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
         value.as_object_mut().unwrap().remove("media_path");
 
@@ -661,7 +698,12 @@ mod tests {
 
     #[test]
     fn older_saved_tiles_default_to_no_video() {
-        let preview = Preview::new(PreviewId(1), "test".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        let preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
         let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
         value.as_object_mut().unwrap().remove("video_source");
 
@@ -670,8 +712,31 @@ mod tests {
     }
 
     #[test]
+    fn older_saved_tiles_default_to_no_folder_playlist() {
+        let preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("folder_playlist");
+        object.remove("playlist_group");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.folder_playlist.is_none());
+        assert!(restored.playlist_group.is_none());
+    }
+
+    #[test]
     fn video_source_round_trips_through_layout() {
-        let mut preview = Preview::new(PreviewId(1), "stream".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "stream".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
         preview.video_source = Some(VideoSource::Stream {
             url: "https://twitch.tv/example".to_owned(),
             quality: "best".to_owned(),
@@ -684,7 +749,12 @@ mod tests {
 
     #[test]
     fn persisted_stream_urls_remove_credentials_and_tokens() {
-        let mut preview = Preview::new(PreviewId(1), "stream".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "stream".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
         preview.video_source = Some(VideoSource::Stream {
             url: "https://user:password@youtube.com/watch?v=abc123&token=secret&sig=private&api_key=hidden&password=hidden&expire=1&X-Amz-Credential=hidden&X-Amz-Signature=hidden#chat".to_owned(),
             quality: "best".to_owned(),
@@ -702,7 +772,12 @@ mod tests {
 
     #[test]
     fn unparseable_stream_urls_are_not_persisted_verbatim() {
-        let mut preview = Preview::new(PreviewId(1), "stream".to_owned(), Pos2::ZERO, Vec2::splat(1.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "stream".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
         preview.video_source = Some(VideoSource::Stream {
             url: "not a url with token=secret".to_owned(),
             quality: "best".to_owned(),

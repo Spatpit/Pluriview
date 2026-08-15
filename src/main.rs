@@ -1,24 +1,25 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod canvas;
-mod preview;
-mod capture;
-mod window_picker;
-mod persistence;
-mod tray;
-mod overlay;
-mod privacy;
-mod media;
-mod external_tools;
-#[cfg(windows)]
-mod browser;
 #[cfg(windows)]
 mod audio;
 #[cfg(windows)]
-mod video;
+mod browser;
+mod canvas;
+mod capture;
+mod external_tools;
 #[cfg(windows)]
 mod libmpv;
+mod media;
+mod overlay;
+mod persistence;
+mod playlist;
+mod preview;
+mod privacy;
+mod tray;
+#[cfg(windows)]
+mod video;
+mod window_picker;
 
 use app::PluriviewApp;
 use eframe::egui;

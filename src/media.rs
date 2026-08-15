@@ -9,8 +9,8 @@ use std::time::Duration;
 const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
 const VIDEO_EXTENSIONS: [&str; 15] = [
-    "mp4", "mkv", "webm", "avi", "mov", "m4v", "wmv", "flv", "mpeg", "mpg", "ts", "m2ts",
-    "3gp", "ogv", "mts",
+    "mp4", "mkv", "webm", "avi", "mov", "m4v", "wmv", "flv", "mpeg", "mpg", "ts", "m2ts", "3gp",
+    "ogv", "mts",
 ];
 
 /// Whether a path has one of the video extensions exposed by the native file
@@ -118,7 +118,11 @@ fn validate_frame_size(width: u32, height: u32, decoded_bytes: usize) -> Result<
 }
 
 #[cfg(windows)]
-fn pick_file_with_filter(owner: Option<isize>, filter_text: &str, title_text: &str) -> Option<PathBuf> {
+fn pick_file_with_filter(
+    owner: Option<isize>,
+    filter_text: &str,
+    title_text: &str,
+) -> Option<PathBuf> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Controls::Dialogs::{
@@ -148,7 +152,9 @@ fn pick_file_with_filter(owner: Option<isize>, filter_text: &str, title_text: &s
         if path.is_absolute() {
             Some(path)
         } else {
-            std::env::current_dir().ok().map(|directory| directory.join(path))
+            std::env::current_dir()
+                .ok()
+                .map(|directory| directory.join(path))
         }
     } else {
         None
@@ -196,9 +202,13 @@ mod tests {
     #[test]
     fn common_video_extensions_are_detected_case_insensitively() {
         assert!(is_supported_video_path(std::path::Path::new("clip.MP4")));
-        assert!(is_supported_video_path(std::path::Path::new("recording.mkv")));
+        assert!(is_supported_video_path(std::path::Path::new(
+            "recording.mkv"
+        )));
         assert!(!is_supported_video_path(std::path::Path::new("poster.png")));
-        assert!(!is_supported_video_path(std::path::Path::new("extensionless")));
+        assert!(!is_supported_video_path(std::path::Path::new(
+            "extensionless"
+        )));
     }
 
     #[test]
