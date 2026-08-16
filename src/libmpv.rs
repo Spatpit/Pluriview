@@ -7,15 +7,17 @@
 //! controls, and drawing in one libmpv core per tile.
 
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     ffi::{c_char, c_int, c_void, CStr, CString, OsString},
     path::{Path, PathBuf},
     ptr,
-    sync::{mpsc, Arc},
+    sync::{
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+        Arc,
+    },
     thread,
+    time::{Duration, Instant},
 };
-
-#[cfg(test)]
-use std::time::{Duration, Instant};
 
 use eframe::{egui, glow};
 use glow::HasContext as _;
@@ -96,6 +98,10 @@ const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
 const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
 const MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
+const MPV_RENDER_PARAM_SW_SIZE: c_int = 17;
+const MPV_RENDER_PARAM_SW_FORMAT: c_int = 18;
+const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
+const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
 const MPV_RENDER_PARAM_INVALID: c_int = 0;
 const MPV_RENDER_UPDATE_FRAME: u64 = 1;
 
@@ -104,7 +110,18 @@ const MPV_EVENT_SHUTDOWN: c_int = 1;
 const MPV_EVENT_START_FILE: c_int = 6;
 const MPV_EVENT_END_FILE: c_int = 7;
 const MPV_EVENT_FILE_LOADED: c_int = 8;
+const MPV_EVENT_SEEK: c_int = 20;
+const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
+
+const SEEK_PREVIEW_WIDTH: i32 = 320;
+const SEEK_PREVIEW_HEIGHT: i32 = 180;
+const SEEK_PREVIEW_CACHE_LEN: usize = 20;
+const SEEK_PREVIEW_COLD_DEBOUNCE: Duration = Duration::from_millis(140);
+const SEEK_PREVIEW_WARM_DEBOUNCE: Duration = Duration::from_millis(50);
+const SEEK_PREVIEW_PREFETCH_OFFSETS: [i64; 4] = [-1, 1, -2, 2];
+const SEEK_PREVIEW_PREFETCH_GRACE: Duration = Duration::from_millis(250);
+const SEEK_PREVIEW_MATCH_SECS: f64 = 0.5;
 
 const MPV_FORMAT_NONE: c_int = 0;
 const MPV_FORMAT_STRING: c_int = 1;
@@ -115,7 +132,7 @@ const MPV_FORMAT_NODE: c_int = 6;
 const MPV_FORMAT_NODE_ARRAY: c_int = 7;
 const MPV_FORMAT_NODE_MAP: c_int = 8;
 
-const OBSERVED_PROPERTIES: [(&str, c_int); 14] = [
+const OBSERVED_PROPERTIES: [(&str, c_int); 15] = [
     ("pause", MPV_FORMAT_FLAG),
     ("time-pos", MPV_FORMAT_DOUBLE),
     ("duration", MPV_FORMAT_DOUBLE),
@@ -130,6 +147,7 @@ const OBSERVED_PROPERTIES: [(&str, c_int); 14] = [
     ("paused-for-cache", MPV_FORMAT_FLAG),
     ("core-idle", MPV_FORMAT_FLAG),
     ("eof-reached", MPV_FORMAT_FLAG),
+    ("seekable", MPV_FORMAT_FLAG),
 ];
 
 struct MpvApi {
@@ -140,6 +158,7 @@ struct MpvApi {
     set_option_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
     set_property_string:
         unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
+    get_property: unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int,
     #[cfg(test)]
     get_property_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char) -> *mut c_char,
     command: unsafe extern "C" fn(*mut MpvHandle, *const *const c_char) -> c_int,
@@ -189,6 +208,7 @@ impl MpvApi {
         let terminate_destroy = unsafe { symbol(&library, b"mpv_terminate_destroy\0")? };
         let set_option_string = unsafe { symbol(&library, b"mpv_set_option_string\0")? };
         let set_property_string = unsafe { symbol(&library, b"mpv_set_property_string\0")? };
+        let get_property = unsafe { symbol(&library, b"mpv_get_property\0")? };
         #[cfg(test)]
         let get_property_string = unsafe { symbol(&library, b"mpv_get_property_string\0")? };
         let command = unsafe { symbol(&library, b"mpv_command\0")? };
@@ -209,6 +229,7 @@ impl MpvApi {
             terminate_destroy,
             set_option_string,
             set_property_string,
+            get_property,
             #[cfg(test)]
             get_property_string,
             command,
@@ -306,6 +327,7 @@ unsafe fn apply_property_event(state: &mut VideoState, property: &MpvEventProper
         "paused-for-cache" => event_flag(property).map(|value| state.paused_for_cache = value),
         "core-idle" => event_flag(property).map(|value| state.core_idle = value),
         "eof-reached" => event_flag(property).map(|value| state.eof_reached = value),
+        "seekable" => event_flag(property).map(|value| state.seekable = value),
         _ => None,
     }
     .is_some()
@@ -410,6 +432,23 @@ struct GlTarget {
     height: i32,
 }
 
+fn flip_rgba_rows(rgba: &mut [u8], width: usize, height: usize) {
+    let Some(stride) = width.checked_mul(4) else {
+        return;
+    };
+    if rgba.len() != stride.saturating_mul(height) {
+        return;
+    }
+    for row in 0..(height / 2) {
+        let opposite = height - 1 - row;
+        let top = row * stride;
+        let bottom = opposite * stride;
+        for column in 0..stride {
+            rgba.swap(top + column, bottom + column);
+        }
+    }
+}
+
 struct MpvCore {
     api: Arc<MpvApi>,
     handle: *mut MpvHandle,
@@ -418,6 +457,7 @@ struct MpvCore {
     has_rendered_frame: bool,
     pending_source: Option<OsString>,
     source_loaded: bool,
+    file_loaded: bool,
     destroyed: bool,
     error: Option<String>,
 }
@@ -442,6 +482,7 @@ impl MpvCore {
             has_rendered_frame: false,
             pending_source: None,
             source_loaded: false,
+            file_loaded: false,
             destroyed: false,
             error: None,
         };
@@ -552,6 +593,7 @@ impl MpvCore {
     fn load_source(&mut self, source: OsString) -> Result<(), String> {
         self.pending_source = Some(source);
         self.source_loaded = false;
+        self.file_loaded = false;
         self.has_rendered_frame = false;
         if !self.render_context.is_null() {
             self.start_pending_source()?;
@@ -599,7 +641,11 @@ impl MpvCore {
                     self.error = Some("The libmpv playback core shut down unexpectedly".to_owned());
                     break;
                 }
-                MPV_EVENT_START_FILE | MPV_EVENT_END_FILE | MPV_EVENT_FILE_LOADED => {
+                MPV_EVENT_START_FILE | MPV_EVENT_END_FILE => {
+                    changes.any = true;
+                }
+                MPV_EVENT_FILE_LOADED => {
+                    self.file_loaded = true;
                     changes.any = true;
                 }
                 MPV_EVENT_PROPERTY_CHANGE => {
@@ -829,6 +875,40 @@ impl MpvCore {
         Ok(())
     }
 
+    unsafe fn snapshot(&self, gl: &glow::Context) -> Option<VideoSnapshot> {
+        if self.destroyed || !self.has_rendered_frame {
+            return None;
+        }
+        let target = self.target.as_ref()?;
+        let width = usize::try_from(target.width).ok()?;
+        let height = usize::try_from(target.height).ok()?;
+        let byte_len = width.checked_mul(height)?.checked_mul(4)?;
+        let mut rgba = vec![0; byte_len];
+
+        let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(target.framebuffer));
+        gl.read_pixels(
+            0,
+            0,
+            target.width,
+            target.height,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(&mut rgba),
+        );
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
+
+        // OpenGL readback starts at the bottom row; egui ColorImage expects
+        // the first row to be the top of the image.
+        flip_rgba_rows(&mut rgba, width, height);
+
+        Some(VideoSnapshot {
+            width: target.width as u32,
+            height: target.height as u32,
+            rgba,
+        })
+    }
+
     unsafe fn cleanup(&mut self, gl: &glow::Context) {
         if self.destroyed {
             return;
@@ -882,6 +962,11 @@ impl VideoRenderer {
         }
     }
 
+    fn snapshot(&self, gl: &glow::Context) -> Option<VideoSnapshot> {
+        let core = self.core.lock();
+        unsafe { core.snapshot(gl) }
+    }
+
     fn load_source(&self, source: OsString) -> Result<(), String> {
         self.core.lock().load_source(source)
     }
@@ -895,6 +980,14 @@ impl VideoRenderer {
     fn cleanup(&self, gl: &glow::Context) {
         unsafe { self.core.lock().cleanup(gl) };
     }
+}
+
+/// A one-frame CPU copy used while replacing an unloaded libmpv tile with an
+/// ordinary lightweight egui texture.
+pub struct VideoSnapshot {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 pub struct VideoSession {
@@ -944,6 +1037,10 @@ impl VideoSession {
 
     pub fn state(&self) -> &VideoState {
         &self.state
+    }
+
+    pub fn source_ready(&self) -> bool {
+        self.stream_receiver.is_none() && self.renderer.core.lock().file_loaded
     }
 
     fn poll(&mut self) -> Vec<VideoUpdate> {
@@ -1163,16 +1260,11 @@ impl VideoManager {
     }
 
     pub fn repaint_fps(&self) -> Option<u32> {
-        if self.tiles.is_empty() {
-            None
-        } else {
-            self.tiles
-                .values()
-                .filter(|tile| tile.session.state.connected && !tile.session.state.pause)
-                .map(|tile| tile.target_fps)
-                .max()
-                .or(Some(10))
-        }
+        self.tiles
+            .values()
+            .filter(|tile| tile.session.state.connected && !tile.session.state.pause)
+            .map(|tile| tile.target_fps)
+            .max()
     }
 
     pub fn get(&self, id: PreviewId) -> Option<&VideoTile> {
@@ -1211,6 +1303,30 @@ impl VideoManager {
         updates
     }
 
+    /// Read the renderer's current FBO after this frame's normal tile paint.
+    /// Foreground ordering guarantees that a visible video gets its newest
+    /// frame before the one-shot snapshot callback runs.
+    pub fn schedule_snapshot(
+        &self,
+        id: PreviewId,
+        ctx: &egui::Context,
+    ) -> Option<mpsc::Receiver<Option<VideoSnapshot>>> {
+        let renderer = self.tiles.get(&id)?.session.renderer.clone();
+        let (sender, receiver) = mpsc::channel();
+        let callback = egui::PaintCallback {
+            rect: ctx.screen_rect(),
+            callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_info, painter| {
+                let _ = sender.send(renderer.snapshot(painter.gl()));
+            })),
+        };
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new(("libmpv_snapshot", id.0)),
+        ))
+        .add(callback);
+        Some(receiver)
+    }
+
     /// Queue GL-safe destruction after paint callbacks for the current frame.
     pub fn schedule_cleanup(&self, ctx: &egui::Context) {
         if self.cleanup_queue.lock().is_empty() {
@@ -1240,6 +1356,825 @@ impl VideoManager {
             renderer.cleanup(gl);
         }
         self.api = None;
+    }
+}
+
+fn source_key(source: &video::VideoThumbnailSource) -> String {
+    match source {
+        video::VideoThumbnailSource::LocalFile(path) => format!("file:{}", path.display()),
+        video::VideoThumbnailSource::Stream { url, quality, .. } => {
+            format!("stream:{url}|{quality}")
+        }
+    }
+}
+
+fn rgb0_to_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+}
+
+fn bucket_time(time: f64) -> f64 {
+    time.round().max(0.0)
+}
+
+fn prefetch_times(center: f64, duration: Option<f64>) -> Vec<f64> {
+    let center = center.round() as i64;
+    SEEK_PREVIEW_PREFETCH_OFFSETS
+        .iter()
+        .filter_map(|offset| {
+            let time = center.checked_add(*offset)?;
+            if time < 0 {
+                return None;
+            }
+            let time = time as f64;
+            if duration.is_some_and(|duration| time > duration.max(0.0)) {
+                return None;
+            }
+            Some(time)
+        })
+        .collect()
+}
+
+fn next_preview_time(
+    requested: f64,
+    duration: Option<f64>,
+    cache: &SeekPreviewCache,
+    prefetch: bool,
+) -> Option<f64> {
+    let requested = bucket_time(requested);
+    if !cache.covered(requested) {
+        return Some(requested);
+    }
+    if !prefetch {
+        return None;
+    }
+    prefetch_times(requested, duration)
+        .into_iter()
+        .find(|time| !cache.covered(*time))
+}
+
+fn frame_matches_hover(frame_time: f64, hover_time: f64) -> bool {
+    (frame_time - hover_time).abs() <= SEEK_PREVIEW_MATCH_SECS
+}
+
+#[derive(Default)]
+struct SeekPreviewCache {
+    frames: VecDeque<(i64, video::VideoThumbnail)>,
+    misses: HashSet<i64>,
+}
+
+impl SeekPreviewCache {
+    fn insert(&mut self, thumbnail: video::VideoThumbnail) {
+        let key = thumbnail.time.round() as i64;
+        self.misses.remove(&key);
+        self.frames.retain(|(existing, _)| *existing != key);
+        self.frames.push_back((key, thumbnail));
+        while self.frames.len() > SEEK_PREVIEW_CACHE_LEN {
+            self.frames.pop_front();
+        }
+    }
+
+    fn insert_grab(&mut self, requested: f64, thumbnail: video::VideoThumbnail) {
+        if !frame_matches_hover(thumbnail.time, requested) {
+            self.misses.insert(requested.round() as i64);
+        }
+        self.insert(thumbnail);
+    }
+
+    fn get(&self, time: f64) -> Option<&video::VideoThumbnail> {
+        let key = time.round() as i64;
+        self.frames
+            .iter()
+            .rev()
+            .find(|(existing, _)| *existing == key)
+            .map(|(_, thumbnail)| thumbnail)
+            .filter(|thumbnail| frame_matches_hover(thumbnail.time, time))
+    }
+
+    fn covered(&self, time: f64) -> bool {
+        self.get(time).is_some() || self.misses.contains(&(time.round() as i64))
+    }
+}
+
+enum SeekPreviewCommand {
+    Grab(f64),
+}
+
+enum SeekPreviewResult {
+    Ready,
+    Frame(video::VideoThumbnail),
+    Error(String),
+}
+
+enum GrabWait {
+    Ready,
+    Newer(f64),
+    Shutdown,
+}
+
+struct ThumbnailCore {
+    api: Arc<MpvApi>,
+    handle: *mut MpvHandle,
+    render_context: *mut MpvRenderContext,
+    destroyed: bool,
+}
+
+unsafe impl Send for ThumbnailCore {}
+
+impl ThumbnailCore {
+    fn new(api: Arc<MpvApi>, network_source: bool) -> Result<Self, String> {
+        let handle = unsafe { (api.create)() };
+        if handle.is_null() {
+            return Err("libmpv could not create a timeline preview core".to_owned());
+        }
+        let mut core = Self {
+            api,
+            handle,
+            render_context: ptr::null_mut(),
+            destroyed: false,
+        };
+        for (name, value) in [
+            ("config", "no"),
+            ("terminal", "no"),
+            ("osc", "no"),
+            ("osd-level", "0"),
+            ("input-default-bindings", "no"),
+            ("load-scripts", "no"),
+            ("keep-open", "yes"),
+            ("idle", "yes"),
+            ("pause", "yes"),
+            ("vo", "libmpv"),
+            ("ao", "null"),
+            ("audio", "no"),
+            ("aid", "no"),
+            ("sid", "no"),
+            ("sub", "no"),
+            ("sub-auto", "no"),
+            ("audio-file-auto", "no"),
+            ("ytdl", "no"),
+            ("hr-seek", "yes"),
+            ("hr-seek-framedrop", "yes"),
+            // Pin a single copy-mode decoder so the first grab does not probe
+            // every safe backend. mpv falls back to software if this fails.
+            ("hwdec", "d3d11va-copy"),
+        ] {
+            if let Err(error) = core.set_option(name, value) {
+                core.destroy();
+                return Err(error);
+            }
+        }
+        if network_source {
+            for (name, value) in [
+                ("cache", "yes"),
+                ("cache-secs", "8"),
+                ("demuxer-readahead-secs", "2"),
+                ("cache-pause", "no"),
+            ] {
+                if let Err(error) = core.set_option(name, value) {
+                    core.destroy();
+                    return Err(error);
+                }
+            }
+        } else {
+            for (name, value) in [("cache", "no"), ("demuxer-readahead-secs", "0.2")] {
+                if let Err(error) = core.set_option(name, value) {
+                    core.destroy();
+                    return Err(error);
+                }
+            }
+        }
+        let result = unsafe { (core.api.initialize)(core.handle) };
+        if result < 0 {
+            let error = core.api.error(result);
+            core.destroy();
+            return Err(format!(
+                "Could not initialize the timeline preview core: {error}"
+            ));
+        }
+        if let Err(error) = core.ensure_sw_render_context() {
+            core.destroy();
+            return Err(error);
+        }
+        Ok(core)
+    }
+
+    fn set_option(&self, name: &str, value: &str) -> Result<(), String> {
+        let name = cstring(name)?;
+        let value = cstring(value)?;
+        let result =
+            unsafe { (self.api.set_option_string)(self.handle, name.as_ptr(), value.as_ptr()) };
+        self.check(result, "set a timeline preview option")
+    }
+
+    fn set_property(&self, name: &str, value: &str) -> Result<(), String> {
+        let name = cstring(name)?;
+        let value = cstring(value)?;
+        let result =
+            unsafe { (self.api.set_property_string)(self.handle, name.as_ptr(), value.as_ptr()) };
+        self.check(result, "change a timeline preview property")
+    }
+
+    fn command(&self, arguments: &[String]) -> Result<(), String> {
+        let strings = arguments
+            .iter()
+            .map(|argument| cstring(argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut pointers = strings
+            .iter()
+            .map(|argument| argument.as_ptr())
+            .collect::<Vec<_>>();
+        pointers.push(ptr::null());
+        let result = unsafe { (self.api.command)(self.handle, pointers.as_ptr()) };
+        self.check(result, "run a timeline preview command")
+    }
+
+    fn check(&self, result: c_int, action: &str) -> Result<(), String> {
+        if result < 0 {
+            Err(format!("Could not {action}: {}", self.api.error(result)))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_sw_render_context(&mut self) -> Result<(), String> {
+        if !self.render_context.is_null() {
+            return Ok(());
+        }
+        let api_type = b"sw\0";
+        let mut params = [
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_API_TYPE,
+                data: api_type.as_ptr() as *mut c_void,
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
+        ];
+        let result = unsafe {
+            (self.api.render_context_create)(
+                &mut self.render_context,
+                self.handle,
+                params.as_mut_ptr(),
+            )
+        };
+        self.check(result, "create the software timeline renderer")
+    }
+
+    fn load_source(&self, source: OsString, start: f64) -> Result<(), String> {
+        if start > 0.05 {
+            self.set_property("start", &format!("{start:.3}"))?;
+        }
+        let source = source.to_string_lossy().into_owned();
+        self.command(&["loadfile".to_owned(), source, "replace".to_owned()])
+    }
+
+    fn seek_exact(&self, time: f64) -> Result<(), String> {
+        self.command(&[
+            "seek".to_owned(),
+            time.max(0.0).to_string(),
+            "absolute+exact".to_owned(),
+        ])
+    }
+
+    fn property_f64(&self, name: &str) -> Option<f64> {
+        let name = CString::new(name).ok()?;
+        let mut value = 0.0_f64;
+        let result = unsafe {
+            (self.api.get_property)(
+                self.handle,
+                name.as_ptr(),
+                MPV_FORMAT_DOUBLE,
+                (&mut value as *mut f64).cast(),
+            )
+        };
+        (result >= 0 && value.is_finite()).then_some(value)
+    }
+
+    fn wait_until_loaded(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64();
+            if remaining <= 0.0 {
+                return Err("Timeline preview timed out".to_owned());
+            }
+            let event = unsafe { (self.api.wait_event)(self.handle, remaining.min(0.05)) };
+            let event_id = if event.is_null() {
+                MPV_EVENT_NONE
+            } else {
+                unsafe { (*event).event_id }
+            };
+            match event_id {
+                MPV_EVENT_SHUTDOWN => {
+                    return Err("The timeline preview core shut down unexpectedly".to_owned());
+                }
+                MPV_EVENT_END_FILE => {
+                    return Err("The timeline preview file could not be opened".to_owned());
+                }
+                MPV_EVENT_FILE_LOADED | MPV_EVENT_PLAYBACK_RESTART => return Ok(()),
+                _ => {}
+            }
+            if !self.render_context.is_null()
+                && unsafe { (self.api.render_context_update)(self.render_context) }
+                    & MPV_RENDER_UPDATE_FRAME
+                    != 0
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn wait_for_frame(
+        &mut self,
+        time: f64,
+        timeout: Duration,
+        commands: &Receiver<SeekPreviewCommand>,
+    ) -> Result<GrabWait, String> {
+        let mut seek_completed = false;
+        self.wait_for(
+            timeout,
+            commands,
+            true,
+            |event_id, update| {
+                if event_id == MPV_EVENT_SEEK {
+                    return false;
+                }
+                if event_id == MPV_EVENT_PLAYBACK_RESTART || event_id == MPV_EVENT_FILE_LOADED {
+                    seek_completed = true;
+                }
+                seek_completed
+                    && (event_id == MPV_EVENT_PLAYBACK_RESTART
+                        || event_id == MPV_EVENT_FILE_LOADED
+                        || update & MPV_RENDER_UPDATE_FRAME != 0)
+            },
+            Some(time),
+            false,
+        )
+    }
+
+    fn time_matches(&self, time: f64) -> bool {
+        self.property_f64("time-pos")
+            .is_some_and(|actual| frame_matches_hover(actual, time))
+    }
+
+    fn wait_for(
+        &mut self,
+        timeout: Duration,
+        commands: &Receiver<SeekPreviewCommand>,
+        abort_on_grab: bool,
+        mut ready: impl FnMut(c_int, u64) -> bool,
+        target_time: Option<f64>,
+        fail_on_timeout: bool,
+    ) -> Result<GrabWait, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match peek_grab(commands) {
+                Some(GrabWait::Newer(time)) if abort_on_grab => return Ok(GrabWait::Newer(time)),
+                Some(GrabWait::Newer(_)) => {}
+                Some(GrabWait::Shutdown) => return Ok(GrabWait::Shutdown),
+                Some(GrabWait::Ready) | None => {}
+            }
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64();
+            if remaining <= 0.0 {
+                return if fail_on_timeout {
+                    Err("Timeline preview timed out".to_owned())
+                } else {
+                    Ok(GrabWait::Ready)
+                };
+            }
+            let event = unsafe { (self.api.wait_event)(self.handle, remaining.min(0.05)) };
+            let event_id = if event.is_null() {
+                MPV_EVENT_NONE
+            } else {
+                unsafe { (*event).event_id }
+            };
+            match event_id {
+                MPV_EVENT_SHUTDOWN => {
+                    return Err("The timeline preview core shut down unexpectedly".to_owned());
+                }
+                MPV_EVENT_END_FILE if fail_on_timeout => {
+                    return Err("The timeline preview file could not be opened".to_owned());
+                }
+                _ => {}
+            }
+            let update = if self.render_context.is_null() {
+                0
+            } else {
+                unsafe { (self.api.render_context_update)(self.render_context) }
+            };
+            if ready(event_id, update) && target_time.is_none_or(|time| self.time_matches(time)) {
+                return Ok(GrabWait::Ready);
+            }
+        }
+    }
+
+    fn render_frame(&mut self, time: f64) -> Result<video::VideoThumbnail, String> {
+        let mut size = [SEEK_PREVIEW_WIDTH, SEEK_PREVIEW_HEIGHT];
+        let format = b"rgb0\0";
+        let mut stride: usize = (SEEK_PREVIEW_WIDTH as usize) * 4;
+        let mut pixels = vec![0_u8; stride * SEEK_PREVIEW_HEIGHT as usize];
+        let mut block_for_target_time: c_int = 1;
+        let mut params = [
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_SW_SIZE,
+                data: size.as_mut_ptr().cast(),
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_SW_FORMAT,
+                data: format.as_ptr() as *mut c_void,
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_SW_STRIDE,
+                data: (&mut stride as *mut usize).cast(),
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_SW_POINTER,
+                data: pixels.as_mut_ptr().cast(),
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                data: (&mut block_for_target_time as *mut c_int).cast(),
+            },
+            MpvRenderParam {
+                kind: MPV_RENDER_PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
+        ];
+        let result =
+            unsafe { (self.api.render_context_render)(self.render_context, params.as_mut_ptr()) };
+        self.check(result, "render the timeline preview")?;
+        rgb0_to_rgba(&mut pixels);
+        let actual_time = self
+            .property_f64("time-pos")
+            .filter(|actual| actual.is_finite() && *actual >= 0.0)
+            .unwrap_or(time);
+        Ok(video::VideoThumbnail {
+            time: actual_time,
+            width: SEEK_PREVIEW_WIDTH as u32,
+            height: SEEK_PREVIEW_HEIGHT as u32,
+            rgba: pixels,
+        })
+    }
+
+    fn grab(
+        &mut self,
+        mut time: f64,
+        commands: &Receiver<SeekPreviewCommand>,
+    ) -> Result<Option<video::VideoThumbnail>, String> {
+        loop {
+            self.seek_exact(time)?;
+            match self.wait_for_frame(time, Duration::from_secs(2), commands)? {
+                GrabWait::Newer(newer) => {
+                    time = newer;
+                    continue;
+                }
+                GrabWait::Shutdown => return Ok(None),
+                GrabWait::Ready => {}
+            }
+            match peek_grab(commands) {
+                Some(GrabWait::Newer(newer)) => {
+                    time = newer;
+                    continue;
+                }
+                Some(GrabWait::Shutdown) => return Ok(None),
+                Some(GrabWait::Ready) | None => {}
+            }
+            return Ok(Some(self.render_frame(time)?));
+        }
+    }
+
+    fn destroy(&mut self) {
+        if self.destroyed {
+            return;
+        }
+        if !self.render_context.is_null() {
+            unsafe { (self.api.render_context_free)(self.render_context) };
+            self.render_context = ptr::null_mut();
+        }
+        if !self.handle.is_null() {
+            unsafe { (self.api.terminate_destroy)(self.handle) };
+            self.handle = ptr::null_mut();
+        }
+        self.destroyed = true;
+    }
+}
+
+impl Drop for ThumbnailCore {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+fn peek_grab(commands: &Receiver<SeekPreviewCommand>) -> Option<GrabWait> {
+    match commands.try_recv() {
+        Ok(SeekPreviewCommand::Grab(time)) => {
+            let mut latest = time;
+            loop {
+                match commands.try_recv() {
+                    Ok(SeekPreviewCommand::Grab(time)) => latest = time,
+                    Err(TryRecvError::Empty) => return Some(GrabWait::Newer(latest)),
+                    Err(TryRecvError::Disconnected) => return Some(GrabWait::Shutdown),
+                }
+            }
+        }
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => Some(GrabWait::Shutdown),
+    }
+}
+
+fn coalesce_command(
+    first: SeekPreviewCommand,
+    commands: &Receiver<SeekPreviewCommand>,
+) -> Result<SeekPreviewCommand, GrabWait> {
+    let mut command = first;
+    loop {
+        match commands.try_recv() {
+            Ok(SeekPreviewCommand::Grab(time)) => command = SeekPreviewCommand::Grab(time),
+            Err(TryRecvError::Empty) => return Ok(command),
+            Err(TryRecvError::Disconnected) => return Err(GrabWait::Shutdown),
+        }
+    }
+}
+
+fn resolve_thumbnail_source(source: &video::VideoThumbnailSource) -> Result<OsString, String> {
+    match source {
+        video::VideoThumbnailSource::LocalFile(path) => Ok(path.as_os_str().to_owned()),
+        video::VideoThumbnailSource::Stream {
+            streamlink_path,
+            url,
+            quality,
+        } => video::resolve_stream_url(streamlink_path, url, quality),
+    }
+}
+
+fn run_seek_preview_worker(
+    api: Arc<MpvApi>,
+    source: video::VideoThumbnailSource,
+    start: f64,
+    commands: Receiver<SeekPreviewCommand>,
+    results: Sender<SeekPreviewResult>,
+) {
+    let network = matches!(source, video::VideoThumbnailSource::Stream { .. });
+    let mut core = match ThumbnailCore::new(api, network) {
+        Ok(core) => core,
+        Err(error) => {
+            let _ = results.send(SeekPreviewResult::Error(error));
+            return;
+        }
+    };
+    let opened = (|| {
+        let path = resolve_thumbnail_source(&source)?;
+        core.load_source(path, start)?;
+        core.wait_until_loaded(if network {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(12)
+        })?;
+        Ok(())
+    })();
+    match opened {
+        Ok(()) => {
+            if results.send(SeekPreviewResult::Ready).is_err() {
+                return;
+            }
+        }
+        Err(error) => {
+            let _ = results.send(SeekPreviewResult::Error(error));
+            return;
+        }
+    }
+
+    loop {
+        let command = match commands.recv_timeout(Duration::from_millis(50)) {
+            Ok(command) => match coalesce_command(command, &commands) {
+                Ok(command) => command,
+                Err(GrabWait::Shutdown) => break,
+                Err(_) => continue,
+            },
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let SeekPreviewCommand::Grab(time) = command;
+        match core.grab(time, &commands) {
+            Ok(Some(frame)) => {
+                if results.send(SeekPreviewResult::Frame(frame)).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                if results.send(SeekPreviewResult::Error(error)).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+struct SeekPreviewSession {
+    commands: Sender<SeekPreviewCommand>,
+    results: Receiver<SeekPreviewResult>,
+    source_key: String,
+    cache: SeekPreviewCache,
+    ready: bool,
+    requested_time: f64,
+    sent_time: Option<f64>,
+    duration: Option<f64>,
+    last_hover: Instant,
+    due: Instant,
+}
+
+impl SeekPreviewSession {
+    fn spawn(
+        api: Arc<MpvApi>,
+        source: video::VideoThumbnailSource,
+        time: f64,
+        duration: Option<f64>,
+    ) -> Result<Self, String> {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let source_key = source_key(&source);
+        thread::Builder::new()
+            .name("pluriview-seek-preview".to_owned())
+            .spawn(move || {
+                run_seek_preview_worker(api, source, time, command_receiver, result_sender);
+            })
+            .map_err(|error| format!("Could not start the timeline preview worker: {error}"))?;
+        Ok(Self {
+            commands: command_sender,
+            results: result_receiver,
+            source_key,
+            cache: SeekPreviewCache::default(),
+            ready: false,
+            requested_time: time,
+            sent_time: None,
+            duration,
+            last_hover: Instant::now(),
+            due: Instant::now() + SEEK_PREVIEW_COLD_DEBOUNCE,
+        })
+    }
+
+    fn request(&mut self, time: f64, duration: Option<f64>) {
+        self.last_hover = Instant::now();
+        self.duration = duration;
+        if (self.requested_time - time).abs() <= 0.01 {
+            return;
+        }
+        self.requested_time = time;
+        let debounce = if self.ready {
+            SEEK_PREVIEW_WARM_DEBOUNCE
+        } else {
+            SEEK_PREVIEW_COLD_DEBOUNCE
+        };
+        self.due = Instant::now() + debounce;
+    }
+
+    fn hovering(&self) -> bool {
+        self.last_hover.elapsed() <= SEEK_PREVIEW_PREFETCH_GRACE
+    }
+
+    fn next_work(&self) -> Option<f64> {
+        next_preview_time(
+            self.requested_time,
+            self.duration,
+            &self.cache,
+            self.hovering(),
+        )
+    }
+
+    fn pump_request(&mut self) {
+        if !self.ready || Instant::now() < self.due {
+            return;
+        }
+        let Some(time) = self.next_work() else {
+            return;
+        };
+        if self
+            .sent_time
+            .is_some_and(|sent| (sent - time).abs() <= 0.01)
+        {
+            return;
+        }
+        if self.commands.send(SeekPreviewCommand::Grab(time)).is_ok() {
+            self.sent_time = Some(time);
+        }
+    }
+}
+
+/// Persistent, in-process libmpv cores used for seek-bar hover previews.
+#[derive(Default)]
+pub struct SeekPreviewManager {
+    api: Option<Arc<MpvApi>>,
+    sessions: HashMap<PreviewId, SeekPreviewSession>,
+}
+
+impl SeekPreviewManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cached_frame(&self, id: PreviewId, time: f64) -> Option<video::VideoThumbnail> {
+        self.sessions
+            .get(&id)
+            .and_then(|session| session.cache.get(time))
+            .cloned()
+            .filter(|thumbnail| frame_matches_hover(thumbnail.time, time))
+    }
+
+    pub fn request(
+        &mut self,
+        id: PreviewId,
+        mpv_path: &Path,
+        source: video::VideoThumbnailSource,
+        time: f64,
+        duration: Option<f64>,
+    ) -> Result<(), String> {
+        let time = bucket_time(time);
+        let key = source_key(&source);
+        if self
+            .sessions
+            .get(&id)
+            .is_some_and(|session| session.source_key != key)
+        {
+            self.sessions.remove(&id);
+        }
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.request(time, duration);
+            session.pump_request();
+            return Ok(());
+        }
+        if self.api.is_none() {
+            self.api = Some(MpvApi::load(mpv_path)?);
+        }
+        let api = self.api.as_ref().expect("libmpv was loaded").clone();
+        self.sessions
+            .insert(id, SeekPreviewSession::spawn(api, source, time, duration)?);
+        Ok(())
+    }
+
+    pub fn poll(&mut self) -> Vec<(PreviewId, video::VideoThumbnail)> {
+        let mut frames = Vec::new();
+        let ids: Vec<_> = self.sessions.keys().copied().collect();
+        for id in ids {
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            loop {
+                match session.results.try_recv() {
+                    Ok(SeekPreviewResult::Ready) => {
+                        session.ready = true;
+                        session.due = Instant::now();
+                    }
+                    Ok(SeekPreviewResult::Frame(thumbnail)) => {
+                        let requested = session.sent_time.unwrap_or(session.requested_time);
+                        let matches_hover =
+                            frame_matches_hover(thumbnail.time, session.requested_time);
+                        session.cache.insert_grab(requested, thumbnail.clone());
+                        session.sent_time = None;
+                        if matches_hover {
+                            frames.push((id, thumbnail));
+                        }
+                    }
+                    Ok(SeekPreviewResult::Error(error)) => {
+                        log::debug!("Timeline preview failed: {error}");
+                        session.sent_time = None;
+                        session.due = Instant::now() + Duration::from_secs(2);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.sessions.remove(&id);
+                        break;
+                    }
+                }
+            }
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.pump_request();
+            }
+        }
+        frames
+    }
+
+    pub fn needs_repaint(&self) -> bool {
+        self.sessions.values().any(|session| {
+            !session.ready || Instant::now() < session.due || session.next_work().is_some()
+        })
+    }
+
+    pub fn remove(&mut self, id: PreviewId) {
+        self.sessions.remove(&id);
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(PreviewId) -> bool) {
+        self.sessions.retain(|id, _| keep(*id));
+    }
+
+    pub fn clear(&mut self) {
+        self.sessions.clear();
     }
 }
 
@@ -1289,6 +2224,120 @@ unsafe extern "C" fn get_gl_proc_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_rows_are_flipped_from_opengl_order() {
+        let mut pixels = vec![
+            1, 2, 3, 4, 5, 6, 7, 8, // bottom row
+            9, 10, 11, 12, 13, 14, 15, 16, // top row
+        ];
+
+        flip_rgba_rows(&mut pixels, 2, 2);
+
+        assert_eq!(
+            pixels,
+            vec![9, 10, 11, 12, 13, 14, 15, 16, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    fn rgb0_pixels_gain_opaque_alpha() {
+        let mut pixels = vec![10, 20, 30, 0, 40, 50, 60, 7];
+        rgb0_to_rgba(&mut pixels);
+        assert_eq!(pixels, vec![10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn seek_preview_cache_keeps_the_most_recent_frames() {
+        let mut cache = SeekPreviewCache::default();
+        for index in 0..SEEK_PREVIEW_CACHE_LEN + 5 {
+            cache.insert(video::VideoThumbnail {
+                time: index as f64,
+                width: 1,
+                height: 1,
+                rgba: vec![index as u8, 0, 0, 255],
+            });
+        }
+        assert!(cache.get(0.0).is_none());
+        assert_eq!(cache.get(5.4).unwrap().rgba[0], 5);
+        assert_eq!(cache.get(24.0).unwrap().rgba[0], 24);
+        cache.insert(video::VideoThumbnail {
+            time: 24.2,
+            width: 1,
+            height: 1,
+            rgba: vec![99, 0, 0, 255],
+        });
+        assert_eq!(cache.get(24.0).unwrap().rgba[0], 99);
+    }
+
+    #[test]
+    fn seek_preview_prefetch_neighbors_nearer_seconds_first() {
+        assert_eq!(prefetch_times(0.4, Some(90.0)), vec![1.0, 2.0]);
+        assert_eq!(
+            prefetch_times(12.0, Some(90.0)),
+            vec![11.0, 13.0, 10.0, 14.0]
+        );
+        assert_eq!(prefetch_times(89.6, Some(90.0)), vec![89.0, 88.0]);
+    }
+
+    #[test]
+    fn seek_preview_work_prefers_the_hovered_time_then_neighbors() {
+        let mut cache = SeekPreviewCache::default();
+        assert_eq!(
+            next_preview_time(12.0, Some(90.0), &cache, true),
+            Some(12.0)
+        );
+        cache.insert(video::VideoThumbnail {
+            time: 12.0,
+            width: 1,
+            height: 1,
+            rgba: vec![1, 0, 0, 255],
+        });
+        assert_eq!(next_preview_time(12.0, Some(90.0), &cache, false), None);
+        assert_eq!(
+            next_preview_time(12.0, Some(90.0), &cache, true),
+            Some(11.0)
+        );
+        cache.insert(video::VideoThumbnail {
+            time: 11.0,
+            width: 1,
+            height: 1,
+            rgba: vec![2, 0, 0, 255],
+        });
+        assert_eq!(
+            next_preview_time(12.0, Some(90.0), &cache, true),
+            Some(13.0)
+        );
+    }
+
+    #[test]
+    fn seek_preview_frame_must_be_within_half_a_second() {
+        assert!(frame_matches_hover(12.0, 12.4));
+        assert!(frame_matches_hover(12.5, 12.0));
+        assert!(!frame_matches_hover(8.0, 12.0));
+        assert!(!frame_matches_hover(14.0, 12.0));
+    }
+
+    #[test]
+    fn seek_preview_cache_does_not_serve_a_keyframe_from_the_wrong_second() {
+        let mut cache = SeekPreviewCache::default();
+        cache.insert_grab(
+            12.0,
+            video::VideoThumbnail {
+                time: 8.2,
+                width: 1,
+                height: 1,
+                rgba: vec![8, 0, 0, 255],
+            },
+        );
+        assert!(cache.get(12.0).is_none());
+        assert!(cache.covered(12.0));
+        assert_eq!(cache.get(8.0).unwrap().rgba[0], 8);
+        assert_eq!(
+            next_preview_time(12.0, Some(90.0), &cache, true),
+            Some(11.0)
+        );
+    }
 
     #[test]
     fn bundled_runtime_initializes_and_accepts_immediate_controls() {

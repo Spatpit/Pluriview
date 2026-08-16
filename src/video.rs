@@ -177,6 +177,7 @@ pub struct VideoState {
     pub paused_for_cache: bool,
     pub core_idle: bool,
     pub eof_reached: bool,
+    pub seekable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -228,6 +229,7 @@ pub enum VideoProperty {
     PausedForCache,
     CoreIdle,
     EofReached,
+    Seekable,
 }
 
 #[derive(Clone, Debug)]
@@ -756,7 +758,7 @@ fn unique_pipe_name() -> String {
     )
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct VideoThumbnail {
     pub time: f64,
     pub width: u32,
@@ -1046,7 +1048,7 @@ fn coalesce_pending_commands(first: VideoCommand, receiver: &Receiver<VideoComma
         .collect()
 }
 
-const OBSERVED_PROPERTIES: [&str; 14] = [
+const OBSERVED_PROPERTIES: [&str; 15] = [
     "pause",
     "time-pos",
     "duration",
@@ -1061,6 +1063,7 @@ const OBSERVED_PROPERTIES: [&str; 14] = [
     "paused-for-cache",
     "core-idle",
     "eof-reached",
+    "seekable",
 ];
 
 fn start_ipc_reader(pipe: File, event_sender: Sender<WorkerEvent>, stop: Arc<AtomicBool>) {
@@ -1195,6 +1198,10 @@ fn apply_property(state: &mut VideoState, name: &str, data: &Value) -> Option<Vi
         "eof-reached" => {
             state.eof_reached = data.as_bool()?;
             Some(VideoProperty::EofReached)
+        }
+        "seekable" => {
+            state.seekable = data.as_bool()?;
+            Some(VideoProperty::Seekable)
         }
         _ => None,
     }
@@ -1494,6 +1501,7 @@ mod tests {
             r#"{"event":"property-change","name":"paused-for-cache","data":true}"#,
             r#"{"event":"property-change","name":"core-idle","data":false}"#,
             r#"{"event":"property-change","name":"eof-reached","data":false}"#,
+            r#"{"event":"property-change","name":"seekable","data":true}"#,
             r#"{"event":"property-change","name":"track-list","data":[{"id":2,"type":"audio","lang":"en","selected":true},{"id":3,"type":"sub","title":"English"}]}"#,
         ] {
             parse_ipc_line(line, &mut state, &mut updates);
@@ -1512,6 +1520,7 @@ mod tests {
         assert!(state.paused_for_cache);
         assert!(!state.core_idle);
         assert!(!state.eof_reached);
+        assert!(state.seekable);
         assert_eq!(state.track_list.len(), 2);
         assert_eq!(state.track_list[0].lang.as_deref(), Some("en"));
         assert!(updates

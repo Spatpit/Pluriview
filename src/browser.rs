@@ -18,9 +18,11 @@ use parking_lot::Mutex;
 use webview2_com::{
     take_pwstr, BrowserExtensionEnableCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2BrowserExtension, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_8,
+        ICoreWebView2BrowserExtension, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_3,
+        ICoreWebView2_8,
     },
     ProfileAddBrowserExtensionCompletedHandler, ProfileGetBrowserExtensionsCompletedHandler,
+    TrySuspendCompletedHandler,
 };
 use webview2_core::{Interface, HSTRING as WebViewHString, PWSTR as WebViewPWSTR};
 use windows::{
@@ -358,6 +360,17 @@ pub struct BrowserHost {
     /// When the live address was last read from WebView2 (see [`Self::poll`]).
     last_url_check: Option<Instant>,
     shared: Arc<Mutex<SharedState>>,
+    /// Desired sleeping state. WebView2 suspension itself is best-effort, but
+    /// the controller remains hidden until the user explicitly resumes it.
+    suspended: bool,
+    /// Ad-block activation may request navigation while a tile sleeps. Keep
+    /// it deferred because WebView2 navigation would otherwise auto-resume it.
+    after_resume: Option<AfterResume>,
+}
+
+enum AfterResume {
+    Load(String),
+    Reload,
 }
 
 impl BrowserHost {
@@ -445,6 +458,8 @@ impl BrowserHost {
             capture_size: (WIDTH, HEIGHT),
             last_url_check: None,
             shared,
+            suspended: false,
+            after_resume: None,
         })
     }
 
@@ -468,7 +483,7 @@ impl BrowserHost {
     /// size. The zoom changes with the backing width, preserving the same CSS
     /// viewport while eliminating bitmap upscaling in the canvas preview.
     pub fn sync_capture_size(&mut self, width: i32, height: i32) {
-        if self.active {
+        if self.active || self.suspended {
             return;
         }
         let size = (width.max(1), height.max(1));
@@ -532,6 +547,9 @@ impl BrowserHost {
     /// Drain pending title/URL changes and apply queued same-tile navigation
     /// from blocked new-window requests. Call once per frame.
     pub fn poll(&mut self) -> BrowserUpdate {
+        if self.suspended {
+            return BrowserUpdate::default();
+        }
         self.refresh_live_url();
         let (update, navigate) = {
             let mut state = self.shared.lock();
@@ -566,6 +584,9 @@ impl BrowserHost {
         pixels_per_point: f32,
         take_focus: bool,
     ) {
+        if self.suspended {
+            return;
+        }
         let mut host_origin = POINT {
             x: (visible_rect.min.x * pixels_per_point).round() as i32,
             y: (visible_rect.min.y * pixels_per_point).round() as i32,
@@ -713,6 +734,72 @@ impl BrowserHost {
         self.active = false;
         self.last_geometry = None;
         self.reveal_at = None;
+    }
+
+    /// Hide the controller and ask WebView2 to put this page to sleep. The
+    /// callback is intentionally non-blocking because WebView2 dispatches it
+    /// through the UI thread's message pump.
+    pub fn suspend(&mut self) -> Result<(), String> {
+        if self.suspended {
+            return Ok(());
+        }
+        self.park();
+        let webview = self.webview.as_ref().ok_or("browser is closed")?;
+        let controller = webview.controller();
+        unsafe {
+            controller
+                .SetIsVisible(false)
+                .map_err(|error| error.to_string())?;
+        }
+        self.suspended = true;
+        let core = unsafe { controller.CoreWebView2() }.map_err(|error| error.to_string())?;
+        let core3: ICoreWebView2_3 = core.cast().map_err(|error| error.to_string())?;
+        let callback = TrySuspendCompletedHandler::create(Box::new(|result, successful| {
+            if let Err(error) = result {
+                log::warn!("WebView2 tile suspension failed: {error}");
+            } else if !successful {
+                log::warn!("WebView2 declined to suspend a frozen tile");
+            }
+            Ok(())
+        }));
+        unsafe {
+            core3
+                .TrySuspend(&callback)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Wake a manually frozen page before its capture session is restarted.
+    pub fn resume(&mut self) -> Result<(), String> {
+        if !self.suspended {
+            return Ok(());
+        }
+        let webview = self.webview.as_ref().ok_or("browser is closed")?;
+        let controller = webview.controller();
+        let resume_result = unsafe { controller.CoreWebView2() }
+            .map_err(|error| error.to_string())
+            .and_then(|core| {
+                let core3: ICoreWebView2_3 = core.cast().map_err(|error| error.to_string())?;
+                unsafe { core3.Resume().map_err(|error| error.to_string()) }
+            });
+        unsafe {
+            controller
+                .SetIsVisible(true)
+                .map_err(|error| error.to_string())?;
+        }
+        self.suspended = false;
+        if let Some(action) = self.after_resume.take() {
+            match action {
+                AfterResume::Load(url) => self.load(&url),
+                AfterResume::Reload => self.reload(),
+            }
+        }
+        self.park();
+        if let Err(error) = resume_result {
+            log::warn!("WebView2 resume API was unavailable; restored visibility instead: {error}");
+        }
+        Ok(())
     }
 
     /// True when keyboard focus belongs to this host (or one of the WebView's
@@ -1094,10 +1181,19 @@ impl BrowserManager {
         }
         self.adblock_settle_until = None;
         let deferred = std::mem::take(&mut self.deferred_loads);
-        for (id, host) in &self.hosts {
-            match deferred.get(id) {
-                Some(url) => host.load(url),
-                None => host.reload(),
+        for (id, host) in &mut self.hosts {
+            let action = deferred
+                .get(id)
+                .cloned()
+                .map(AfterResume::Load)
+                .unwrap_or(AfterResume::Reload);
+            if host.suspended {
+                host.after_resume = Some(action);
+            } else {
+                match action {
+                    AfterResume::Load(url) => host.load(&url),
+                    AfterResume::Reload => host.reload(),
+                }
             }
         }
     }
@@ -1161,10 +1257,6 @@ impl BrowserManager {
 
     pub fn contains(&self, id: PreviewId) -> bool {
         self.hosts.contains_key(&id)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.hosts.is_empty()
     }
 
     /// PID of the shared WebView2 browser process, once any host can report it.

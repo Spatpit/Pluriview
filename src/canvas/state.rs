@@ -1,8 +1,8 @@
 use super::animation::{AnimationState, DragTracker};
 use crate::capture::CaptureCoordinator;
 use crate::preview::{
-    BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager, RemovedPreviewInfo,
-    VideoPlaybackState, VideoTileStatus,
+    compact_title, BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager,
+    RemovedPreviewInfo, VideoPlaybackState, VideoTileStatus,
 };
 #[cfg(debug_assertions)]
 use crate::privacy;
@@ -13,6 +13,8 @@ use std::time::Instant;
 
 /// How long the "Removed '...' · Undo" toast stays on screen.
 const UNDO_TOAST_SECS: f32 = 4.0;
+/// Screen-space hit target shared by resize interaction and marquee exclusion.
+const RESIZE_HANDLE_HIT_SIZE: f32 = 14.0;
 
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
@@ -45,11 +47,11 @@ pub enum DragState {
 mod tests {
     use super::{
         format_time, video_placeholder_content, CanvasState, DragState, PlaylistAction,
-        ResizeHandle, VideoAction,
+        ResizeHandle, TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
-    use crate::preview::{FpsPreset, PreviewId, PreviewManager, VideoSource, VideoTileStatus};
     use crate::playlist::FolderPlaylist;
+    use crate::preview::{FpsPreset, PreviewId, PreviewManager, VideoSource, VideoTileStatus};
     use eframe::egui::{
         CentralPanel, Context, CursorIcon, Event, Modifiers, PointerButton, Pos2, RawInput, Rect,
         Shape, Vec2,
@@ -191,6 +193,161 @@ mod tests {
     }
 
     #[test]
+    fn left_drag_on_empty_canvas_marquee_selects_intersecting_tiles() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let first = previews.add(
+            "first".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::splat(100.0),
+        );
+        let second = previews.add(
+            "second".to_owned(),
+            Pos2::new(260.0, 100.0),
+            Vec2::splat(100.0),
+        );
+        let outside = previews.add(
+            "outside".to_owned(),
+            Pos2::new(440.0, 100.0),
+            Vec2::splat(100.0),
+        );
+        canvas.selection = vec![outside];
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+        let mut run_frame = |events| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            );
+        };
+
+        let start = Pos2::new(50.0, 50.0);
+        let end = Pos2::new(390.0, 240.0);
+        run_frame(vec![Event::PointerMoved(start)]);
+        run_frame(vec![Event::PointerButton {
+            pos: start,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerMoved(end)]);
+        run_frame(vec![Event::PointerButton {
+            pos: end,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        assert!(canvas.selection.contains(&first));
+        assert!(canvas.selection.contains(&second));
+        assert!(!canvas.selection.contains(&outside));
+    }
+
+    #[test]
+    fn resize_handle_outside_tile_wins_over_empty_canvas_marquee() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add(
+            "resizable".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::splat(100.0),
+        );
+        canvas.selection = vec![id];
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        let mut run_frame = |events| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            );
+        };
+
+        // The right handle is centered at (200, 150). This press is outside
+        // the tile itself but inside the handle's deliberately larger hit box.
+        let start = Pos2::new(206.5, 150.0);
+        let end = Pos2::new(246.5, 150.0);
+        run_frame(vec![Event::PointerMoved(start)]);
+        run_frame(vec![Event::PointerButton {
+            pos: start,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerMoved(end)]);
+        run_frame(vec![Event::PointerButton {
+            pos: end,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        assert!(canvas.marquee.is_none());
+        assert!(previews.get(id).unwrap().size.x > 100.0);
+    }
+
+    #[test]
+    fn group_activity_action_is_queued_for_every_selected_tile() {
+        let mut canvas = CanvasState::default();
+        let ids = [PreviewId(2), PreviewId(7), PreviewId(9)];
+
+        canvas.queue_activity_for_selection(&ids, TileActivityAction::Freeze);
+
+        assert_eq!(
+            canvas.pending_tile_activity_actions,
+            vec![
+                (PreviewId(2), TileActivityAction::Freeze),
+                (PreviewId(7), TileActivityAction::Freeze),
+                (PreviewId(9), TileActivityAction::Freeze),
+            ]
+        );
+    }
+
+    #[test]
+    fn viewport_culling_never_resumes_a_manually_frozen_tile() {
+        let canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add(
+            "frozen".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::splat(100.0),
+        );
+        let preview = previews.get_mut(id).unwrap();
+        preview.manually_frozen = true;
+        preview.capture_paused = true;
+        let mut captures = CaptureCoordinator::new();
+
+        canvas.update_viewport_culling(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0)),
+            &mut previews,
+            &mut captures,
+        );
+
+        assert!(previews.get(id).unwrap().capture_paused);
+    }
+
+    #[test]
     fn tile_close_button_starts_removal() {
         let context = Context::default();
         let mut canvas = CanvasState::default();
@@ -301,10 +458,8 @@ mod tests {
 
     #[test]
     fn playlist_row_queues_file_selection() {
-        let root = std::env::temp_dir().join(format!(
-            "pluriview-canvas-playlist-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("pluriview-canvas-playlist-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let video = root.join("01 opening.mp4");
         std::fs::write(&video, b"").unwrap();
@@ -500,6 +655,15 @@ pub enum PlaylistAction {
     RequestThumbnail(PathBuf),
 }
 
+/// User-requested runtime activity changes. The canvas queues these and the
+/// app applies them because it owns browser hosts, video sessions, and capture
+/// workers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileActivityAction {
+    Freeze,
+    Resume,
+}
+
 /// Snapshot of the input state the canvas actually needs, gathered once per
 /// frame instead of cloning the entire egui `InputState` several times.
 struct FrameInput {
@@ -511,10 +675,29 @@ struct FrameInput {
     ctrl: bool,
     middle_down: bool,
     primary_down: bool,
+    primary_pressed: bool,
+    primary_released: bool,
     time: f64,
     delete_pressed: bool,
     select_all: bool,
     escape_pressed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MarqueeSelection {
+    start: Pos2,
+    current: Pos2,
+    base_selection: Vec<PreviewId>,
+}
+
+impl MarqueeSelection {
+    fn rect(&self) -> Rect {
+        Rect::from_two_pos(self.start, self.current)
+    }
+
+    fn is_drag(&self) -> bool {
+        (self.current - self.start).length_sq() >= 16.0
+    }
 }
 
 #[derive(Clone)]
@@ -548,6 +731,7 @@ struct TileInfo {
     video_status: VideoTileStatus,
     video_playback: VideoPlaybackState,
     supports_seek_preview: bool,
+    manually_frozen: bool,
 }
 
 impl TileInfo {
@@ -572,6 +756,7 @@ impl TileInfo {
             video_status: preview.video_status.clone(),
             video_playback: preview.video_playback.clone(),
             supports_seek_preview: preview.supports_seek_preview(),
+            manually_frozen: preview.manually_frozen,
         }
     }
 
@@ -595,6 +780,7 @@ impl TileInfo {
         self.video_status.clone_from(&preview.video_status);
         self.video_playback.clone_from(&preview.video_playback);
         self.supports_seek_preview = preview.supports_seek_preview();
+        self.manually_frozen = preview.manually_frozen;
     }
 }
 
@@ -921,6 +1107,9 @@ pub struct CanvasState {
     /// Video tile actions queued by hover controls / context menus.
     pub pending_video_actions: Vec<(PreviewId, VideoAction)>,
 
+    /// Freeze/resume requests queued by tile or background context menus.
+    pub pending_tile_activity_actions: Vec<(PreviewId, TileActivityAction)>,
+
     /// Folder playlist actions queued by its rows and header controls.
     pub pending_playlist_actions: Vec<(PreviewId, PlaylistAction)>,
 
@@ -949,6 +1138,9 @@ pub struct CanvasState {
 
     /// Canvas view to restore when the user exits temporary tile focus.
     focus: Option<FocusState>,
+
+    /// Left-button selection box started on empty canvas.
+    marquee: Option<MarqueeSelection>,
 }
 
 impl Default for CanvasState {
@@ -978,6 +1170,7 @@ impl Default for CanvasState {
             pending_stream_add: None,
             pending_browser_actions: Vec::new(),
             pending_video_actions: Vec::new(),
+            pending_tile_activity_actions: Vec::new(),
             pending_playlist_actions: Vec::new(),
             pending_browser_restore: None,
             pending_media_restore: None,
@@ -987,6 +1180,7 @@ impl Default for CanvasState {
             last_screen_rect: None,
             last_double_clicked: None,
             focus: None,
+            marquee: None,
         }
     }
 }
@@ -998,6 +1192,7 @@ impl CanvasState {
         self.zoom = 1.0;
         self.selection.clear();
         self.drag_state = None;
+        self.marquee = None;
         self.animation.preview_springs.clear();
     }
 
@@ -1102,8 +1297,6 @@ impl CanvasState {
         canvas_rect: Rect,
         preview_manager: &PreviewManager,
     ) -> Option<(PreviewId, ResizeHandle)> {
-        let handle_size = 12.0; // Slightly larger hit area
-
         for id in &self.selection {
             if let Some(preview) = preview_manager.get(*id) {
                 let screen_rect = self.canvas_rect_to_screen(preview.rect(), canvas_rect);
@@ -1120,7 +1313,8 @@ impl CanvasState {
                 ];
 
                 for (handle_pos, handle_type) in handles {
-                    let handle_rect = Rect::from_center_size(handle_pos, Vec2::splat(handle_size));
+                    let handle_rect =
+                        Rect::from_center_size(handle_pos, Vec2::splat(RESIZE_HANDLE_HIT_SIZE));
                     if handle_rect.contains(screen_pos) {
                         return Some((*id, handle_type));
                     }
@@ -1153,6 +1347,8 @@ impl CanvasState {
             ctrl: i.modifiers.ctrl,
             middle_down: i.pointer.middle_down(),
             primary_down: i.pointer.primary_down(),
+            primary_pressed: i.pointer.primary_pressed(),
+            primary_released: i.pointer.primary_released(),
             time: i.time,
             delete_pressed: i.key_pressed(egui::Key::Delete),
             select_all: i.modifiers.ctrl && i.key_pressed(egui::Key::A),
@@ -1164,6 +1360,7 @@ impl CanvasState {
         }
         if !show_overlays {
             self.drag_state = None;
+            self.marquee = None;
         }
 
         // Calculate delta time for animations
@@ -1222,6 +1419,8 @@ impl CanvasState {
             self.draw_empty_state(&painter, canvas_rect);
         }
 
+        self.handle_marquee_input(canvas_rect, preview_manager, &input, show_overlays);
+
         // Draw previews and handle their interactions (AFTER bg allocation)
         self.draw_and_interact_previews(
             ui,
@@ -1235,8 +1434,12 @@ impl CanvasState {
 
         // Draw selection rectangles and interactive resize handles
         // Handles are allocated AFTER previews so they have higher interaction priority
-        if show_overlays {
+        if show_overlays && self.marquee.is_none() {
             self.draw_and_interact_selection(ui, canvas_rect, preview_manager, &input);
+        }
+
+        if show_overlays {
+            self.draw_marquee(&painter, canvas_rect);
         }
 
         // Minimal Void: Floating status indicator (bottom-right corner)
@@ -1300,7 +1503,7 @@ impl CanvasState {
             let is_visible = viewport.intersects(preview_rect);
 
             // Update pause state based on visibility
-            if is_visible && preview.capture_paused {
+            if is_visible && preview.capture_paused && !preview.manually_frozen {
                 // Resume capture - preview is now visible
                 capture_coordinator.resume_capture(id);
                 preview.capture_paused = false;
@@ -1309,7 +1512,7 @@ impl CanvasState {
                     "Viewport culling: Resumed capture for '{}'",
                     privacy::redact_title(&preview.title)
                 );
-            } else if !is_visible && !preview.capture_paused {
+            } else if (!is_visible || preview.manually_frozen) && !preview.capture_paused {
                 // Pause capture - preview is now off-screen
                 capture_coordinator.pause_capture(id);
                 preview.capture_paused = true;
@@ -1340,6 +1543,94 @@ impl CanvasState {
                 }
             }
         }
+    }
+
+    fn draw_marquee(&self, painter: &egui::Painter, canvas_rect: Rect) {
+        let Some(marquee) = self.marquee.as_ref().filter(|marquee| marquee.is_drag()) else {
+            return;
+        };
+        let rect = marquee.rect().intersect(canvas_rect);
+        painter.rect_filled(rect, 2.0, Color32::from_rgba_unmultiplied(74, 158, 255, 34));
+        painter.rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::from_rgb(74, 158, 255)));
+    }
+
+    fn update_marquee_selection(
+        &mut self,
+        canvas_rect: Rect,
+        preview_manager: &PreviewManager,
+        pointer: Pos2,
+    ) {
+        let Some(marquee) = self.marquee.as_mut() else {
+            return;
+        };
+        marquee.current = pointer;
+        if !marquee.is_drag() {
+            return;
+        }
+
+        let selection_rect = marquee.rect().intersect(canvas_rect);
+        let mut selected = marquee.base_selection.clone();
+        for preview in preview_manager
+            .all()
+            .filter(|preview| preview.removing.is_none())
+        {
+            let screen_rect = Rect::from_min_size(
+                canvas_rect.min + (preview.position.to_vec2() + self.pan) * self.zoom,
+                preview.size * self.zoom,
+            );
+            if selection_rect.intersects(screen_rect) && !selected.contains(&preview.id) {
+                selected.push(preview.id);
+            }
+        }
+        self.selection = selected;
+    }
+
+    fn handle_marquee_input(
+        &mut self,
+        canvas_rect: Rect,
+        preview_manager: &PreviewManager,
+        input: &FrameInput,
+        show_overlays: bool,
+    ) {
+        // Left-dragging from empty canvas draws a marquee. Tile drags still
+        // move tiles, while Alt+left and middle-button drags remain panning.
+        if show_overlays
+            && input.primary_pressed
+            && !input.alt
+            && !input.middle_down
+            && self.drag_state.is_none()
+        {
+            if let Some(pointer) = input.interact_pos.filter(|pos| canvas_rect.contains(*pos)) {
+                let canvas_pos = self.screen_to_canvas(pointer, canvas_rect);
+                let over_resize_handle = self
+                    .get_handle_at(pointer, canvas_rect, preview_manager)
+                    .is_some();
+                if !over_resize_handle && preview_manager.get_preview_at(canvas_pos).is_none() {
+                    self.marquee = Some(MarqueeSelection {
+                        start: pointer,
+                        current: pointer,
+                        base_selection: if input.ctrl {
+                            self.selection.clone()
+                        } else {
+                            Vec::new()
+                        },
+                    });
+                }
+            }
+        }
+        if self.marquee.is_some() {
+            if let Some(pointer) = input.hover_pos.or(input.interact_pos) {
+                self.update_marquee_selection(canvas_rect, preview_manager, pointer);
+            }
+            if input.primary_released {
+                self.marquee = None;
+            }
+        }
+    }
+
+    fn queue_activity_for_selection(&mut self, ids: &[PreviewId], action: TileActivityAction) {
+        self.pending_tile_activity_actions
+            .extend(ids.iter().copied().map(|id| (id, action)));
     }
 
     /// Handle canvas-level input (background clicks, pan, zoom)
@@ -1488,6 +1779,26 @@ impl CanvasState {
             ui.checkbox(&mut self.show_grid, "Show Grid");
             ui.separator();
             if !self.selection.is_empty() {
+                let selected = self.selection.clone();
+                let any_live = selected.iter().any(|id| {
+                    preview_manager
+                        .get(*id)
+                        .is_some_and(|preview| !preview.manually_frozen)
+                });
+                let any_frozen = selected.iter().any(|id| {
+                    preview_manager
+                        .get(*id)
+                        .is_some_and(|preview| preview.manually_frozen)
+                });
+                if any_live && ui.button("Freeze Selected").clicked() {
+                    self.queue_activity_for_selection(&selected, TileActivityAction::Freeze);
+                    ui.close_menu();
+                }
+                if any_frozen && ui.button("Resume Selected").clicked() {
+                    self.queue_activity_for_selection(&selected, TileActivityAction::Resume);
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("Remove Selected").clicked() {
                     for id in self.selection.clone() {
                         capture_coordinator.stop_capture(id);
@@ -1571,6 +1882,7 @@ impl CanvasState {
             let video_status = &info.video_status;
             let video_playback = &info.video_playback;
             let supports_seek_preview = info.supports_seek_preview;
+            let manually_frozen = info.manually_frozen;
             let screen_rect = self.canvas_rect_to_screen(rect, canvas_rect);
 
             if !canvas_rect.intersects(screen_rect) {
@@ -1690,7 +2002,16 @@ impl CanvasState {
             };
 
             if !has_texture {
-                if is_browser {
+                if manually_frozen {
+                    painter.rect_filled(anim_rect, 8.0, Color32::from_rgb(22, 26, 32));
+                    painter.text(
+                        anim_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Frozen",
+                        egui::FontId::proportional(12.0),
+                        Color32::from_rgb(140, 170, 205),
+                    );
+                } else if is_browser {
                     paint_browser_placeholder(
                         &painter,
                         anim_rect,
@@ -1802,12 +2123,7 @@ impl CanvasState {
                 }
 
                 // Title (truncated, on the left) - handle UTF-8 properly
-                let title_text: Cow<'_, str> = if title.chars().count() > 25 {
-                    let truncated: String = title.chars().take(22).collect();
-                    Cow::Owned(format!("{}...", truncated))
-                } else {
-                    Cow::Borrowed(title)
-                };
+                let title_text = compact_title(title, 25);
                 let title_pos = if is_browser || is_media || is_video || is_playlist {
                     // Source badge marks app-owned tiles; shift the title right.
                     painter.text(
@@ -1832,13 +2148,13 @@ impl CanvasState {
                 painter.text(
                     title_pos,
                     egui::Align2::LEFT_CENTER,
-                    title_text.as_ref(),
+                    title_text,
                     egui::FontId::proportional(11.0),
                     Color32::from_rgb(200, 200, 200),
                 );
 
                 // Browser tiles: navigation + audio controls along the bottom
-                if is_browser && *browser_status == BrowserTileStatus::Ready {
+                if is_browser && !manually_frozen && *browser_status == BrowserTileStatus::Ready {
                     let bottom_overlay = Rect::from_min_size(
                         screen_rect.left_bottom() + Vec2::new(0.0, -42.0),
                         Vec2::new(screen_rect.width(), 42.0),
@@ -1922,7 +2238,7 @@ impl CanvasState {
                     }
                 }
 
-                if is_video {
+                if is_video && !manually_frozen {
                     let bottom_overlay = Rect::from_min_size(
                         screen_rect.left_bottom() + Vec2::new(0.0, -48.0),
                         Vec2::new(screen_rect.width(), 48.0),
@@ -2147,15 +2463,19 @@ impl CanvasState {
                                     popup_rect.min + Vec2::splat(4.0),
                                     Pos2::new(popup_rect.right() - 4.0, popup_rect.bottom() - 22.0),
                                 );
-                                let texture_id = preview_manager.get_mut(id).and_then(|preview| {
-                                    let matches_time = preview
-                                        .seek_preview_time()
-                                        .is_some_and(|time| (time - hover_time).abs() <= 1.0);
-                                    matches_time
-                                        .then(|| preview.get_seek_preview_texture(ctx))
-                                        .flatten()
-                                        .map(|texture| texture.id())
-                                });
+                                let (texture_id, matches_time) = preview_manager
+                                    .get_mut(id)
+                                    .map_or((None, false), |preview| {
+                                        let matches_time = preview
+                                            .seek_preview_time()
+                                            .is_some_and(|time| (time - hover_time).abs() <= 0.5);
+                                        (
+                                            preview
+                                                .get_seek_preview_texture(ctx)
+                                                .map(|texture| texture.id()),
+                                            matches_time,
+                                        )
+                                    });
                                 if let Some(texture_id) = texture_id {
                                     painter.image(
                                         texture_id,
@@ -2163,6 +2483,20 @@ impl CanvasState {
                                         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                                         Color32::WHITE,
                                     );
+                                    if !matches_time {
+                                        painter.rect_filled(
+                                            image_rect,
+                                            0.0,
+                                            Color32::from_black_alpha(90),
+                                        );
+                                        painter.text(
+                                            image_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "Loading preview…",
+                                            egui::FontId::proportional(11.0),
+                                            Color32::from_rgb(210, 210, 216),
+                                        );
+                                    }
                                 } else {
                                     painter.text(
                                         image_rect.center(),
@@ -2250,6 +2584,30 @@ impl CanvasState {
                 );
             }
 
+            if show_overlays && manually_frozen {
+                let badge_rect = Rect::from_min_size(
+                    screen_rect.left_top() + Vec2::new(8.0, 8.0),
+                    Vec2::new(72.0, 24.0),
+                );
+                painter.rect_filled(
+                    badge_rect,
+                    7.0,
+                    Color32::from_rgba_unmultiplied(20, 25, 32, 220),
+                );
+                painter.rect_stroke(
+                    badge_rect,
+                    7.0,
+                    Stroke::new(1.0, Color32::from_rgb(104, 174, 255)),
+                );
+                painter.text(
+                    badge_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}  Frozen", egui_phosphor::regular::SNOWFLAKE),
+                    egui::FontId::proportional(10.0),
+                    Color32::from_rgb(210, 230, 255),
+                );
+            }
+
             // Minimal Void: Only show border when selected (thin blue accent);
             // green accent marks the browser tile currently in interaction mode.
             if show_overlays {
@@ -2281,10 +2639,16 @@ impl CanvasState {
                 }
             }
 
+            // A context click on an unselected tile makes it the target;
+            // clicking any selected tile keeps the whole group selected.
+            if preview_response.secondary_clicked() && !self.selection.contains(&id) {
+                self.selection = vec![id];
+            }
+
             // Handle double-click: browsers enter interaction mode (the app
             // consumes last_double_clicked); other previews focus their
             // source window.
-            if preview_response.double_clicked() {
+            if preview_response.double_clicked() && !manually_frozen {
                 if is_video {
                     self.pending_video_actions
                         .push((id, VideoAction::SetPaused(!video_playback.paused)));
@@ -2403,7 +2767,50 @@ impl CanvasState {
 
             // Context menu for preview
             preview_response.context_menu(|ui| {
-                ui.label(egui::RichText::new(title.clone()).strong());
+                ui.set_max_width(280.0);
+                ui.label(egui::RichText::new(compact_title(title, 42)).strong());
+                ui.separator();
+
+                let selected_ids = if self.selection.contains(&id) {
+                    self.selection.clone()
+                } else {
+                    vec![id]
+                };
+                let any_live = selected_ids.iter().any(|selected_id| {
+                    preview_manager
+                        .get(*selected_id)
+                        .is_some_and(|preview| !preview.manually_frozen)
+                });
+                let any_frozen = selected_ids.iter().any(|selected_id| {
+                    preview_manager
+                        .get(*selected_id)
+                        .is_some_and(|preview| preview.manually_frozen)
+                });
+                let group = selected_ids.len() > 1;
+                if any_live
+                    && ui
+                        .button(if group {
+                            "Freeze Selected"
+                        } else {
+                            "Freeze Tile"
+                        })
+                        .clicked()
+                {
+                    self.queue_activity_for_selection(&selected_ids, TileActivityAction::Freeze);
+                    ui.close_menu();
+                }
+                if any_frozen
+                    && ui
+                        .button(if group {
+                            "Resume Selected"
+                        } else {
+                            "Resume Tile"
+                        })
+                        .clicked()
+                {
+                    self.queue_activity_for_selection(&selected_ids, TileActivityAction::Resume);
+                    ui.close_menu();
+                }
                 ui.separator();
 
                 if !is_media && !is_playlist {
@@ -2469,7 +2876,8 @@ impl CanvasState {
                 } else if is_browser {
                     // Browser tiles: navigation and audio instead of crop
                     // (a cropped page has ambiguous interactive coordinates).
-                    let browser_ready = *browser_status == BrowserTileStatus::Ready;
+                    let browser_ready =
+                        *browser_status == BrowserTileStatus::Ready && !manually_frozen;
                     if !browser_ready {
                         ui.label(egui::RichText::new("Browser preview is starting…").weak());
                     }
@@ -2499,7 +2907,10 @@ impl CanvasState {
                             .push((id, BrowserAction::Reload));
                         ui.close_menu();
                     }
-                    if ui.button("Change URL...").clicked() {
+                    if ui
+                        .add_enabled(browser_ready, egui::Button::new("Change URL..."))
+                        .clicked()
+                    {
                         self.pending_browser_actions
                             .push((id, BrowserAction::EditUrl));
                         ui.close_menu();
@@ -2521,12 +2932,16 @@ impl CanvasState {
                         ui.close_menu();
                     }
                 } else if is_video {
-                    let controls_enabled = video_playback.connected
+                    let controls_enabled = !manually_frozen
+                        && video_playback.connected
                         && !matches!(video_status, VideoTileStatus::Failed(_));
                     if !controls_enabled {
                         ui.label(egui::RichText::new("Video controls are unavailable").weak());
                     }
-                    if ui.button("Reload").clicked() {
+                    if ui
+                        .add_enabled(!manually_frozen, egui::Button::new("Reload"))
+                        .clicked()
+                    {
                         self.pending_video_actions.push((id, VideoAction::Reload));
                         ui.close_menu();
                     }
@@ -3321,7 +3736,6 @@ impl CanvasState {
 
             // Minimal Void: Smaller, more subtle resize handles
             let handle_size = 6.0; // Reduced from 8.0
-            let handle_hit_size = 14.0; // Keep large hit area for usability
             let handles = [
                 (screen_rect.left_top(), ResizeHandle::TopLeft),
                 (screen_rect.center_top(), ResizeHandle::Top),
@@ -3335,7 +3749,8 @@ impl CanvasState {
 
             for (handle_pos, handle_type) in handles {
                 let handle_rect = Rect::from_center_size(handle_pos, Vec2::splat(handle_size));
-                let hit_rect = Rect::from_center_size(handle_pos, Vec2::splat(handle_hit_size));
+                let hit_rect =
+                    Rect::from_center_size(handle_pos, Vec2::splat(RESIZE_HANDLE_HIT_SIZE));
 
                 // Minimal Void: Clean handles matching selection color
                 let handle_fill = if alt_held && !is_browser && !is_playlist {

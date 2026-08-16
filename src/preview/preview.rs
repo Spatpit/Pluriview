@@ -71,6 +71,7 @@ pub struct VideoPlaybackState {
     pub tracks: Vec<VideoTrack>,
     pub audio_track: Option<i64>,
     pub subtitle_track: Option<i64>,
+    pub seekable: bool,
 }
 
 impl Default for VideoPlaybackState {
@@ -87,6 +88,7 @@ impl Default for VideoPlaybackState {
             tracks: Vec::new(),
             audio_track: None,
             subtitle_track: None,
+            seekable: false,
         }
     }
 }
@@ -140,6 +142,11 @@ pub struct Preview {
 
     /// Is capture paused (e.g., for viewport culling)?
     pub capture_paused: bool,
+
+    /// User-requested freeze. Frozen tiles keep their last painted frame but
+    /// must not advance media or restart a culled capture until resumed.
+    /// This is deliberately runtime-only: saved workspaces start live.
+    pub manually_frozen: bool,
 
     /// Lock aspect ratio when resizing? (always true by default)
     pub lock_aspect_ratio: bool,
@@ -245,6 +252,7 @@ impl Preview {
             window_handle: None,
             title,
             capture_paused: false,
+            manually_frozen: false,
             lock_aspect_ratio: true,
             source_aspect_ratio: aspect_ratio,
             z_order: 0,
@@ -298,7 +306,15 @@ impl Preview {
     }
 
     pub fn supports_seek_preview(&self) -> bool {
-        self.video_source.is_some()
+        let duration_ok = self
+            .video_playback
+            .duration
+            .is_some_and(|duration| duration.is_finite() && duration > 0.0);
+        match self.video_source.as_ref() {
+            Some(VideoSource::LocalFile { .. }) => duration_ok,
+            Some(VideoSource::Stream { .. }) => duration_ok && self.video_playback.seekable,
+            None => false,
+        }
     }
 
     pub fn update_seek_preview(&mut self, time: f64, width: u32, height: u32, data: Vec<u8>) {
@@ -308,6 +324,12 @@ impl Preview {
             height,
             data,
         });
+    }
+
+    pub fn clear_seek_preview(&mut self) {
+        self.seek_preview_time = None;
+        self.seek_preview_texture = None;
+        self.seek_preview_frame = None;
     }
 
     pub fn seek_preview_time(&self) -> Option<f64> {
@@ -455,7 +477,7 @@ impl Preview {
 
     /// Advance an animated image according to its authored per-frame delays.
     fn advance_media_animation(&mut self, ctx: &egui::Context) {
-        if self.media_frames.len() <= 1 {
+        if self.manually_frozen || self.media_frames.len() <= 1 {
             return;
         }
 
@@ -558,7 +580,10 @@ impl From<&Preview> for PreviewLayout {
         Self {
             position: (preview.position.x, preview.position.y),
             size: (preview.size.x, preview.size.y),
-            window_title: preview.title.clone(),
+            window_title: match preview.video_source.as_ref() {
+                Some(source) => video_tile_title(source, Some(&preview.title)),
+                None => preview.title.clone(),
+            },
             window_exe: None, // TODO: Get exe name from window handle
             lock_aspect_ratio: preview.lock_aspect_ratio,
             z_order: preview.z_order,
@@ -630,12 +655,143 @@ fn is_sensitive_stream_parameter(name: &str) -> bool {
         || name.starts_with("x_amz_")
 }
 
+const MAX_USABLE_TITLE_CHARS: usize = 80;
+
+/// True when mpv's `media-title` is a real name, not a CDN URL or query blob.
+pub fn is_usable_media_title(title: &str) -> bool {
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > MAX_USABLE_TITLE_CHARS {
+        return false;
+    }
+    let lower = title.to_ascii_lowercase();
+    if lower.contains("://") || lower.starts_with("http:") || lower.starts_with("https:") {
+        return false;
+    }
+    if lower.contains("videoplayback")
+        || lower.contains("googlevideo")
+        || lower.contains("mime=")
+        || lower.contains("clen=")
+        || lower.contains("ratebypass=")
+    {
+        return false;
+    }
+    !(title.contains('&') && title.contains('='))
+}
+
+/// Compact label for menus and overlays so a long title cannot stretch the UI.
+pub fn compact_title(title: &str, max_chars: usize) -> String {
+    let title = title.trim();
+    if title.chars().count() <= max_chars {
+        return title.to_owned();
+    }
+    let truncated: String = title.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{truncated}...")
+}
+
+/// Display name for a video tile: a usable title, else a short name from the source.
+pub fn video_tile_title(source: &VideoSource, preferred: Option<&str>) -> String {
+    if let Some(title) = preferred.filter(|title| is_usable_media_title(title)) {
+        return title.trim().to_owned();
+    }
+    match source {
+        VideoSource::LocalFile { path } => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "Video".to_owned()),
+        VideoSource::Stream { url, .. } => stream_display_title(url),
+    }
+}
+
+fn stream_display_title(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return compact_title(url, 48);
+    };
+    let host = parsed
+        .host_str()
+        .unwrap_or("stream")
+        .trim_start_matches("www.");
+    if host.contains("googlevideo.com") {
+        return "YouTube stream".to_owned();
+    }
+    if is_youtube_host(host) {
+        return match youtube_video_id(&parsed) {
+            Some(id) => format!("YouTube · {id}"),
+            None => "YouTube".to_owned(),
+        };
+    }
+    if host == "twitch.tv" || host.ends_with(".twitch.tv") {
+        return match twitch_label(&parsed) {
+            Some(label) => format!("Twitch · {label}"),
+            None => "Twitch".to_owned(),
+        };
+    }
+    let leaf = parsed
+        .path()
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if leaf.is_empty() || leaf.contains('&') || leaf.contains('=') {
+        compact_title(host, 48)
+    } else {
+        compact_title(&format!("{host} · {leaf}"), 48)
+    }
+}
+
+fn is_youtube_host(host: &str) -> bool {
+    matches!(
+        host,
+        "youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtube-nocookie.com" | "youtu.be"
+    ) || host.ends_with(".youtube.com")
+        || host.ends_with(".youtu.be")
+}
+
+fn youtube_video_id(parsed: &url::Url) -> Option<String> {
+    if parsed
+        .host_str()
+        .is_some_and(|host| host.trim_start_matches("www.") == "youtu.be")
+    {
+        let id = parsed.path().trim_matches('/').split('/').next()?;
+        if !id.is_empty() {
+            return Some(id.to_owned());
+        }
+    }
+    if let Some((_, id)) = parsed.query_pairs().find(|(name, _)| name == "v") {
+        if !id.is_empty() {
+            return Some(id.into_owned());
+        }
+    }
+    let path = parsed.path().trim_matches('/');
+    for prefix in ["shorts/", "embed/", "live/", "v/"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            let id = rest.split('/').next().unwrap_or("");
+            if !id.is_empty() {
+                return Some(id.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn twitch_label(parsed: &url::Url) -> Option<String> {
+    let mut segments = parsed.path().trim_matches('/').split('/');
+    let first = segments.next().filter(|segment| !segment.is_empty())?;
+    if first.eq_ignore_ascii_case("videos") {
+        let id = segments.next().filter(|segment| !segment.is_empty())?;
+        Some(format!("video {id}"))
+    } else {
+        Some(first.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Preview, PreviewId, PreviewLayout, VideoSource};
     use crate::media::MediaFrame;
     use eframe::egui::{Context, Pos2, Vec2};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn frame_updates_reuse_the_texture() {
@@ -679,6 +835,40 @@ mod tests {
         assert!(preview.get_texture(&context).is_some());
         assert!(!preview.media_frame_dirty);
         assert!(preview.frame_buffer.is_none());
+    }
+
+    #[test]
+    fn frozen_gif_does_not_advance_or_schedule_from_elapsed_time() {
+        let context = Context::default();
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.set_media(
+            "test.gif".to_owned(),
+            vec![
+                MediaFrame {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255, 0, 0, 255],
+                    duration: Duration::from_millis(10),
+                },
+                MediaFrame {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![0, 255, 0, 255],
+                    duration: Duration::from_millis(10),
+                },
+            ],
+        );
+        preview.manually_frozen = true;
+        preview.media_frame_started = Instant::now() - Duration::from_secs(1);
+
+        let _ = preview.get_texture(&context);
+
+        assert_eq!(preview.media_frame_index, 0);
     }
 
     #[test]
@@ -791,5 +981,102 @@ mod tests {
                 quality: "best".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn local_files_support_seek_preview_once_duration_is_known() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "local".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.video_source = Some(VideoSource::LocalFile {
+            path: std::path::PathBuf::from("clip.mp4"),
+        });
+        assert!(!preview.supports_seek_preview());
+        preview.video_playback.duration = Some(90.0);
+        assert!(preview.supports_seek_preview());
+    }
+
+    #[test]
+    fn livestreams_do_not_support_seek_preview() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "live".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.video_source = Some(VideoSource::Stream {
+            url: "https://example.test/live".to_owned(),
+            quality: "best".to_owned(),
+        });
+        preview.video_playback.duration = Some(30.0);
+        preview.video_playback.seekable = false;
+        assert!(!preview.supports_seek_preview());
+        preview.video_playback.seekable = true;
+        assert!(preview.supports_seek_preview());
+    }
+
+    #[test]
+    fn stream_cdn_blobs_are_not_usable_titles() {
+        assert!(super::is_usable_media_title("Interview clip"));
+        assert!(!super::is_usable_media_title(
+            "mp4&rqh=1&gir=yes&clen=90158012&ratebypass=yes&dur=2756.765"
+        ));
+        assert!(!super::is_usable_media_title(
+            "https://www.youtube.com/watch?v=abc123"
+        ));
+        assert_eq!(
+            super::video_tile_title(
+                &VideoSource::Stream {
+                    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+                    quality: "best".to_owned(),
+                },
+                Some("mp4&rqh=1&gir=yes&clen=90158012&ratebypass=yes")
+            ),
+            "YouTube · dQw4w9WgXcQ"
+        );
+        assert_eq!(
+            super::video_tile_title(
+                &VideoSource::Stream {
+                    url: "https://www.twitch.tv/example".to_owned(),
+                    quality: "best".to_owned(),
+                },
+                Some("https://www.twitch.tv/example")
+            ),
+            "Twitch · example"
+        );
+        assert_eq!(
+            super::video_tile_title(
+                &VideoSource::Stream {
+                    url: "https://rr5---sn-abc.googlevideo.com/videoplayback?expire=1".to_owned(),
+                    quality: "best".to_owned(),
+                },
+                None
+            ),
+            "YouTube stream"
+        );
+        assert_eq!(super::compact_title("short", 42), "short");
+        assert_eq!(
+            super::compact_title("abcdefghijklmnopqrstuvwxyz", 10),
+            "abcdefg..."
+        );
+    }
+
+    #[test]
+    fn persisted_stream_titles_drop_cdn_query_blobs() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "mp4&rqh=1&gir=yes&clen=90158012&ratebypass=yes&dur=2756.765".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.video_source = Some(VideoSource::Stream {
+            url: "https://www.youtube.com/watch?v=abc123".to_owned(),
+            quality: "best".to_owned(),
+        });
+        let layout = PreviewLayout::from(&preview);
+        assert_eq!(layout.window_title, "YouTube · abc123");
     }
 }

@@ -2,11 +2,11 @@
 use crate::browser::{
     self, normalize_url, scrub_url_for_storage, BrowserManager, ExtensionPreparationStatus,
 };
-use crate::canvas::{BrowserAction, CanvasState, PlaylistAction, VideoAction};
+use crate::canvas::{BrowserAction, CanvasState, PlaylistAction, TileActivityAction, VideoAction};
 use crate::capture::CaptureCoordinator;
 use crate::external_tools::{self, ExternalTools, ToolKind, ToolStatus};
 #[cfg(windows)]
-use crate::libmpv::VideoManager;
+use crate::libmpv::{SeekPreviewManager, VideoManager, VideoSnapshot};
 use crate::media;
 use crate::overlay::RegionSelector;
 use crate::persistence::{
@@ -14,8 +14,9 @@ use crate::persistence::{
 };
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout, ThumbnailState};
 use crate::preview::{
-    BrowserTileStatus, FpsPreset, PreviewId, PreviewLayout, PreviewManager, VideoPlaybackState,
-    VideoSource, VideoTileStatus, VideoTrack, WindowHandle,
+    is_usable_media_title, video_tile_title, BrowserTileStatus, FpsPreset, PreviewId,
+    PreviewLayout, PreviewManager, VideoPlaybackState, VideoSource, VideoTileStatus, VideoTrack,
+    WindowHandle,
 };
 #[cfg(debug_assertions)]
 use crate::privacy;
@@ -153,7 +154,18 @@ fn preview_playback_state(state: &video::VideoState) -> VideoPlaybackState {
             video::TrackSelection::Id(id) => Some(id),
             _ => None,
         },
+        seekable: state.seekable,
     }
+}
+
+#[cfg(windows)]
+fn resumable_video_position(playback: &VideoPlaybackState) -> Option<f64> {
+    playback.time_pos.filter(|position| {
+        position.is_finite()
+            && playback
+                .duration
+                .is_some_and(|duration| duration.is_finite() && duration > 0.0)
+    })
 }
 
 #[cfg(windows)]
@@ -258,13 +270,16 @@ struct PendingVideoTile {
 }
 
 #[cfg(windows)]
-struct SeekPreviewJob {
-    mpv_path: std::path::PathBuf,
-    source: video::VideoThumbnailSource,
-    requested_time: f64,
-    due: Instant,
-    delivered_time: Option<f64>,
-    in_flight: Option<(f64, video::VideoThumbnailReceiver)>,
+struct PendingVideoFreeze {
+    receiver: std::sync::mpsc::Receiver<Option<VideoSnapshot>>,
+    requested_at: Instant,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct FrozenVideoCheckpoint {
+    playback: VideoPlaybackState,
+    seek_position: Option<f64>,
 }
 
 #[cfg(windows)]
@@ -327,9 +342,19 @@ pub struct PluriviewApp {
     /// Restored sessions stay visibly paused until mpv reports playback.
     #[cfg(windows)]
     restored_paused_videos: HashSet<PreviewId>,
-    /// Debounced, background thumbnail decoders for seekable video tiles.
+    /// Direct renderers waiting for their one-frame GL readback before their
+    /// libmpv cores can be destroyed.
     #[cfg(windows)]
-    seek_preview_jobs: HashMap<PreviewId, SeekPreviewJob>,
+    pending_video_freezes: HashMap<PreviewId, PendingVideoFreeze>,
+    /// Playback state retained while libmpv is fully unloaded.
+    #[cfg(windows)]
+    frozen_video_checkpoints: HashMap<PreviewId, FrozenVideoCheckpoint>,
+    /// Checkpoints waiting to be applied after a recreated source is ready.
+    #[cfg(windows)]
+    video_resume_checkpoints: HashMap<PreviewId, FrozenVideoCheckpoint>,
+    /// Persistent in-process timeline preview cores for seekable video tiles.
+    #[cfg(windows)]
+    seek_preview_manager: SeekPreviewManager,
     /// Lazy playlist poster decoding. Only two helper processes may run at once.
     #[cfg(windows)]
     playlist_thumbnail_queue: VecDeque<(PreviewId, std::path::PathBuf)>,
@@ -511,7 +536,13 @@ impl PluriviewApp {
             #[cfg(windows)]
             restored_paused_videos: HashSet::new(),
             #[cfg(windows)]
-            seek_preview_jobs: HashMap::new(),
+            pending_video_freezes: HashMap::new(),
+            #[cfg(windows)]
+            frozen_video_checkpoints: HashMap::new(),
+            #[cfg(windows)]
+            video_resume_checkpoints: HashMap::new(),
+            #[cfg(windows)]
+            seek_preview_manager: SeekPreviewManager::new(),
             #[cfg(windows)]
             playlist_thumbnail_queue: VecDeque::new(),
             #[cfg(windows)]
@@ -583,6 +614,7 @@ impl PluriviewApp {
         fps: FpsPreset,
         start_paused: bool,
     ) -> PreviewId {
+        let title = video_tile_title(&source, Some(&title));
         let id = self.preview_manager.add_video_placeholder(
             source,
             title,
@@ -840,6 +872,9 @@ impl PluriviewApp {
             .ok_or_else(|| "The video tile no longer exists".to_owned())?;
 
         self.capture_coordinator.stop_capture(id);
+        self.pending_video_freezes.remove(&id);
+        self.frozen_video_checkpoints.remove(&id);
+        self.video_resume_checkpoints.remove(&id);
         self.video_manager.remove(id);
         self.pending_video_tiles.insert(
             id,
@@ -887,7 +922,11 @@ impl PluriviewApp {
             .pending_video_tiles
             .iter()
             .filter_map(|(id, pending)| {
-                (!pending.start_paused && pending.retry_ready).then_some(*id)
+                let live = self
+                    .preview_manager
+                    .get(*id)
+                    .is_some_and(|preview| !preview.manually_frozen);
+                (!pending.start_paused && pending.retry_ready && live).then_some(*id)
             })
             .collect();
         for id in immediate {
@@ -908,7 +947,8 @@ impl PluriviewApp {
                 self.pending_video_tiles.iter().find_map(|(id, pending)| {
                     let preview = self.preview_manager.get(*id);
                     let eligible = preview.is_some_and(|preview| {
-                        !matches!(preview.video_status, VideoTileStatus::Failed(_))
+                        !preview.manually_frozen
+                            && !matches!(preview.video_status, VideoTileStatus::Failed(_))
                     });
                     restored_video_ready(pending, preview.map(|preview| preview.rect()), viewport)
                         .then_some(*id)
@@ -928,7 +968,8 @@ impl PluriviewApp {
         let visible_restored_pending = self.pending_video_tiles.iter().any(|(id, pending)| {
             let preview = self.preview_manager.get(*id);
             preview.is_some_and(|preview| {
-                !matches!(preview.video_status, VideoTileStatus::Failed(_))
+                !preview.manually_frozen
+                    && !matches!(preview.video_status, VideoTileStatus::Failed(_))
                     && restored_video_ready(pending, Some(preview.rect()), viewport)
             })
         });
@@ -946,6 +987,7 @@ impl PluriviewApp {
     fn poll_video_manager(&mut self, ctx: &egui::Context) {
         let updates = self.video_manager.poll();
         if updates.is_empty() {
+            self.restore_ready_video_checkpoints();
             return;
         }
 
@@ -999,8 +1041,16 @@ impl PluriviewApp {
             }
             if let Some(preview) = self.preview_manager.get_mut(id) {
                 preview.video_playback = preview_playback_state(&state);
-                if let Some(title) = state.media_title.as_ref().filter(|title| !title.is_empty()) {
+                if let Some(title) = state
+                    .media_title
+                    .as_ref()
+                    .filter(|title| is_usable_media_title(title))
+                {
                     preview.title.clone_from(title);
+                } else if !is_usable_media_title(&preview.title) {
+                    if let Some(source) = preview.video_source.as_ref() {
+                        preview.title = video_tile_title(source, None);
+                    }
                 }
                 preview.video_status = errors
                     .remove(&id)
@@ -1033,6 +1083,7 @@ impl PluriviewApp {
             self.video_manager.remove(id);
             self.restored_paused_videos.remove(&id);
         }
+        self.restore_ready_video_checkpoints();
         ctx.request_repaint();
     }
 
@@ -1041,12 +1092,21 @@ impl PluriviewApp {
         if !time.is_finite() || time < 0.0 {
             return;
         }
-        let Some(source) = self
-            .preview_manager
-            .get(id)
-            .and_then(|preview| preview.video_source.clone())
-        else {
-            return;
+        let requested_time = time.round().max(0.0);
+        let (source, already_showing, duration) = {
+            let Some(preview) = self.preview_manager.get(id) else {
+                return;
+            };
+            if !preview.supports_seek_preview() {
+                return;
+            }
+            let Some(source) = preview.video_source.clone() else {
+                return;
+            };
+            let already_showing = preview
+                .seek_preview_time()
+                .is_some_and(|current| (current - requested_time).abs() <= 0.5);
+            (source, already_showing, preview.video_playback.duration)
         };
         let ToolStatus::Available { path: mpv_path, .. } =
             self.external_tools.status(ToolKind::Mpv)
@@ -1071,122 +1131,294 @@ impl PluriviewApp {
             }
         };
 
-        // A one-second bucket gives stable previews while still feeling exact,
-        // and avoids launching a decoder for every sub-pixel pointer movement.
-        let requested_time = time.round().max(0.0);
-        let now = Instant::now();
-        match self.seek_preview_jobs.entry(id) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let job = entry.get_mut();
-                if (job.requested_time - requested_time).abs() > 0.01 {
-                    job.requested_time = requested_time;
-                    job.due = now + Duration::from_millis(140);
+        if let Some(thumbnail) = self.seek_preview_manager.cached_frame(id, requested_time) {
+            if !already_showing {
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.update_seek_preview(
+                        thumbnail.time,
+                        thumbnail.width,
+                        thumbnail.height,
+                        thumbnail.rgba,
+                    );
                 }
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(SeekPreviewJob {
-                    mpv_path: mpv_path.clone(),
-                    source: thumbnail_source,
-                    requested_time,
-                    due: now + Duration::from_millis(140),
-                    delivered_time: None,
-                    in_flight: None,
-                });
-            }
+        }
+        if let Err(error) = self.seek_preview_manager.request(
+            id,
+            &mpv_path,
+            thumbnail_source,
+            requested_time,
+            duration,
+        ) {
+            log::debug!("Timeline preview could not start: {error}");
         }
     }
 
     #[cfg(windows)]
     fn poll_seek_previews(&mut self, ctx: &egui::Context) {
-        let now = Instant::now();
-        let ids: Vec<_> = self.seek_preview_jobs.keys().copied().collect();
-        let mut completed = Vec::new();
-
-        for id in ids {
-            let Some(job) = self.seek_preview_jobs.get_mut(&id) else {
-                continue;
-            };
-            let mut just_completed = false;
-            if let Some((time, receiver)) = job.in_flight.as_ref() {
-                match receiver.try_recv() {
-                    Ok(result) => {
-                        completed.push((id, *time, result));
-                        job.in_flight = None;
-                        just_completed = true;
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        completed.push((
-                            id,
-                            *time,
-                            Err("Timeline preview worker stopped unexpectedly".to_owned()),
-                        ));
-                        job.in_flight = None;
-                        just_completed = true;
-                    }
-                    Err(TryRecvError::Empty) => {}
-                }
+        for (id, thumbnail) in self.seek_preview_manager.poll() {
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.update_seek_preview(
+                    thumbnail.time,
+                    thumbnail.width,
+                    thumbnail.height,
+                    thumbnail.rgba,
+                );
             }
-
-            let already_delivered = job
-                .delivered_time
-                .is_some_and(|time| (time - job.requested_time).abs() <= 0.01);
-            if !just_completed && job.in_flight.is_none() && !already_delivered && now >= job.due {
-                let time = job.requested_time;
-                job.in_flight = Some((
-                    time,
-                    video::spawn_video_thumbnail(job.mpv_path.clone(), job.source.clone(), time),
-                ));
-            }
+            ctx.request_repaint();
         }
 
-        for (id, completed_time, result) in completed {
-            let still_requested = self
-                .seek_preview_jobs
-                .get(&id)
-                .is_some_and(|job| (job.requested_time - completed_time).abs() <= 0.01);
-            match result {
-                Ok(thumbnail) if still_requested => {
-                    if let Some(job) = self.seek_preview_jobs.get_mut(&id) {
-                        job.delivered_time = Some(completed_time);
-                    }
-                    if let Some(preview) = self.preview_manager.get_mut(id) {
-                        preview.update_seek_preview(
-                            thumbnail.time,
-                            thumbnail.width,
-                            thumbnail.height,
-                            thumbnail.rgba,
-                        );
-                    }
-                    ctx.request_repaint();
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    if still_requested {
-                        if let Some(job) = self.seek_preview_jobs.get_mut(&id) {
-                            job.delivered_time = None;
-                            job.due = Instant::now() + Duration::from_secs(2);
-                        }
-                    }
-                    log::debug!("Timeline preview failed: {error}");
-                }
-            }
-        }
-
-        let previews = &self.preview_manager;
-        self.seek_preview_jobs.retain(|id, _| {
-            previews
-                .get(*id)
-                .is_some_and(|preview| preview.supports_seek_preview())
-        });
-        if self.seek_preview_jobs.values().any(|job| {
-            job.in_flight.is_some()
-                || (!job
-                    .delivered_time
-                    .is_some_and(|time| (time - job.requested_time).abs() <= 0.01)
-                    && now < job.due)
-        }) {
+        let active: HashSet<PreviewId> = self
+            .preview_manager
+            .all()
+            .filter(|preview| preview.supports_seek_preview())
+            .map(|preview| preview.id)
+            .collect();
+        self.seek_preview_manager.retain(|id| active.contains(&id));
+        if self.seek_preview_manager.needs_repaint() {
             ctx.request_repaint_after(Duration::from_millis(40));
         }
+    }
+
+    #[cfg(windows)]
+    fn poll_video_freezes(&mut self, ctx: &egui::Context) {
+        let ids: Vec<_> = self.pending_video_freezes.keys().copied().collect();
+        for id in ids {
+            let completed = self.pending_video_freezes.get(&id).and_then(|pending| {
+                match pending.receiver.try_recv() {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                        if pending.requested_at.elapsed() >= Duration::from_secs(1) =>
+                    {
+                        // Resource release is more important than retaining a
+                        // frame if painting was interrupted (for example while
+                        // the app was minimized during the freeze request).
+                        Some(None)
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                }
+            });
+            let Some(snapshot) = completed else {
+                continue;
+            };
+
+            if let Some(snapshot) = snapshot {
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.update_frame(snapshot.width, snapshot.height, snapshot.rgba);
+                }
+            }
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.video_renderer = None;
+                preview.video_playback.connected = false;
+                preview.video_playback.paused = true;
+            }
+            self.video_manager.remove(id);
+            self.restored_paused_videos.remove(&id);
+            self.pending_video_freezes.remove(&id);
+            ctx.request_repaint();
+        }
+    }
+
+    #[cfg(windows)]
+    fn restore_ready_video_checkpoints(&mut self) {
+        let ready: Vec<_> = self
+            .video_resume_checkpoints
+            .keys()
+            .copied()
+            .filter(|id| {
+                self.video_manager
+                    .get(*id)
+                    .is_some_and(|tile| tile.session.source_ready())
+            })
+            .collect();
+
+        for id in ready {
+            let Some(checkpoint) = self.video_resume_checkpoints.get(&id).cloned() else {
+                continue;
+            };
+            let mut failures = Vec::new();
+            if let Some(tile) = self.video_manager.get_mut(id) {
+                let session = &mut tile.session;
+                let mut apply = |label: &str, result: Result<(), String>| {
+                    if let Err(error) = result {
+                        failures.push(format!("{label}: {error}"));
+                    }
+                };
+                apply("volume", session.set_volume(checkpoint.playback.volume));
+                apply("mute", session.set_muted(checkpoint.playback.muted));
+                apply("speed", session.set_speed(checkpoint.playback.speed));
+                apply("loop", session.set_looping(checkpoint.playback.looping));
+                if let Some(position) = checkpoint.seek_position {
+                    apply("position", session.seek_absolute(position));
+                }
+                if let Some(track) = checkpoint.playback.audio_track {
+                    apply("audio track", session.select_audio_track(track));
+                }
+                if let Some(track) = checkpoint.playback.subtitle_track {
+                    apply("subtitle track", session.select_subtitle_track(track));
+                } else {
+                    apply("subtitles", session.disable_subtitles());
+                }
+                if !checkpoint.playback.paused {
+                    apply("playback", session.play());
+                }
+            }
+            if !failures.is_empty() {
+                log::warn!(
+                    "Some resumed video settings could not be restored: {}",
+                    failures.join("; ")
+                );
+            }
+            self.video_resume_checkpoints.remove(&id);
+            self.restored_paused_videos.remove(&id);
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.video_playback = checkpoint.playback;
+                preview.video_playback.connected = true;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_tile_activity_action(
+        &mut self,
+        ctx: &egui::Context,
+        id: PreviewId,
+        action: TileActivityAction,
+    ) {
+        let Some((already_frozen, is_browser, is_video, window, title, fps)) =
+            self.preview_manager.get(id).map(|preview| {
+                (
+                    preview.manually_frozen,
+                    preview.is_browser(),
+                    preview.is_video(),
+                    preview.window_handle.clone(),
+                    preview.title.clone(),
+                    preview.target_fps,
+                )
+            })
+        else {
+            return;
+        };
+
+        let freeze = action == TileActivityAction::Freeze;
+        if already_frozen == freeze {
+            return;
+        }
+
+        if freeze {
+            if is_video {
+                let pending_was_playing = self
+                    .pending_video_tiles
+                    .get(&id)
+                    .is_some_and(|pending| !pending.start_paused);
+                let mut playback = self
+                    .preview_manager
+                    .get(id)
+                    .map(|preview| preview.video_playback.clone())
+                    .unwrap_or_default();
+                if pending_was_playing {
+                    playback.paused = false;
+                }
+                let seek_position = resumable_video_position(&playback);
+                self.frozen_video_checkpoints.insert(
+                    id,
+                    FrozenVideoCheckpoint {
+                        playback,
+                        seek_position,
+                    },
+                );
+                if let Some(pending) = self.pending_video_tiles.get_mut(&id) {
+                    pending.start_paused = true;
+                }
+                if let Some(tile) = self.video_manager.get_mut(id) {
+                    if let Err(error) = tile.session.set_paused(true) {
+                        log::warn!("Could not pause a frozen video tile: {error}");
+                    }
+                }
+                if let Some(receiver) = self.video_manager.schedule_snapshot(id, ctx) {
+                    self.pending_video_freezes.insert(
+                        id,
+                        PendingVideoFreeze {
+                            receiver,
+                            requested_at: Instant::now(),
+                        },
+                    );
+                }
+            } else {
+                // A manually frozen capture is fully stopped, not merely
+                // throttled like an off-screen capture.
+                self.capture_coordinator.stop_capture(id);
+                if is_browser {
+                    if let Some(host) = self.browser.get_mut(id) {
+                        if let Err(error) = host.suspend() {
+                            log::warn!("Could not suspend a frozen browser tile: {error}");
+                        }
+                    }
+                    self.browser_activated_at = None;
+                }
+            }
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.manually_frozen = true;
+                preview.capture_paused = true;
+                if is_video {
+                    preview.video_playback.paused = true;
+                }
+            }
+        } else {
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.manually_frozen = false;
+                preview.capture_paused = false;
+            }
+
+            if is_video {
+                let checkpoint = self.frozen_video_checkpoints.remove(&id);
+                let canceled_readback = self.pending_video_freezes.remove(&id).is_some();
+                if canceled_readback && self.video_manager.contains(id) {
+                    if checkpoint
+                        .as_ref()
+                        .is_some_and(|checkpoint| !checkpoint.playback.paused)
+                    {
+                        if let Some(tile) = self.video_manager.get_mut(id) {
+                            if let Err(error) = tile.session.play() {
+                                log::warn!("Could not resume a frozen video tile: {error}");
+                            }
+                        }
+                    }
+                } else if let Some(checkpoint) = checkpoint {
+                    self.video_resume_checkpoints.insert(id, checkpoint);
+                    self.pending_video_tiles.insert(
+                        id,
+                        PendingVideoTile {
+                            start_paused: true,
+                            shown_once: true,
+                            retry_ready: true,
+                        },
+                    );
+                    if let Err(error) = self.try_activate_video_tile(id) {
+                        self.mark_video_launch_failed(id, error);
+                    }
+                }
+            } else if is_browser {
+                let resumed_hwnd = self
+                    .browser
+                    .get_mut(id)
+                    .and_then(|host| match host.resume() {
+                        Ok(()) => Some(host.hwnd()),
+                        Err(error) => {
+                            log::warn!("Could not resume a frozen browser tile: {error}");
+                            None
+                        }
+                    });
+                if let Some(hwnd) = resumed_hwnd {
+                    self.capture_coordinator.start_capture(id, hwnd, title, fps);
+                }
+            } else if let Some(window) = window {
+                self.capture_coordinator
+                    .start_capture(id, window.hwnd, title, fps);
+            }
+        }
+        ctx.request_repaint();
     }
 
     #[cfg(windows)]
@@ -1438,7 +1670,10 @@ impl PluriviewApp {
             video_id
         };
 
-        self.seek_preview_jobs.remove(&video_id);
+        self.seek_preview_manager.remove(video_id);
+        if let Some(preview) = self.preview_manager.get_mut(video_id) {
+            preview.clear_seek_preview();
+        }
         let title = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1579,6 +1814,12 @@ impl PluriviewApp {
             .retain(|id, _| previews.get(*id).is_some_and(|preview| preview.is_video()));
         self.restored_paused_videos
             .retain(|id| previews.get(*id).is_some_and(|preview| preview.is_video()));
+        self.pending_video_freezes
+            .retain(|id, _| previews.get(*id).is_some_and(|preview| preview.is_video()));
+        self.frozen_video_checkpoints
+            .retain(|id, _| previews.get(*id).is_some_and(|preview| preview.is_video()));
+        self.video_resume_checkpoints
+            .retain(|id, _| previews.get(*id).is_some_and(|preview| preview.is_video()));
     }
 
     /// Create a browser tile: WebView host, preview, and capture session.
@@ -1668,7 +1909,11 @@ impl PluriviewApp {
 
         if can_create {
             let immediate_id = self.pending_browser_tiles.iter().find_map(|(id, pending)| {
-                (pending.shown_once && !pending.restore_deferred).then_some(*id)
+                let live = self
+                    .preview_manager
+                    .get(*id)
+                    .is_some_and(|preview| !preview.manually_frozen);
+                (pending.shown_once && !pending.restore_deferred && live).then_some(*id)
             });
             let restored_slot_available = self
                 .last_restored_browser_start
@@ -1680,8 +1925,11 @@ impl PluriviewApp {
             let restored_id = restored_slot_available
                 .then(|| {
                     self.pending_browser_tiles.iter().find_map(|(id, pending)| {
-                        let tile_rect = self.preview_manager.get(*id).map(|preview| preview.rect());
-                        restored_browser_ready(pending, tile_rect, viewport).then_some(*id)
+                        let preview = self.preview_manager.get(*id);
+                        let tile_rect = preview.map(|preview| preview.rect());
+                        (preview.is_some_and(|preview| !preview.manually_frozen)
+                            && restored_browser_ready(pending, tile_rect, viewport))
+                        .then_some(*id)
                     })
                 })
                 .flatten();
@@ -1712,8 +1960,10 @@ impl PluriviewApp {
 
             let visible_restored_pending =
                 self.pending_browser_tiles.iter().any(|(id, pending)| {
-                    let tile_rect = self.preview_manager.get(*id).map(|preview| preview.rect());
-                    restored_browser_ready(pending, tile_rect, viewport)
+                    let preview = self.preview_manager.get(*id);
+                    let tile_rect = preview.map(|preview| preview.rect());
+                    preview.is_some_and(|preview| !preview.manually_frozen)
+                        && restored_browser_ready(pending, tile_rect, viewport)
                 });
             if visible_restored_pending {
                 let delay = self
@@ -2278,7 +2528,10 @@ impl PluriviewApp {
     #[cfg(windows)]
     fn audio_monitor_upkeep(&mut self) {
         let enabled = self.monitor_device.is_some();
-        if !enabled || self.browser.is_empty() {
+        let has_live_browser = self.preview_manager.all().any(|preview| {
+            preview.is_browser() && !preview.manually_frozen && preview.removing.is_none()
+        });
+        if !enabled || !has_live_browser {
             self.audio_monitor = None;
             self.audio_monitor_checked = None;
             return;
@@ -2309,11 +2562,21 @@ impl PluriviewApp {
     fn browser_frame(&mut self, ctx: &egui::Context) {
         self.audio_monitor_upkeep();
 
+        let frozen: HashSet<_> = self
+            .preview_manager
+            .all()
+            .filter(|preview| preview.is_browser() && preview.manually_frozen)
+            .map(|preview| preview.id)
+            .collect();
+
         // Mirror page titles and current URLs onto the tiles so the hover
         // overlay shows "lofi hip hop radio..." instead of the raw URL and
         // layouts save where the user actually navigated.
         let mut updates = Vec::new();
         for (id, host) in self.browser.iter_mut() {
+            if frozen.contains(id) {
+                continue;
+            }
             let update = host.poll();
             if update.title.is_some() || update.url.is_some() {
                 updates.push((*id, update));
@@ -2338,6 +2601,9 @@ impl PluriviewApp {
         let pixels_per_point = ctx.pixels_per_point();
         let ids: Vec<_> = self.browser.ids().collect();
         for id in ids {
+            if frozen.contains(&id) {
+                continue;
+            }
             let Some(preview) = self.preview_manager.get(id) else {
                 continue;
             };
@@ -3584,7 +3850,10 @@ impl PluriviewApp {
             self.pending_video_tiles.clear();
             self.last_restored_video_start = None;
             self.restored_paused_videos.clear();
-            self.seek_preview_jobs.clear();
+            self.pending_video_freezes.clear();
+            self.frozen_video_checkpoints.clear();
+            self.video_resume_checkpoints.clear();
+            self.seek_preview_manager.clear();
             self.playlist_thumbnail_queue.clear();
             self.playlist_thumbnail_jobs.clear();
             self.next_playlist_group = layout
@@ -3812,10 +4081,11 @@ impl PluriviewApp {
 mod tests {
     use super::{
         preview_playback_state, preview_video_status, restored_browser_ready, restored_video_ready,
-        video_launch_for_source, FpsPreset, PendingBrowserTile, PendingVideoTile, VideoSource,
-        VideoTileStatus,
+        resumable_video_position, video_launch_for_source, FpsPreset, PendingBrowserTile,
+        PendingVideoTile, VideoSource, VideoTileStatus,
     };
     use crate::external_tools::{DiscoverySource, ToolStatus};
+    use crate::preview::VideoPlaybackState;
     use crate::video::{LoopMode, TrackInfo, TrackSelection, VideoState};
     use eframe::egui::{Pos2, Rect, Vec2};
     use std::path::PathBuf;
@@ -3962,6 +4232,7 @@ mod tests {
             audio_track: TrackSelection::Id(2),
             subtitle_track: TrackSelection::Disabled,
             media_title: Some("Mapped title".to_owned()),
+            seekable: true,
             ..Default::default()
         };
         state.track_list.push(TrackInfo {
@@ -3981,6 +4252,7 @@ mod tests {
         assert_eq!(mapped.audio_track, Some(2));
         assert_eq!(mapped.subtitle_track, None);
         assert_eq!(mapped.tracks[0].language.as_deref(), Some("en"));
+        assert!(mapped.seekable);
         assert_eq!(
             preview_video_status(&state, true),
             VideoTileStatus::PausedOnRestore
@@ -3995,11 +4267,37 @@ mod tests {
         state.paused_for_cache = false;
         assert_eq!(preview_video_status(&state, false), VideoTileStatus::Ready);
     }
+
+    #[test]
+    fn frozen_vod_resumes_at_position_but_live_stream_reconnects() {
+        let vod = VideoPlaybackState {
+            time_pos: Some(42.5),
+            duration: Some(120.0),
+            ..Default::default()
+        };
+        assert_eq!(resumable_video_position(&vod), Some(42.5));
+
+        let live = VideoPlaybackState {
+            time_pos: Some(1_000.0),
+            duration: None,
+            ..Default::default()
+        };
+        assert_eq!(resumable_video_position(&live), None);
+
+        let invalid = VideoPlaybackState {
+            time_pos: Some(f64::NAN),
+            duration: Some(120.0),
+            ..Default::default()
+        };
+        assert_eq!(resumable_video_position(&invalid), None);
+    }
 }
 
 impl Drop for PluriviewApp {
     fn drop(&mut self) {
         self.capture_coordinator.stop_all();
+        #[cfg(windows)]
+        self.seek_preview_manager.clear();
         #[cfg(windows)]
         self.video_manager.clear();
     }
@@ -4012,6 +4310,8 @@ impl eframe::App for PluriviewApp {
             eprintln!("{error}");
         }
         self.capture_coordinator.stop_all();
+        #[cfg(windows)]
+        self.seek_preview_manager.clear();
         #[cfg(windows)]
         if let Some(gl) = gl {
             self.video_manager.cleanup_all(gl);
@@ -4067,6 +4367,8 @@ impl eframe::App for PluriviewApp {
         // background worker and activates them when preparation completes.
         #[cfg(windows)]
         self.browser_preparation_upkeep(ctx);
+        #[cfg(windows)]
+        self.poll_video_freezes(ctx);
         #[cfg(windows)]
         self.poll_video_manager(ctx);
         #[cfg(windows)]
@@ -4308,6 +4610,10 @@ impl eframe::App for PluriviewApp {
 
         #[cfg(windows)]
         {
+            for (id, action) in std::mem::take(&mut self.canvas.pending_tile_activity_actions) {
+                self.handle_tile_activity_action(ctx, id, action);
+            }
+
             if let Some(position) = self.canvas.pending_video_add.take() {
                 self.add_local_video(position);
             }

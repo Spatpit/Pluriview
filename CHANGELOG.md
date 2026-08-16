@@ -7,18 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Added left-drag marquee selection from empty canvas, with Ctrl for additive
+  selection and group movement through the existing multi-select behavior.
+- Added Freeze Selected and Resume Selected context actions. Frozen window
+  captures stop their capture sessions, browser tiles use WebView2 suspension,
+  mpv and Streamlink tiles keep a still frame while fully unloading their player
+  and cache, and animated GIFs stop advancing. Resumed on-demand videos restore
+  their position and playback settings; live streams reconnect at the live edge.
 - Added drag-and-drop video folders, creating a linked libmpv player and a
   resizable canvas playlist with lazy thumbnails, natural filename sorting,
   previous/next, autoplay, shuffle, repeat, scrolling, and workspace restore.
 
 ### Added
 - Local video files can be dropped onto the canvas and start in MPV immediately
-- Hovering a local or seekable on-demand video's seek bar shows a debounced frame preview without interrupting playback
+- Hovering a local or on-demand video's seek bar reuses a persistent libmpv decoder, keeps the last frame while the next one loads, prefetches nearby seconds, and skips livestreams
 - MPV and Streamlink tiles have an in-place reload action for stopped or failed playback
 
 ### Fixed
 - Play/pause and volume controls update immediately and ignore stale MPV acknowledgements instead of lagging or reversing the requested state
 - Play resumes the existing MPV process instead of recreating it, and leaves a healthy Windows capture session running so pause/play does not freeze or blank the tile
+- Seek-bar hover previews seek to the exact hovered time instead of a nearby keyframe, so the popup frame matches the timestamp
+- Stream tiles no longer use CDN query strings as their name; the menu and overlay show a short title from the original URL
 
 ## [0.5.1] - 2026-08-10
 

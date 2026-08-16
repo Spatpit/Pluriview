@@ -27,6 +27,7 @@
 | **Image & GIF Tiles** | Add static images or animated GIFs; portable copies are managed beside the executable |
 | **Ad & Tracker Blocking** | uBlock Origin Lite is integrated into the shared browser-tile profile and enabled by default |
 | **Infinite Canvas** | Pan and zoom freely to organize your workspace |
+| **Tile Freeze** | Box-select tiles and suspend their live work while keeping the last frame visible; video players and stream caches unload until resumed |
 | **Crop Regions** | Focus on specific parts of windows with Alt+drag |
 | **Adjustable FPS** | Choose 5, 15, 30, or 60 FPS per preview |
 | **Auto-Save** | Layouts persist automatically between sessions, including browser URLs |
@@ -142,6 +143,9 @@ are migrated into a workspace named **Default** the first time this version runs
 | Toggle canvas-only mode | `H` |
 | Select all | `Ctrl + A` |
 | Multi-select | `Ctrl + Click` |
+| Box-select tiles | `Left-drag empty canvas` |
+| Add with box selection | `Ctrl + Left-drag empty canvas` |
+| Freeze or resume selection | `Right-click selected tile or canvas` |
 | Delete selected | `Delete` |
 | Crop preview | `Alt + Drag corners` |
 | Focus window | `Double-click preview` |
