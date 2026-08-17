@@ -46,8 +46,8 @@ pub enum DragState {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_time, video_placeholder_content, CanvasState, DragState, PlaylistAction,
-        ResizeHandle, TileActivityAction, VideoAction,
+        format_time, stream_audio_badge_rect, video_placeholder_content, CanvasState, DragState,
+        PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -78,6 +78,41 @@ mod tests {
     fn video_action_queue_starts_empty() {
         let canvas = CanvasState::default();
         assert!(canvas.pending_video_actions.is_empty());
+    }
+
+    #[test]
+    fn stream_audio_badge_sits_left_of_fps_when_hovered() {
+        let tile = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 120.0));
+        let fps = Rect::from_min_size(
+            tile.right_top() + Vec2::new(-72.0, 10.0),
+            Vec2::new(36.0, 20.0),
+        );
+        let sa = stream_audio_badge_rect(tile, true, true);
+        assert!(sa.right() <= fps.left() + 0.1);
+        assert!(sa.left() > tile.left());
+    }
+
+    #[test]
+    fn stream_audio_on_badge_is_wider_than_off() {
+        let tile = Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0));
+        let off = stream_audio_badge_rect(tile, false, true);
+        let on = stream_audio_badge_rect(tile, true, true);
+        assert!(on.width() > off.width());
+    }
+
+    #[test]
+    fn stream_audio_toggle_flips_window_tiles_only() {
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let window =
+            previews.add_for_window(1, 42, "game".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let other = previews.add("image".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+
+        canvas.pending_stream_audio_toggles.extend([window, other]);
+        canvas.apply_pending_stream_audio_toggles(&mut previews);
+
+        assert!(previews.get(window).unwrap().stream_audio);
+        assert!(!previews.get(other).unwrap().stream_audio);
     }
 
     #[test]
@@ -726,7 +761,9 @@ struct TileInfo {
     is_media: bool,
     is_video: bool,
     is_playlist: bool,
+    is_window_capture: bool,
     muted: bool,
+    stream_audio: bool,
     browser_status: BrowserTileStatus,
     video_status: VideoTileStatus,
     video_playback: VideoPlaybackState,
@@ -751,7 +788,9 @@ impl TileInfo {
             is_media: preview.is_media(),
             is_video: preview.is_video(),
             is_playlist: preview.is_playlist(),
+            is_window_capture: preview.is_window_capture(),
             muted: preview.browser_muted,
+            stream_audio: preview.stream_audio,
             browser_status: preview.browser_status.clone(),
             video_status: preview.video_status.clone(),
             video_playback: preview.video_playback.clone(),
@@ -775,7 +814,9 @@ impl TileInfo {
         self.is_media = preview.is_media();
         self.is_video = preview.is_video();
         self.is_playlist = preview.is_playlist();
+        self.is_window_capture = preview.is_window_capture();
         self.muted = preview.browser_muted;
+        self.stream_audio = preview.stream_audio;
         self.browser_status.clone_from(&preview.browser_status);
         self.video_status.clone_from(&preview.video_status);
         self.video_playback.clone_from(&preview.video_playback);
@@ -805,6 +846,29 @@ fn ellipsize(text: &str, max_chars: usize) -> Cow<'_, str> {
     } else {
         let keep = max_chars.saturating_sub(1);
         Cow::Owned(format!("{}…", text.chars().take(keep).collect::<String>()))
+    }
+}
+
+/// Hover FPS pill sits at x=-72 with width 36; SA is 4px to its left.
+fn stream_audio_badge_rect(screen_rect: Rect, enabled: bool, beside_fps: bool) -> Rect {
+    let width = if enabled { 54.0 } else { 32.0 };
+    let x = if beside_fps {
+        -76.0 - width
+    } else {
+        -8.0 - width
+    };
+    Rect::from_min_size(
+        screen_rect.right_top() + Vec2::new(x, 10.0),
+        Vec2::new(width, 20.0),
+    )
+}
+
+fn stream_audio_tooltip(enabled: bool, monitor_ready: bool) -> &'static str {
+    match (enabled, monitor_ready) {
+        (true, true) => "Streaming audio — click to stop",
+        (true, false) => "SA is on — pick a device under View → Stream Audio Monitor",
+        (false, true) => "Stream audio to Discord/OBS",
+        (false, false) => "Pick a Stream Audio Monitor device in View first",
     }
 }
 
@@ -1058,6 +1122,9 @@ pub struct CanvasState {
     /// Pending FPS changes to apply
     pending_fps_changes: Vec<PendingFpsChange>,
 
+    /// Window-capture tiles whose SA toggle was clicked this frame.
+    pending_stream_audio_toggles: Vec<PreviewId>,
+
     /// Animation state for smooth movements
     pub animation: AnimationState,
 
@@ -1130,6 +1197,9 @@ pub struct CanvasState {
     /// frame so the canvas can outline it in the accent color.
     pub interactive_browser: Option<PreviewId>,
 
+    /// True when View → Stream Audio Monitor has a target device.
+    pub stream_monitor_ready: bool,
+
     /// Last canvas rectangle in egui screen coordinates.
     pub last_screen_rect: Option<Rect>,
 
@@ -1155,6 +1225,7 @@ impl Default for CanvasState {
             show_grid: true,
             grid_size: 50.0,
             pending_fps_changes: Vec::new(),
+            pending_stream_audio_toggles: Vec::new(),
             animation: AnimationState::new(),
             tile_scratch: Vec::new(),
             preview_dragging: false,
@@ -1177,6 +1248,7 @@ impl Default for CanvasState {
             pending_video_restore: None,
             pending_playlist_restore: None,
             interactive_browser: None,
+            stream_monitor_ready: false,
             last_screen_rect: None,
             last_double_clicked: None,
             focus: None,
@@ -1466,6 +1538,7 @@ impl CanvasState {
 
         // Apply pending FPS changes
         self.apply_pending_fps_changes(preview_manager, capture_coordinator);
+        self.apply_pending_stream_audio_toggles(preview_manager);
 
         // Viewport culling: pause/resume captures based on visibility
         self.update_viewport_culling(canvas_rect, preview_manager, capture_coordinator);
@@ -1542,6 +1615,56 @@ impl CanvasState {
                     capture_coordinator.set_target_fps(change.preview_id, preview.target_fps);
                 }
             }
+        }
+    }
+
+    fn apply_pending_stream_audio_toggles(&mut self, preview_manager: &mut PreviewManager) {
+        for id in self.pending_stream_audio_toggles.drain(..) {
+            if let Some(preview) = preview_manager.get_mut(id) {
+                if preview.is_window_capture() {
+                    preview.stream_audio = !preview.stream_audio;
+                }
+            }
+        }
+    }
+
+    fn paint_stream_audio_badge(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        id: PreviewId,
+        screen_rect: Rect,
+        enabled: bool,
+        beside_fps: bool,
+    ) {
+        let badge_rect = stream_audio_badge_rect(screen_rect, enabled, beside_fps);
+        let response = ui
+            .interact(
+                badge_rect,
+                ui.id().with(("stream_audio", id.0)),
+                Sense::click(),
+            )
+            .on_hover_text(stream_audio_tooltip(enabled, self.stream_monitor_ready));
+        let hovered = response.hovered();
+        let fill = if enabled {
+            Color32::from_rgba_unmultiplied(18, 42, 72, if hovered { 230 } else { 200 })
+        } else {
+            Color32::from_rgba_unmultiplied(0, 0, 0, if hovered { 210 } else { 180 })
+        };
+        painter.rect_filled(badge_rect, 10.0, fill);
+        painter.text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            if enabled { "SA: On" } else { "SA" },
+            egui::FontId::proportional(10.0),
+            if enabled {
+                Color32::from_rgb(140, 200, 255)
+            } else {
+                Color32::from_rgb(150, 150, 150)
+            },
+        );
+        if response.clicked() {
+            self.pending_stream_audio_toggles.push(id);
         }
     }
 
@@ -1873,11 +1996,13 @@ impl CanvasState {
             let is_media = info.is_media;
             let is_video = info.is_video;
             let is_playlist = info.is_playlist;
+            let is_window_capture = info.is_window_capture;
             let muted = if is_video {
                 info.video_playback.muted
             } else {
                 info.muted
             };
+            let stream_audio = info.stream_audio;
             let browser_status = &info.browser_status;
             let video_status = &info.video_status;
             let video_playback = &info.video_playback;
@@ -2120,6 +2245,16 @@ impl CanvasState {
                         egui::FontId::proportional(10.0),
                         Color32::from_rgb(150, 150, 150),
                     );
+                    if is_window_capture {
+                        self.paint_stream_audio_badge(
+                            ui,
+                            &painter,
+                            id,
+                            screen_rect,
+                            stream_audio,
+                            true,
+                        );
+                    }
                 }
 
                 // Title (truncated, on the left) - handle UTF-8 properly
@@ -2582,6 +2717,10 @@ impl CanvasState {
                     egui::FontId::proportional(12.0),
                     Color32::from_rgb(255, 150, 100),
                 );
+            }
+
+            if show_overlays && is_window_capture && stream_audio && !pointer_over_tile {
+                self.paint_stream_audio_badge(ui, &painter, id, screen_rect, true, false);
             }
 
             if show_overlays && manually_frozen {
@@ -3650,6 +3789,7 @@ impl CanvasState {
                 if let Some(preview) = preview_manager.get_mut(id) {
                     preview.set_fps_preset(info.fps_preset);
                     preview.crop_uv = info.crop_uv;
+                    preview.stream_audio = info.stream_audio;
                 }
                 capture_coordinator.start_capture(
                     id,

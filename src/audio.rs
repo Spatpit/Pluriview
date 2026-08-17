@@ -1,20 +1,21 @@
-//! Stream audio monitor: plays a copy of the browser tiles' audio from the
+//! Stream audio monitor: plays a copy of selected tile audio from the
 //! Pluriview process to a user-chosen output device, OBS-style.
 //!
-//! Why: WebView2 renders sound from its own msedgewebview2.exe subprocesses,
-//! so per-app audio capture (Discord window share, OBS "Application Audio
-//! Capture", Game Bar) hears nothing from browser tiles when Pluriview is
-//! shared (MicrosoftEdge/WebView2Feedback#2236). The monitor makes Pluriview
-//! itself render a copy, which those tools pick up — the per-process
-//! loopback tap they use is device-agnostic (verified experimentally), so
-//! the copy can go to a device the user doesn't listen to (a virtual cable,
-//! an unconnected output) and viewers hear it while the user doesn't.
+//! Why: captured games and apps render sound from their own processes, and
+//! WebView2 renders from msedgewebview2.exe, so per-app audio capture
+//! (Discord window share, OBS "Application Audio Capture") hears nothing
+//! from those sources when Pluriview is shared (MicrosoftEdge/WebView2Feedback#2236).
+//! The monitor makes Pluriview itself render a copy, which those tools pick
+//! up — the per-process loopback tap they use is device-agnostic (verified
+//! experimentally), so the copy can go to a device the user doesn't listen
+//! to (a virtual cable, an unconnected output) and viewers hear it while
+//! the user doesn't.
 //!
 //! Unlike a ducking approach, this touches nothing outside Pluriview: no
 //! session volumes, no other apps, no persistence side effects. The user
-//! hears the original WebView2 audio, untouched. Off by default.
+//! hears the original application audio, untouched. Off by default.
 //!
-//! Pipeline: WASAPI process loopback of the WebView2 process tree in the
+//! Pipeline: WASAPI process loopback of a target process tree in the
 //! default device's mix format (requesting any other format makes the
 //! engine channel-matrix the tap, about -13 dB for 7.1 -> stereo), fold to
 //! stereo ourselves with unity front-channel coefficients, render to the
@@ -110,34 +111,34 @@ pub fn render_devices() -> Vec<AudioDevice> {
     devices
 }
 
-/// Plays a copy of one WebView2 browser process tree's audio from this
-/// process to the chosen render device. Dropping it stops the monitor.
+/// Plays a copy of one process tree's audio from this process to the
+/// chosen render device. Dropping it stops the monitor.
 pub struct AudioMonitor {
-    browser_pid: u32,
+    pid: u32,
     device_id: String,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl AudioMonitor {
-    pub fn start(browser_pid: u32, device_id: String) -> Self {
+    pub fn start(pid: u32, device_id: String) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let thread_device = device_id.clone();
         let thread = std::thread::Builder::new()
             .name("audio-monitor".into())
-            .spawn(move || monitor_thread(browser_pid, &thread_device, &thread_stop))
+            .spawn(move || monitor_thread(pid, &thread_device, &thread_stop))
             .ok();
         Self {
-            browser_pid,
+            pid,
             device_id,
             stop,
             thread,
         }
     }
 
-    pub fn browser_pid(&self) -> u32 {
-        self.browser_pid
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
     pub fn device_id(&self) -> &str {
@@ -190,7 +191,7 @@ fn monitor_thread(browser_pid: u32, device_id: &str, stop: &AtomicBool) {
         };
         if !logged {
             log::info!(
-                "audio monitor started: WebView2 process {browser_pid} ({} ch, {} Hz) -> device {device_id}",
+                "audio monitor started: process {browser_pid} ({} ch, {} Hz) -> device {device_id}",
                 format.channels,
                 format.sample_rate
             );
@@ -342,8 +343,8 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for CompletionHandler_Impl {
     }
 }
 
-/// WASAPI process-loopback capture of the WebView2 process tree, at full
-/// volume — nothing about the sessions is modified.
+/// WASAPI process-loopback capture of a process tree, at full volume —
+/// nothing about the sessions is modified.
 struct Capture {
     client: IAudioClient,
     capture: IAudioCaptureClient,

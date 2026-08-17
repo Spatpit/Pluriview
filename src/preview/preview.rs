@@ -184,6 +184,10 @@ pub struct Preview {
     /// Is this browser tile's audio muted? (Only meaningful for browsers.)
     pub browser_muted: bool,
 
+    /// Replay this window-capture tile's process audio through the stream
+    /// audio monitor (Discord/OBS). Ignored for browser, video, and image tiles.
+    pub stream_audio: bool,
+
     /// Loading/error state rendered while a browser host is being prepared.
     pub browser_status: BrowserTileStatus,
 
@@ -264,6 +268,7 @@ impl Preview {
             frame_buffer: None,
             browser_url: None,
             browser_muted: false,
+            stream_audio: false,
             browser_status: BrowserTileStatus::Ready,
             media_path: None,
             video_source: None,
@@ -303,6 +308,15 @@ impl Preview {
 
     pub fn is_playlist(&self) -> bool {
         self.folder_playlist.is_some()
+    }
+
+    /// Captured OS window/game — not a browser, video, image, or playlist tile.
+    pub fn is_window_capture(&self) -> bool {
+        self.window_handle.is_some()
+            && !self.is_browser()
+            && !self.is_media()
+            && !self.is_video()
+            && !self.is_playlist()
     }
 
     pub fn supports_seek_preview(&self) -> bool {
@@ -560,6 +574,9 @@ pub struct PreviewLayout {
     /// WebView2 mute is per-session, so remember it and reapply on restore.
     #[serde(default)]
     pub browser_muted: bool,
+    /// Replay this captured window's audio through the stream monitor.
+    #[serde(default)]
+    pub stream_audio: bool,
     /// Managed filename for an image/GIF tile. Kept relative so portable
     /// installs can be moved as a unit.
     #[serde(default)]
@@ -591,6 +608,7 @@ impl From<&Preview> for PreviewLayout {
             crop_uv: preview.crop_uv,
             browser_url: preview.browser_url.clone(),
             browser_muted: preview.browser_muted,
+            stream_audio: preview.stream_audio,
             media_path: preview.media_path.clone(),
             video_source: preview.video_source.as_ref().map(scrub_video_source),
             playlist_group: preview.playlist_group,
@@ -788,7 +806,7 @@ fn twitch_label(parsed: &url::Url) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Preview, PreviewId, PreviewLayout, VideoSource};
+    use super::{Preview, PreviewId, PreviewLayout, VideoSource, WindowHandle};
     use crate::media::MediaFrame;
     use eframe::egui::{Context, Pos2, Vec2};
     use std::time::{Duration, Instant};
@@ -884,6 +902,54 @@ mod tests {
 
         let restored: PreviewLayout = serde_json::from_value(value).unwrap();
         assert!(restored.media_path.is_none());
+    }
+
+    #[test]
+    fn older_saved_tiles_default_stream_audio_off() {
+        let preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        value.as_object_mut().unwrap().remove("stream_audio");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(!restored.stream_audio);
+    }
+
+    #[test]
+    fn stream_audio_round_trips_through_layout() {
+        let mut preview = Preview::for_window(
+            PreviewId(1),
+            1,
+            42,
+            "game".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.stream_audio = true;
+
+        let restored = PreviewLayout::from(&preview);
+        assert!(restored.stream_audio);
+        assert!(preview.is_window_capture());
+    }
+
+    #[test]
+    fn browser_tiles_are_not_window_captures() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "browser".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.window_handle = Some(WindowHandle {
+            hwnd: 1,
+            process_id: 2,
+        });
+        preview.browser_url = Some("https://example.com".to_owned());
+        assert!(!preview.is_window_capture());
     }
 
     #[test]

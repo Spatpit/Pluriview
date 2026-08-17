@@ -37,7 +37,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::ShellExecuteW;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, SetForegroundWindow, SW_SHOWNORMAL,
+    GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SW_SHOWNORMAL,
 };
 use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
@@ -70,6 +70,15 @@ fn media_tile_size(width: u32, height: u32) -> Vec2 {
     let height = height.max(1) as f32;
     let scale = (640.0 / width).min(480.0 / height);
     Vec2::new(width * scale, height * scale)
+}
+
+#[cfg(windows)]
+fn hwnd_process_id(hwnd: isize) -> u32 {
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid));
+    }
+    pid
 }
 
 #[cfg(windows)]
@@ -467,6 +476,9 @@ pub struct PluriviewApp {
     /// Last time the monitor checked the WebView2 browser process PID.
     #[cfg(windows)]
     audio_monitor_checked: Option<Instant>,
+    /// Per-window process loopbacks for tiles with SA enabled.
+    #[cfg(windows)]
+    window_audio_monitors: HashMap<u32, crate::audio::AudioMonitor>,
 
     /// Held state of the polled numpad shortcuts (`[Numpad 1, Numpad 2]`),
     /// kept so the toggles fire once per press instead of every frame.
@@ -592,6 +604,8 @@ impl PluriviewApp {
             audio_monitor: None,
             #[cfg(windows)]
             audio_monitor_checked: None,
+            #[cfg(windows)]
+            window_audio_monitors: HashMap::new(),
             #[cfg(windows)]
             numpad_held: [false; 2],
         };
@@ -2524,7 +2538,8 @@ impl PluriviewApp {
 
     /// Keep the stream audio monitor alive while it's enabled and browser
     /// tiles exist, pointed at the current WebView2 browser process (which
-    /// changes if the WebView2 runtime crashes and restarts).
+    /// changes if the WebView2 runtime crashes and restarts). Window tiles
+    /// with SA enabled get their own process-loopback copies on the same device.
     #[cfg(windows)]
     fn audio_monitor_upkeep(&mut self) {
         let enabled = self.monitor_device.is_some();
@@ -2534,25 +2549,71 @@ impl PluriviewApp {
         if !enabled || !has_live_browser {
             self.audio_monitor = None;
             self.audio_monitor_checked = None;
-            return;
+        } else {
+            let due = self
+                .audio_monitor_checked
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
+            if due {
+                self.audio_monitor_checked = Some(Instant::now());
+                let device_id = self.monitor_device.as_ref().map(|(id, _)| id.clone());
+                let (Some(device_id), Some(pid)) = (device_id, self.browser.browser_process_id())
+                else {
+                    self.window_audio_monitor_upkeep();
+                    return;
+                };
+                let current = self
+                    .audio_monitor
+                    .as_ref()
+                    .map(|m| (m.pid(), m.device_id().to_owned()));
+                if current != Some((pid, device_id.clone())) {
+                    self.audio_monitor = Some(crate::audio::AudioMonitor::start(pid, device_id));
+                }
+            }
         }
-        let due = self
-            .audio_monitor_checked
-            .is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
-        if !due {
-            return;
-        }
-        self.audio_monitor_checked = Some(Instant::now());
-        let device_id = self.monitor_device.as_ref().map(|(id, _)| id.clone());
-        let (Some(device_id), Some(pid)) = (device_id, self.browser.browser_process_id()) else {
+        self.window_audio_monitor_upkeep();
+    }
+
+    #[cfg(windows)]
+    fn window_audio_monitor_upkeep(&mut self) {
+        let Some((device_id, _)) = self.monitor_device.clone() else {
+            self.window_audio_monitors.clear();
             return;
         };
-        let current = self
-            .audio_monitor
-            .as_ref()
-            .map(|m| (m.browser_pid(), m.device_id().to_owned()));
-        if current != Some((pid, device_id.clone())) {
-            self.audio_monitor = Some(crate::audio::AudioMonitor::start(pid, device_id));
+
+        for preview in self.preview_manager.all_mut() {
+            if preview.stream_audio && preview.is_window_capture() {
+                if let Some(handle) = preview.window_handle.as_mut() {
+                    if handle.process_id == 0 {
+                        handle.process_id = hwnd_process_id(handle.hwnd);
+                    }
+                }
+            }
+        }
+
+        let wanted: HashSet<u32> = self
+            .preview_manager
+            .all()
+            .filter(|preview| {
+                preview.stream_audio && preview.is_window_capture() && preview.removing.is_none()
+            })
+            .filter_map(|preview| {
+                preview
+                    .window_handle
+                    .as_ref()
+                    .map(|handle| handle.process_id)
+                    .filter(|pid| *pid != 0)
+            })
+            .collect();
+
+        self.window_audio_monitors
+            .retain(|pid, monitor| wanted.contains(pid) && monitor.device_id() == device_id);
+        for pid in wanted {
+            if !self.window_audio_monitors.contains_key(&pid) {
+                self.window_audio_monitors.insert(
+                    pid,
+                    crate::audio::AudioMonitor::start(pid, device_id.clone()),
+                );
+            }
         }
     }
 
@@ -3376,7 +3437,7 @@ impl PluriviewApp {
             None => "Stream Audio Monitor: Off".to_owned(),
         };
         ui.menu_button(label, |ui| {
-            ui.label("Replay tile audio to a device so Discord/OBS\nwindow shares carry sound. Pick one you don't\nlisten to (virtual cable, unused output).");
+            ui.label("Replay tile audio to a device so Discord/OBS\nwindow shares carry sound. Pick one you don't\nlisten to (virtual cable, unused output).\nBrowser tiles replay automatically; window\ntiles use the SA toggle on hover.");
             ui.separator();
             if ui
                 .radio(self.monitor_device.is_none(), "Off")
@@ -3871,6 +3932,9 @@ impl PluriviewApp {
             self.browser.clear();
             self.pending_browser_tiles.clear();
             self.last_restored_browser_start = None;
+            self.audio_monitor = None;
+            self.audio_monitor_checked = None;
+            self.window_audio_monitors.clear();
         }
 
         // Restore canvas state
@@ -4021,6 +4085,7 @@ impl PluriviewApp {
                     Pos2::new(preview_layout.position.0, preview_layout.position.1),
                     Vec2::new(preview_layout.size.0, preview_layout.size.1),
                     window_info.hwnd,
+                    window_info.process_id,
                     preview_layout.fps_preset,
                     preview_layout.z_order,
                 );
@@ -4034,10 +4099,9 @@ impl PluriviewApp {
                 );
 
                 // Restore crop region if it was saved
-                if let Some(crop) = preview_layout.crop_uv {
-                    if let Some(preview) = self.preview_manager.get_mut(id) {
-                        preview.crop_uv = Some(crop);
-                    }
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.crop_uv = preview_layout.crop_uv;
+                    preview.stream_audio = preview_layout.stream_audio;
                 }
 
                 #[cfg(debug_assertions)]
@@ -4451,6 +4515,10 @@ impl eframe::App for PluriviewApp {
         // Minimal Void: No status bar - floating indicator is drawn in the canvas
 
         // Minimal Void: Main canvas area with dark background
+        #[cfg(windows)]
+        {
+            self.canvas.stream_monitor_ready = self.monitor_device.is_some();
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(13, 13, 13)))
             .show(ctx, |ui| {

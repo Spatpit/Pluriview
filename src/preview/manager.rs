@@ -22,6 +22,8 @@ pub struct RemovedPreviewInfo {
     pub browser_url: Option<String>,
     /// Reapplied when undo recreates the browser tile.
     pub browser_muted: bool,
+    /// Reapplied when undo recreates a window-capture tile.
+    pub stream_audio: bool,
     /// Set for managed image and GIF tiles.
     pub media_path: Option<String>,
     /// Set for mpv-backed local video and Streamlink tiles.
@@ -209,6 +211,7 @@ impl PreviewManager {
                     crop_uv: preview.crop_uv,
                     browser_url: preview.browser_url,
                     browser_muted: preview.browser_muted,
+                    stream_audio: preview.stream_audio,
                     media_path: preview.media_path,
                     video_source: preview.video_source,
                     folder_playlist: preview.folder_playlist,
@@ -233,6 +236,7 @@ impl PreviewManager {
         position: Pos2,
         size: Vec2,
         hwnd: isize,
+        process_id: u32,
         fps_preset: FpsPreset,
         z_order: u32,
     ) -> PreviewId {
@@ -241,7 +245,7 @@ impl PreviewManager {
             self.max_z_order = z_order;
         }
 
-        let mut preview = Preview::for_window(id, hwnd, 0, title, position, size);
+        let mut preview = Preview::for_window(id, hwnd, process_id, title, position, size);
         preview.z_order = z_order;
         preview.set_fps_preset(fps_preset);
         // Restored layouts should appear instantly, not all spawn-animate at once.
