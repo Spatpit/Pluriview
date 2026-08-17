@@ -58,6 +58,21 @@ const RESTORED_VIDEO_START_INTERVAL: Duration = Duration::from_secs(2);
 /// How many recent browser URLs to keep for the Add Browser dialog.
 const MAX_RECENT_URLS: usize = 8;
 
+/// Custom title bar height when fully visible (also the window-control hit size).
+const TITLE_BAR_HEIGHT: f32 = 34.0;
+/// Leftover strip while auto-hidden so the top window edge stays an egui hit
+/// target (native tiles cannot steal those pixels).
+const TITLE_BAR_COLLAPSED_HEIGHT: f32 = 2.0;
+/// How close the pointer must be to the top of the window to reveal the bar.
+const TITLE_BAR_HOVER_ZONE: f32 = 12.0;
+/// Slide/fade duration when the title bar auto-hides or comes back.
+const TITLE_BAR_ANIM_SECS: f32 = 0.16;
+
+fn title_bar_ease(t: f32) -> f32 {
+    let inv = 1.0 - t;
+    1.0 - inv * inv * inv
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 struct BrowserTilePlacement {
@@ -395,6 +410,13 @@ pub struct PluriviewApp {
     /// Hide app chrome without changing the user's sidebar preference.
     canvas_only: bool,
 
+    /// Current animated title-bar height, used by the frameless resize border.
+    title_bar_shown_height: f32,
+
+    /// True while a File/View/Help menu is open, so auto-hide cannot collapse
+    /// the bar out from under the dropdown.
+    title_bar_menu_open: bool,
+
     /// Storage for persistence
     storage: Option<Storage>,
 
@@ -579,6 +601,8 @@ impl PluriviewApp {
             next_playlist_group: 1,
             picker_open: true,
             canvas_only: false,
+            title_bar_shown_height: TITLE_BAR_HEIGHT,
+            title_bar_menu_open: false,
             storage,
             app_config,
             external_tools,
@@ -3000,11 +3024,39 @@ impl PluriviewApp {
             .map(|workspace| workspace.name.clone())
             .unwrap_or_else(|| "Default".to_owned());
 
+        let screen = ctx.input(|i| i.screen_rect());
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let hover_zone = TITLE_BAR_HOVER_ZONE.max(self.title_bar_shown_height);
+        let hovering = pointer.is_some_and(|pos| {
+            pos.x >= screen.min.x
+                && pos.x <= screen.max.x
+                && pos.y >= screen.min.y
+                && pos.y <= screen.min.y + hover_zone
+        });
+        let want_visible =
+            self.app_config.always_show_title_bar || hovering || self.title_bar_menu_open;
+        let t = ctx.animate_bool_with_time_and_easing(
+            egui::Id::new("title_bar_reveal"),
+            want_visible,
+            TITLE_BAR_ANIM_SECS,
+            title_bar_ease,
+        );
+        let height = egui::lerp(TITLE_BAR_COLLAPSED_HEIGHT..=TITLE_BAR_HEIGHT, t);
+        self.title_bar_shown_height = height;
+
         egui::TopBottomPanel::top("custom_title_bar")
             .frame(egui::Frame::none().fill(bg))
-            .exact_height(34.0)
+            .exact_height(height)
             .show(ctx, |ui| {
-                let title_bar_rect = ui.max_rect();
+                let panel_rect = ui.max_rect();
+                ui.set_clip_rect(panel_rect);
+                // Keep the chrome laid out at full height and slide it with the
+                // panel so the bar eases in from above instead of popping.
+                let title_bar_rect = egui::Rect::from_min_size(
+                    egui::Pos2::new(panel_rect.left(), panel_rect.bottom() - TITLE_BAR_HEIGHT),
+                    Vec2::new(panel_rect.width(), TITLE_BAR_HEIGHT),
+                );
+                ui.multiply_opacity(t);
 
                 // Background drag handle, allocated FIRST so the buttons
                 // (added after) take interaction priority where they overlap.
@@ -3052,7 +3104,7 @@ impl PluriviewApp {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
 
-                        let btn_size = Vec2::new(44.0, 34.0);
+                        let btn_size = Vec2::new(44.0, TITLE_BAR_HEIGHT);
 
                         let close = ui.add_sized(
                             btn_size,
@@ -3106,6 +3158,8 @@ impl PluriviewApp {
                     });
                 });
             });
+
+        self.title_bar_menu_open = want_visible && ctx.memory(|m| m.any_popup_open());
     }
 
     /// The File / View / Help menus. Rendered inline in the title bar next
@@ -3235,6 +3289,19 @@ impl PluriviewApp {
                     .checkbox(&mut self.canvas.show_grid, "Show Grid (G)")
                     .clicked()
                 {
+                    ui.close_menu();
+                }
+                if ui
+                    .checkbox(
+                        &mut self.app_config.always_show_title_bar,
+                        "Always Show Top Bar",
+                    )
+                    .on_hover_text(
+                        "When off, the top bar hides until you move the mouse to the top of the window.",
+                    )
+                    .clicked()
+                {
+                    self.save_app_config();
                     ui.close_menu();
                 }
                 if ui.button("Set Wallpaper...").clicked() {
@@ -3524,7 +3591,10 @@ impl PluriviewApp {
             ToolKind::Streamlink => self.app_config.external_tools.streamlink_path = path.clone(),
         }
         self.external_tools.set_override(kind, path);
+        self.save_app_config();
+    }
 
+    fn save_app_config(&mut self) {
         self.config_error = match &self.storage {
             Some(storage) => storage
                 .save_config(&self.app_config)
@@ -3680,7 +3750,11 @@ impl PluriviewApp {
         // the min/max/close buttons) — never treat that area as a resize
         // zone, or a click on a title bar button can also start a native
         // resize drag and leave the window stuck at a tiny size.
-        let title_bar_height = if self.canvas_only { 0.0 } else { 34.0 };
+        let title_bar_height = if self.canvas_only {
+            0.0
+        } else {
+            self.title_bar_shown_height
+        };
         let rect = ctx.input(|i| i.screen_rect());
         let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
             return;

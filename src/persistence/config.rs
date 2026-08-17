@@ -9,6 +9,9 @@ pub const CURRENT_CONFIG_VERSION: u32 = 1;
 pub struct AppConfig {
     pub version: u32,
     pub external_tools: ExternalToolsConfig,
+    /// When true (default), the custom title bar stays on screen. When false,
+    /// it hides until the pointer is at the top of the window.
+    pub always_show_title_bar: bool,
 }
 
 impl Default for AppConfig {
@@ -16,6 +19,7 @@ impl Default for AppConfig {
         Self {
             version: CURRENT_CONFIG_VERSION,
             external_tools: ExternalToolsConfig::default(),
+            always_show_title_bar: true,
         }
     }
 }
@@ -37,6 +41,7 @@ mod tests {
         let config: AppConfig = serde_json::from_str("{}").unwrap();
 
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        assert!(config.always_show_title_bar);
         assert!(config.external_tools.mpv_path.is_none());
         assert!(config.external_tools.streamlink_path.is_none());
     }
@@ -56,6 +61,7 @@ mod tests {
             Some(PathBuf::from(r"C:\Tools\mpv.exe"))
         );
         assert!(config.external_tools.streamlink_path.is_none());
+        assert!(config.always_show_title_bar);
     }
 
     #[test]
@@ -63,11 +69,13 @@ mod tests {
         let mut config = AppConfig::default();
         config.external_tools.mpv_path = Some(PathBuf::from(r"D:\Portable\mpv.exe"));
         config.external_tools.streamlink_path = Some(PathBuf::from(r"D:\Portable\streamlink.exe"));
+        config.always_show_title_bar = false;
 
         let json = serde_json::to_string(&config).unwrap();
         let restored: AppConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.version, CURRENT_CONFIG_VERSION);
+        assert!(!restored.always_show_title_bar);
         assert_eq!(
             restored.external_tools.mpv_path,
             config.external_tools.mpv_path
