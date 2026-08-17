@@ -432,6 +432,32 @@ struct GlTarget {
     height: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlitDestination {
+    left: i32,
+    bottom: i32,
+    right: i32,
+    top: i32,
+}
+
+fn video_blit_destination(
+    viewport: egui::Rect,
+    pixels_per_point: f32,
+    screen_height: i32,
+) -> BlitDestination {
+    let left = (viewport.min.x * pixels_per_point).round() as i32;
+    let top_from_screen = (viewport.min.y * pixels_per_point).round() as i32;
+    let right = (viewport.max.x * pixels_per_point).round() as i32;
+    let bottom_from_screen = (viewport.max.y * pixels_per_point).round() as i32;
+    let bottom = screen_height - bottom_from_screen;
+    BlitDestination {
+        left,
+        bottom,
+        right,
+        top: bottom + (bottom_from_screen - top_from_screen),
+    }
+}
+
 fn flip_rgba_rows(rgba: &mut [u8], width: usize, height: usize) {
     let Some(stride) = width.checked_mul(4) else {
         return;
@@ -458,6 +484,7 @@ struct MpvCore {
     pending_source: Option<OsString>,
     source_loaded: bool,
     file_loaded: bool,
+    wallpaper: bool,
     destroyed: bool,
     error: Option<String>,
 }
@@ -468,7 +495,12 @@ struct MpvCore {
 unsafe impl Send for MpvCore {}
 
 impl MpvCore {
-    fn new(api: Arc<MpvApi>, start_paused: bool, network_source: bool) -> Result<Self, String> {
+    fn new(
+        api: Arc<MpvApi>,
+        start_paused: bool,
+        network_source: bool,
+        wallpaper: bool,
+    ) -> Result<Self, String> {
         let handle = unsafe { (api.create)() };
         if handle.is_null() {
             return Err("libmpv could not create a playback core".to_owned());
@@ -483,6 +515,7 @@ impl MpvCore {
             pending_source: None,
             source_loaded: false,
             file_loaded: false,
+            wallpaper,
             destroyed: false,
             error: None,
         };
@@ -501,6 +534,23 @@ impl MpvCore {
             if let Err(error) = core.set_option(name, value) {
                 core.destroy_without_render_context();
                 return Err(error);
+            }
+        }
+        if wallpaper {
+            // Background video should fill its rectangle, loop, and never
+            // touch the user's audio devices. These are best-effort: a
+            // rejected option must not prevent the wallpaper from starting.
+            for (name, value) in [
+                ("loop-file", "inf"),
+                ("mute", "yes"),
+                ("ao", "null"),
+                ("aid", "no"),
+                ("sid", "no"),
+                ("panscan", "1.0"),
+            ] {
+                if let Err(error) = core.set_option(name, value) {
+                    log::warn!("Wallpaper mpv option {name}={value} was rejected: {error}");
+                }
             }
         }
         if network_source {
@@ -533,6 +583,13 @@ impl MpvCore {
             return Err(error);
         }
         core.set_property("pause", if start_paused { "yes" } else { "no" })?;
+        if wallpaper {
+            let _ = core.set_property("loop-file", "inf");
+            let _ = core.set_property("mute", "yes");
+            let _ = core.set_property("panscan", "1.0");
+            let _ = core.set_property("aid", "no");
+            let _ = core.set_property("sid", "no");
+        }
         Ok(core)
     }
 
@@ -641,8 +698,14 @@ impl MpvCore {
                     self.error = Some("The libmpv playback core shut down unexpectedly".to_owned());
                     break;
                 }
-                MPV_EVENT_START_FILE | MPV_EVENT_END_FILE => {
+                MPV_EVENT_START_FILE => {
                     changes.any = true;
+                }
+                MPV_EVENT_END_FILE => {
+                    changes.any = true;
+                    if self.wallpaper && !self.file_loaded {
+                        self.error = Some("The wallpaper video could not be opened".to_owned());
+                    }
                 }
                 MPV_EVENT_FILE_LOADED => {
                     self.file_loaded = true;
@@ -775,39 +838,24 @@ impl MpvCore {
         Ok(true)
     }
 
-    unsafe fn paint(
+    unsafe fn render_to_fbo(
         &mut self,
-        info: egui::PaintCallbackInfo,
         gl: &glow::Context,
+        width: i32,
+        height: i32,
     ) -> Result<(), String> {
         if self.destroyed {
             return Ok(());
         }
-        // PaintCallbackInfo's convenience viewport is clamped to the screen.
-        // Using it as the render-target size made the FBO resize for every
-        // pixel of movement across a screen edge. Keep a stable full-tile
-        // target instead and let OpenGL clip the destination blit.
-        let pixels_per_point = info.pixels_per_point;
-        let left_px = (info.viewport.min.x * pixels_per_point).round() as i32;
-        let top_px = (info.viewport.min.y * pixels_per_point).round() as i32;
-        let right_px = (info.viewport.max.x * pixels_per_point).round() as i32;
-        let bottom_px = (info.viewport.max.y * pixels_per_point).round() as i32;
-        let viewport_width = right_px - left_px;
-        let viewport_height = bottom_px - top_px;
-        if viewport_width <= 0 || viewport_height <= 0 {
-            return Ok(());
-        }
-        let from_bottom_px = info.screen_size_px[1] as i32 - bottom_px;
-
-        // During an interactive resize, only reallocate at 32-pixel steps.
-        // The final blit scales the cached frame to the exact tile rectangle.
-        let target_width = ((viewport_width + 31) / 32) * 32;
-        let target_height = ((viewport_height + 31) / 32) * 32;
-
+        let width = width.max(1);
+        let height = height.max(1);
         let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
         let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
+        let mut previous_viewport = [0; 4];
+        gl.get_parameter_i32_slice(glow::VIEWPORT, &mut previous_viewport);
+        let scissor_enabled = gl.is_enabled(glow::SCISSOR_TEST);
         self.ensure_render_context()?;
-        let target_changed = self.ensure_target(gl, target_width, target_height)?;
+        let target_changed = self.ensure_target(gl, width, height)?;
         let target = self.target.as_ref().expect("target was just created");
 
         let mut fbo = MpvOpenGlFbo {
@@ -816,12 +864,7 @@ impl MpvCore {
             h: target.height,
             internal_format: glow::RGBA8 as c_int,
         };
-        // libmpv's image orientation is opposite to the texture orientation
-        // used when this off-screen FBO is blitted into egui's framebuffer.
         let mut flip_y: c_int = 1;
-        // The UI thread owns this GL context. Let the app's repaint cadence
-        // handle presentation timing instead of allowing libmpv to sleep in
-        // the middle of an egui paint pass.
         let mut block_for_target_time: c_int = 0;
         let mut params = [
             MpvRenderParam {
@@ -841,35 +884,109 @@ impl MpvCore {
                 data: ptr::null_mut(),
             },
         ];
-        let update = (self.api.render_context_update)(self.render_context);
-        if target_changed || !self.has_rendered_frame || update & MPV_RENDER_UPDATE_FRAME != 0 {
-            let result = (self.api.render_context_render)(self.render_context, params.as_mut_ptr());
-            self.check(result, "render the video frame")?;
-            self.has_rendered_frame = true;
+        // egui_glow sets the window viewport to the callback rect. libmpv
+        // must render into our FBO at (0,0), not into that window rectangle.
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
+        gl.viewport(0, 0, target.width, target.height);
+        if scissor_enabled {
+            gl.disable(glow::SCISSOR_TEST);
         }
+        let update = (self.api.render_context_update)(self.render_context);
+        let render_result = if target_changed
+            || !self.has_rendered_frame
+            || update & MPV_RENDER_UPDATE_FRAME != 0
+        {
+            let result = (self.api.render_context_render)(self.render_context, params.as_mut_ptr());
+            let checked = self.check(result, "render the video frame");
+            if checked.is_ok() {
+                self.has_rendered_frame = true;
+            }
+            checked
+        } else {
+            Ok(())
+        };
+        if scissor_enabled {
+            gl.enable(glow::SCISSOR_TEST);
+        }
+        gl.viewport(
+            previous_viewport[0],
+            previous_viewport[1],
+            previous_viewport[2],
+            previous_viewport[3],
+        );
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
+        render_result
+    }
+
+    unsafe fn paint(
+        &mut self,
+        info: egui::PaintCallbackInfo,
+        gl: &glow::Context,
+    ) -> Result<(), String> {
+        if self.destroyed {
+            return Ok(());
+        }
+        // PaintCallbackInfo's convenience viewport is clamped to the screen.
+        // Using it as the render-target size made the FBO resize for every
+        // pixel of movement across a screen edge. Keep a stable full-tile
+        // target instead and let OpenGL clip the destination blit.
+        let pixels_per_point = info.pixels_per_point;
+        let destination = video_blit_destination(
+            info.viewport,
+            pixels_per_point,
+            info.screen_size_px[1] as i32,
+        );
+        let viewport_width = destination.right - destination.left;
+        let viewport_height = destination.top - destination.bottom;
+        if viewport_width <= 0 || viewport_height <= 0 {
+            return Ok(());
+        }
+
+        // During an interactive resize, only reallocate at 32-pixel steps.
+        // The final blit scales the cached frame to the exact tile rectangle.
+        let target_width = ((viewport_width + 31) / 32) * 32;
+        let target_height = ((viewport_height + 31) / 32) * 32;
+
+        self.render_to_fbo(gl, target_width, target_height)?;
+        let Some(target) = self.target.as_ref() else {
+            return Ok(());
+        };
+        let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
+        let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
 
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(target.framebuffer));
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
         let clip = info.clip_rect_in_pixels();
-        gl.enable(glow::SCISSOR_TEST);
-        gl.scissor(
-            clip.left_px,
-            clip.from_bottom_px,
-            clip.width_px,
-            clip.height_px,
-        );
-        gl.blit_framebuffer(
-            0,
-            0,
-            target.width,
-            target.height,
-            left_px,
-            from_bottom_px,
-            right_px,
-            from_bottom_px + viewport_height,
-            glow::COLOR_BUFFER_BIT,
-            glow::LINEAR,
-        );
+        let screen_w = info.screen_size_px[0] as i32;
+        let screen_h = info.screen_size_px[1] as i32;
+        let scissor_x = clip.left_px.clamp(0, screen_w);
+        let scissor_y = clip.from_bottom_px.clamp(0, screen_h);
+        let scissor_w = clip.width_px.min(screen_w.saturating_sub(scissor_x)).max(0);
+        let scissor_h = clip
+            .height_px
+            .min(screen_h.saturating_sub(scissor_y))
+            .max(0);
+        if scissor_w > 0 && scissor_h > 0 {
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(scissor_x, scissor_y, scissor_w, scissor_h);
+            // Keep the full, potentially offscreen destination rectangle.
+            // OpenGL clips it against the framebuffer/scissor while retaining
+            // the original source-to-destination scale. Clamping these edges
+            // first squashed the whole video into its visible remainder.
+            gl.blit_framebuffer(
+                0,
+                0,
+                target.width,
+                target.height,
+                destination.left,
+                destination.bottom,
+                destination.right,
+                destination.top,
+                glow::COLOR_BUFFER_BIT,
+                glow::LINEAR,
+            );
+        }
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
         Ok(())
@@ -945,9 +1062,10 @@ impl VideoRenderer {
         api: Arc<MpvApi>,
         start_paused: bool,
         network_source: bool,
+        wallpaper: bool,
     ) -> Result<Arc<Self>, String> {
         Ok(Arc::new(Self {
-            core: Mutex::new(MpvCore::new(api, start_paused, network_source)?),
+            core: Mutex::new(MpvCore::new(api, start_paused, network_source, wallpaper)?),
         }))
     }
 
@@ -962,7 +1080,7 @@ impl VideoRenderer {
         }
     }
 
-    fn snapshot(&self, gl: &glow::Context) -> Option<VideoSnapshot> {
+    pub fn snapshot(&self, gl: &glow::Context) -> Option<VideoSnapshot> {
         let core = self.core.lock();
         unsafe { core.snapshot(gl) }
     }
@@ -1041,6 +1159,10 @@ impl VideoSession {
 
     pub fn source_ready(&self) -> bool {
         self.stream_receiver.is_none() && self.renderer.core.lock().file_loaded
+    }
+
+    pub fn renderer(&self) -> Arc<VideoRenderer> {
+        self.renderer.clone()
     }
 
     fn poll(&mut self) -> Vec<VideoUpdate> {
@@ -1185,6 +1307,15 @@ impl VideoSession {
         Ok(())
     }
 
+    /// Crop the video to fill its paint rectangle instead of letterboxing.
+    pub fn set_fill_frame(&mut self, enabled: bool) -> Result<(), String> {
+        self.renderer
+            .core
+            .lock()
+            .set_property("panscan", if enabled { "1.0" } else { "0.0" })?;
+        Ok(())
+    }
+
     pub fn select_audio_track(&mut self, id: i64) -> Result<(), String> {
         self.renderer
             .core
@@ -1243,6 +1374,7 @@ impl VideoManager {
             self.api.as_ref().expect("libmpv was loaded").clone(),
             launch.start_paused,
             matches!(&launch.source, video::VideoSource::Stream { .. }),
+            launch.wallpaper,
         )?;
         let session = VideoSession::new(renderer.clone(), &launch)?;
         self.tiles.insert(
@@ -2248,6 +2380,50 @@ mod tests {
     }
 
     #[test]
+    fn video_blit_destination_keeps_full_size_beyond_each_screen_edge() {
+        let screen_height = 200;
+        assert_eq!(
+            video_blit_destination(
+                egui::Rect::from_min_max(egui::pos2(-80.0, 20.0), egui::pos2(240.0, 200.0)),
+                1.0,
+                screen_height,
+            ),
+            BlitDestination {
+                left: -80,
+                bottom: 0,
+                right: 240,
+                top: 180,
+            }
+        );
+        assert_eq!(
+            video_blit_destination(
+                egui::Rect::from_min_max(egui::pos2(100.0, -50.0), egui::pos2(420.0, 130.0)),
+                1.0,
+                screen_height,
+            ),
+            BlitDestination {
+                left: 100,
+                bottom: 70,
+                right: 420,
+                top: 250,
+            }
+        );
+        assert_eq!(
+            video_blit_destination(
+                egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(420.0, 260.0)),
+                1.0,
+                screen_height,
+            ),
+            BlitDestination {
+                left: 100,
+                bottom: -60,
+                right: 420,
+                top: 100,
+            }
+        );
+    }
+
+    #[test]
     fn seek_preview_cache_keeps_the_most_recent_frames() {
         let mut cache = SeekPreviewCache::default();
         for index in 0..SEEK_PREVIEW_CACHE_LEN + 5 {
@@ -2342,7 +2518,8 @@ mod tests {
     #[test]
     fn bundled_runtime_initializes_and_accepts_immediate_controls() {
         let api = MpvApi::load(Path::new("mpv.exe")).expect("load bundled libmpv");
-        let mut core = MpvCore::new(api, true, true).expect("initialize network-tuned libmpv");
+        let mut core =
+            MpvCore::new(api, true, true, false).expect("initialize network-tuned libmpv");
         core.set_property("pause", "no").expect("resume");
         core.set_property("pause", "yes").expect("pause");
         core.set_property("volume", "37").expect("set volume");
@@ -2401,11 +2578,13 @@ mod tests {
         };
 
         let api = MpvApi::load(Path::new("mpv.exe")).expect("load bundled libmpv");
-        let renderer = VideoRenderer::new(api, false, false).expect("create renderer");
+        let wallpaper = std::env::var_os("PLURIVIEW_TEST_WALLPAPER").is_some();
+        let renderer = VideoRenderer::new(api, false, false, wallpaper).expect("create renderer");
         let launch = VideoLaunch {
             mpv_path: PathBuf::from("mpv.exe"),
             source: video::VideoSource::LocalFile(media.clone()),
             start_paused: false,
+            wallpaper,
         };
         let mut session = VideoSession::new(renderer.clone(), &launch).expect("create session");
         // Keep the diagnostic silent even when the supplied video has audio;
@@ -2439,6 +2618,44 @@ mod tests {
             thread::sleep(Duration::from_millis(16));
         }
         let before_pause = session.state.time_pos.expect("video did not start");
+        let snapshot = renderer.snapshot(&gl).expect("rendered video snapshot");
+        assert!(
+            snapshot
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
+            "libmpv rendered only black pixels"
+        );
+        let mut presented = vec![0_u8; 320 * 180 * 4];
+        unsafe {
+            gl.read_pixels(
+                0,
+                0,
+                320,
+                180,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(&mut presented),
+            );
+        }
+        assert!(
+            presented
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
+            "video frame was not copied to the destination framebuffer"
+        );
+        let partially_offscreen = egui::PaintCallbackInfo {
+            viewport: egui::Rect::from_min_size(egui::pos2(-80.0, 0.0), egui::vec2(320.0, 180.0)),
+            clip_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 180.0)),
+            pixels_per_point: 1.0,
+            screen_size_px: [320, 180],
+        };
+        renderer.paint(partially_offscreen, &gl);
+        assert_eq!(
+            unsafe { gl.get_error() },
+            glow::NO_ERROR,
+            "partially offscreen video paint produced an OpenGL error"
+        );
         if std::env::var_os("PLURIVIEW_TEST_REQUIRE_HWDEC").is_some() {
             let hwdec = renderer
                 .core

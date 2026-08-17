@@ -1,4 +1,5 @@
 use super::animation::{AnimationState, DragTracker};
+use super::wallpaper::CanvasWallpaper;
 use crate::capture::CaptureCoordinator;
 use crate::preview::{
     compact_title, BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager,
@@ -7,7 +8,6 @@ use crate::preview::{
 #[cfg(debug_assertions)]
 use crate::privacy;
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
-use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -15,6 +15,11 @@ use std::time::Instant;
 const UNDO_TOAST_SECS: f32 = 4.0;
 /// Screen-space hit target shared by resize interaction and marquee exclusion.
 const RESIZE_HANDLE_HIT_SIZE: f32 = 14.0;
+/// Playlist chrome is authored in canvas pixels so zoom keeps the same layout.
+const PLAYLIST_CORNER: f32 = 10.0;
+const PLAYLIST_HEADER_HEIGHT: f32 = 52.0;
+const PLAYLIST_TOOLBAR_HEIGHT: f32 = 36.0;
+const PLAYLIST_ROW_HEIGHT: f32 = 60.0;
 
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
@@ -24,14 +29,15 @@ use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, S
 /// Represents the current drag operation
 #[derive(Clone, Debug)]
 pub enum DragState {
-    /// Resizing a preview (with aspect ratio lock)
+    /// Resizing a preview. `aspect_ratio` is `None` when the tile may change
+    /// width and height independently, such as a folder playlist.
     Resizing {
         id: PreviewId,
         handle: ResizeHandle,
         start_rect: Rect,
         start_mouse: Pos2,
         /// Aspect ratio to maintain during resize (width/height)
-        aspect_ratio: f32,
+        aspect_ratio: Option<f32>,
     },
     /// Cropping a preview (Alt+drag to adjust UV coordinates)
     Cropping {
@@ -46,8 +52,9 @@ pub enum DragState {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_time, stream_audio_badge_rect, video_placeholder_content, CanvasState, DragState,
-        PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
+        apply_resize, format_time, playlist_first_row_center, stream_audio_badge_rect,
+        video_placeholder_content, CanvasState, DragState, PlaylistAction, ResizeHandle,
+        TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -183,7 +190,7 @@ mod tests {
             handle: ResizeHandle::BottomRight,
             start_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
             start_mouse: Pos2::new(100.0, 100.0),
-            aspect_ratio: 1.0,
+            aspect_ratio: Some(1.0),
         });
         let mut previews = PreviewManager::new();
         let mut captures = CaptureCoordinator::new();
@@ -195,6 +202,29 @@ mod tests {
         });
 
         assert!(canvas.drag_state.is_none());
+    }
+
+    #[test]
+    fn unlocked_edge_resize_changes_only_the_grabbed_axis() {
+        let start = Rect::from_min_size(Pos2::new(40.0, 80.0), Vec2::new(200.0, 360.0));
+
+        let taller = apply_resize(ResizeHandle::Bottom, start, Vec2::new(90.0, 80.0), None);
+        assert!((taller.width() - 200.0).abs() < f32::EPSILON);
+        assert!((taller.height() - 440.0).abs() < f32::EPSILON);
+        assert!((taller.min.x - 40.0).abs() < f32::EPSILON);
+
+        let wider = apply_resize(ResizeHandle::Right, start, Vec2::new(120.0, 90.0), None);
+        assert!((wider.width() - 320.0).abs() < f32::EPSILON);
+        assert!((wider.height() - 360.0).abs() < f32::EPSILON);
+        assert!((wider.min.y - 80.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn locked_edge_resize_still_keeps_aspect_ratio() {
+        let start = Rect::from_min_size(Pos2::new(40.0, 80.0), Vec2::new(200.0, 100.0));
+        let resized = apply_resize(ResizeHandle::Right, start, Vec2::new(100.0, 0.0), Some(2.0));
+        assert!((resized.width() - 300.0).abs() < f32::EPSILON);
+        assert!((resized.height() - 150.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -531,7 +561,77 @@ mod tests {
             );
         };
 
-        let row_center = Pos2::new(300.0, 204.0);
+        let row_center = playlist_first_row_center(
+            Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(340.0, 360.0)),
+            1.0,
+        );
+        run_frame(vec![Event::PointerMoved(row_center)]);
+        run_frame(vec![Event::PointerButton {
+            pos: row_center,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerButton {
+            pos: row_center,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        assert!(canvas
+            .pending_playlist_actions
+            .contains(&(id, PlaylistAction::Select(video))));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn playlist_row_stays_clickable_after_canvas_zoom() {
+        let root = std::env::temp_dir().join(format!(
+            "pluriview-canvas-playlist-zoom-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let video = root.join("01 opening.mp4");
+        std::fs::write(&video, b"").unwrap();
+
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        canvas.zoom = 2.0;
+        let mut previews = PreviewManager::new();
+        let playlist = FolderPlaylist::scan(root.clone(), None).unwrap();
+        let id = previews.add_folder_playlist(
+            playlist,
+            "Test folder".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(340.0, 360.0),
+            1,
+            None,
+        );
+        previews.get_mut(id).unwrap().created_at = Instant::now() - Duration::from_secs(1);
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 1100.0));
+        let mut run_frame = |events| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            );
+        };
+
+        let row_center = playlist_first_row_center(
+            Rect::from_min_size(Pos2::new(200.0, 200.0), Vec2::new(680.0, 720.0)),
+            2.0,
+        );
         run_frame(vec![Event::PointerMoved(row_center)]);
         run_frame(vec![Event::PointerButton {
             pos: row_center,
@@ -840,13 +940,80 @@ fn format_time(seconds: Option<f64>) -> String {
     }
 }
 
-fn ellipsize(text: &str, max_chars: usize) -> Cow<'_, str> {
-    if text.chars().count() <= max_chars {
-        Cow::Borrowed(text)
-    } else {
-        let keep = max_chars.saturating_sub(1);
-        Cow::Owned(format!("{}…", text.chars().take(keep).collect::<String>()))
+fn playlist_zoom(zoom: f32) -> f32 {
+    zoom.max(0.05)
+}
+
+fn playlist_px(value: f32, zoom: f32) -> f32 {
+    value * playlist_zoom(zoom)
+}
+
+fn playlist_font(size: f32, zoom: f32) -> egui::FontId {
+    egui::FontId::proportional(playlist_px(size, zoom).max(1.0))
+}
+
+fn playlist_chrome_height(zoom: f32) -> f32 {
+    playlist_px(PLAYLIST_HEADER_HEIGHT + PLAYLIST_TOOLBAR_HEIGHT, zoom)
+}
+
+fn playlist_first_row_center(tile: Rect, zoom: f32) -> Pos2 {
+    let row_top = tile.min.y + playlist_chrome_height(zoom);
+    Pos2::new(
+        tile.center().x,
+        row_top + playlist_px(PLAYLIST_ROW_HEIGHT, zoom) * 0.5,
+    )
+}
+
+fn playlist_entry_labels(name: &str) -> (&str, Option<&str>) {
+    match name.rsplit_once('.') {
+        Some((stem, ext))
+            if !stem.is_empty()
+                && ext.len() <= 5
+                && ext
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()) =>
+        {
+            (stem, Some(ext))
+        }
+        _ => (name, None),
     }
+}
+
+fn cover_uv(image: Vec2, dest: Vec2) -> Rect {
+    if image.x <= 0.0 || image.y <= 0.0 || dest.x <= 0.0 || dest.y <= 0.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let image_aspect = image.x / image.y;
+    let dest_aspect = dest.x / dest.y;
+    if image_aspect > dest_aspect {
+        let visible = dest_aspect / image_aspect;
+        let pad = (1.0 - visible) * 0.5;
+        Rect::from_min_max(Pos2::new(pad, 0.0), Pos2::new(1.0 - pad, 1.0))
+    } else {
+        let visible = image_aspect / dest_aspect;
+        let pad = (1.0 - visible) * 0.5;
+        Rect::from_min_max(Pos2::new(0.0, pad), Pos2::new(1.0, 1.0 - pad))
+    }
+}
+
+fn paint_truncated_text(
+    painter: &egui::Painter,
+    pos: Pos2,
+    anchor: egui::Align2,
+    text: &str,
+    font_id: egui::FontId,
+    color: Color32,
+    max_width: f32,
+) {
+    if text.is_empty() || max_width <= 1.0 {
+        return;
+    }
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font_id, color, max_width);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    let galley = painter.layout_job(job);
+    painter.galley(anchor.anchor_size(pos, galley.size()).min, galley, color);
 }
 
 /// Hover FPS pill sits at x=-72 with width 36; SA is 4px to its left.
@@ -1119,6 +1286,16 @@ pub struct CanvasState {
     /// Grid size in canvas units
     pub grid_size: f32,
 
+    /// Screen-space live wallpaper drawn behind tiles. Pan and zoom never
+    /// move or scale it.
+    pub wallpaper: Option<CanvasWallpaper>,
+
+    /// Open the wallpaper file picker after the context/menu closes.
+    pub pending_wallpaper_pick: bool,
+
+    /// Drop the current wallpaper after the context/menu closes.
+    pub pending_wallpaper_clear: bool,
+
     /// Pending FPS changes to apply
     pending_fps_changes: Vec<PendingFpsChange>,
 
@@ -1224,6 +1401,9 @@ impl Default for CanvasState {
             drag_state: None,
             show_grid: true,
             grid_size: 50.0,
+            wallpaper: None,
+            pending_wallpaper_pick: false,
+            pending_wallpaper_clear: false,
             pending_fps_changes: Vec::new(),
             pending_stream_audio_toggles: Vec::new(),
             animation: AnimationState::new(),
@@ -1480,6 +1660,10 @@ impl CanvasState {
 
         // Draw background - Minimal Void theme (#0d0d0d)
         painter.rect_filled(canvas_rect, 0.0, Color32::from_rgb(13, 13, 13));
+
+        if let Some(wallpaper) = self.wallpaper.as_mut() {
+            wallpaper.paint(&painter, canvas_rect, ctx);
+        }
 
         // Draw grid
         if show_overlays && self.show_grid {
@@ -1798,8 +1982,9 @@ impl CanvasState {
                             .get_mut(id)
                             .and_then(|preview| preview.folder_playlist.as_mut())
                         {
-                            playlist.scroll_offset =
-                                (playlist.scroll_offset - scroll_delta).max(0.0);
+                            playlist.scroll_offset = (playlist.scroll_offset
+                                - scroll_delta / playlist_zoom(self.zoom))
+                            .max(0.0);
                         }
                     } else {
                         let zoom_factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
@@ -1900,6 +2085,14 @@ impl CanvasState {
             }
             ui.separator();
             ui.checkbox(&mut self.show_grid, "Show Grid");
+            if ui.button("Set Wallpaper...").clicked() {
+                self.pending_wallpaper_pick = true;
+                ui.close_menu();
+            }
+            if self.wallpaper.is_some() && ui.button("Clear Wallpaper").clicked() {
+                self.pending_wallpaper_clear = true;
+                ui.close_menu();
+            }
             ui.separator();
             if !self.selection.is_empty() {
                 let selected = self.selection.clone();
@@ -2183,24 +2376,36 @@ impl CanvasState {
                         == Some(id)
             });
             if show_overlays && pointer_over_tile {
-                // Semi-transparent overlay gradient at top for controls
-                let overlay_rect =
-                    Rect::from_min_size(screen_rect.min, Vec2::new(screen_rect.width(), 40.0));
-                painter.rect_filled(
-                    overlay_rect,
-                    egui::Rounding {
-                        nw: 8.0,
-                        ne: 8.0,
-                        sw: 0.0,
-                        se: 0.0,
-                    },
-                    Color32::from_rgba_unmultiplied(0, 0, 0, 120),
-                );
+                // Playlist tiles already have a designed header; a second title
+                // bar would cover the folder name and transport controls.
+                if !is_playlist {
+                    let overlay_rect =
+                        Rect::from_min_size(screen_rect.min, Vec2::new(screen_rect.width(), 40.0));
+                    painter.rect_filled(
+                        overlay_rect,
+                        egui::Rounding {
+                            nw: 8.0,
+                            ne: 8.0,
+                            sw: 0.0,
+                            se: 0.0,
+                        },
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                    );
+                }
 
                 // Close button (top-right)
+                let close_scale = if is_playlist {
+                    playlist_zoom(self.zoom)
+                } else {
+                    1.0
+                };
                 let close_btn_rect = Rect::from_min_size(
-                    screen_rect.right_top() + Vec2::new(-32.0, 8.0),
-                    Vec2::new(24.0, 24.0),
+                    screen_rect.right_top()
+                        + Vec2::new(
+                            playlist_px(-32.0, close_scale),
+                            playlist_px(8.0, close_scale),
+                        ),
+                    Vec2::splat(playlist_px(24.0, close_scale)),
                 );
                 let close_response = ui.interact(
                     close_btn_rect,
@@ -2212,12 +2417,12 @@ impl CanvasState {
                 } else {
                     Color32::from_rgba_unmultiplied(255, 80, 80, 200)
                 };
-                painter.rect_filled(close_btn_rect, 4.0, close_bg);
+                painter.rect_filled(close_btn_rect, playlist_px(4.0, close_scale), close_bg);
                 painter.text(
                     close_btn_rect.center(),
                     egui::Align2::CENTER_CENTER,
                     egui_phosphor::regular::X,
-                    egui::FontId::proportional(13.0),
+                    playlist_font(13.0, close_scale),
                     Color32::WHITE,
                 );
                 if close_response.clicked() {
@@ -2257,36 +2462,36 @@ impl CanvasState {
                     }
                 }
 
-                // Title (truncated, on the left) - handle UTF-8 properly
-                let title_text = compact_title(title, 25);
-                let title_pos = if is_browser || is_media || is_video || is_playlist {
-                    // Source badge marks app-owned tiles; shift the title right.
+                if !is_playlist {
+                    // Title (truncated, on the left) - handle UTF-8 properly
+                    let title_text = compact_title(title, 25);
+                    let title_pos = if is_browser || is_media || is_video {
+                        // Source badge marks app-owned tiles; shift the title right.
+                        painter.text(
+                            screen_rect.left_top() + Vec2::new(12.0, 20.0),
+                            egui::Align2::LEFT_CENTER,
+                            if is_browser {
+                                egui_phosphor::regular::GLOBE
+                            } else if is_video {
+                                egui_phosphor::regular::VIDEO
+                            } else {
+                                egui_phosphor::regular::IMAGE
+                            },
+                            egui::FontId::proportional(12.0),
+                            Color32::from_rgb(107, 170, 75),
+                        );
+                        screen_rect.left_top() + Vec2::new(28.0, 20.0)
+                    } else {
+                        screen_rect.left_top() + Vec2::new(12.0, 20.0)
+                    };
                     painter.text(
-                        screen_rect.left_top() + Vec2::new(12.0, 20.0),
+                        title_pos,
                         egui::Align2::LEFT_CENTER,
-                        if is_browser {
-                            egui_phosphor::regular::GLOBE
-                        } else if is_playlist {
-                            egui_phosphor::regular::PLAYLIST
-                        } else if is_video {
-                            egui_phosphor::regular::VIDEO
-                        } else {
-                            egui_phosphor::regular::IMAGE
-                        },
-                        egui::FontId::proportional(12.0),
-                        Color32::from_rgb(107, 170, 75),
+                        title_text,
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(200, 200, 200),
                     );
-                    screen_rect.left_top() + Vec2::new(28.0, 20.0)
-                } else {
-                    screen_rect.left_top() + Vec2::new(12.0, 20.0)
-                };
-                painter.text(
-                    title_pos,
-                    egui::Align2::LEFT_CENTER,
-                    title_text,
-                    egui::FontId::proportional(11.0),
-                    Color32::from_rgb(200, 200, 200),
-                );
+                }
 
                 // Browser tiles: navigation + audio controls along the bottom
                 if is_browser && !manually_frozen && *browser_status == BrowserTileStatus::Ready {
@@ -3290,60 +3495,106 @@ impl CanvasState {
         id: PreviewId,
         alpha: u8,
     ) {
+        let z = playlist_zoom(self.zoom);
+        let s = |value: f32| playlist_px(value, z);
+        let corner = s(PLAYLIST_CORNER);
         let clipped = painter.with_clip_rect(rect);
         clipped.rect_filled(
             rect,
-            8.0,
-            Color32::from_rgba_unmultiplied(19, 20, 24, alpha),
+            corner,
+            Color32::from_rgba_unmultiplied(16, 17, 21, alpha),
         );
-        let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 72.0));
+
+        let header_height = s(PLAYLIST_HEADER_HEIGHT).min(rect.height());
+        let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_height));
         clipped.rect_filled(
             header,
             egui::Rounding {
-                nw: 8.0,
-                ne: 8.0,
+                nw: corner,
+                ne: corner,
                 sw: 0.0,
                 se: 0.0,
             },
-            Color32::from_rgba_unmultiplied(27, 29, 35, alpha),
+            Color32::from_rgba_unmultiplied(22, 24, 29, alpha),
         );
 
         let Some(preview) = preview_manager.get_mut(id) else {
             return;
         };
+        let title = preview.title.clone();
         let Some(playlist) = preview.folder_playlist.as_mut() else {
             return;
         };
 
-        let count_text = format!(
-            "{} video{}",
-            playlist.entries.len(),
-            if playlist.entries.len() == 1 { "" } else { "s" }
+        let count = playlist.entries.len();
+        let count_text = if count == 1 {
+            "1 video".to_owned()
+        } else {
+            format!("{count} videos")
+        };
+
+        let icon_size = s(28.0);
+        let icon_rect = Rect::from_center_size(
+            Pos2::new(header.left() + s(22.0), header.center().y),
+            Vec2::splat(icon_size),
+        );
+        clipped.rect_filled(
+            icon_rect,
+            s(8.0),
+            Color32::from_rgba_unmultiplied(107, 170, 75, 38),
         );
         clipped.text(
-            header.left_top() + Vec2::new(14.0, 18.0),
-            egui::Align2::LEFT_CENTER,
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
             egui_phosphor::regular::FOLDER_OPEN,
-            egui::FontId::proportional(18.0),
-            Color32::from_rgb(107, 170, 75),
+            playlist_font(15.0, z),
+            Color32::from_rgb(138, 196, 108),
         );
-        clipped.text(
-            header.left_top() + Vec2::new(40.0, 16.0),
+
+        let text_left = icon_rect.right() + s(10.0);
+        let text_right = header.right() - s(40.0);
+        paint_truncated_text(
+            &clipped,
+            Pos2::new(text_left, header.center().y - s(8.0)),
             egui::Align2::LEFT_CENTER,
-            ellipsize(
-                &preview.title,
-                ((rect.width() - 90.0) / 7.0).max(6.0) as usize,
+            &title,
+            playlist_font(13.5, z),
+            Color32::from_rgb(236, 236, 240),
+            (text_right - text_left).max(8.0),
+        );
+        paint_truncated_text(
+            &clipped,
+            Pos2::new(text_left, header.center().y + s(10.0)),
+            egui::Align2::LEFT_CENTER,
+            &count_text,
+            playlist_font(10.5, z),
+            Color32::from_rgb(132, 136, 148),
+            (text_right - text_left).max(8.0),
+        );
+
+        let toolbar_top = header.bottom();
+        let toolbar_height = s(PLAYLIST_TOOLBAR_HEIGHT);
+        let toolbar = Rect::from_min_size(
+            Pos2::new(rect.left(), toolbar_top),
+            Vec2::new(
+                rect.width(),
+                toolbar_height.min((rect.bottom() - toolbar_top).max(0.0)),
             ),
-            egui::FontId::proportional(13.0),
-            Color32::from_rgb(232, 232, 237),
         );
-        clipped.text(
-            header.left_top() + Vec2::new(40.0, 35.0),
-            egui::Align2::LEFT_CENTER,
-            count_text,
-            egui::FontId::proportional(10.0),
-            Color32::from_rgb(135, 137, 146),
-        );
+        if toolbar.height() > 1.0 {
+            clipped.rect_filled(
+                toolbar,
+                0.0,
+                Color32::from_rgba_unmultiplied(18, 19, 24, alpha),
+            );
+            clipped.line_segment(
+                [toolbar.left_top(), toolbar.right_top()],
+                Stroke::new(
+                    s(1.0).max(1.0),
+                    Color32::from_rgba_unmultiplied(48, 50, 58, alpha),
+                ),
+            );
+        }
 
         let controls = [
             (
@@ -3371,16 +3622,24 @@ impl CanvasState {
                 "Repeat playlist",
             ),
             (
-                egui_phosphor::regular::PLAY,
+                egui_phosphor::regular::PLAYLIST,
                 PlaylistAction::ToggleAutoplay,
                 playlist.autoplay,
                 "Autoplay next",
             ),
         ];
+        let button_size = s(26.0);
+        let button_gap = s(6.0);
+        let controls_width = controls.len() as f32 * button_size
+            + (controls.len().saturating_sub(1) as f32) * button_gap;
+        let controls_left = toolbar.center().x - controls_width * 0.5;
         for (index, (icon, action, active, tip)) in controls.into_iter().enumerate() {
-            let button = Rect::from_min_size(
-                header.left_bottom() + Vec2::new(12.0 + index as f32 * 30.0, -29.0),
-                Vec2::splat(24.0),
+            let button = Rect::from_center_size(
+                Pos2::new(
+                    controls_left + button_size * 0.5 + index as f32 * (button_size + button_gap),
+                    toolbar.center().y,
+                ),
+                Vec2::splat(button_size),
             );
             let response = ui
                 .interact(
@@ -3389,14 +3648,17 @@ impl CanvasState {
                     Sense::click(),
                 )
                 .on_hover_text(tip);
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
             if response.hovered() || active {
                 clipped.rect_filled(
                     button,
-                    5.0,
+                    s(7.0),
                     if active {
-                        Color32::from_rgba_unmultiplied(74, 158, 255, 70)
+                        Color32::from_rgba_unmultiplied(74, 158, 255, 64)
                     } else {
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 22)
                     },
                 );
             }
@@ -3404,11 +3666,11 @@ impl CanvasState {
                 button.center(),
                 egui::Align2::CENTER_CENTER,
                 icon,
-                egui::FontId::proportional(13.0),
+                playlist_font(13.0, z),
                 if active {
-                    Color32::from_rgb(125, 190, 255)
+                    Color32::from_rgb(158, 206, 255)
                 } else {
-                    Color32::from_rgb(190, 192, 200)
+                    Color32::from_rgb(188, 190, 198)
                 },
             );
             if response.clicked() {
@@ -3416,21 +3678,46 @@ impl CanvasState {
             }
         }
 
-        let row_height = 64.0;
-        let list_rect = Rect::from_min_max(Pos2::new(rect.left(), header.bottom()), rect.max);
-        let max_scroll = (playlist.entries.len() as f32 * row_height - list_rect.height()).max(0.0);
+        let row_height = s(PLAYLIST_ROW_HEIGHT);
+        let list_rect = Rect::from_min_max(
+            Pos2::new(rect.left(), header.bottom() + toolbar.height()),
+            rect.max,
+        );
+        let list = clipped.with_clip_rect(list_rect);
+        let list_height_canvas = list_rect.height() / z;
+        let max_scroll =
+            (playlist.entries.len() as f32 * PLAYLIST_ROW_HEIGHT - list_height_canvas).max(0.0);
         playlist.scroll_offset = playlist.scroll_offset.clamp(0.0, max_scroll);
-        let first = (playlist.scroll_offset / row_height).floor() as usize;
-        let y_remainder = playlist.scroll_offset % row_height;
-        let selected = playlist.selected.as_ref();
+        let first = (playlist.scroll_offset / PLAYLIST_ROW_HEIGHT).floor() as usize;
+        let y_remainder = (playlist.scroll_offset % PLAYLIST_ROW_HEIGHT) * z;
+        let selected = playlist.selected.clone();
 
         if let Some(error) = playlist.error.as_ref() {
-            clipped.text(
+            paint_truncated_text(
+                &list,
                 list_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                ellipsize(error, 52),
-                egui::FontId::proportional(11.0),
-                Color32::from_rgb(220, 140, 125),
+                error,
+                playlist_font(12.0, z),
+                Color32::from_rgb(220, 148, 132),
+                list_rect.width() - s(24.0),
+            );
+        } else if playlist.entries.is_empty() {
+            list.text(
+                list_rect.center() - Vec2::new(0.0, s(10.0)),
+                egui::Align2::CENTER_CENTER,
+                egui_phosphor::regular::VIDEO,
+                playlist_font(22.0, z),
+                Color32::from_rgb(78, 82, 92),
+            );
+            paint_truncated_text(
+                &list,
+                list_rect.center() + Vec2::new(0.0, s(16.0)),
+                egui::Align2::CENTER_CENTER,
+                "No videos in this folder",
+                playlist_font(12.0, z),
+                Color32::from_rgb(132, 136, 148),
+                list_rect.width() - s(24.0),
             );
         }
 
@@ -3447,49 +3734,66 @@ impl CanvasState {
                 continue;
             }
 
-            let active = selected.is_some_and(|path| path == &entry.path);
+            let active = selected.as_ref().is_some_and(|path| path == &entry.path);
+            let hit = row.intersect(list_rect);
             let response = ui
                 .interact(
-                    row.intersect(list_rect),
+                    hit,
                     ui.id().with(("playlist_row", id.0, index)),
                     Sense::click(),
                 )
                 .on_hover_text(&entry.name);
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+
+            let pad = s(8.0);
+            let card = Rect::from_min_max(
+                Pos2::new(row.left() + pad, row.top() + s(4.0)),
+                Pos2::new(row.right() - pad, row.bottom() - s(4.0)),
+            );
             if active || response.hovered() {
-                clipped.rect_filled(
-                    row,
-                    0.0,
+                list.rect_filled(
+                    card,
+                    s(8.0),
                     if active {
-                        Color32::from_rgba_unmultiplied(74, 158, 255, 42)
+                        Color32::from_rgba_unmultiplied(74, 158, 255, 36)
                     } else {
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 12)
                     },
                 );
             }
             if active {
-                clipped.rect_filled(
-                    Rect::from_min_size(row.min, Vec2::new(3.0, row.height())),
-                    0.0,
-                    Color32::from_rgb(74, 158, 255),
+                list.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(card.left(), card.top() + s(8.0)),
+                        Vec2::new(s(3.0), card.height() - s(16.0)),
+                    ),
+                    s(1.5),
+                    Color32::from_rgb(107, 170, 75),
                 );
             }
 
-            let thumb = Rect::from_min_size(row.min + Vec2::new(10.0, 8.0), Vec2::new(80.0, 45.0));
-            clipped.rect_filled(thumb, 5.0, Color32::from_rgb(31, 33, 39));
+            let thumb = Rect::from_min_size(
+                Pos2::new(card.left() + s(10.0), card.center().y - s(20.0)),
+                Vec2::new(s(72.0), s(40.0)),
+            );
+            list.rect_filled(thumb, s(6.0), Color32::from_rgb(28, 30, 36));
             if let Some(texture) = &entry.thumbnail {
-                clipped.image(
+                let thumb_clip = list.with_clip_rect(thumb);
+                thumb_clip.image(
                     texture.id(),
                     thumb,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
+                    cover_uv(texture.size_vec2(), thumb.size()),
+                    Color32::from_white_alpha(alpha),
                 );
             } else {
-                clipped.text(
+                list.text(
                     thumb.center(),
                     egui::Align2::CENTER_CENTER,
                     egui_phosphor::regular::VIDEO,
-                    egui::FontId::proportional(18.0),
-                    Color32::from_rgb(92, 95, 105),
+                    playlist_font(16.0, z),
+                    Color32::from_rgb(88, 92, 102),
                 );
                 if entry.thumbnail_state == crate::playlist::ThumbnailState::Idle {
                     entry.thumbnail_state = crate::playlist::ThumbnailState::Loading;
@@ -3498,30 +3802,41 @@ impl CanvasState {
                 }
             }
 
-            clipped.text(
-                Pos2::new(thumb.right() + 10.0, row.center().y - 8.0),
+            let (stem, extension) = playlist_entry_labels(&entry.name);
+            let text_x = thumb.right() + s(10.0);
+            let text_max = card.right() - s(12.0);
+            paint_truncated_text(
+                &list,
+                Pos2::new(text_x, card.center().y - s(8.0)),
                 egui::Align2::LEFT_CENTER,
-                ellipsize(&entry.name, ((row.width() - 112.0) / 6.5).max(5.0) as usize),
-                egui::FontId::proportional(11.5),
+                stem,
+                playlist_font(12.5, z),
                 if active {
                     Color32::WHITE
                 } else {
-                    Color32::from_rgb(205, 206, 213)
+                    Color32::from_rgb(214, 216, 222)
                 },
+                (text_max - text_x).max(8.0),
             );
-            clipped.text(
-                Pos2::new(thumb.right() + 10.0, row.center().y + 10.0),
+            let meta = if active {
+                "Now playing".to_owned()
+            } else if let Some(extension) = extension {
+                format!("{:02}  ·  {}", index + 1, extension.to_ascii_uppercase())
+            } else {
+                format!("{:02}", index + 1)
+            };
+            paint_truncated_text(
+                &list,
+                Pos2::new(text_x, card.center().y + s(10.0)),
                 egui::Align2::LEFT_CENTER,
-                format!("{:02}", index + 1),
-                egui::FontId::monospace(9.5),
-                Color32::from_rgb(110, 112, 122),
-            );
-            clipped.line_segment(
-                [
-                    Pos2::new(row.left() + 10.0, row.bottom()),
-                    Pos2::new(row.right() - 10.0, row.bottom()),
-                ],
-                Stroke::new(1.0, Color32::from_rgb(35, 37, 43)),
+                &meta,
+                playlist_font(10.0, z),
+                if active {
+                    Color32::from_rgb(138, 196, 108)
+                } else {
+                    Color32::from_rgb(118, 122, 132)
+                },
+                (text_max - text_x).max(8.0),
             );
             if response.clicked() {
                 self.pending_playlist_actions
@@ -3530,22 +3845,28 @@ impl CanvasState {
         }
 
         if max_scroll > 0.0 {
-            let fraction = (list_rect.height() / (playlist.entries.len() as f32 * row_height))
+            let fraction = (list_height_canvas
+                / (playlist.entries.len() as f32 * PLAYLIST_ROW_HEIGHT))
                 .clamp(0.08, 1.0);
             let track = Rect::from_min_max(
-                Pos2::new(rect.right() - 4.0, list_rect.top() + 4.0),
-                Pos2::new(rect.right() - 2.0, list_rect.bottom() - 4.0),
+                Pos2::new(rect.right() - s(7.0), list_rect.top() + s(8.0)),
+                Pos2::new(rect.right() - s(3.0), list_rect.bottom() - s(8.0)),
+            );
+            list.rect_filled(
+                track,
+                s(2.0),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 16),
             );
             let thumb_height = track.height() * fraction;
             let thumb_top = track.top()
                 + (track.height() - thumb_height) * (playlist.scroll_offset / max_scroll);
-            clipped.rect_filled(
+            list.rect_filled(
                 Rect::from_min_size(
                     Pos2::new(track.left(), thumb_top),
                     Vec2::new(track.width(), thumb_height),
                 ),
-                1.0,
-                Color32::from_rgb(82, 85, 94),
+                s(2.0),
+                Color32::from_rgb(92, 96, 108),
             );
         }
     }
@@ -3825,6 +4146,7 @@ impl CanvasState {
                         *id,
                         p.rect(),
                         p.source_aspect_ratio,
+                        p.lock_aspect_ratio,
                         p.crop_uv,
                         p.frame_size,
                         p.is_browser(),
@@ -3834,8 +4156,16 @@ impl CanvasState {
             })
             .collect();
 
-        for (id, preview_rect, aspect_ratio, crop_uv, frame_size, is_browser, is_playlist) in
-            selection_info
+        for (
+            id,
+            preview_rect,
+            aspect_ratio,
+            lock_aspect_ratio,
+            crop_uv,
+            frame_size,
+            is_browser,
+            is_playlist,
+        ) in selection_info
         {
             let screen_rect = self.canvas_rect_to_screen(preview_rect, canvas_rect);
 
@@ -3927,13 +4257,12 @@ impl CanvasState {
                             start_crop_uv: current_crop,
                         });
                     } else {
-                        // Start resize mode with aspect ratio lock
                         self.drag_state = Some(DragState::Resizing {
                             id,
                             handle: handle_type,
                             start_rect: preview_rect,
                             start_mouse: input.interact_pos.unwrap_or(handle_pos),
-                            aspect_ratio,
+                            aspect_ratio: lock_aspect_ratio.then_some(aspect_ratio),
                         });
                     }
                 }
@@ -3952,7 +4281,7 @@ impl CanvasState {
                         if *resize_id == id && *handle == handle_type {
                             if let Some(current_pos) = input.interact_pos {
                                 let delta = (current_pos - *start_mouse) / self.zoom;
-                                let new_rect = apply_resize(*handle, *start_rect, delta, Some(*ar));
+                                let new_rect = apply_resize(*handle, *start_rect, delta, *ar);
 
                                 // Apply minimum size
                                 let min_size = 100.0;

@@ -1,5 +1,6 @@
 use crate::preview::PreviewLayout;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Complete saved layout
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,12 +64,25 @@ impl Default for WindowLayout {
     }
 }
 
+/// Screen-space canvas background that ignores pan and zoom.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WallpaperLayout {
+    /// Managed image or GIF filename inside `pluriview_data/media`.
+    Image { path: String },
+    /// Original local video path, matching how video tiles are stored.
+    Video { path: PathBuf },
+}
+
 /// Serializable canvas state
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CanvasLayout {
     pub pan: (f32, f32),
     pub zoom: f32,
     pub show_grid: bool,
+    /// Optional live wallpaper drawn behind tiles in screen space.
+    #[serde(default)]
+    pub wallpaper: Option<WallpaperLayout>,
 }
 
 impl Default for CanvasLayout {
@@ -77,6 +91,7 @@ impl Default for CanvasLayout {
             pan: (0.0, 0.0),
             zoom: 1.0,
             show_grid: true,
+            wallpaper: None,
         }
     }
 }
@@ -90,6 +105,7 @@ impl SavedLayout {
                 pan: (0.0, 0.0),
                 zoom: 1.0,
                 show_grid: true,
+                wallpaper: None,
             },
             previews: Vec::new(),
             recent_browser_urls: Vec::new(),
@@ -166,5 +182,36 @@ mod tests {
 
         let restored: SavedLayout = serde_json::from_value(value).unwrap();
         assert!(restored.picker_open);
+    }
+
+    #[test]
+    fn wallpaper_survives_a_round_trip() {
+        let mut layout = SavedLayout::new();
+        layout.canvas.wallpaper = Some(super::WallpaperLayout::Image {
+            path: "bg.gif".to_owned(),
+        });
+        let json = serde_json::to_string(&layout).unwrap();
+
+        let restored: SavedLayout = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.canvas.wallpaper,
+            Some(super::WallpaperLayout::Image {
+                path: "bg.gif".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn older_layouts_have_no_wallpaper() {
+        let layout = SavedLayout::new();
+        let mut value = serde_json::to_value(layout).unwrap();
+        value
+            .get_mut("canvas")
+            .and_then(|canvas| canvas.as_object_mut())
+            .unwrap()
+            .remove("wallpaper");
+
+        let restored: SavedLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.canvas.wallpaper.is_none());
     }
 }

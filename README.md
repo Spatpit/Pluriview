@@ -27,6 +27,7 @@
 | **Image & GIF Tiles** | Add static images or animated GIFs; portable copies are managed beside the executable |
 | **Ad & Tracker Blocking** | uBlock Origin Lite is integrated into the shared browser-tile profile and enabled by default |
 | **Infinite Canvas** | Pan and zoom freely to organize your workspace |
+| **Live Wallpaper** | Pin an image, GIF, or looping muted video behind the canvas; it stays screen-sized and does not pan or zoom with tiles |
 | **Tile Freeze** | Box-select tiles and suspend their live work while keeping the last frame visible; video players and stream caches unload until resumed |
 | **Crop Regions** | Focus on specific parts of windows with Alt+drag |
 | **Adjustable FPS** | Choose 5, 15, 30, or 60 FPS per preview |
@@ -58,6 +59,15 @@ timeline thumbnails.
 Development builds keep this folder at the repository root rather than under
 Cargo's disposable `target` directory. Release builds remain portable and keep
 `pluriview_data` beside the executable.
+
+### Live wallpaper
+
+Choose **View → Set Wallpaper...** or right-click the canvas → **Set Wallpaper...**.
+Images, animated GIFs, and local videos fill the window like a desktop wallpaper:
+they never pan or zoom with the canvas. GIFs keep their authored timing; videos
+loop muted through MPV and crop to cover the window. Image wallpapers are copied
+into `pluriview_data/media` with other imported media; video wallpapers keep their
+original path, the same way video tiles do. The wallpaper is saved per workspace.
 
 ### Browser tiles
 
@@ -114,11 +124,12 @@ distribute `pluriview.pdb`; Windows debug symbols can contain local source paths
 2. **Add windows** from the Window Picker panel (left side)
 3. **Add browsers** by right-clicking the canvas → Add Browser...
 4. **Add images or GIFs** with File → Add Image... or the canvas context menu
-5. **Arrange** by dragging previews on the canvas
-6. **Resize** by dragging corners or edges
-7. **Crop** window previews by holding Alt and dragging corners
-8. **Focus** a tile with right-click → **Focus on This Tile**; press `Esc` to restore the canvas
-9. **Right-click** for other context menu options
+5. **Set a wallpaper** with View → Set Wallpaper... or the canvas context menu. Images, GIFs, and videos fill the window and stay put while you pan and zoom
+6. **Arrange** by dragging previews on the canvas
+7. **Resize** by dragging corners or edges
+8. **Crop** window previews by holding Alt and dragging corners
+9. **Focus** a tile with right-click → **Focus on This Tile**; press `Esc` to restore the canvas
+10. **Right-click** for other context menu options
 
 ### Video folders and playlists
 
@@ -127,8 +138,11 @@ Pluriview scans supported videos directly inside that folder, sorts numbered
 filenames naturally, and starts the first video. Click any playlist row to
 replace the current file in the same player. The playlist header provides
 previous/next, shuffle, repeat, and autoplay controls; scroll over the playlist
-to browse longer folders without zooming the canvas. Folder playlists and their
-linked tile positions are restored with the workspace.
+to browse longer folders without zooming the canvas. Zooming the canvas scales
+the playlist as one panel, so the header, buttons, and rows keep the same layout.
+Grab a side handle to change only the width, or a top/bottom handle to change
+only the height. Folder playlists and their linked tile positions are restored
+with the workspace.
 
 Use the **Workspace** menu to create separate reusable setups. Existing installs
 are migrated into a workspace named **Default** the first time this version runs.

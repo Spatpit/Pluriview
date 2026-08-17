@@ -8,21 +8,30 @@ use std::time::Duration;
 /// Avoid allowing a pathological animation to consume unbounded memory.
 const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
+const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 const VIDEO_EXTENSIONS: [&str; 15] = [
     "mp4", "mkv", "webm", "avi", "mov", "m4v", "wmv", "flv", "mpeg", "mpg", "ts", "m2ts", "3gp",
     "ogv", "mts",
 ];
 
-/// Whether a path has one of the video extensions exposed by the native file
-/// picker. MPV still performs the authoritative media validation at launch.
-pub fn is_supported_video_path(path: &Path) -> bool {
+fn extension_matches(path: &Path, candidates: &[&str]) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
-            VIDEO_EXTENSIONS
+            candidates
                 .iter()
                 .any(|candidate| extension.eq_ignore_ascii_case(candidate))
         })
+}
+
+/// Whether a path has one of the video extensions exposed by the native file
+/// picker. MPV still performs the authoritative media validation at launch.
+pub fn is_supported_image_path(path: &Path) -> bool {
+    extension_matches(path, &IMAGE_EXTENSIONS)
+}
+
+pub fn is_supported_video_path(path: &Path) -> bool {
+    extension_matches(path, &VIDEO_EXTENSIONS)
 }
 
 #[derive(Clone)]
@@ -181,6 +190,16 @@ pub fn pick_video_file(owner: Option<isize>) -> Option<PathBuf> {
     )
 }
 
+/// Show a combined image/video picker for the canvas wallpaper.
+#[cfg(windows)]
+pub fn pick_wallpaper_file(owner: Option<isize>) -> Option<PathBuf> {
+    pick_file_with_filter(
+        owner,
+        "Wallpaper (*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.mp4;*.mkv;*.webm;*.avi;*.mov;*.m4v;*.wmv;*.flv;*.mpeg;*.mpg;*.ts;*.m2ts;*.3gp;*.ogv)\0*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.mp4;*.mkv;*.webm;*.avi;*.mov;*.m4v;*.wmv;*.flv;*.mpeg;*.mpg;*.ts;*.m2ts;*.3gp;*.ogv\0Images (*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp)\0*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp\0Videos (*.mp4;*.mkv;*.webm;*.avi;*.mov;*.m4v;*.wmv;*.flv;*.mpeg;*.mpg;*.ts;*.m2ts;*.3gp;*.ogv)\0*.mp4;*.mkv;*.webm;*.avi;*.mov;*.m4v;*.wmv;*.flv;*.mpeg;*.mpg;*.ts;*.m2ts;*.3gp;*.ogv\0All files (*.*)\0*.*\0\0",
+        "Set Wallpaper",
+    )
+}
+
 #[cfg(not(windows))]
 pub fn pick_file(_owner: Option<isize>) -> Option<PathBuf> {
     None
@@ -191,9 +210,14 @@ pub fn pick_video_file(_owner: Option<isize>) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(windows))]
+pub fn pick_wallpaper_file(owner: Option<isize>) -> Option<PathBuf> {
+    pick_file(owner)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_supported_video_path, load};
+    use super::{is_supported_image_path, is_supported_video_path, load};
     use image::codecs::gif::{GifEncoder, Repeat};
     use image::{Delay, Frame, Rgba, RgbaImage};
     use std::fs::{self, File};
@@ -205,7 +229,9 @@ mod tests {
         assert!(is_supported_video_path(std::path::Path::new(
             "recording.mkv"
         )));
+        assert!(is_supported_image_path(std::path::Path::new("poster.PNG")));
         assert!(!is_supported_video_path(std::path::Path::new("poster.png")));
+        assert!(!is_supported_image_path(std::path::Path::new("clip.mp4")));
         assert!(!is_supported_video_path(std::path::Path::new(
             "extensionless"
         )));

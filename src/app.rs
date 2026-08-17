@@ -2,7 +2,10 @@
 use crate::browser::{
     self, normalize_url, scrub_url_for_storage, BrowserManager, ExtensionPreparationStatus,
 };
-use crate::canvas::{BrowserAction, CanvasState, PlaylistAction, TileActivityAction, VideoAction};
+use crate::canvas::{
+    BrowserAction, CanvasState, CanvasWallpaper, PlaylistAction, TileActivityAction, VideoAction,
+    WallpaperSource, WALLPAPER_VIDEO_ID,
+};
 use crate::capture::CaptureCoordinator;
 use crate::external_tools::{self, ExternalTools, ToolKind, ToolStatus};
 #[cfg(windows)]
@@ -10,7 +13,7 @@ use crate::libmpv::{SeekPreviewManager, VideoManager, VideoSnapshot};
 use crate::media;
 use crate::overlay::RegionSelector;
 use crate::persistence::{
-    AppConfig, CanvasLayout, SavedLayout, Storage, WindowLayout, WorkspaceIndex,
+    AppConfig, CanvasLayout, SavedLayout, Storage, WallpaperLayout, WindowLayout, WorkspaceIndex,
 };
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout, ThumbnailState};
 use crate::preview::{
@@ -130,6 +133,7 @@ fn video_launch_for_source(
         mpv_path,
         source,
         start_paused,
+        wallpaper: false,
     }))
 }
 
@@ -310,6 +314,18 @@ fn restored_video_ready(
         && tile_rect
             .zip(viewport)
             .is_some_and(|(tile, viewport)| tile.intersects(viewport))
+}
+
+fn video_session_is_stale(
+    id: PreviewId,
+    wallpaper_video_active: bool,
+    preview_is_video: bool,
+) -> bool {
+    if id == WALLPAPER_VIDEO_ID {
+        !wallpaper_video_active
+    } else {
+        !preview_is_video
+    }
 }
 
 #[cfg(windows)]
@@ -754,7 +770,7 @@ impl PluriviewApp {
             playlist,
             title,
             position + Vec2::new(664.0, 0.0),
-            Vec2::new(340.0, 360.0),
+            Vec2::new(380.0, 360.0),
             group,
             Some(video_id),
         );
@@ -1043,6 +1059,16 @@ impl PluriviewApp {
 
         let mut auto_advance = Vec::new();
         for id in changed {
+            if id == WALLPAPER_VIDEO_ID {
+                if let Some(error) = errors.remove(&id) {
+                    log::error!("Wallpaper video failed: {error}");
+                    if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
+                        wallpaper.error = Some(error.clone());
+                    }
+                    self.media_error = Some(error);
+                }
+                continue;
+            }
             let Some(state) = self
                 .video_manager
                 .get(id)
@@ -1093,6 +1119,16 @@ impl PluriviewApp {
         }
 
         for id in exited {
+            if id == WALLPAPER_VIDEO_ID {
+                if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
+                    wallpaper.video_renderer = None;
+                    if wallpaper.error.is_none() {
+                        wallpaper.error = Some("The wallpaper video stopped".to_owned());
+                    }
+                }
+                self.video_manager.remove(id);
+                continue;
+            }
             self.capture_coordinator.stop_capture(id);
             self.video_manager.remove(id);
             self.restored_paused_videos.remove(&id);
@@ -1809,13 +1845,20 @@ impl PluriviewApp {
     /// Drop video hosts only after their capture sessions have been stopped.
     #[cfg(windows)]
     fn prune_video_tiles(&mut self) {
+        let wallpaper_video_active = self
+            .canvas
+            .wallpaper
+            .as_ref()
+            .is_some_and(|wallpaper| matches!(wallpaper.source, WallpaperSource::Video { .. }));
         let stale: Vec<_> = self
             .video_manager
             .ids()
             .filter(|id| {
-                self.preview_manager
+                let preview_is_video = self
+                    .preview_manager
                     .get(*id)
-                    .is_none_or(|preview| !preview.is_video())
+                    .is_some_and(|preview| preview.is_video());
+                video_session_is_stale(*id, wallpaper_video_active, preview_is_video)
             })
             .collect();
         for id in stale {
@@ -2084,6 +2127,155 @@ impl PluriviewApp {
             position,
             size,
         ))
+    }
+
+    fn pick_wallpaper(&mut self) {
+        let Some(path) = media::pick_wallpaper_file(self.main_hwnd) else {
+            return;
+        };
+        if let Err(error) = self.set_wallpaper_from_path(path) {
+            log::error!("Failed to set wallpaper: {error}");
+            self.media_error = Some(error);
+        }
+    }
+
+    fn clear_wallpaper(&mut self) {
+        #[cfg(windows)]
+        if self.video_manager.contains(WALLPAPER_VIDEO_ID) {
+            self.video_manager.remove(WALLPAPER_VIDEO_ID);
+        }
+        self.canvas.wallpaper = None;
+    }
+
+    fn set_wallpaper_from_path(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        if media::is_supported_video_path(&path) {
+            #[cfg(windows)]
+            self.required_tool_paths("Setting a video wallpaper", &[ToolKind::Mpv])?;
+            self.set_video_wallpaper(path)
+        } else if media::is_supported_image_path(&path) {
+            self.set_image_wallpaper(&path)
+        } else {
+            Err(format!("Unsupported wallpaper file: {}", path.display()))
+        }
+    }
+
+    fn set_image_wallpaper(&mut self, source: &std::path::Path) -> Result<(), String> {
+        let asset = media::load(source)?;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "Pluriview storage is unavailable".to_owned())?;
+        let managed_path = storage
+            .import_media(source)
+            .map_err(|error| format!("Could not copy wallpaper into managed storage: {error}"))?;
+        self.clear_wallpaper();
+        self.canvas.wallpaper = Some(CanvasWallpaper::from_image(managed_path, asset.frames));
+        Ok(())
+    }
+
+    fn restore_image_wallpaper(&mut self, managed_path: &str) -> Result<(), String> {
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "Pluriview storage is unavailable".to_owned())?;
+        let path = storage
+            .resolve_media(managed_path)
+            .ok_or_else(|| "Saved wallpaper path is invalid".to_owned())?;
+        if !path.is_file() {
+            return Err(format!("Saved wallpaper is missing: {}", path.display()));
+        }
+        let asset = media::load(&path)?;
+        self.clear_wallpaper();
+        self.canvas.wallpaper = Some(CanvasWallpaper::from_image(
+            managed_path.to_owned(),
+            asset.frames,
+        ));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn set_video_wallpaper(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        if !path.is_file() {
+            return Err(format!("Video file does not exist: {}", path.display()));
+        }
+        self.clear_wallpaper();
+        self.canvas.wallpaper = Some(CanvasWallpaper::from_video(path));
+        match self.ensure_wallpaper_video() {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
+                    wallpaper.error = Some(error.clone());
+                }
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn set_video_wallpaper(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        Err(format!(
+            "Video wallpaper requires Windows and MPV: {}",
+            path.display()
+        ))
+    }
+
+    fn restore_wallpaper(&mut self, layout: WallpaperLayout) -> Result<(), String> {
+        match layout {
+            WallpaperLayout::Image { path } => self.restore_image_wallpaper(&path),
+            WallpaperLayout::Video { path } => self.set_video_wallpaper(path),
+        }
+    }
+
+    /// Attach libmpv to the current video wallpaper when the file and tools
+    /// are ready. Returns false when mpv is still being discovered.
+    #[cfg(windows)]
+    fn ensure_wallpaper_video(&mut self) -> Result<bool, String> {
+        let path = match self.canvas.wallpaper.as_ref() {
+            Some(wallpaper) if wallpaper.video_renderer.is_none() => match &wallpaper.source {
+                WallpaperSource::Video { path } => path.clone(),
+                WallpaperSource::Image { .. } => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        if let Some(tile) = self.video_manager.get(WALLPAPER_VIDEO_ID) {
+            let renderer = tile.session.renderer();
+            if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
+                wallpaper.video_renderer = Some(renderer);
+            }
+            return Ok(true);
+        }
+        if self
+            .canvas
+            .wallpaper
+            .as_ref()
+            .is_some_and(|wallpaper| wallpaper.error.is_some())
+        {
+            return Ok(false);
+        }
+        let source = VideoSource::LocalFile { path };
+        let Some(mut launch) = video_launch_for_source(
+            &source,
+            self.external_tools.status(ToolKind::Mpv),
+            self.external_tools.status(ToolKind::Streamlink),
+            false,
+        )?
+        else {
+            return Ok(false);
+        };
+        launch.wallpaper = true;
+        let renderer =
+            self.video_manager
+                .launch(WALLPAPER_VIDEO_ID, launch, FpsPreset::Medium.as_u32())?;
+        if let Some(tile) = self.video_manager.get_mut(WALLPAPER_VIDEO_ID) {
+            let _ = tile.session.set_looping(true);
+            let _ = tile.session.set_muted(true);
+            let _ = tile.session.set_fill_frame(true);
+        }
+        if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
+            wallpaper.video_renderer = Some(renderer);
+            wallpaper.error = None;
+        }
+        Ok(true)
     }
 
     /// Open files dropped anywhere over the app and place them where the
@@ -3045,6 +3237,14 @@ impl PluriviewApp {
                 {
                     ui.close_menu();
                 }
+                if ui.button("Set Wallpaper...").clicked() {
+                    self.canvas.pending_wallpaper_pick = true;
+                    ui.close_menu();
+                }
+                if self.canvas.wallpaper.is_some() && ui.button("Clear Wallpaper").clicked() {
+                    self.canvas.pending_wallpaper_clear = true;
+                    ui.close_menu();
+                }
                 ui.separator();
                 if ui.button("Reset View").clicked() {
                     self.canvas.reset();
@@ -3863,6 +4063,11 @@ impl PluriviewApp {
             pan: (self.canvas.pan.x, self.canvas.pan.y),
             zoom: self.canvas.zoom,
             show_grid: self.canvas.show_grid,
+            wallpaper: self
+                .canvas
+                .wallpaper
+                .as_ref()
+                .map(CanvasWallpaper::to_layout),
         };
 
         // Save all previews
@@ -3903,6 +4108,7 @@ impl PluriviewApp {
 
     /// Apply a SavedLayout to restore state
     fn apply_layout(&mut self, layout: &SavedLayout) {
+        self.clear_wallpaper();
         // Clear existing state
         self.capture_coordinator.stop_all();
         #[cfg(windows)]
@@ -3941,6 +4147,12 @@ impl PluriviewApp {
         self.canvas.pan = Vec2::new(layout.canvas.pan.0, layout.canvas.pan.1);
         self.canvas.zoom = layout.canvas.zoom;
         self.canvas.show_grid = layout.canvas.show_grid;
+        if let Some(wallpaper) = layout.canvas.wallpaper.clone() {
+            if let Err(error) = self.restore_wallpaper(wallpaper) {
+                log::error!("Failed to restore wallpaper: {error}");
+                self.media_error = Some(error);
+            }
+        }
         self.picker_open = layout.picker_open;
         // The window is not moved from here — main.rs opens it at the saved
         // geometry, and reloading a layout mid-session should not move the
@@ -4145,8 +4357,8 @@ impl PluriviewApp {
 mod tests {
     use super::{
         preview_playback_state, preview_video_status, restored_browser_ready, restored_video_ready,
-        resumable_video_position, video_launch_for_source, FpsPreset, PendingBrowserTile,
-        PendingVideoTile, VideoSource, VideoTileStatus,
+        resumable_video_position, video_launch_for_source, video_session_is_stale, FpsPreset,
+        PendingBrowserTile, PendingVideoTile, VideoSource, VideoTileStatus, WALLPAPER_VIDEO_ID,
     };
     use crate::external_tools::{DiscoverySource, ToolStatus};
     use crate::preview::VideoPlaybackState;
@@ -4233,6 +4445,22 @@ mod tests {
             },
             Some(visible),
             Some(viewport),
+        ));
+    }
+
+    #[test]
+    fn active_wallpaper_video_session_is_not_pruned_as_an_orphan_tile() {
+        assert!(!video_session_is_stale(WALLPAPER_VIDEO_ID, true, false));
+        assert!(video_session_is_stale(WALLPAPER_VIDEO_ID, false, false));
+        assert!(!video_session_is_stale(
+            crate::preview::PreviewId(7),
+            false,
+            true
+        ));
+        assert!(video_session_is_stale(
+            crate::preview::PreviewId(7),
+            true,
+            false
         ));
     }
 
@@ -4435,6 +4663,14 @@ impl eframe::App for PluriviewApp {
         self.poll_video_freezes(ctx);
         #[cfg(windows)]
         self.poll_video_manager(ctx);
+        #[cfg(windows)]
+        if let Err(error) = self.ensure_wallpaper_video() {
+            log::error!("Could not start wallpaper video: {error}");
+            if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
+                wallpaper.error = Some(error.clone());
+            }
+            self.media_error = Some(error);
+        }
         #[cfg(windows)]
         self.poll_seek_previews(ctx);
 
@@ -4674,6 +4910,16 @@ impl eframe::App for PluriviewApp {
                     self.media_error = Some(error);
                 }
             }
+        }
+
+        if self.canvas.pending_wallpaper_pick {
+            self.canvas.pending_wallpaper_pick = false;
+            self.pick_wallpaper();
+            ctx.request_repaint();
+        }
+        if self.canvas.pending_wallpaper_clear {
+            self.canvas.pending_wallpaper_clear = false;
+            self.clear_wallpaper();
         }
 
         #[cfg(windows)]

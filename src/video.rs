@@ -158,6 +158,8 @@ pub struct VideoLaunch {
     pub mpv_path: PathBuf,
     pub source: VideoSource,
     pub start_paused: bool,
+    /// Loop muted, fill the paint rectangle, and disable audio output.
+    pub wallpaper: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -597,6 +599,7 @@ impl VideoManager {
                 mpv_path,
                 source: VideoSource::LocalFile(media_path),
                 start_paused,
+                wallpaper: false,
             },
         )
     }
@@ -625,6 +628,7 @@ impl VideoManager {
                     streamlink_path,
                 },
                 start_paused,
+                wallpaper: false,
             },
         )
     }

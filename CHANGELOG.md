@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added drag-and-drop video folders, creating a linked libmpv player and a
   resizable canvas playlist with lazy thumbnails, natural filename sorting,
   previous/next, autoplay, shuffle, repeat, scrolling, and workspace restore.
+  The playlist keeps a designed header, transport bar, and row layout while
+  the canvas zooms, so labels and controls stay in proportion. Edge handles
+  change only width or only height, so the list can grow as a column or a
+  row without empty leftover space.
+- Added a screen-space live wallpaper for images, GIFs, and looping muted
+  videos. The wallpaper fills the window and does not pan or zoom with the
+  canvas, and it is saved with each workspace.
 
 ### Added
 - Local video files can be dropped onto the canvas and start in MPV immediately
