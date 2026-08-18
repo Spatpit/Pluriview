@@ -100,11 +100,52 @@ try {
 
     $libmpvHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distLibmpv).Hash
 
+    $metadataJson = & cargo metadata --locked --no-deps --format-version 1
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo metadata failed with exit code $LASTEXITCODE."
+    }
+    $metadata = $metadataJson | ConvertFrom-Json
+    $releaseVersion = ($metadata.packages | Where-Object { $_.name -eq "pluriview" } | Select-Object -First 1).version
+    if ([string]::IsNullOrWhiteSpace($releaseVersion)) {
+        throw "Could not determine the Pluriview package version."
+    }
+
+    $fullArchive = Join-Path $distDirectory "Pluriview-v$releaseVersion-windows-x64-full.zip"
+    $liteArchive = Join-Path $distDirectory "Pluriview-v$releaseVersion-windows-x64-lite.zip"
+    $checksumManifest = Join-Path $distDirectory "SHA256SUMS.txt"
+    $licensePath = Join-Path $workspace "LICENSE"
+    $noticesPath = Join-Path $workspace "THIRD_PARTY_NOTICES.md"
+
+    foreach ($path in @($fullArchive, $liteArchive, $checksumManifest)) {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Force
+        }
+    }
+
+    Compress-Archive -LiteralPath @(
+        $distExecutable,
+        $distLibmpv,
+        $licensePath,
+        $noticesPath
+    ) -DestinationPath $fullArchive -CompressionLevel Optimal
+    Compress-Archive -LiteralPath $distExecutable -DestinationPath $liteArchive -CompressionLevel Optimal
+
+    $publishedAssets = @($fullArchive, $liteArchive)
+    $checksumLines = foreach ($asset in $publishedAssets) {
+        $assetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
+        "$assetHash  $(Split-Path -Leaf $asset)"
+    }
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllLines($checksumManifest, [string[]]$checksumLines, $utf8NoBom)
+
     Write-Host "Privacy-safe release executable: $executable"
     Write-Host "Persistent release executable: $distExecutable"
     Write-Host "Executable SHA-256: $hash"
     Write-Host "libmpv SHA-256: $libmpvHash"
-    Write-Warning "Publish pluriview.exe together with libmpv-2.dll. Do not publish pluriview.pdb; debug symbols can contain local source paths."
+    Write-Host "Full release: $fullArchive"
+    Write-Host "Lite release: $liteArchive"
+    Write-Host "Checksums: $checksumManifest"
+    Write-Warning "Publish the two versioned zip archives and SHA256SUMS.txt. Do not publish pluriview.pdb; debug symbols can contain local source paths."
 } finally {
     if ($null -eq $previousRustFlags) {
         Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue

@@ -27,6 +27,7 @@ The pinned Windows runtime is extracted from the shinchiro mpv-dev archive:
 - mpv git: `304426c`
 - Asset: [`mpv-dev-x86_64-v3-20260610-git-304426c.7z`](https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-x86_64-v3-20260610-git-304426c.7z)
 - Archive SHA-256: `D4B3D6DF9FDB33D5591C4ECE7D0CC24D2F7822B298F6A1528595E0CCFF7424A6`
+- Extracted `libmpv-2.dll` SHA-256: `ADE5CAC46CFC397A3D5CD356A968CDA7ACF0DEBFFB705A16509DAFDF93029F5E`
 - Prepare script: `scripts/prepare-libmpv.ps1`
 
 mpv is copyright the mpv-player contributors. The mpv project is GPLv2+ by

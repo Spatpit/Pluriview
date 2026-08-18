@@ -1218,12 +1218,10 @@ impl PluriviewApp {
                 }
             }
         }
-        if let Err(error) = self.seek_preview_manager.request(
-            id,
-            thumbnail_source,
-            requested_time,
-            duration,
-        ) {
+        if let Err(error) =
+            self.seek_preview_manager
+                .request(id, thumbnail_source, requested_time, duration)
+        {
             log::debug!("Timeline preview could not start: {error}");
         }
     }
@@ -2305,10 +2303,7 @@ impl PluriviewApp {
     #[cfg(windows)]
     fn sync_wallpaper_under_tile_focus(&mut self) {
         let covered = self.canvas.is_focusing_tile();
-        if let Err(error) = self
-            .video_manager
-            .set_paused(WALLPAPER_VIDEO_ID, covered)
-        {
+        if let Err(error) = self.video_manager.set_paused(WALLPAPER_VIDEO_ID, covered) {
             log::warn!("Could not pause wallpaper under a focused tile: {error}");
         }
     }

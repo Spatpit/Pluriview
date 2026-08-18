@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Video playback no longer launches `mpv.exe`. Settings only configures Streamlink, which is required only for stream URLs
 - Browser tiles capture at 2× the tile size (still capped at 4K). Window captures still see the native HWND, then downscale in the worker so 4K frames are not stored
 - Video wallpaper pauses while a tile is in focus mode, then resumes when focus is cleared
-- Full GitHub releases include `libmpv-2.dll` beside the exe; a Lite zip is exe-only
+- Full GitHub releases include `libmpv-2.dll`, the license, and third-party notices beside the exe; a Lite zip is exe-only, and both downloads have published SHA-256 checksums
 
 ### Fixed
 - Play/pause and volume follow the control immediately instead of lagging or reversing

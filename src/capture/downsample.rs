@@ -134,7 +134,8 @@ mod tests {
 
     #[test]
     fn crop_inflates_the_full_frame_target() {
-        let (width, height) = window_capture_target(400.0, 225.0, 1.0, Some((0.25, 0.25, 0.75, 0.75)));
+        let (width, height) =
+            window_capture_target(400.0, 225.0, 1.0, Some((0.25, 0.25, 0.75, 0.75)));
         assert!(width >= 1600);
         assert!(height >= 896);
     }
@@ -169,7 +170,9 @@ mod tests {
 
     #[test]
     fn averages_a_solid_color() {
-        let src = vec![200, 10, 20, 255, 200, 10, 20, 255, 200, 10, 20, 255, 200, 10, 20, 255];
+        let src = vec![
+            200, 10, 20, 255, 200, 10, 20, 255, 200, 10, 20, 255, 200, 10, 20, 255,
+        ];
         let dst = downsample_rgba(&src, 2, 2, 8, 1, 1).unwrap();
         assert_eq!(dst, vec![200, 10, 20, 255]);
     }

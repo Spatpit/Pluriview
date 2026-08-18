@@ -115,7 +115,7 @@ Get the latest release from [Releases](https://github.com/Spatpit/Pluriview/rele
 
 | Zip | Contains | Use when |
 |-----|----------|----------|
-| **Full** (recommended) | `pluriview.exe` + `libmpv-2.dll` | You want video tiles, playlists, or video wallpaper |
+| **Full** (recommended) | `pluriview.exe` + `libmpv-2.dll` + license/notices | You want video tiles, playlists, or video wallpaper |
 | **Lite** | `pluriview.exe` only | You only need windows, browsers, and images |
 
 Keep `libmpv-2.dll` in the **same folder** as `pluriview.exe`. You can add the
@@ -133,9 +133,10 @@ cd Pluriview
 .\scripts\build-release.ps1
 ```
 
-`dist` will contain the privacy-safe executable and `libmpv-2.dll`. Keep both
-together. Do not distribute `pluriview.pdb`; debug symbols can contain local
-paths.
+`dist` will contain the privacy-safe executable, `libmpv-2.dll`, versioned Full
+and Lite zip archives, and `SHA256SUMS.txt`. Keep the DLL beside the executable
+when using the Full build. Do not distribute `pluriview.pdb`; debug symbols can
+contain local paths.
 
 ## Usage
 
