@@ -2302,6 +2302,19 @@ impl PluriviewApp {
         Ok(true)
     }
 
+    /// Video wallpaper keeps decoding while focused tiles cover it. Pause the
+    /// player (and skip painting) until tile focus is cleared.
+    #[cfg(windows)]
+    fn sync_wallpaper_under_tile_focus(&mut self) {
+        let covered = self.canvas.is_focusing_tile();
+        if let Err(error) = self
+            .video_manager
+            .set_paused(WALLPAPER_VIDEO_ID, covered)
+        {
+            log::warn!("Could not pause wallpaper under a focused tile: {error}");
+        }
+    }
+
     /// Open files dropped anywhere over the app and place them where the
     /// pointer meets the canvas. Images use managed storage; videos launch as
     /// MPV-backed tiles. Multiple files fan out so each remains selectable.
@@ -4840,6 +4853,9 @@ impl eframe::App for PluriviewApp {
                     !self.canvas_only,
                 );
             });
+
+        #[cfg(windows)]
+        self.sync_wallpaper_under_tile_focus();
 
         self.file_drop_overlay(ctx);
         self.import_dropped_files(ctx);

@@ -7,6 +7,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use super::downsample::{downsample_rgba, fitted_capture_size};
+
 /// Frame data sent from capture threads
 struct CapturedFrame {
     pub width: u32,
@@ -29,6 +31,11 @@ struct CaptureSession {
     /// Target FPS, shared with the capture thread so changes apply live
     /// without restarting the capture session.
     target_fps: Arc<AtomicU32>,
+
+    /// Max output size in pixels. The worker fits the source inside this box
+    /// without upscaling. Zero means native source size.
+    target_width: Arc<AtomicU32>,
+    target_height: Arc<AtomicU32>,
 
     /// Is capture active?
     active: Arc<AtomicBool>,
@@ -72,10 +79,14 @@ impl CaptureCoordinator {
         let active = Arc::new(AtomicBool::new(true));
         let paused = Arc::new(AtomicBool::new(false));
         let fps = Arc::new(AtomicU32::new(target_fps.max(1)));
+        let target_width = Arc::new(AtomicU32::new(0));
+        let target_height = Arc::new(AtomicU32::new(0));
         let latest_frame = Arc::new(Mutex::new(None));
         let active_clone = active.clone();
         let paused_clone = paused.clone();
         let fps_clone = fps.clone();
+        let target_width_clone = target_width.clone();
+        let target_height_clone = target_height.clone();
         let worker_frame = latest_frame.clone();
         let (stop_sender, stop_receiver) = mpsc::channel();
 
@@ -86,6 +97,8 @@ impl CaptureCoordinator {
                 hwnd,
                 window_title,
                 fps_clone,
+                target_width_clone,
+                target_height_clone,
                 active_clone,
                 paused_clone,
                 worker_frame,
@@ -95,6 +108,8 @@ impl CaptureCoordinator {
 
         let session = CaptureSession {
             target_fps: fps,
+            target_width,
+            target_height,
             active,
             paused,
             latest_frame,
@@ -145,6 +160,15 @@ impl CaptureCoordinator {
     pub fn set_target_fps(&mut self, preview_id: PreviewId, fps: u32) {
         if let Some(session) = self.sessions.get_mut(&preview_id) {
             session.target_fps.store(fps.max(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Live output cap for this session. The worker downscales into this box
+    /// on the next frame; it never upscales a smaller source.
+    pub fn set_target_size(&mut self, preview_id: PreviewId, width: u32, height: u32) {
+        if let Some(session) = self.sessions.get_mut(&preview_id) {
+            session.target_width.store(width, Ordering::Relaxed);
+            session.target_height.store(height, Ordering::Relaxed);
         }
     }
 
@@ -250,6 +274,8 @@ fn capture_window_loop(
     hwnd: isize,
     window_title: String,
     target_fps: Arc<AtomicU32>,
+    target_width: Arc<AtomicU32>,
+    target_height: Arc<AtomicU32>,
     active: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
@@ -272,6 +298,8 @@ fn capture_window_loop(
         active: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
+        target_width: Arc<AtomicU32>,
+        target_height: Arc<AtomicU32>,
     }
 
     struct Capture {
@@ -280,6 +308,8 @@ fn capture_window_loop(
         active: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
+        target_width: Arc<AtomicU32>,
+        target_height: Arc<AtomicU32>,
         last_frame: std::time::Instant,
     }
 
@@ -294,6 +324,8 @@ fn capture_window_loop(
                 active: ctx.flags.active,
                 paused: ctx.flags.paused,
                 fps: ctx.flags.fps,
+                target_width: ctx.flags.target_width,
+                target_height: ctx.flags.target_height,
                 last_frame: std::time::Instant::now(),
             })
         }
@@ -327,15 +359,31 @@ fn capture_window_loop(
             let mut buffer = frame.buffer()?;
             let width = buffer.width();
             let height = buffer.height();
-
-            // Copy frame data without row padding
-            let data = buffer.as_nopadding_buffer()?.to_vec();
-
-            // Send frame to main thread
-            let captured_frame = CapturedFrame {
+            let (out_width, out_height) = fitted_capture_size(
                 width,
                 height,
-                data,
+                self.target_width.load(Ordering::Relaxed),
+                self.target_height.load(Ordering::Relaxed),
+            );
+
+            let captured_frame = if out_width == width && out_height == height {
+                CapturedFrame {
+                    width,
+                    height,
+                    data: buffer.as_nopadding_buffer()?.to_vec(),
+                }
+            } else {
+                let stride = buffer.row_pitch();
+                let raw = buffer.as_raw_buffer();
+                let Some(data) = downsample_rgba(raw, width, height, stride, out_width, out_height)
+                else {
+                    return Err("Could not downscale the captured frame".into());
+                };
+                CapturedFrame {
+                    width: out_width,
+                    height: out_height,
+                    data,
+                }
             };
             *self.latest_frame.lock() = Some(captured_frame);
 
@@ -367,6 +415,8 @@ fn capture_window_loop(
         active: active.clone(),
         paused,
         fps: target_fps,
+        target_width,
+        target_height,
     };
 
     let settings = Settings::new(
@@ -415,6 +465,8 @@ mod tests {
         let (stop_sender, _stop_receiver) = mpsc::channel();
         CaptureSession {
             target_fps: Arc::new(AtomicU32::new(fps)),
+            target_width: Arc::new(AtomicU32::new(0)),
+            target_height: Arc::new(AtomicU32::new(0)),
             active: Arc::new(AtomicBool::new(active)),
             paused: Arc::new(AtomicBool::new(paused)),
             latest_frame: Arc::new(Mutex::new(None)),
@@ -508,6 +560,8 @@ mod tests {
             preview_id,
             CaptureSession {
                 target_fps: Arc::new(AtomicU32::new(30)),
+                target_width: Arc::new(AtomicU32::new(0)),
+                target_height: Arc::new(AtomicU32::new(0)),
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
@@ -532,6 +586,8 @@ mod tests {
             preview_id,
             CaptureSession {
                 target_fps: Arc::new(AtomicU32::new(30)),
+                target_width: Arc::new(AtomicU32::new(0)),
+                target_height: Arc::new(AtomicU32::new(0)),
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),

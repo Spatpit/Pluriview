@@ -1,6 +1,6 @@
 use super::animation::{AnimationState, DragTracker};
 use super::wallpaper::CanvasWallpaper;
-use crate::capture::CaptureCoordinator;
+use crate::capture::{window_capture_target, CaptureCoordinator};
 use crate::preview::{
     compact_title, BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager,
     RemovedPreviewInfo, VideoPlaybackState, VideoTileStatus,
@@ -52,9 +52,9 @@ pub enum DragState {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_resize, format_time, playlist_first_row_center, stream_audio_badge_rect,
-        video_placeholder_content, CanvasState, DragState, PlaylistAction, ResizeHandle,
-        TileActivityAction, VideoAction,
+        apply_resize, capture_resolution_badge_rect, format_time, playlist_first_row_center,
+        stream_audio_badge_rect, video_placeholder_content, CanvasState, DragState, PlaylistAction,
+        ResizeHandle, TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -97,6 +97,27 @@ mod tests {
         let sa = stream_audio_badge_rect(tile, true, true);
         assert!(sa.right() <= fps.left() + 0.1);
         assert!(sa.left() > tile.left());
+    }
+
+    #[test]
+    fn capture_resolution_sits_left_of_fps_when_hovered() {
+        let tile = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 360.0));
+        let fps = Rect::from_min_size(
+            tile.right_top() + Vec2::new(-72.0, 10.0),
+            Vec2::new(36.0, 20.0),
+        );
+        let resolution = capture_resolution_badge_rect(fps);
+        assert!(resolution.right() <= fps.left() + 0.1);
+        assert!(resolution.left() > tile.left());
+    }
+
+    #[test]
+    fn capture_resolution_sits_left_of_stream_audio_when_both_are_shown() {
+        let tile = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 360.0));
+        let sa = stream_audio_badge_rect(tile, true, true);
+        let resolution = capture_resolution_badge_rect(sa);
+        assert!(resolution.right() <= sa.left() + 0.1);
+        assert!(resolution.left() > tile.left());
     }
 
     #[test]
@@ -673,8 +694,10 @@ mod tests {
         assert_eq!(canvas.selection, vec![PreviewId(2)]);
         assert!(!canvas.animation.momentum_active);
         assert_eq!(canvas.animation.momentum_velocity, Vec2::ZERO);
+        assert!(canvas.is_focusing_tile());
 
         assert!(canvas.exit_focus());
+        assert!(!canvas.is_focusing_tile());
         assert_eq!(canvas.pan, Vec2::new(21.0, -8.0));
         assert_eq!(canvas.zoom, 0.75);
         assert_eq!(canvas.selection, vec![PreviewId(9)]);
@@ -869,6 +892,7 @@ struct TileInfo {
     video_playback: VideoPlaybackState,
     supports_seek_preview: bool,
     manually_frozen: bool,
+    frame_size: Option<(u32, u32)>,
 }
 
 impl TileInfo {
@@ -896,6 +920,7 @@ impl TileInfo {
             video_playback: preview.video_playback.clone(),
             supports_seek_preview: preview.supports_seek_preview(),
             manually_frozen: preview.manually_frozen,
+            frame_size: preview.frame_size,
         }
     }
 
@@ -922,6 +947,7 @@ impl TileInfo {
         self.video_playback.clone_from(&preview.video_playback);
         self.supports_seek_preview = preview.supports_seek_preview();
         self.manually_frozen = preview.manually_frozen;
+        self.frame_size = preview.frame_size;
     }
 }
 
@@ -1014,6 +1040,20 @@ fn paint_truncated_text(
     job.wrap.overflow_character = Some('…');
     let galley = painter.layout_job(job);
     painter.galley(anchor.anchor_size(pos, galley.size()).min, galley, color);
+}
+
+/// Hover capture-resolution pill sits 4px left of FPS, or of the SA badge
+/// when that is shown beside FPS.
+const CAPTURE_RESOLUTION_BADGE_WIDTH: f32 = 70.0;
+
+fn capture_resolution_badge_rect(left_of: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            left_of.left() - 4.0 - CAPTURE_RESOLUTION_BADGE_WIDTH,
+            left_of.top(),
+        ),
+        Vec2::new(CAPTURE_RESOLUTION_BADGE_WIDTH, left_of.height()),
+    )
 }
 
 /// Hover FPS pill sits at x=-72 with width 36; SA is 4px to its left.
@@ -1484,6 +1524,10 @@ impl CanvasState {
         self.animation.momentum_velocity = Vec2::ZERO;
     }
 
+    pub fn is_focusing_tile(&self) -> bool {
+        self.focus.is_some()
+    }
+
     /// Restore the canvas view saved before tile focus.
     pub fn exit_focus(&mut self) -> bool {
         let Some(focus) = self.focus.take() else {
@@ -1661,8 +1705,10 @@ impl CanvasState {
         // Draw background - Minimal Void theme (#0d0d0d)
         painter.rect_filled(canvas_rect, 0.0, Color32::from_rgb(13, 13, 13));
 
-        if let Some(wallpaper) = self.wallpaper.as_mut() {
-            wallpaper.paint(&painter, canvas_rect, ctx);
+        if self.focus.is_none() {
+            if let Some(wallpaper) = self.wallpaper.as_mut() {
+                wallpaper.paint(&painter, canvas_rect, ctx);
+            }
         }
 
         // Draw grid
@@ -1723,6 +1769,7 @@ impl CanvasState {
         // Apply pending FPS changes
         self.apply_pending_fps_changes(preview_manager, capture_coordinator);
         self.apply_pending_stream_audio_toggles(preview_manager);
+        self.sync_window_capture_targets(ctx, preview_manager, capture_coordinator);
 
         // Viewport culling: pause/resume captures based on visibility
         self.update_viewport_culling(canvas_rect, preview_manager, capture_coordinator);
@@ -1741,6 +1788,27 @@ impl CanvasState {
                     preview.position = spring.current_pos();
                 }
             }
+        }
+    }
+
+    fn sync_window_capture_targets(
+        &self,
+        ctx: &egui::Context,
+        preview_manager: &PreviewManager,
+        capture_coordinator: &mut CaptureCoordinator,
+    ) {
+        let pixels_per_point = ctx.pixels_per_point();
+        for preview in preview_manager.all() {
+            if !preview.is_window_capture() || preview.manually_frozen {
+                continue;
+            }
+            let (width, height) = window_capture_target(
+                preview.size.x,
+                preview.size.y,
+                pixels_per_point,
+                preview.crop_uv,
+            );
+            capture_coordinator.set_target_size(preview.id, width, height);
         }
     }
 
@@ -2201,6 +2269,7 @@ impl CanvasState {
             let video_playback = &info.video_playback;
             let supports_seek_preview = info.supports_seek_preview;
             let manually_frozen = info.manually_frozen;
+            let frame_size = info.frame_size;
             let screen_rect = self.canvas_rect_to_screen(rect, canvas_rect);
 
             if !canvas_rect.intersects(screen_rect) {
@@ -2459,6 +2528,35 @@ impl CanvasState {
                             stream_audio,
                             true,
                         );
+                    }
+                    if is_browser || is_window_capture {
+                        if let Some((width, height)) = frame_size {
+                            let left_of = if is_window_capture {
+                                stream_audio_badge_rect(screen_rect, stream_audio, true)
+                            } else {
+                                fps_rect
+                            };
+                            let resolution_rect = capture_resolution_badge_rect(left_of);
+                            let resolution_text = format!("{width}×{height}");
+                            ui.interact(
+                                resolution_rect,
+                                ui.id().with(("capture_resolution", id.0)),
+                                Sense::hover(),
+                            )
+                            .on_hover_text("Capture resolution");
+                            painter.rect_filled(
+                                resolution_rect,
+                                10.0,
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                            );
+                            painter.text(
+                                resolution_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                resolution_text,
+                                egui::FontId::proportional(10.0),
+                                Color32::from_rgb(150, 150, 150),
+                            );
+                        }
                     }
                 }
 

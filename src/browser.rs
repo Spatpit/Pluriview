@@ -63,9 +63,10 @@ const HEIGHT: i32 = 720;
 /// WebView2 rejects zoom factors outside roughly this range.
 const MIN_ZOOM: f64 = 0.25;
 const MAX_ZOOM: f64 = 4.0;
-/// Parked browsers use a stable supersampled backing. It is deliberately
-/// independent of canvas zoom so navigation never resizes the webpage.
-const MIN_CAPTURE_WIDTH: i32 = 2560;
+/// Parked browsers use a 2× supersampled backing from the tile's physical
+/// size, not canvas zoom, so navigation never resizes the webpage. Zoom
+/// (`capture_width / WIDTH`) keeps the CSS viewport at WIDTH pixels.
+const CAPTURE_SCALE: f64 = 2.0;
 const MAX_CAPTURE_WIDTH: i32 = 3840;
 const MAX_CAPTURE_HEIGHT: i32 = 2160;
 /// Give WebView2's compositor time to apply a new viewport and zoom before
@@ -334,9 +335,12 @@ fn browser_geometry(
 pub fn capture_size_for_tile(width: i32, height: i32) -> (i32, i32) {
     let width = width.max(1) as f64;
     let height = height.max(1) as f64;
-    let upscale = (MIN_CAPTURE_WIDTH as f64 / width).max(1.0);
+    // WebView2 zoom is capture_width / WIDTH, clamped to MIN_ZOOM. Stay at or
+    // above that width so the page still layouts at WIDTH CSS pixels.
+    let min_width = WIDTH as f64 * MIN_ZOOM;
+    let desired = CAPTURE_SCALE.max(min_width / width);
     let cap = (MAX_CAPTURE_WIDTH as f64 / width).min(MAX_CAPTURE_HEIGHT as f64 / height);
-    let scale = upscale.min(cap).max(f64::MIN_POSITIVE);
+    let scale = desired.min(cap).max(f64::MIN_POSITIVE);
     (
         (width * scale).round().max(1.0) as i32,
         (height * scale).round().max(1.0) as i32,
@@ -479,9 +483,9 @@ impl BrowserHost {
         self.muted
     }
 
-    /// Match an inactive browser's capture backing to its displayed physical
-    /// size. The zoom changes with the backing width, preserving the same CSS
-    /// viewport while eliminating bitmap upscaling in the canvas preview.
+    /// Match an inactive browser's capture backing to 2× its displayed
+    /// physical size. The zoom changes with the backing width, preserving the
+    /// same CSS viewport while keeping the canvas preview reasonably sharp.
     pub fn sync_capture_size(&mut self, width: i32, height: i32) {
         if self.active || self.suspended {
             return;
@@ -1711,9 +1715,14 @@ mod tests {
 
     #[test]
     fn browser_capture_is_supersampled_without_following_canvas_zoom() {
-        assert_eq!(capture_size_for_tile(640, 360), (2560, 1440));
+        assert_eq!(capture_size_for_tile(640, 360), (1280, 720));
         assert_eq!(capture_size_for_tile(1280, 720), (2560, 1440));
         assert_eq!(capture_size_for_tile(5000, 2813), (3839, 2160));
+    }
+
+    #[test]
+    fn tiny_browser_tiles_keep_the_css_viewport_zoom_floor() {
+        assert_eq!(capture_size_for_tile(100, 56), (320, 179));
     }
 
     #[test]

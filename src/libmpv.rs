@@ -1391,6 +1391,16 @@ impl VideoManager {
         self.tiles.contains_key(&id)
     }
 
+    pub fn set_paused(&mut self, id: PreviewId, paused: bool) -> Result<(), String> {
+        let Some(tile) = self.tiles.get_mut(&id) else {
+            return Ok(());
+        };
+        if tile.session.state.pause == paused {
+            return Ok(());
+        }
+        tile.session.set_paused(paused)
+    }
+
     pub fn repaint_fps(&self) -> Option<u32> {
         self.tiles
             .values()
