@@ -182,8 +182,8 @@ unsafe impl Send for MpvApi {}
 unsafe impl Sync for MpvApi {}
 
 impl MpvApi {
-    fn load(mpv_path: &Path) -> Result<Arc<Self>, String> {
-        let path = find_libmpv(mpv_path).ok_or_else(|| {
+    fn load() -> Result<Arc<Self>, String> {
+        let path = find_libmpv().ok_or_else(|| {
             "libmpv-2.dll is missing. Reinstall Pluriview or place libmpv-2.dll beside pluriview.exe."
                 .to_owned()
         })?;
@@ -257,7 +257,12 @@ impl MpvApi {
     }
 }
 
-fn find_libmpv(mpv_path: &Path) -> Option<PathBuf> {
+/// True when `libmpv-2.dll` is beside the exe, in `vendor/`, or in the cwd.
+pub fn runtime_is_available() -> bool {
+    find_libmpv().is_some()
+}
+
+fn find_libmpv() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(executable) = std::env::current_exe() {
         if let Some(directory) = executable.parent() {
@@ -266,9 +271,6 @@ fn find_libmpv(mpv_path: &Path) -> Option<PathBuf> {
     }
     if let Ok(directory) = std::env::current_dir() {
         candidates.push(directory.join("vendor").join("libmpv-2.dll"));
-        candidates.push(directory.join("libmpv-2.dll"));
-    }
-    if let Some(directory) = mpv_path.parent() {
         candidates.push(directory.join("libmpv-2.dll"));
     }
     candidates.into_iter().find(|path| path.is_file())
@@ -1368,7 +1370,7 @@ impl VideoManager {
             return Err(format!("A video session already exists for {id:?}"));
         }
         if self.api.is_none() {
-            self.api = Some(MpvApi::load(&launch.mpv_path)?);
+            self.api = Some(MpvApi::load()?);
         }
         let renderer = VideoRenderer::new(
             self.api.as_ref().expect("libmpv was loaded").clone(),
@@ -2231,7 +2233,6 @@ impl SeekPreviewManager {
     pub fn request(
         &mut self,
         id: PreviewId,
-        mpv_path: &Path,
         source: video::VideoThumbnailSource,
         time: f64,
         duration: Option<f64>,
@@ -2251,7 +2252,7 @@ impl SeekPreviewManager {
             return Ok(());
         }
         if self.api.is_none() {
-            self.api = Some(MpvApi::load(mpv_path)?);
+            self.api = Some(MpvApi::load()?);
         }
         let api = self.api.as_ref().expect("libmpv was loaded").clone();
         self.sessions
@@ -2527,7 +2528,7 @@ mod tests {
 
     #[test]
     fn bundled_runtime_initializes_and_accepts_immediate_controls() {
-        let api = MpvApi::load(Path::new("mpv.exe")).expect("load bundled libmpv");
+        let api = MpvApi::load().expect("load bundled libmpv");
         let mut core =
             MpvCore::new(api, true, true, false).expect("initialize network-tuned libmpv");
         core.set_property("pause", "no").expect("resume");
@@ -2587,7 +2588,7 @@ mod tests {
             })
         };
 
-        let api = MpvApi::load(Path::new("mpv.exe")).expect("load bundled libmpv");
+        let api = MpvApi::load().expect("load bundled libmpv");
         let wallpaper = std::env::var_os("PLURIVIEW_TEST_WALLPAPER").is_some();
         let renderer = VideoRenderer::new(api, false, false, wallpaper).expect("create renderer");
         let launch = VideoLaunch {

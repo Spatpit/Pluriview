@@ -27,7 +27,6 @@ impl Default for AppConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ExternalToolsConfig {
-    pub mpv_path: Option<PathBuf>,
     pub streamlink_path: Option<PathBuf>,
 }
 
@@ -42,7 +41,6 @@ mod tests {
 
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         assert!(config.always_show_title_bar);
-        assert!(config.external_tools.mpv_path.is_none());
         assert!(config.external_tools.streamlink_path.is_none());
     }
 
@@ -56,10 +54,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            config.external_tools.mpv_path,
-            Some(PathBuf::from(r"C:\Tools\mpv.exe"))
-        );
         assert!(config.external_tools.streamlink_path.is_none());
         assert!(config.always_show_title_bar);
     }
@@ -67,7 +61,6 @@ mod tests {
     #[test]
     fn config_round_trip_preserves_overrides_and_version() {
         let mut config = AppConfig::default();
-        config.external_tools.mpv_path = Some(PathBuf::from(r"D:\Portable\mpv.exe"));
         config.external_tools.streamlink_path = Some(PathBuf::from(r"D:\Portable\streamlink.exe"));
         config.always_show_title_bar = false;
 
@@ -76,10 +69,6 @@ mod tests {
 
         assert_eq!(restored.version, CURRENT_CONFIG_VERSION);
         assert!(!restored.always_show_title_bar);
-        assert_eq!(
-            restored.external_tools.mpv_path,
-            config.external_tools.mpv_path
-        );
         assert_eq!(
             restored.external_tools.streamlink_path,
             config.external_tools.streamlink_path

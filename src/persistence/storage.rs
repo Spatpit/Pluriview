@@ -278,19 +278,20 @@ mod tests {
             data_dir: root.clone(),
         };
         let defaults = storage.load_config().unwrap();
-        assert!(defaults.external_tools.mpv_path.is_none());
+        assert!(defaults.external_tools.streamlink_path.is_none());
         assert!(storage.config_path().exists());
 
         let mut config = AppConfig::default();
-        config.external_tools.mpv_path = Some(std::path::PathBuf::from(r"C:\Tools\mpv.exe"));
+        config.external_tools.streamlink_path =
+            Some(std::path::PathBuf::from(r"C:\Tools\streamlink.exe"));
 
         storage.save_config(&config).unwrap();
         let restored = storage.load_config().unwrap();
 
         assert_eq!(storage.config_path(), root.join("config.json"));
         assert_eq!(
-            restored.external_tools.mpv_path,
-            config.external_tools.mpv_path
+            restored.external_tools.streamlink_path,
+            config.external_tools.streamlink_path
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -19,6 +19,10 @@ pub enum ToolKind {
 }
 
 impl ToolKind {
+    /// Tools shown in Settings. mpv.exe is no longer configurable; playback
+    /// uses bundled libmpv. mpv.exe is still discovered silently for playlist
+    /// JPEG thumbnails when it happens to be installed.
+    pub const SETTINGS: [Self; 1] = [Self::Streamlink];
     pub const ALL: [Self; 2] = [Self::Mpv, Self::Streamlink];
 
     pub fn display_name(self) -> &'static str {
@@ -121,10 +125,10 @@ pub struct ExternalTools {
 }
 
 impl ExternalTools {
-    pub fn new(mpv_override: Option<PathBuf>, streamlink_override: Option<PathBuf>) -> Self {
+    pub fn new(streamlink_override: Option<PathBuf>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let mut tools = Self {
-            mpv: ToolState::new(mpv_override),
+            mpv: ToolState::new(None),
             streamlink: ToolState::new(streamlink_override),
             sender,
             receiver,

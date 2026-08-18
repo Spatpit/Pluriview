@@ -7,34 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Added left-drag marquee selection from empty canvas, with Ctrl for additive
-  selection and group movement through the existing multi-select behavior.
-- Added Freeze Selected and Resume Selected context actions. Frozen window
-  captures stop their capture sessions, browser tiles use WebView2 suspension,
-  mpv and Streamlink tiles keep a still frame while fully unloading their player
-  and cache, and animated GIFs stop advancing. Resumed on-demand videos restore
-  their position and playback settings; live streams reconnect at the live edge.
-- Added drag-and-drop video folders, creating a linked libmpv player and a
-  resizable canvas playlist with lazy thumbnails, natural filename sorting,
-  previous/next, autoplay, shuffle, repeat, scrolling, and workspace restore.
-  The playlist keeps a designed header, transport bar, and row layout while
-  the canvas zooms, so labels and controls stay in proportion. Edge handles
-  change only width or only height, so the list can grow as a column or a
-  row without empty leftover space.
-- Added a screen-space live wallpaper for images, GIFs, and looping muted
-  videos. The wallpaper fills the window and does not pan or zoom with the
-  canvas, and it is saved with each workspace.
+## [0.6.0] - 2026-08-18
 
 ### Added
-- Local video files can be dropped onto the canvas and start in MPV immediately
-- Hovering a local or on-demand video's seek bar reuses a persistent libmpv decoder, keeps the last frame while the next one loads, prefetches nearby seconds, and skips livestreams
-- MPV and Streamlink tiles have an in-place reload action for stopped or failed playback
+- Local video tiles play in-process with bundled `libmpv-2.dll` (drop a file, play/pause, seek, volume, mute, speed, loop, tracks, reload)
+- Hovering a local or on-demand seek bar shows a frame at that time without moving the playing video
+- Drag-and-drop video folders create a linked player and a playlist tile (next/prev, shuffle, repeat, autoplay, natural filename sort, workspace restore)
+- Live wallpaper for images, GIFs, and looping muted videos; it fills the window and does not pan or zoom with the canvas
+- Freeze Selected / Resume Selected: frozen window captures stop, browsers suspend, video tiles keep a still frame after unloading the player, GIFs stop advancing
+- Stream Audio Monitor copies tile audio into the Pluriview process so Discord/OBS window shares can pick it up
+- Optional auto-hiding title bar (show it only when the pointer is at the top of the window)
+- Left-drag marquee selection from empty canvas; Ctrl adds to the current selection
+- Capture-resolution badge on hover for browser and window tiles
+
+### Changed
+- Video playback no longer launches `mpv.exe`. Settings only configures Streamlink, which is required only for stream URLs
+- Browser tiles capture at 2× the tile size (still capped at 4K). Window captures still see the native HWND, then downscale in the worker so 4K frames are not stored
+- Video wallpaper pauses while a tile is in focus mode, then resumes when focus is cleared
+- Full GitHub releases include `libmpv-2.dll` beside the exe; a Lite zip is exe-only
 
 ### Fixed
-- Play/pause and volume controls update immediately and ignore stale MPV acknowledgements instead of lagging or reversing the requested state
-- Play resumes the existing MPV process instead of recreating it, and leaves a healthy Windows capture session running so pause/play does not freeze or blank the tile
-- Seek-bar hover previews seek to the exact hovered time instead of a nearby keyframe, so the popup frame matches the timestamp
-- Stream tiles no longer use CDN query strings as their name; the menu and overlay show a short title from the original URL
+- Play/pause and volume follow the control immediately instead of lagging or reversing
+- Seek-bar hover previews match the hovered timestamp instead of a nearby keyframe
+- Stream tiles show a short title from the original URL instead of CDN query strings
 
 ## [0.5.1] - 2026-08-10
 

@@ -115,13 +115,9 @@ fn available_tool_path(
 #[cfg(windows)]
 fn video_launch_for_source(
     source: &VideoSource,
-    mpv_status: &ToolStatus,
     streamlink_status: &ToolStatus,
     start_paused: bool,
 ) -> Result<Option<VideoLaunch>, String> {
-    let Some(mpv_path) = available_tool_path(mpv_status, "mpv")? else {
-        return Ok(None);
-    };
     let source = match source {
         VideoSource::LocalFile { path } => {
             if !path.is_file() {
@@ -145,7 +141,7 @@ fn video_launch_for_source(
         }
     };
     Ok(Some(VideoLaunch {
-        mpv_path,
+        mpv_path: std::path::PathBuf::new(),
         source,
         start_paused,
         wallpaper: false,
@@ -423,7 +419,8 @@ pub struct PluriviewApp {
     /// App-global settings, kept outside workspace layouts.
     app_config: AppConfig,
 
-    /// Optional mpv/Streamlink discovery and validation state.
+    /// Optional Streamlink discovery. mpv.exe is scanned silently for playlist
+    /// thumbnails only; playback uses bundled libmpv.
     external_tools: ExternalTools,
 
     /// Show app-global Settings dialog.
@@ -546,10 +543,7 @@ impl PluriviewApp {
                 Some("Settings storage is unavailable.".to_owned()),
             ),
         };
-        let external_tools = ExternalTools::new(
-            app_config.external_tools.mpv_path.clone(),
-            app_config.external_tools.streamlink_path.clone(),
-        );
+        let external_tools = ExternalTools::new(app_config.external_tools.streamlink_path.clone());
         let (workspaces, workspace_error) = match &storage {
             Some(storage) => match storage.load_or_initialize_workspaces() {
                 Ok(index) => (index, None),
@@ -719,9 +713,20 @@ impl PluriviewApp {
     }
 
     #[cfg(windows)]
+    fn require_libmpv(action: &str) -> Result<(), String> {
+        if crate::libmpv::runtime_is_available() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{action} needs libmpv-2.dll next to pluriview.exe."
+            ))
+        }
+    }
+
+    #[cfg(windows)]
     fn add_local_video(&mut self, position: Pos2) {
-        if let Err(error) = self.required_tool_paths("Adding a video", &[ToolKind::Mpv]) {
-            self.external_tool_error = Some(error);
+        if let Err(error) = Self::require_libmpv("Adding a video") {
+            self.media_error = Some(error);
             return;
         }
         let Some(path) = media::pick_video_file(self.main_hwnd) else {
@@ -741,7 +746,7 @@ impl PluriviewApp {
         path: std::path::PathBuf,
         position: Pos2,
     ) -> Result<PreviewId, String> {
-        self.required_tool_paths("Adding a video", &[ToolKind::Mpv])?;
+        Self::require_libmpv("Adding a video")?;
         if !path.is_file() {
             return Err(format!("Video file does not exist: {}", path.display()));
         }
@@ -770,7 +775,7 @@ impl PluriviewApp {
         folder: std::path::PathBuf,
         position: Pos2,
     ) -> Result<(PreviewId, PreviewId), String> {
-        self.required_tool_paths("Adding a video folder", &[ToolKind::Mpv])?;
+        Self::require_libmpv("Adding a video folder")?;
         let playlist = FolderPlaylist::scan(folder.clone(), None)?;
         let first = playlist
             .selected
@@ -824,9 +829,11 @@ impl PluriviewApp {
 
     #[cfg(windows)]
     fn open_add_stream(&mut self, position: Pos2) {
-        let paths = match self
-            .required_tool_paths("Adding a stream", &[ToolKind::Mpv, ToolKind::Streamlink])
-        {
+        if let Err(error) = Self::require_libmpv("Adding a stream") {
+            self.media_error = Some(error);
+            return;
+        }
+        let paths = match self.required_tool_paths("Adding a stream", &[ToolKind::Streamlink]) {
             Ok(paths) => paths,
             Err(error) => {
                 self.external_tool_error = Some(error);
@@ -843,7 +850,7 @@ impl PluriviewApp {
             probe_due: None,
             probe_receiver: None,
             probing_url: String::new(),
-            streamlink_path: paths[1].clone(),
+            streamlink_path: paths[0].clone(),
             focused: false,
         });
     }
@@ -870,7 +877,6 @@ impl PluriviewApp {
             .is_some_and(|pending| pending.start_paused);
         let Some(launch) = video_launch_for_source(
             &source,
-            self.external_tools.status(ToolKind::Mpv),
             self.external_tools.status(ToolKind::Streamlink),
             start_paused,
         )?
@@ -1182,11 +1188,6 @@ impl PluriviewApp {
                 .is_some_and(|current| (current - requested_time).abs() <= 0.5);
             (source, already_showing, preview.video_playback.duration)
         };
-        let ToolStatus::Available { path: mpv_path, .. } =
-            self.external_tools.status(ToolKind::Mpv)
-        else {
-            return;
-        };
         let thumbnail_source = match source {
             VideoSource::LocalFile { path } => video::VideoThumbnailSource::LocalFile(path),
             VideoSource::Stream { url, quality } => {
@@ -1219,7 +1220,6 @@ impl PluriviewApp {
         }
         if let Err(error) = self.seek_preview_manager.request(
             id,
-            &mpv_path,
             thumbnail_source,
             requested_time,
             duration,
@@ -2174,7 +2174,7 @@ impl PluriviewApp {
     fn set_wallpaper_from_path(&mut self, path: std::path::PathBuf) -> Result<(), String> {
         if media::is_supported_video_path(&path) {
             #[cfg(windows)]
-            self.required_tool_paths("Setting a video wallpaper", &[ToolKind::Mpv])?;
+            Self::require_libmpv("Setting a video wallpaper")?;
             self.set_video_wallpaper(path)
         } else if media::is_supported_image_path(&path) {
             self.set_image_wallpaper(&path)
@@ -2238,7 +2238,7 @@ impl PluriviewApp {
     #[cfg(not(windows))]
     fn set_video_wallpaper(&mut self, path: std::path::PathBuf) -> Result<(), String> {
         Err(format!(
-            "Video wallpaper requires Windows and MPV: {}",
+            "Video wallpaper requires Windows and libmpv: {}",
             path.display()
         ))
     }
@@ -2250,8 +2250,7 @@ impl PluriviewApp {
         }
     }
 
-    /// Attach libmpv to the current video wallpaper when the file and tools
-    /// are ready. Returns false when mpv is still being discovered.
+    /// Attach libmpv to the current video wallpaper when the file is ready.
     #[cfg(windows)]
     fn ensure_wallpaper_video(&mut self) -> Result<bool, String> {
         let path = match self.canvas.wallpaper.as_ref() {
@@ -2279,7 +2278,6 @@ impl PluriviewApp {
         let source = VideoSource::LocalFile { path };
         let Some(mut launch) = video_launch_for_source(
             &source,
-            self.external_tools.status(ToolKind::Mpv),
             self.external_tools.status(ToolKind::Streamlink),
             false,
         )?
@@ -3418,13 +3416,13 @@ impl PluriviewApp {
                 ui.heading("External tools");
                 ui.label(
                     egui::RichText::new(
-                        "Optional helpers are detected automatically. They are not required to use Pluriview.",
+                        "Video files play with bundled libmpv. Streamlink is only needed for live stream URLs.",
                     )
                     .weak(),
                 );
                 ui.add_space(8.0);
 
-                for kind in ToolKind::ALL {
+                for kind in ToolKind::SETTINGS {
                     ui.group(|ui| {
                         Self::external_tool_settings_row(
                             ui,
@@ -3600,7 +3598,7 @@ impl PluriviewApp {
 
     fn set_external_tool_override(&mut self, kind: ToolKind, path: Option<std::path::PathBuf>) {
         match kind {
-            ToolKind::Mpv => self.app_config.external_tools.mpv_path = path.clone(),
+            ToolKind::Mpv => {}
             ToolKind::Streamlink => self.app_config.external_tools.streamlink_path = path.clone(),
         }
         self.external_tools.set_override(kind, path);
@@ -4552,7 +4550,7 @@ mod tests {
     }
 
     #[test]
-    fn video_launches_only_with_validated_available_tools() {
+    fn video_launches_local_files_without_mpv_and_streams_need_streamlink() {
         let media_path = std::env::temp_dir().join(format!(
             "pluriview-video-source-test-{}.mp4",
             std::process::id()
@@ -4563,23 +4561,7 @@ mod tests {
         };
         let checking = ToolStatus::Checking;
         let missing = ToolStatus::Missing;
-        assert!(video_launch_for_source(&source, &checking, &missing, true)
-            .unwrap()
-            .is_none());
-
-        let invalid = ToolStatus::Invalid {
-            path: PathBuf::from(r"C:\broken\mpv.exe"),
-            error: "version check failed".to_owned(),
-            source: DiscoverySource::Override,
-        };
-        assert!(video_launch_for_source(&source, &invalid, &missing, true).is_err());
-
-        let available = ToolStatus::Available {
-            path: PathBuf::from(r"C:\mpv\mpv.exe"),
-            version: "mpv test".to_owned(),
-            source: DiscoverySource::Path,
-        };
-        let launch = video_launch_for_source(&source, &available, &missing, true)
+        let launch = video_launch_for_source(&source, &missing, true)
             .unwrap()
             .unwrap();
         assert!(launch.start_paused);
@@ -4589,11 +4571,34 @@ mod tests {
                 if path == media_path
         ));
 
+        let invalid = ToolStatus::Invalid {
+            path: PathBuf::from(r"C:\broken\streamlink.exe"),
+            error: "version check failed".to_owned(),
+            source: DiscoverySource::Override,
+        };
         let stream = VideoSource::Stream {
             url: "https://example.test/live".to_owned(),
             quality: "best".to_owned(),
         };
-        assert!(video_launch_for_source(&stream, &available, &missing, false).is_err());
+        assert!(video_launch_for_source(&stream, &checking, false)
+            .unwrap()
+            .is_none());
+        assert!(video_launch_for_source(&stream, &missing, false).is_err());
+        assert!(video_launch_for_source(&stream, &invalid, false).is_err());
+
+        let available = ToolStatus::Available {
+            path: PathBuf::from(r"C:\Tools\streamlink.exe"),
+            version: "streamlink test".to_owned(),
+            source: DiscoverySource::Path,
+        };
+        let launch = video_launch_for_source(&stream, &available, false)
+            .unwrap()
+            .unwrap();
+        assert!(!launch.start_paused);
+        assert!(matches!(
+            launch.source,
+            crate::video::VideoSource::Stream { ref url, .. } if url == "https://example.test/live"
+        ));
         std::fs::remove_file(media_path).unwrap();
     }
 
