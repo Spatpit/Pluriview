@@ -44,7 +44,8 @@ try {
 
     $executable = Join-Path $workspace "target\release\pluriview.exe"
     $bytes = [IO.File]::ReadAllBytes($executable)
-    $ascii = [Text.Encoding]::Latin1.GetString($bytes)
+    # Windows PowerShell 5.1 has no Encoding::Latin1; ISO-8859-1 is the same 1:1 mapping.
+    $ascii = [Text.Encoding]::GetEncoding(28591).GetString($bytes)
     $utf16 = [Text.Encoding]::Unicode.GetString($bytes)
 
     $forbiddenText = @(
@@ -58,8 +59,11 @@ try {
     )
 
     foreach ($value in $forbiddenText) {
-        if ($ascii.Contains($value, [StringComparison]::OrdinalIgnoreCase) -or
-            $utf16.Contains($value, [StringComparison]::OrdinalIgnoreCase)) {
+        if ([string]::IsNullOrEmpty($value)) {
+            continue
+        }
+        if ($ascii.IndexOf($value, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $utf16.IndexOf($value, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
             throw "Release privacy check failed: the executable contains a local or internal path."
         }
     }
