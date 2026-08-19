@@ -4,6 +4,12 @@ pub const CAPTURE_SCALE: f32 = 2.0;
 pub const MAX_CAPTURE_WIDTH: u32 = 3840;
 pub const MAX_CAPTURE_HEIGHT: u32 = 2160;
 
+/// Canvas zoom below 100% shrinks capture backing. Zooming in past 100% does
+/// not request more than the 2×-tile budget used at 1.0.
+pub fn capture_lod_factor(canvas_zoom: f32) -> f32 {
+    canvas_zoom.clamp(0.05, 1.0)
+}
+
 /// 2× the tile's physical pixels, inflated so a crop still has enough source
 /// samples, then quantized to 32px so interactive resize does not rebuild the
 /// GPU texture every pixel.
@@ -123,13 +129,31 @@ pub fn downsample_rgba(
 #[cfg(test)]
 mod tests {
     use super::{
-        downsample_rgba, fitted_capture_size, window_capture_target, MAX_CAPTURE_HEIGHT,
-        MAX_CAPTURE_WIDTH,
+        capture_lod_factor, downsample_rgba, fitted_capture_size, window_capture_target,
+        MAX_CAPTURE_HEIGHT, MAX_CAPTURE_WIDTH,
     };
 
     #[test]
     fn default_tile_requests_2x_pixels() {
         assert_eq!(window_capture_target(640.0, 360.0, 1.0, None), (1280, 736));
+    }
+
+    #[test]
+    fn capture_lod_never_exceeds_100_percent() {
+        assert_eq!(capture_lod_factor(1.0), 1.0);
+        assert_eq!(capture_lod_factor(1.75), 1.0);
+        assert_eq!(capture_lod_factor(0.3), 0.3);
+        assert_eq!(capture_lod_factor(0.01), 0.05);
+    }
+
+    #[test]
+    fn zoomed_out_window_capture_uses_fewer_pixels() {
+        let full = window_capture_target(640.0, 360.0, 1.0, None);
+        let lod = capture_lod_factor(0.3);
+        let out = window_capture_target(640.0 * lod, 360.0 * lod, 1.0, None);
+        assert!(out.0 < full.0);
+        assert!(out.1 < full.1);
+        assert_eq!(out, window_capture_target(192.0, 108.0, 1.0, None));
     }
 
     #[test]

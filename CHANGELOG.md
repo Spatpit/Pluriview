@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Window-capture resolution follows canvas zoom below 100%, so zoomed-out tiles keep smaller textures. Browser and video tiles are unchanged.
+- Tile focus hides the selection border, resize handles, and zoom badge until focus is cleared.
+- Cropped window tiles no longer show a bottom-left CROP badge; cropping still works via Alt-drag and Clear Crop.
+
 ## [0.6.0] - 2026-08-18
 
 ### Added

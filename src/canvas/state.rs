@@ -1,6 +1,6 @@
 use super::animation::{AnimationState, DragTracker};
 use super::wallpaper::CanvasWallpaper;
-use crate::capture::{window_capture_target, CaptureCoordinator};
+use crate::capture::{capture_lod_factor, window_capture_target, CaptureCoordinator};
 use crate::preview::{
     compact_title, BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager,
     RemovedPreviewInfo, VideoPlaybackState, VideoTileStatus,
@@ -276,6 +276,46 @@ mod tests {
         );
 
         assert_eq!(output.platform_output.cursor_icon, CursorIcon::Default);
+    }
+
+    #[test]
+    fn tile_focus_hides_zoom_badge_and_resize_cursor() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add(
+            "tile".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(400.0, 225.0),
+        );
+        let tile = previews.get(id).unwrap().rect();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        canvas.focus_on_tile(id, tile, screen_rect);
+        let mut captures = CaptureCoordinator::new();
+        let focused = canvas.canvas_rect_to_screen(tile, screen_rect);
+        let output = context.run(
+            RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![Event::PointerMoved(focused.right_bottom())],
+                ..Default::default()
+            },
+            |context| {
+                CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(context, |ui| {
+                        canvas.ui(ui, &mut previews, &mut captures, context, true);
+                    });
+            },
+        );
+
+        assert!(canvas.is_focusing_tile());
+        assert_eq!(output.platform_output.cursor_icon, CursorIcon::Default);
+        assert!(!output.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                Shape::Text(text) if text.galley.text().contains('%')
+            )
+        }));
     }
 
     #[test]
@@ -1658,6 +1698,14 @@ impl CanvasState {
             self.drag_state = None;
             self.marquee = None;
         }
+        if self.is_focusing_tile()
+            && matches!(
+                self.drag_state,
+                Some(DragState::Resizing { .. } | DragState::Cropping { .. })
+            )
+        {
+            self.drag_state = None;
+        }
 
         // Calculate delta time for animations
         let current_time = input.time;
@@ -1736,7 +1784,7 @@ impl CanvasState {
 
         // Draw selection rectangles and interactive resize handles
         // Handles are allocated AFTER previews so they have higher interaction priority
-        if show_overlays && self.marquee.is_none() {
+        if show_overlays && self.marquee.is_none() && !self.is_focusing_tile() {
             self.draw_and_interact_selection(ui, canvas_rect, preview_manager, &input);
         }
 
@@ -1745,8 +1793,10 @@ impl CanvasState {
         }
 
         // Minimal Void: Floating status indicator (bottom-right corner)
-        if show_overlays {
+        if show_overlays && !self.is_focusing_tile() {
             self.draw_floating_status(&painter, canvas_rect, preview_manager.count());
+        }
+        if show_overlays {
             self.draw_and_interact_undo_toast(
                 ui,
                 canvas_rect,
@@ -1798,13 +1848,14 @@ impl CanvasState {
         capture_coordinator: &mut CaptureCoordinator,
     ) {
         let pixels_per_point = ctx.pixels_per_point();
+        let lod = capture_lod_factor(self.zoom);
         for preview in preview_manager.all() {
             if !preview.is_window_capture() || preview.manually_frozen {
                 continue;
             }
             let (width, height) = window_capture_target(
-                preview.size.x,
-                preview.size.y,
+                preview.size.x * lod,
+                preview.size.y * lod,
                 pixels_per_point,
                 preview.crop_uv,
             );
@@ -2022,7 +2073,7 @@ impl CanvasState {
         // Use the pre-allocated background response
 
         // Update cursor based on drag state or handle hover
-        if show_overlays {
+        if show_overlays && !self.is_focusing_tile() {
             if let Some(mouse_pos) = input.hover_pos {
                 if canvas_rect.contains(mouse_pos) {
                     if let Some((_, handle)) =
@@ -2970,26 +3021,6 @@ impl CanvasState {
                         }
                     }
                 }
-
-                // Crop indicator (if has crop)
-                if has_crop {
-                    let crop_rect = Rect::from_min_size(
-                        screen_rect.left_bottom() + Vec2::new(8.0, -28.0),
-                        Vec2::new(50.0, 20.0),
-                    );
-                    painter.rect_filled(
-                        crop_rect,
-                        10.0,
-                        Color32::from_rgba_unmultiplied(255, 150, 100, 180),
-                    );
-                    painter.text(
-                        crop_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "CROP",
-                        egui::FontId::proportional(9.0),
-                        Color32::WHITE,
-                    );
-                }
             }
 
             // Muted badge stays visible even without hover so silent tiles
@@ -3052,7 +3083,8 @@ impl CanvasState {
 
             // Minimal Void: Only show border when selected (thin blue accent);
             // green accent marks the browser tile currently in interaction mode.
-            if show_overlays {
+            // Tile focus already fills the canvas, so the chrome is noise.
+            if show_overlays && !self.is_focusing_tile() {
                 if self.interactive_browser == Some(id) {
                     painter.rect_stroke(
                         screen_rect,
@@ -4281,26 +4313,6 @@ impl CanvasState {
                 8.0, // Rounded corners
                 Stroke::new(2.0, border_color),
             );
-
-            // Minimal Void: Subtle crop indicator (bottom-left badge, only when selected)
-            if crop_uv.is_some() {
-                let crop_badge_rect = Rect::from_min_size(
-                    screen_rect.left_bottom() + Vec2::new(8.0, -28.0),
-                    Vec2::new(50.0, 20.0),
-                );
-                painter.rect_filled(
-                    crop_badge_rect,
-                    10.0,
-                    Color32::from_rgba_unmultiplied(255, 150, 100, 200),
-                );
-                painter.text(
-                    crop_badge_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "CROP",
-                    egui::FontId::proportional(9.0),
-                    Color32::WHITE,
-                );
-            }
 
             // Minimal Void: Smaller, more subtle resize handles
             let handle_size = 6.0; // Reduced from 8.0
