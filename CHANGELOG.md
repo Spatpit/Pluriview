@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-19
+
 ### Fixed
 - Window capture on Windows 10 no longer stays on "Connecting...". Border and cursor Graphics Capture settings are requested only when those APIs exist, and tiles show a failed state if capture cannot start.
 
