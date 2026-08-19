@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use windows_capture::capture::GraphicsCaptureApiError;
+use windows_capture::graphics_capture_api::GraphicsCaptureApi;
+use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
 
 use super::downsample::{downsample_rgba, fitted_capture_size};
 
@@ -47,11 +50,24 @@ struct CaptureSession {
     /// a different slot, so an old worker can never publish a stale frame into it.
     latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
 
+    /// Set when the worker cannot start Windows Graphics Capture.
+    failure: Arc<Mutex<Option<String>>>,
+
     /// Stops Windows Graphics Capture directly, even when a static window is
     /// no longer producing frame callbacks.
     stop_sender: Sender<()>,
 
     worker: Option<JoinHandle<()>>,
+}
+
+impl CaptureSession {
+    fn is_live(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+    }
 }
 
 impl CaptureCoordinator {
@@ -82,12 +98,14 @@ impl CaptureCoordinator {
         let target_width = Arc::new(AtomicU32::new(0));
         let target_height = Arc::new(AtomicU32::new(0));
         let latest_frame = Arc::new(Mutex::new(None));
+        let failure = Arc::new(Mutex::new(None));
         let active_clone = active.clone();
         let paused_clone = paused.clone();
         let fps_clone = fps.clone();
         let target_width_clone = target_width.clone();
         let target_height_clone = target_height.clone();
         let worker_frame = latest_frame.clone();
+        let worker_failure = failure.clone();
         let (stop_sender, stop_receiver) = mpsc::channel();
 
         // Start capture in a new thread
@@ -102,6 +120,7 @@ impl CaptureCoordinator {
                 active_clone,
                 paused_clone,
                 worker_frame,
+                worker_failure,
                 stop_receiver,
             );
         });
@@ -113,6 +132,7 @@ impl CaptureCoordinator {
             active,
             paused,
             latest_frame,
+            failure,
             stop_sender,
             worker: Some(worker),
         };
@@ -128,13 +148,9 @@ impl CaptureCoordinator {
     /// True while a capture worker is still attached and producing a session.
     #[cfg(test)]
     pub fn is_live(&self, preview_id: PreviewId) -> bool {
-        self.sessions.get(&preview_id).is_some_and(|session| {
-            session.active.load(Ordering::Relaxed)
-                && session
-                    .worker
-                    .as_ref()
-                    .is_some_and(|worker| !worker.is_finished())
-        })
+        self.sessions
+            .get(&preview_id)
+            .is_some_and(CaptureSession::is_live)
     }
 
     fn retire_session(&mut self, preview_id: PreviewId, join: bool) {
@@ -176,8 +192,15 @@ impl CaptureCoordinator {
     pub fn process_frames(&mut self, preview_manager: &mut PreviewManager) {
         for (preview_id, session) in &self.sessions {
             let frame = session.latest_frame.lock().take();
-            if let (Some(frame), Some(preview)) = (frame, preview_manager.get_mut(*preview_id)) {
-                preview.update_frame(frame.width, frame.height, frame.data);
+            let failure = session.failure.lock().take();
+            if let Some(preview) = preview_manager.get_mut(*preview_id) {
+                if let Some(frame) = frame {
+                    preview.update_frame(frame.width, frame.height, frame.data);
+                } else if let Some(error) = failure {
+                    preview.set_capture_error(error);
+                } else if session.is_live() {
+                    preview.clear_capture_error();
+                }
             }
         }
         self.reap_finished_workers();
@@ -279,6 +302,7 @@ fn capture_window_loop(
     active: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
+    failure: Arc<Mutex<Option<String>>>,
     stop_receiver: Receiver<()>,
 ) {
     use windows_capture::{
@@ -292,6 +316,7 @@ fn capture_window_loop(
     };
 
     // Capture flags passed to the handler
+    #[derive(Clone)]
     struct CaptureFlags {
         preview_id: PreviewId,
         latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
@@ -397,7 +422,6 @@ fn capture_window_loop(
         }
     }
 
-    let window = capture_target_from_hwnd(hwnd);
     log::info!(
         "Capturing HWND for {}",
         privacy::redact_title(&window_title)
@@ -419,20 +443,45 @@ fn capture_window_loop(
         target_height,
     };
 
-    let settings = Settings::new(
-        window,
-        CursorCaptureSettings::WithoutCursor,
-        DrawBorderSettings::WithoutBorder,
-        SecondaryWindowSettings::Default,
-        min_interval,
-        DirtyRegionSettings::Default,
-        ColorFormat::Rgba8,
-        flags,
-    );
+    // Request WithoutCursor / WithoutBorder only when those Graphics Capture
+    // properties exist. Windows 10 1903 has capture but not IsBorderRequired
+    // (Win11) or, on 1903, IsCursorCaptureEnabled (2004+). The crate refuses to
+    // start if those settings are not Default and the API is missing.
+    let cursor = probed_cursor_capture_setting();
+    let border = probed_draw_border_setting();
+    let try_start = |cursor, border, flags| {
+        let settings = Settings::new(
+            capture_target_from_hwnd(hwnd),
+            cursor,
+            border,
+            SecondaryWindowSettings::Default,
+            min_interval,
+            DirtyRegionSettings::Default,
+            ColorFormat::Rgba8,
+            flags,
+        );
+        Capture::start_free_threaded(settings)
+    };
+
+    let start_result = match try_start(cursor, border, flags.clone()) {
+        Err(error)
+            if capture_settings_unsupported(&error)
+                && (cursor != CursorCaptureSettings::Default
+                    || border != DrawBorderSettings::Default) =>
+        {
+            log::warn!("Retrying capture with default cursor and border settings: {error}");
+            try_start(
+                CursorCaptureSettings::Default,
+                DrawBorderSettings::Default,
+                flags,
+            )
+        }
+        other => other,
+    };
 
     // Keep an explicit CaptureControl so static/paused windows can be stopped
     // without waiting for another frame callback to arrive.
-    match Capture::start_free_threaded(settings) {
+    match start_result {
         Ok(control) => {
             while active.load(Ordering::Relaxed) {
                 match stop_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -446,9 +495,56 @@ fn capture_window_loop(
         }
         Err(error) => {
             log::error!("Failed to start capture: {error}");
+            *failure.lock() = Some(error.to_string());
         }
     }
     completion_active.store(false, Ordering::Relaxed);
+}
+
+fn cursor_capture_setting(supported: bool) -> CursorCaptureSettings {
+    if supported {
+        CursorCaptureSettings::WithoutCursor
+    } else {
+        CursorCaptureSettings::Default
+    }
+}
+
+fn draw_border_setting(supported: bool) -> DrawBorderSettings {
+    if supported {
+        DrawBorderSettings::WithoutBorder
+    } else {
+        DrawBorderSettings::Default
+    }
+}
+
+fn probed_cursor_capture_setting() -> CursorCaptureSettings {
+    match GraphicsCaptureApi::is_cursor_settings_supported() {
+        Ok(supported) => cursor_capture_setting(supported),
+        Err(error) => {
+            log::debug!("Could not probe cursor capture support: {error}");
+            CursorCaptureSettings::WithoutCursor
+        }
+    }
+}
+
+fn probed_draw_border_setting() -> DrawBorderSettings {
+    match GraphicsCaptureApi::is_border_settings_supported() {
+        Ok(supported) => draw_border_setting(supported),
+        Err(error) => {
+            log::debug!("Could not probe border capture support: {error}");
+            DrawBorderSettings::WithoutBorder
+        }
+    }
+}
+
+fn capture_settings_unsupported<E>(error: &GraphicsCaptureApiError<E>) -> bool {
+    matches!(
+        error,
+        GraphicsCaptureApiError::GraphicsCaptureApiError(
+            windows_capture::graphics_capture_api::Error::BorderConfigUnsupported
+                | windows_capture::graphics_capture_api::Error::CursorConfigUnsupported
+        )
+    )
 }
 
 #[cfg(test)]
@@ -470,6 +566,7 @@ mod tests {
             active: Arc::new(AtomicBool::new(active)),
             paused: Arc::new(AtomicBool::new(paused)),
             latest_frame: Arc::new(Mutex::new(None)),
+            failure: Arc::new(Mutex::new(None)),
             stop_sender,
             worker: None,
         }
@@ -565,6 +662,7 @@ mod tests {
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
+                failure: Arc::new(Mutex::new(None)),
                 stop_sender,
                 worker: Some(worker),
             },
@@ -591,6 +689,7 @@ mod tests {
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
+                failure: Arc::new(Mutex::new(None)),
                 stop_sender,
                 worker: None,
             },
@@ -600,5 +699,76 @@ mod tests {
 
         assert!(stop_receiver.try_recv().is_ok());
         assert!(!coordinator.sessions.contains_key(&preview_id));
+    }
+
+    #[test]
+    fn capture_settings_use_defaults_when_unsupported() {
+        use super::{cursor_capture_setting, draw_border_setting};
+        use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
+
+        assert_eq!(
+            cursor_capture_setting(true),
+            CursorCaptureSettings::WithoutCursor
+        );
+        assert_eq!(
+            cursor_capture_setting(false),
+            CursorCaptureSettings::Default
+        );
+        assert_eq!(draw_border_setting(true), DrawBorderSettings::WithoutBorder);
+        assert_eq!(draw_border_setting(false), DrawBorderSettings::Default);
+    }
+
+    #[test]
+    fn process_frames_applies_start_failure_to_the_preview() {
+        let mut previews = PreviewManager::new();
+        let preview_id =
+            previews.add_for_window(1, 42, "game".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
+        let failed = session(30, false, false);
+        *failed.failure.lock() = Some("BorderConfigUnsupported".to_owned());
+        let mut coordinator = CaptureCoordinator::new();
+        coordinator.sessions.insert(preview_id, failed);
+
+        coordinator.process_frames(&mut previews);
+
+        assert_eq!(
+            previews.get(preview_id).unwrap().capture_error.as_deref(),
+            Some("BorderConfigUnsupported")
+        );
+    }
+
+    #[test]
+    fn live_session_clears_a_stale_capture_error() {
+        let mut previews = PreviewManager::new();
+        let preview_id =
+            previews.add_for_window(1, 42, "game".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
+        previews
+            .get_mut(preview_id)
+            .unwrap()
+            .set_capture_error("stale".to_owned());
+
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = stop_receiver.recv();
+        });
+        let mut coordinator = CaptureCoordinator::new();
+        coordinator.sessions.insert(
+            preview_id,
+            CaptureSession {
+                target_fps: Arc::new(AtomicU32::new(30)),
+                target_width: Arc::new(AtomicU32::new(0)),
+                target_height: Arc::new(AtomicU32::new(0)),
+                active: Arc::new(AtomicBool::new(true)),
+                paused: Arc::new(AtomicBool::new(false)),
+                latest_frame: Arc::new(Mutex::new(None)),
+                failure: Arc::new(Mutex::new(None)),
+                stop_sender,
+                worker: Some(worker),
+            },
+        );
+
+        coordinator.process_frames(&mut previews);
+        assert!(previews.get(preview_id).unwrap().capture_error.is_none());
+
+        coordinator.stop_capture(preview_id);
     }
 }

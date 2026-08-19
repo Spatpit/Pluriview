@@ -53,8 +53,8 @@ pub enum DragState {
 mod tests {
     use super::{
         apply_resize, capture_resolution_badge_rect, format_time, playlist_first_row_center,
-        stream_audio_badge_rect, video_placeholder_content, CanvasState, DragState, PlaylistAction,
-        ResizeHandle, TileActivityAction, VideoAction,
+        stream_audio_badge_rect, video_placeholder_content, window_capture_placeholder_content,
+        CanvasState, DragState, PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -161,6 +161,14 @@ mod tests {
         assert_eq!(content.0, "Video unavailable");
         assert!(!content.2);
         assert!(!content.1.contains("stderr"));
+    }
+
+    #[test]
+    fn window_capture_placeholder_stops_animating_when_failed() {
+        assert_eq!(window_capture_placeholder_content(true).0, "Capture failed");
+        assert!(!window_capture_placeholder_content(true).2);
+        assert_eq!(window_capture_placeholder_content(false).0, "Connecting...");
+        assert!(window_capture_placeholder_content(false).2);
     }
 
     #[test]
@@ -927,6 +935,7 @@ struct TileInfo {
     is_window_capture: bool,
     muted: bool,
     stream_audio: bool,
+    capture_failed: bool,
     browser_status: BrowserTileStatus,
     video_status: VideoTileStatus,
     video_playback: VideoPlaybackState,
@@ -955,6 +964,7 @@ impl TileInfo {
             is_window_capture: preview.is_window_capture(),
             muted: preview.browser_muted,
             stream_audio: preview.stream_audio,
+            capture_failed: preview.capture_error.is_some(),
             browser_status: preview.browser_status.clone(),
             video_status: preview.video_status.clone(),
             video_playback: preview.video_playback.clone(),
@@ -982,6 +992,7 @@ impl TileInfo {
         self.is_window_capture = preview.is_window_capture();
         self.muted = preview.browser_muted;
         self.stream_audio = preview.stream_audio;
+        self.capture_failed = preview.capture_error.is_some();
         self.browser_status.clone_from(&preview.browser_status);
         self.video_status.clone_from(&preview.video_status);
         self.video_playback.clone_from(&preview.video_playback);
@@ -1144,6 +1155,55 @@ fn video_placeholder_content(status: &VideoTileStatus) -> (&'static str, &'stati
         VideoTileStatus::Failed(_) => {
             ("Video unavailable", "Check the source and try again", false)
         }
+    }
+}
+
+fn window_capture_placeholder_content(failed: bool) -> (&'static str, &'static str, bool) {
+    if failed {
+        ("Capture failed", "This window could not be captured", false)
+    } else {
+        ("Connecting...", "", true)
+    }
+}
+
+fn paint_window_capture_placeholder(
+    painter: &egui::Painter,
+    rect: Rect,
+    failed: bool,
+    time: f32,
+) -> bool {
+    let (title, detail, animated) = window_capture_placeholder_content(failed);
+    if failed {
+        painter.rect_filled(rect, 8.0, Color32::from_rgb(22, 18, 18));
+        painter.text(
+            rect.center() + Vec2::new(0.0, if detail.is_empty() { 0.0 } else { -8.0 }),
+            egui::Align2::CENTER_CENTER,
+            title,
+            egui::FontId::proportional(12.0),
+            Color32::from_rgb(225, 112, 96),
+        );
+        if rect.height() >= 80.0 && !detail.is_empty() {
+            painter.text(
+                rect.center() + Vec2::new(0.0, 12.0),
+                egui::Align2::CENTER_CENTER,
+                detail,
+                egui::FontId::proportional(11.0),
+                Color32::from_rgb(140, 110, 105),
+            );
+        }
+        false
+    } else {
+        let pulse = (time * 1.8).sin() * 0.5 + 0.5;
+        let v = (18.0 + pulse * 14.0) as u8;
+        painter.rect_filled(rect, 8.0, Color32::from_rgb(v, v, v + 2));
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            title,
+            egui::FontId::proportional(12.0),
+            Color32::from_rgb(95, 95, 95),
+        );
+        animated
     }
 }
 
@@ -2315,6 +2375,7 @@ impl CanvasState {
                 info.muted
             };
             let stream_audio = info.stream_audio;
+            let capture_failed = info.capture_failed;
             let browser_status = &info.browser_status;
             let video_status = &info.video_status;
             let video_playback = &info.video_playback;
@@ -2456,7 +2517,8 @@ impl CanvasState {
                         browser_status,
                         input.time as f32,
                     );
-                    any_spawn_or_remove_animating = true;
+                    any_spawn_or_remove_animating |=
+                        !matches!(browser_status, BrowserTileStatus::Failed(_));
                 } else if is_video {
                     any_spawn_or_remove_animating |= paint_video_placeholder(
                         &painter,
@@ -2465,19 +2527,12 @@ impl CanvasState {
                         input.time as f32,
                     );
                 } else {
-                    // Shimmering placeholder while the capture connects
-                    let t = input.time as f32;
-                    let pulse = (t * 1.8).sin() * 0.5 + 0.5;
-                    let v = (18.0 + pulse * 14.0) as u8;
-                    painter.rect_filled(anim_rect, 8.0, Color32::from_rgb(v, v, v + 2));
-                    painter.text(
-                        anim_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "Connecting...",
-                        egui::FontId::proportional(12.0),
-                        Color32::from_rgb(95, 95, 95),
+                    any_spawn_or_remove_animating |= paint_window_capture_placeholder(
+                        &painter,
+                        anim_rect,
+                        capture_failed,
+                        input.time as f32,
                     );
-                    any_spawn_or_remove_animating = true;
                 }
             }
 

@@ -188,6 +188,10 @@ pub struct Preview {
     /// audio monitor (Discord/OBS). Ignored for browser, video, and image tiles.
     pub stream_audio: bool,
 
+    /// Set when Windows Graphics Capture fails to start. Cleared when a frame
+    /// arrives or a new capture session is connecting.
+    pub capture_error: Option<String>,
+
     /// Loading/error state rendered while a browser host is being prepared.
     pub browser_status: BrowserTileStatus,
 
@@ -269,6 +273,7 @@ impl Preview {
             browser_url: None,
             browser_muted: false,
             stream_audio: false,
+            capture_error: None,
             browser_status: BrowserTileStatus::Ready,
             media_path: None,
             video_source: None,
@@ -317,6 +322,22 @@ impl Preview {
             && !self.is_media()
             && !self.is_video()
             && !self.is_playlist()
+    }
+
+    /// Record that Windows Graphics Capture could not start for this tile.
+    pub fn set_capture_error(&mut self, error: String) {
+        self.capture_error = Some(error.clone());
+        if self.is_browser() {
+            self.browser_status = BrowserTileStatus::Failed(error);
+        }
+    }
+
+    /// Clear a previous capture start failure, restoring Connecting/Ready.
+    pub fn clear_capture_error(&mut self) {
+        self.capture_error = None;
+        if self.is_browser() && matches!(self.browser_status, BrowserTileStatus::Failed(_)) {
+            self.browser_status = BrowserTileStatus::Ready;
+        }
     }
 
     pub fn supports_seek_preview(&self) -> bool {
@@ -414,6 +435,7 @@ impl Preview {
 
     /// Update frame data from capture
     pub fn update_frame(&mut self, width: u32, height: u32, data: Vec<u8>) {
+        self.clear_capture_error();
         // Update source aspect ratio from actual frame dimensions
         if width > 0 && height > 0 {
             self.frame_size = Some((width, height));
@@ -950,6 +972,51 @@ mod tests {
         });
         preview.browser_url = Some("https://example.com".to_owned());
         assert!(!preview.is_window_capture());
+    }
+
+    #[test]
+    fn capture_error_marks_window_and_browser_tiles() {
+        let mut window = Preview::for_window(
+            PreviewId(1),
+            1,
+            42,
+            "game".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        window.set_capture_error("start failed".to_owned());
+        assert_eq!(window.capture_error.as_deref(), Some("start failed"));
+
+        let mut browser = Preview::new(
+            PreviewId(2),
+            "browser".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        browser.browser_url = Some("https://example.com".to_owned());
+        browser.set_capture_error("start failed".to_owned());
+        assert!(matches!(
+            browser.browser_status,
+            super::BrowserTileStatus::Failed(_)
+        ));
+        browser.clear_capture_error();
+        assert!(browser.capture_error.is_none());
+        assert_eq!(browser.browser_status, super::BrowserTileStatus::Ready);
+    }
+
+    #[test]
+    fn frame_update_clears_a_capture_error() {
+        let mut preview = Preview::for_window(
+            PreviewId(1),
+            1,
+            42,
+            "game".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.set_capture_error("start failed".to_owned());
+        preview.update_frame(1, 1, vec![255, 0, 0, 255]);
+        assert!(preview.capture_error.is_none());
     }
 
     #[test]
