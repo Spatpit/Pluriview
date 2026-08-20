@@ -9,11 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Capture live Spout2 senders (VTube Studio and similar) as canvas tiles. Pluriview receives the shared GPU texture; it does not publish a Spout sender.
+- Spout2 tiles can be pinned to the viewport so their position and size stay fixed while the canvas pans or zooms.
 - Keyboard shortcuts can be reassigned in Settings to one key or any two-key combination, with conflict validation and a restore-defaults button. Mouse controls remain fixed.
+- The Window Picker has a configurable keyboard shortcut that defaults to `W`.
+- Window-capture tiles can be resized to their native capture resolution from the tile context menu.
 
 ### Changed
 - Live capture tiles request sharper backing frames as the canvas zooms in, up to the source resolution and existing 4K cap.
 - The window-capture audio button now says "Stream Audio" instead of "SA" for clarity.
+- The enabled Stream Audio button hides with the rest of the tile controls when the tile is not hovered.
+- Browser Back and Forward controls use a persistent blue accent so they are easier to discover.
+- Settings moved from the File menu to the View menu.
+
+### Fixed
+- Window-capture resolution targets refresh immediately while tiles resize or the canvas zooms.
+- A pinned Spout2 tile can be dragged to a new viewport position and remains pinned when released.
 
 ## [0.6.2] - 2026-08-19
 

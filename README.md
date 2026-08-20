@@ -157,7 +157,7 @@ into a workspace named **Default** the first time workspaces run.
 
 ## Keyboard Shortcuts
 
-Keyboard shortcuts can be changed under **File → Settings → Keyboard
+Keyboard shortcuts can be changed under **View → Settings → Keyboard
 shortcuts**. A binding can be one key or any two keys held together. Mouse
 controls remain fixed. **Restore Default Keys** returns the keyboard bindings
 to those shown below.
@@ -166,6 +166,7 @@ to those shown below.
 |--------|----------|
 | Pan canvas | `Middle Mouse` or `Alt + Drag` |
 | Zoom | `Scroll Wheel` |
+| Toggle Window Picker | `W` |
 | Toggle grid | `G` |
 | Toggle canvas-only mode | `H` |
 | Select all | `Ctrl + A` |
@@ -175,9 +176,9 @@ to those shown below.
 | Freeze or resume selection | `Right-click selected tile or canvas` |
 | Delete selected | `Delete` |
 | Crop preview | `Alt + Drag corners` |
-| Focus window | `Double-click preview` |
+| Focus current tile | `Numpad 2` or `Double-click preview` |
 | Exit tile focus | `Esc` |
-| Interact with browser tile | `Double-click` or `Ctrl + B` |
+| Interact with browser tile | `Ctrl + B`, `Numpad 1`, or `Double-click` |
 | Exit browser interaction | `Esc` or click outside |
 | Show shortcuts | `F1` |
 
