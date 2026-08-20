@@ -412,7 +412,7 @@ unsafe fn node_i64(node: &MpvNode) -> Option<i64> {
 }
 
 unsafe fn node_flag(node: &MpvNode) -> Option<bool> {
-    (node.format == MPV_FORMAT_FLAG).then(|| node.value.flag != 0)
+    (node.format == MPV_FORMAT_FLAG).then_some(node.value.flag != 0)
 }
 
 unsafe fn node_string(node: &MpvNode) -> Option<String> {
@@ -2351,12 +2351,11 @@ unsafe extern "C" fn get_gl_proc_address(
     name: *const c_char,
 ) -> *mut c_void {
     let address = wglGetProcAddress(name);
-    let invalid =
-        address.is_null() || matches!(address as usize, 1 | 2 | 3) || address as isize == -1;
+    let invalid = address.is_null() || matches!(address as usize, 1..=3) || address as isize == -1;
     if !invalid {
         return address;
     }
-    let module = GetModuleHandleA(b"opengl32.dll\0".as_ptr().cast());
+    let module = GetModuleHandleA(c"opengl32.dll".as_ptr());
     if module.is_null() {
         ptr::null_mut()
     } else {

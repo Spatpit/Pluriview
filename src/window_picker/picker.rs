@@ -6,6 +6,13 @@ use crate::spout::{self, SpoutDetection, SpoutSender};
 use eframe::egui::{self, Pos2, RichText, Rounding, Stroke, Vec2};
 use std::borrow::Cow;
 
+#[derive(Clone, Copy)]
+struct PickerPalette {
+    text_secondary: egui::Color32,
+    card_bg: egui::Color32,
+    card_hover: egui::Color32,
+}
+
 /// Window picker panel state
 pub struct WindowPicker {
     /// Cached list of windows
@@ -122,9 +129,11 @@ impl WindowPicker {
             preview_manager,
             capture_coordinator,
             canvas,
-            text_secondary,
-            card_bg,
-            card_hover,
+            PickerPalette {
+                text_secondary,
+                card_bg,
+                card_hover,
+            },
         );
 
         // Window count and refresh indicator
@@ -332,10 +341,9 @@ impl WindowPicker {
         preview_manager: &mut PreviewManager,
         capture_coordinator: &mut CaptureCoordinator,
         canvas: &CanvasState,
-        text_secondary: egui::Color32,
-        card_bg: egui::Color32,
-        card_hover: egui::Color32,
+        palette: PickerPalette,
     ) {
+        let text_secondary = palette.text_secondary;
         let accent = egui::Color32::from_rgb(107, 170, 75);
         ui.horizontal(|ui| {
             ui.label(
@@ -394,9 +402,7 @@ impl WindowPicker {
                         sender,
                         available_width,
                         row_height,
-                        card_bg,
-                        card_hover,
-                        text_secondary,
+                        palette,
                         self.spout.active_sender.as_deref(),
                     ) {
                         add_sender = Some(sender.clone());
@@ -470,11 +476,14 @@ fn draw_spout_sender_row(
     sender: &SpoutSender,
     available_width: f32,
     row_height: f32,
-    card_bg: egui::Color32,
-    card_hover: egui::Color32,
-    text_secondary: egui::Color32,
+    palette: PickerPalette,
     active_sender: Option<&str>,
 ) -> bool {
+    let PickerPalette {
+        text_secondary,
+        card_bg,
+        card_hover,
+    } = palette;
     let accent_color = egui::Color32::from_rgb(107, 170, 75);
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(available_width, row_height), egui::Sense::hover());

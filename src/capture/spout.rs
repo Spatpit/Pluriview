@@ -3,10 +3,8 @@
 
 use crate::privacy;
 use crate::spout::{self, share_handle_from_u32};
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
 use std::time::Duration;
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
@@ -22,20 +20,23 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 
-use super::coordinator::CapturedFrame;
+use super::coordinator::{CaptureWorkerState, CapturedFrame};
 use super::downsample::{fitted_capture_size, RgbaDownsampler};
 
 pub fn capture_spout_loop(
     sender_name: String,
-    target_fps: Arc<AtomicU32>,
-    target_width: Arc<AtomicU32>,
-    target_height: Arc<AtomicU32>,
-    active: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
-    failure: Arc<Mutex<Option<String>>>,
+    worker_state: CaptureWorkerState,
     stop_receiver: Receiver<()>,
 ) {
+    let CaptureWorkerState {
+        target_fps,
+        target_width,
+        target_height,
+        active,
+        paused,
+        latest_frame,
+        failure,
+    } = worker_state;
     log::info!(
         "Receiving Spout sender {}",
         privacy::redact_title(&sender_name)

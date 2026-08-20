@@ -4518,8 +4518,10 @@ impl PluriviewApp {
                     window_info.title.clone(),
                     Pos2::new(preview_layout.position.0, preview_layout.position.1),
                     Vec2::new(preview_layout.size.0, preview_layout.size.1),
-                    window_info.hwnd,
-                    window_info.process_id,
+                    WindowHandle {
+                        hwnd: window_info.hwnd,
+                        process_id: window_info.process_id,
+                    },
                     preview_layout.fps_preset,
                     preview_layout.z_order,
                 );

@@ -19,6 +19,17 @@ pub(crate) struct CapturedFrame {
     pub data: Vec<u8>,
 }
 
+/// Shared controls and result slots passed to either capture worker type.
+pub(crate) struct CaptureWorkerState {
+    pub target_fps: Arc<AtomicU32>,
+    pub target_width: Arc<AtomicU32>,
+    pub target_height: Arc<AtomicU32>,
+    pub active: Arc<AtomicBool>,
+    pub paused: Arc<AtomicBool>,
+    pub latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
+    pub failure: Arc<Mutex<Option<String>>>,
+}
+
 /// Manages all window capture sessions
 pub struct CaptureCoordinator {
     /// Active capture sessions by preview ID
@@ -99,30 +110,20 @@ impl CaptureCoordinator {
         let target_height = Arc::new(AtomicU32::new(0));
         let latest_frame = Arc::new(Mutex::new(None));
         let failure = Arc::new(Mutex::new(None));
-        let active_clone = active.clone();
-        let paused_clone = paused.clone();
-        let fps_clone = fps.clone();
-        let target_width_clone = target_width.clone();
-        let target_height_clone = target_height.clone();
-        let worker_frame = latest_frame.clone();
-        let worker_failure = failure.clone();
+        let worker_state = CaptureWorkerState {
+            target_fps: fps.clone(),
+            target_width: target_width.clone(),
+            target_height: target_height.clone(),
+            active: active.clone(),
+            paused: paused.clone(),
+            latest_frame: latest_frame.clone(),
+            failure: failure.clone(),
+        };
         let (stop_sender, stop_receiver) = mpsc::channel();
 
         // Start capture in a new thread
         let worker = std::thread::spawn(move || {
-            capture_window_loop(
-                preview_id,
-                hwnd,
-                window_title,
-                fps_clone,
-                target_width_clone,
-                target_height_clone,
-                active_clone,
-                paused_clone,
-                worker_frame,
-                worker_failure,
-                stop_receiver,
-            );
+            capture_window_loop(preview_id, hwnd, window_title, worker_state, stop_receiver);
         });
 
         let session = CaptureSession {
@@ -156,27 +157,19 @@ impl CaptureCoordinator {
         let target_height = Arc::new(AtomicU32::new(0));
         let latest_frame = Arc::new(Mutex::new(None));
         let failure = Arc::new(Mutex::new(None));
-        let active_clone = active.clone();
-        let paused_clone = paused.clone();
-        let fps_clone = fps.clone();
-        let target_width_clone = target_width.clone();
-        let target_height_clone = target_height.clone();
-        let worker_frame = latest_frame.clone();
-        let worker_failure = failure.clone();
+        let worker_state = CaptureWorkerState {
+            target_fps: fps.clone(),
+            target_width: target_width.clone(),
+            target_height: target_height.clone(),
+            active: active.clone(),
+            paused: paused.clone(),
+            latest_frame: latest_frame.clone(),
+            failure: failure.clone(),
+        };
         let (stop_sender, stop_receiver) = mpsc::channel();
 
         let worker = std::thread::spawn(move || {
-            super::spout::capture_spout_loop(
-                sender_name,
-                fps_clone,
-                target_width_clone,
-                target_height_clone,
-                active_clone,
-                paused_clone,
-                worker_frame,
-                worker_failure,
-                stop_receiver,
-            );
+            super::spout::capture_spout_loop(sender_name, worker_state, stop_receiver);
         });
 
         self.sessions.insert(
@@ -351,13 +344,7 @@ fn capture_window_loop(
     preview_id: PreviewId,
     hwnd: isize,
     window_title: String,
-    target_fps: Arc<AtomicU32>,
-    target_width: Arc<AtomicU32>,
-    target_height: Arc<AtomicU32>,
-    active: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
-    failure: Arc<Mutex<Option<String>>>,
+    worker_state: CaptureWorkerState,
     stop_receiver: Receiver<()>,
 ) {
     use windows_capture::{
@@ -369,6 +356,16 @@ fn capture_window_loop(
             MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
         },
     };
+
+    let CaptureWorkerState {
+        target_fps,
+        target_width,
+        target_height,
+        active,
+        paused,
+        latest_frame,
+        failure,
+    } = worker_state;
 
     // Capture flags passed to the handler
     #[derive(Clone)]

@@ -256,8 +256,7 @@ impl PreviewManager {
         title: String,
         position: Pos2,
         size: Vec2,
-        hwnd: isize,
-        process_id: u32,
+        window_handle: WindowHandle,
         fps_preset: FpsPreset,
         z_order: u32,
     ) -> PreviewId {
@@ -266,7 +265,14 @@ impl PreviewManager {
             self.max_z_order = z_order;
         }
 
-        let mut preview = Preview::for_window(id, hwnd, process_id, title, position, size);
+        let mut preview = Preview::for_window(
+            id,
+            window_handle.hwnd,
+            window_handle.process_id,
+            title,
+            position,
+            size,
+        );
         preview.z_order = z_order;
         preview.set_fps_preset(fps_preset);
         // Restored layouts should appear instantly, not all spawn-animate at once.

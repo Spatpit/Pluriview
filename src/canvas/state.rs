@@ -924,6 +924,14 @@ struct FrameInput {
     escape_pressed: bool,
 }
 
+/// Immutable canvas values shared by the interaction passes for one frame.
+#[derive(Clone, Copy)]
+struct CanvasFrameScope<'a> {
+    canvas_rect: Rect,
+    input: &'a FrameInput,
+    show_overlays: bool,
+}
+
 /// Keyboard actions resolved by the app's configurable hotkey layer. `None`
 /// means a direct CanvasState test/embedding, which retains the legacy defaults.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1904,16 +1912,14 @@ impl CanvasState {
 
         self.handle_marquee_input(canvas_rect, preview_manager, &input, show_overlays);
 
-        // Draw previews and handle their interactions (AFTER bg allocation)
-        self.draw_and_interact_previews(
-            ui,
+        let frame_scope = CanvasFrameScope {
             canvas_rect,
-            preview_manager,
-            ctx,
-            capture_coordinator,
-            &input,
+            input: &input,
             show_overlays,
-        );
+        };
+
+        // Draw previews and handle their interactions (AFTER bg allocation)
+        self.draw_and_interact_previews(ui, frame_scope, preview_manager, ctx, capture_coordinator);
 
         // Draw selection rectangles and interactive resize handles
         // Handles are allocated AFTER previews so they have higher interaction priority
@@ -1941,12 +1947,10 @@ impl CanvasState {
         // Handle canvas-level input using the pre-allocated bg_response
         self.handle_canvas_input_with_response(
             ui,
-            canvas_rect,
+            frame_scope,
             preview_manager,
             capture_coordinator,
             bg_response,
-            &input,
-            show_overlays,
         );
 
         // Apply pending FPS changes
@@ -2200,13 +2204,16 @@ impl CanvasState {
     fn handle_canvas_input_with_response(
         &mut self,
         ui: &mut egui::Ui,
-        canvas_rect: Rect,
+        frame: CanvasFrameScope<'_>,
         preview_manager: &mut PreviewManager,
         capture_coordinator: &mut CaptureCoordinator,
         bg_response: egui::Response,
-        input: &FrameInput,
-        show_overlays: bool,
     ) {
+        let CanvasFrameScope {
+            canvas_rect,
+            input,
+            show_overlays,
+        } = frame;
         // Use the pre-allocated background response
 
         // Update cursor based on drag state or handle hover
@@ -2402,13 +2409,16 @@ impl CanvasState {
     fn draw_and_interact_previews(
         &mut self,
         ui: &mut egui::Ui,
-        canvas_rect: Rect,
+        frame: CanvasFrameScope<'_>,
         preview_manager: &mut PreviewManager,
         ctx: &egui::Context,
         capture_coordinator: &mut CaptureCoordinator,
-        input: &FrameInput,
-        show_overlays: bool,
     ) {
+        let CanvasFrameScope {
+            canvas_rect,
+            input,
+            show_overlays,
+        } = frame;
         let viewport = self.get_viewport(canvas_rect);
 
         // Reuse one allocation for the visible, z-sorted interaction snapshot.
