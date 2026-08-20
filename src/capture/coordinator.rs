@@ -16,6 +16,8 @@ use super::downsample::{fitted_capture_size, RgbaDownsampler};
 pub(crate) struct CapturedFrame {
     pub width: u32,
     pub height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
     pub data: Vec<u8>,
 }
 
@@ -276,7 +278,13 @@ impl CaptureCoordinator {
             let failure = session.failure.lock().take();
             if let Some(preview) = preview_manager.get_mut(*preview_id) {
                 if let Some(frame) = frame {
-                    preview.update_frame(frame.width, frame.height, frame.data);
+                    preview.update_capture_frame(
+                        frame.width,
+                        frame.height,
+                        frame.source_width,
+                        frame.source_height,
+                        frame.data,
+                    );
                 } else if let Some(error) = failure {
                     preview.set_capture_error(error);
                 } else if session.is_live() {
@@ -522,6 +530,8 @@ fn capture_window_loop(
                 CapturedFrame {
                     width,
                     height,
+                    source_width: width,
+                    source_height: height,
                     data: buffer.as_nopadding_buffer()?.to_vec(),
                 }
             } else {
@@ -536,6 +546,8 @@ fn capture_window_loop(
                 CapturedFrame {
                     width: out_width,
                     height: out_height,
+                    source_width: width,
+                    source_height: height,
                     data,
                 }
             };
@@ -745,11 +757,15 @@ mod tests {
         *pending.lock() = Some(CapturedFrame {
             width: 1,
             height: 1,
+            source_width: 1,
+            source_height: 1,
             data: vec![1; 4],
         });
         *pending.lock() = Some(CapturedFrame {
             width: 2,
             height: 2,
+            source_width: 2,
+            source_height: 2,
             data: vec![2; 16],
         });
 
@@ -789,11 +805,15 @@ mod tests {
         *stale_slot.lock() = Some(CapturedFrame {
             width: 1,
             height: 1,
+            source_width: 1,
+            source_height: 1,
             data: vec![1; 4],
         });
         *current.latest_frame.lock() = Some(CapturedFrame {
             width: 2,
             height: 2,
+            source_width: 4,
+            source_height: 4,
             data: vec![2; 16],
         });
         let mut coordinator = CaptureCoordinator::new();
@@ -801,6 +821,10 @@ mod tests {
         coordinator.process_frames(&mut previews);
 
         assert_eq!(previews.get(preview_id).unwrap().frame_size, Some((2, 2)));
+        assert_eq!(
+            previews.get(preview_id).unwrap().source_frame_size,
+            Some((4, 4))
+        );
         assert_eq!(stale_slot.lock().as_ref().unwrap().width, 1);
     }
 

@@ -170,8 +170,12 @@ pub struct Preview {
     /// (min_u, min_v, max_u, max_v) where (0,0) is top-left and (1,1) is bottom-right
     pub crop_uv: Option<(f32, f32, f32, f32)>,
 
-    /// Original frame dimensions (updated when receiving frames)
+    /// Dimensions of the texture currently uploaded for this preview.
     pub frame_size: Option<(u32, u32)>,
+
+    /// Native dimensions produced by a live capture source before adaptive
+    /// downsampling. Used for pixel-accurate sizing and crop coordinates.
+    pub source_frame_size: Option<(u32, u32)>,
 
     /// Current frame texture
     texture: Option<TextureHandle>,
@@ -272,6 +276,7 @@ impl Preview {
             fps_preset: FpsPreset::default(),
             crop_uv: None,
             frame_size: None,
+            source_frame_size: None,
             texture: None,
             frame_buffer: None,
             browser_url: None,
@@ -456,14 +461,28 @@ impl Preview {
 
     /// Update frame data from capture
     pub fn update_frame(&mut self, width: u32, height: u32, data: Vec<u8>) {
+        self.update_capture_frame(width, height, width, height, data);
+    }
+
+    /// Update a live-capture texture while retaining the source's native size.
+    pub fn update_capture_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        source_width: u32,
+        source_height: u32,
+        data: Vec<u8>,
+    ) {
         self.clear_capture_error();
-        // Update source aspect ratio from actual frame dimensions
-        if width > 0 && height > 0 {
-            self.frame_size = Some((width, height));
+        if source_width > 0 && source_height > 0 {
+            self.source_frame_size = Some((source_width, source_height));
             // Only update aspect ratio if we don't have a crop region
             if self.crop_uv.is_none() {
-                self.source_aspect_ratio = width as f32 / height as f32;
+                self.source_aspect_ratio = source_width as f32 / source_height as f32;
             }
+        }
+        if width > 0 && height > 0 {
+            self.frame_size = Some((width, height));
         }
 
         self.frame_buffer = Some(FrameData {
@@ -486,7 +505,7 @@ impl Preview {
     pub fn clear_crop(&mut self) {
         self.crop_uv = None;
         // Restore aspect ratio from frame size
-        if let Some((w, h)) = self.frame_size {
+        if let Some((w, h)) = self.source_frame_size.or(self.frame_size) {
             if h > 0 {
                 self.source_aspect_ratio = w as f32 / h as f32;
             }

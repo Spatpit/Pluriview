@@ -4980,7 +4980,7 @@ impl eframe::App for PluriviewApp {
                     if let Some(preview_id) = self.region_select_preview_id {
                         if let Some(preview) = self.preview_manager.get_mut(preview_id) {
                             // Get source dimensions from frame if available
-                            if let Some((w, h)) = preview.frame_size {
+                            if let Some((w, h)) = preview.source_frame_size.or(preview.frame_size) {
                                 let crop_uv = selection.to_uv(w, h);
                                 preview.crop_uv = Some(crop_uv);
                                 // Update aspect ratio for the cropped region

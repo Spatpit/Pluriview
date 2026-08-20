@@ -249,6 +249,8 @@ impl SpoutGpuReceiver {
         Ok(Some(CapturedFrame {
             width: out_width,
             height: out_height,
+            source_width: self.width,
+            source_height: self.height,
             data,
         }))
     }

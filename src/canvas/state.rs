@@ -52,9 +52,10 @@ pub enum DragState {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_resize, capture_resolution_badge_rect, format_time, playlist_first_row_center,
-        stream_audio_badge_rect, video_placeholder_content, window_capture_placeholder_content,
-        CanvasState, DragState, PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
+        apply_resize, capture_resolution_badge_rect, format_time, native_capture_canvas_size,
+        pixel_aligned_rect, playlist_first_row_center, stream_audio_badge_rect,
+        video_placeholder_content, window_capture_placeholder_content, CanvasState, DragState,
+        PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -153,6 +154,60 @@ mod tests {
         let resolution = capture_resolution_badge_rect(sa);
         assert!(resolution.right() <= sa.left() + 0.1);
         assert!(resolution.left() > tile.left());
+    }
+
+    #[test]
+    fn capture_rect_edges_align_to_physical_pixels() {
+        let aligned = pixel_aligned_rect(
+            Rect::from_min_max(Pos2::new(0.31, 1.09), Pos2::new(100.42, 50.77)),
+            1.25,
+        );
+        for edge in [
+            aligned.left(),
+            aligned.top(),
+            aligned.right(),
+            aligned.bottom(),
+        ] {
+            assert!((edge * 1.25 - (edge * 1.25).round()).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn native_capture_size_maps_each_source_pixel_to_one_screen_pixel() {
+        let size = native_capture_canvas_size((1920, 1080), None, 1.25, 2.0);
+        assert_eq!(size, Vec2::new(768.0, 432.0));
+
+        let cropped =
+            native_capture_canvas_size((1920, 1080), Some((0.25, 0.25, 0.75, 0.75)), 1.25, 2.0);
+        assert_eq!(cropped, Vec2::new(384.0, 216.0));
+    }
+
+    #[test]
+    fn native_capture_action_aligns_and_resizes_the_tile() {
+        let mut canvas = CanvasState {
+            zoom: 2.0,
+            pan: Vec2::new(3.17, -1.43),
+            ..Default::default()
+        };
+        let canvas_rect = Rect::from_min_size(Pos2::new(10.3, 20.7), Vec2::splat(1200.0));
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_window(
+            1,
+            42,
+            "window".to_owned(),
+            Pos2::new(7.13, 9.81),
+            Vec2::splat(100.0),
+        );
+
+        canvas.set_native_capture_size(id, (1920, 1080), canvas_rect, 1.25, &mut previews);
+
+        let preview = previews.get(id).unwrap();
+        assert_eq!(preview.size, Vec2::new(768.0, 432.0));
+        let screen = canvas.canvas_rect_to_screen(preview.rect(), canvas_rect);
+        assert_eq!((screen.width() * 1.25).round() as u32, 1920);
+        assert_eq!((screen.height() * 1.25).round() as u32, 1080);
+        assert!((screen.left() * 1.25 - (screen.left() * 1.25).round()).abs() < 0.001);
+        assert!((screen.top() * 1.25 - (screen.top() * 1.25).round()).abs() < 0.001);
     }
 
     #[test]
@@ -995,6 +1050,7 @@ struct TileInfo {
     supports_seek_preview: bool,
     manually_frozen: bool,
     frame_size: Option<(u32, u32)>,
+    source_frame_size: Option<(u32, u32)>,
 }
 
 impl TileInfo {
@@ -1025,6 +1081,7 @@ impl TileInfo {
             supports_seek_preview: preview.supports_seek_preview(),
             manually_frozen: preview.manually_frozen,
             frame_size: preview.frame_size,
+            source_frame_size: preview.source_frame_size,
         }
     }
 
@@ -1054,6 +1111,7 @@ impl TileInfo {
         self.supports_seek_preview = preview.supports_seek_preview();
         self.manually_frozen = preview.manually_frozen;
         self.frame_size = preview.frame_size;
+        self.source_frame_size = preview.source_frame_size;
     }
 }
 
@@ -1128,6 +1186,35 @@ fn cover_uv(image: Vec2, dest: Vec2) -> Rect {
         let pad = (1.0 - visible) * 0.5;
         Rect::from_min_max(Pos2::new(0.0, pad), Pos2::new(1.0, 1.0 - pad))
     }
+}
+
+fn pixel_aligned_rect(rect: Rect, pixels_per_point: f32) -> Rect {
+    let scale = pixels_per_point.max(0.01);
+    let snap = |value: f32| (value * scale).round() / scale;
+    Rect::from_min_max(
+        Pos2::new(snap(rect.min.x), snap(rect.min.y)),
+        Pos2::new(snap(rect.max.x), snap(rect.max.y)),
+    )
+}
+
+fn native_capture_canvas_size(
+    source_size: (u32, u32),
+    crop_uv: Option<(f32, f32, f32, f32)>,
+    pixels_per_point: f32,
+    canvas_zoom: f32,
+) -> Vec2 {
+    let (u_span, v_span) = crop_uv
+        .map(|(min_u, min_v, max_u, max_v)| {
+            (
+                (max_u - min_u).clamp(0.0, 1.0),
+                (max_v - min_v).clamp(0.0, 1.0),
+            )
+        })
+        .unwrap_or((1.0, 1.0));
+    let width_px = (source_size.0 as f32 * u_span).round().max(1.0);
+    let height_px = (source_size.1 as f32 * v_span).round().max(1.0);
+    let screen_scale = pixels_per_point.max(0.01) * canvas_zoom.max(0.01);
+    Vec2::new(width_px / screen_scale, height_px / screen_scale)
 }
 
 fn paint_truncated_text(
@@ -1742,6 +1829,42 @@ impl CanvasState {
         let min = self.canvas_to_screen(canvas_rect.min, screen_canvas_rect);
         let max = self.canvas_to_screen(canvas_rect.max, screen_canvas_rect);
         Rect::from_min_max(min, max)
+    }
+
+    fn set_native_capture_size(
+        &mut self,
+        id: PreviewId,
+        source_size: (u32, u32),
+        canvas_rect: Rect,
+        pixels_per_point: f32,
+        preview_manager: &mut PreviewManager,
+    ) {
+        // Focus mode owns the canvas zoom, so restore the user's normal view
+        // before calculating a persistent 1:1 tile size.
+        self.exit_focus();
+
+        let Some((position, crop_uv)) = preview_manager
+            .get(id)
+            .map(|preview| (preview.position, preview.crop_uv))
+        else {
+            return;
+        };
+        let screen_min = self.canvas_to_screen(position, canvas_rect);
+        let aligned_min = pixel_aligned_rect(
+            Rect::from_min_size(screen_min, Vec2::ZERO),
+            pixels_per_point,
+        )
+        .min;
+        let position = self.screen_to_canvas(aligned_min, canvas_rect);
+        let size = native_capture_canvas_size(source_size, crop_uv, pixels_per_point, self.zoom);
+
+        if let Some(preview) = preview_manager.get_mut(id) {
+            preview.position = position;
+            preview.size = size;
+        }
+        if let Some(spring) = self.animation.preview_springs.get_mut(&id) {
+            spring.set_immediate_pos(position);
+        }
     }
 
     /// Get the visible canvas area
@@ -2470,7 +2593,13 @@ impl CanvasState {
             let supports_seek_preview = info.supports_seek_preview;
             let manually_frozen = info.manually_frozen;
             let frame_size = info.frame_size;
+            let source_frame_size = info.source_frame_size;
             let screen_rect = self.canvas_rect_to_screen(rect, canvas_rect);
+            let screen_rect = if is_window_capture {
+                pixel_aligned_rect(screen_rect, ctx.pixels_per_point())
+            } else {
+                screen_rect
+            };
 
             if !canvas_rect.intersects(screen_rect) {
                 continue;
@@ -2490,6 +2619,11 @@ impl CanvasState {
                 Rect::from_center_size(screen_rect.center(), screen_rect.size() * scale)
             } else {
                 screen_rect
+            };
+            let anim_rect = if is_window_capture {
+                pixel_aligned_rect(anim_rect, ctx.pixels_per_point())
+            } else {
+                anim_rect
             };
             let alpha_u8 = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
 
@@ -3451,6 +3585,30 @@ impl CanvasState {
                             });
                             ui.close_menu();
                         }
+                    }
+                    ui.separator();
+                }
+
+                if is_window_capture {
+                    let native_size = ui
+                        .add_enabled(
+                            source_frame_size.is_some(),
+                            egui::Button::new("Native Size (1:1)"),
+                        )
+                        .on_hover_text(
+                            "Resize this tile so every captured source pixel maps to one screen pixel",
+                        );
+                    if native_size.clicked() {
+                        if let Some(source_size) = source_frame_size {
+                            self.set_native_capture_size(
+                                id,
+                                source_size,
+                                canvas_rect,
+                                ctx.pixels_per_point(),
+                                preview_manager,
+                            );
+                        }
+                        ui.close_menu();
                     }
                     ui.separator();
                 }
@@ -4436,7 +4594,8 @@ impl CanvasState {
                         p.source_aspect_ratio,
                         p.lock_aspect_ratio,
                         p.crop_uv,
-                        p.frame_size,
+                        p.source_frame_size.or(p.frame_size),
+                        p.is_window_capture(),
                         p.is_browser(),
                         p.is_playlist(),
                     )
@@ -4451,11 +4610,17 @@ impl CanvasState {
             lock_aspect_ratio,
             crop_uv,
             frame_size,
+            is_window_capture,
             is_browser,
             is_playlist,
         ) in selection_info
         {
             let screen_rect = self.canvas_rect_to_screen(preview_rect, canvas_rect);
+            let screen_rect = if is_window_capture {
+                pixel_aligned_rect(screen_rect, ui.ctx().pixels_per_point())
+            } else {
+                screen_rect
+            };
 
             // Minimal Void: Selection border with accent color
             // (browsers can't be cropped, so no orange crop hint for them)
