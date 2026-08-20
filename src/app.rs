@@ -4497,6 +4497,7 @@ impl PluriviewApp {
                 if let Some(preview) = self.preview_manager.get_mut(id) {
                     preview.lock_aspect_ratio = preview_layout.lock_aspect_ratio;
                     preview.crop_uv = preview_layout.crop_uv;
+                    preview.viewport_pin = preview_layout.viewport_pin;
                     preview.created_at = Instant::now() - Duration::from_secs(1);
                 }
                 self.capture_coordinator.start_spout_capture(

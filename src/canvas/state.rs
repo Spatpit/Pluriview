@@ -3,7 +3,7 @@ use super::wallpaper::CanvasWallpaper;
 use crate::capture::{capture_lod_factor, window_capture_target, CaptureCoordinator};
 use crate::preview::{
     compact_title, BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager,
-    RemovedPreviewInfo, VideoPlaybackState, VideoTileStatus,
+    RemovedPreviewInfo, VideoPlaybackState, VideoTileStatus, ViewportPin,
 };
 #[cfg(debug_assertions)]
 use crate::privacy;
@@ -38,6 +38,8 @@ pub enum DragState {
         start_mouse: Pos2,
         /// Aspect ratio to maintain during resize (width/height)
         aspect_ratio: Option<f32>,
+        /// Pinned Spout tiles resize directly in viewport coordinates.
+        screen_space: bool,
     },
     /// Cropping a preview (Alt+drag to adjust UV coordinates)
     Cropping {
@@ -52,10 +54,10 @@ pub enum DragState {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_resize, capture_resolution_badge_rect, format_time, native_capture_canvas_size,
-        pixel_aligned_rect, playlist_first_row_center, stream_audio_badge_rect,
-        video_placeholder_content, window_capture_placeholder_content, CanvasState, DragState,
-        PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
+        apply_resize, capture_resolution_badge_rect, format_time, live_capture_display_size,
+        native_capture_canvas_size, pixel_aligned_rect, playlist_first_row_center,
+        stream_audio_badge_rect, video_placeholder_content, window_capture_placeholder_content,
+        CanvasState, DragState, PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -234,6 +236,76 @@ mod tests {
     }
 
     #[test]
+    fn pinned_spout_stays_fixed_through_canvas_pan_and_zoom() {
+        let mut canvas = CanvasState {
+            pan: Vec2::new(20.0, -10.0),
+            zoom: 1.5,
+            ..Default::default()
+        };
+        let viewport = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(1200.0, 700.0));
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_spout(
+            "VTube Studio".to_owned(),
+            Pos2::new(100.0, 80.0),
+            Vec2::new(320.0, 480.0),
+            FpsPreset::Medium,
+        );
+        let before = canvas.preview_screen_rect(previews.get(id).unwrap(), viewport);
+
+        canvas.toggle_spout_viewport_pin(id, viewport, &mut previews);
+        canvas.pan = Vec2::new(-500.0, 900.0);
+        canvas.zoom = 0.25;
+
+        assert_eq!(
+            canvas.preview_screen_rect(previews.get(id).unwrap(), viewport),
+            before
+        );
+        assert_eq!(
+            live_capture_display_size(previews.get(id).unwrap(), 0.25),
+            before.size()
+        );
+    }
+
+    #[test]
+    fn unpinning_spout_preserves_its_current_screen_rect() {
+        let mut canvas = CanvasState {
+            pan: Vec2::new(-60.0, 25.0),
+            zoom: 0.75,
+            ..Default::default()
+        };
+        let viewport = Rect::from_min_size(Pos2::new(25.0, 15.0), Vec2::new(1000.0, 700.0));
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_spout(
+            "avatar".to_owned(),
+            Pos2::new(220.0, 160.0),
+            Vec2::new(240.0, 360.0),
+            FpsPreset::Medium,
+        );
+        canvas.toggle_spout_viewport_pin(id, viewport, &mut previews);
+        let pinned_rect = canvas.preview_screen_rect(previews.get(id).unwrap(), viewport);
+
+        canvas.toggle_spout_viewport_pin(id, viewport, &mut previews);
+
+        assert!(previews.get(id).unwrap().viewport_pin.is_none());
+        assert_eq!(
+            canvas.preview_screen_rect(previews.get(id).unwrap(), viewport),
+            pinned_rect
+        );
+    }
+
+    #[test]
+    fn viewport_pin_toggle_ignores_non_spout_tiles() {
+        let mut canvas = CanvasState::default();
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        let mut previews = PreviewManager::new();
+        let id = previews.add("image".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+
+        canvas.toggle_spout_viewport_pin(id, viewport, &mut previews);
+
+        assert!(previews.get(id).unwrap().viewport_pin.is_none());
+    }
+
+    #[test]
     fn video_time_format_handles_hours_and_missing_values() {
         assert_eq!(format_time(None), "0:00");
         assert_eq!(format_time(Some(65.9)), "1:05");
@@ -310,6 +382,7 @@ mod tests {
             start_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
             start_mouse: Pos2::new(100.0, 100.0),
             aspect_ratio: Some(1.0),
+            screen_space: false,
         });
         let mut previews = PreviewManager::new();
         let mut captures = CaptureCoordinator::new();
@@ -1041,6 +1114,7 @@ struct TileInfo {
     is_playlist: bool,
     is_window_capture: bool,
     is_spout_capture: bool,
+    viewport_pin: Option<ViewportPin>,
     muted: bool,
     stream_audio: bool,
     capture_failed: bool,
@@ -1072,6 +1146,7 @@ impl TileInfo {
             is_playlist: preview.is_playlist(),
             is_window_capture: preview.is_window_capture(),
             is_spout_capture: preview.is_spout_capture(),
+            viewport_pin: preview.viewport_pin,
             muted: preview.browser_muted,
             stream_audio: preview.stream_audio,
             capture_failed: preview.capture_error.is_some(),
@@ -1102,6 +1177,7 @@ impl TileInfo {
         self.is_playlist = preview.is_playlist();
         self.is_window_capture = preview.is_window_capture();
         self.is_spout_capture = preview.is_spout_capture();
+        self.viewport_pin = preview.viewport_pin;
         self.muted = preview.browser_muted;
         self.stream_audio = preview.stream_audio;
         self.capture_failed = preview.capture_error.is_some();
@@ -1215,6 +1291,14 @@ fn native_capture_canvas_size(
     let height_px = (source_size.1 as f32 * v_span).round().max(1.0);
     let screen_scale = pixels_per_point.max(0.01) * canvas_zoom.max(0.01);
     Vec2::new(width_px / screen_scale, height_px / screen_scale)
+}
+
+fn live_capture_display_size(preview: &Preview, canvas_lod: f32) -> Vec2 {
+    preview
+        .viewport_pin
+        .filter(|_| preview.is_spout_capture())
+        .map(ViewportPin::size_vec2)
+        .unwrap_or(preview.size * canvas_lod)
 }
 
 fn paint_truncated_text(
@@ -1595,6 +1679,10 @@ pub struct CanvasState {
     /// Is a preview currently being dragged?
     preview_dragging: bool,
 
+    /// Original viewport placements for pinned Spout tiles in the active
+    /// drag, paired with their IDs so egui's cumulative drag delta is stable.
+    pinned_drag_origins: Vec<(PreviewId, ViewportPin)>,
+
     /// Is the canvas currently being panned?
     canvas_panning: bool,
 
@@ -1696,6 +1784,7 @@ impl Default for CanvasState {
             animation: AnimationState::new(),
             tile_scratch: Vec::new(),
             preview_dragging: false,
+            pinned_drag_origins: Vec::new(),
             canvas_panning: false,
             pan_drag_tracker: DragTracker::new(),
             pending_region_select: None,
@@ -1737,12 +1826,14 @@ impl CanvasState {
         self.selection.clear();
         self.drag_state = None;
         self.marquee = None;
+        self.pinned_drag_origins.clear();
         self.animation.preview_springs.clear();
     }
 
     /// Drop animation state belonging to previews from a previous layout.
     pub fn clear_preview_animations(&mut self) {
         self.animation.preview_springs.clear();
+        self.pinned_drag_origins.clear();
     }
 
     fn prune_preview_animations(&mut self, preview_manager: &PreviewManager) {
@@ -1797,7 +1888,7 @@ impl CanvasState {
         };
         if let Some(tile_rect) = preview_manager
             .get(id)
-            .filter(|preview| preview.removing.is_none())
+            .filter(|preview| preview.removing.is_none() && preview.viewport_pin.is_none())
             .map(|preview| preview.rect())
         {
             self.focus_on_tile(id, tile_rect, canvas_rect);
@@ -1829,6 +1920,55 @@ impl CanvasState {
         let min = self.canvas_to_screen(canvas_rect.min, screen_canvas_rect);
         let max = self.canvas_to_screen(canvas_rect.max, screen_canvas_rect);
         Rect::from_min_max(min, max)
+    }
+
+    fn preview_screen_rect(&self, preview: &Preview, canvas_rect: Rect) -> Rect {
+        preview
+            .viewport_pin
+            .filter(|_| preview.is_spout_capture())
+            .map(|pin| pin.rect(canvas_rect))
+            .unwrap_or_else(|| self.canvas_rect_to_screen(preview.rect(), canvas_rect))
+    }
+
+    fn toggle_spout_viewport_pin(
+        &mut self,
+        id: PreviewId,
+        canvas_rect: Rect,
+        preview_manager: &mut PreviewManager,
+    ) {
+        let Some((is_spout, pin, canvas_preview_rect)) = preview_manager.get(id).map(|preview| {
+            (
+                preview.is_spout_capture(),
+                preview.viewport_pin,
+                preview.rect(),
+            )
+        }) else {
+            return;
+        };
+        if !is_spout {
+            return;
+        }
+
+        self.exit_focus();
+        self.animation.preview_springs.remove(&id);
+        self.pinned_drag_origins
+            .retain(|(drag_id, _)| *drag_id != id);
+
+        if let Some(pin) = pin {
+            let screen_rect = pin.rect(canvas_rect);
+            let min = self.screen_to_canvas(screen_rect.min, canvas_rect);
+            let max = self.screen_to_canvas(screen_rect.max, canvas_rect);
+            if let Some(preview) = preview_manager.get_mut(id) {
+                preview.position = min;
+                preview.size = (max - min).max(Vec2::splat(1.0));
+                preview.viewport_pin = None;
+            }
+        } else {
+            let screen_rect = self.canvas_rect_to_screen(canvas_preview_rect, canvas_rect);
+            if let Some(preview) = preview_manager.get_mut(id) {
+                preview.viewport_pin = Some(ViewportPin::from_rect(screen_rect, canvas_rect));
+            }
+        }
     }
 
     fn set_native_capture_size(
@@ -1883,7 +2023,7 @@ impl CanvasState {
     ) -> Option<(PreviewId, ResizeHandle)> {
         for id in &self.selection {
             if let Some(preview) = preview_manager.get(*id) {
-                let screen_rect = self.canvas_rect_to_screen(preview.rect(), canvas_rect);
+                let screen_rect = self.preview_screen_rect(preview, canvas_rect);
 
                 let handles = [
                     (screen_rect.left_top(), ResizeHandle::TopLeft),
@@ -1906,6 +2046,24 @@ impl CanvasState {
             }
         }
         None
+    }
+
+    fn preview_at_screen(
+        &self,
+        screen_pos: Pos2,
+        canvas_rect: Rect,
+        preview_manager: &PreviewManager,
+    ) -> Option<PreviewId> {
+        preview_manager
+            .all()
+            .filter(|preview| {
+                preview.removing.is_none()
+                    && self
+                        .preview_screen_rect(preview, canvas_rect)
+                        .contains(screen_pos)
+            })
+            .max_by_key(|preview| (preview.viewport_pin.is_some(), preview.z_order))
+            .map(|preview| preview.id)
     }
 
     /// Main UI rendering for the canvas
@@ -2095,7 +2253,9 @@ impl CanvasState {
         for (id, spring) in &self.animation.preview_springs {
             if spring.is_animating() {
                 if let Some(preview) = preview_manager.get_mut(*id) {
-                    preview.position = spring.current_pos();
+                    if preview.viewport_pin.is_none() {
+                        preview.position = spring.current_pos();
+                    }
                 }
             }
         }
@@ -2113,9 +2273,10 @@ impl CanvasState {
             if !preview.is_live_capture() || preview.manually_frozen {
                 continue;
             }
+            let display_size = live_capture_display_size(preview, lod);
             let (width, height) = window_capture_target(
-                preview.size.x * lod,
-                preview.size.y * lod,
+                display_size.x,
+                display_size.y,
                 pixels_per_point,
                 preview.crop_uv,
             );
@@ -2136,7 +2297,7 @@ impl CanvasState {
         for preview in preview_manager.all_mut() {
             let id = preview.id;
             let preview_rect = preview.rect();
-            let is_visible = viewport.intersects(preview_rect);
+            let is_visible = preview.viewport_pin.is_some() || viewport.intersects(preview_rect);
 
             // Update pause state based on visibility
             if is_visible && preview.capture_paused && !preview.manually_frozen {
@@ -2264,10 +2425,7 @@ impl CanvasState {
             .all()
             .filter(|preview| preview.removing.is_none())
         {
-            let screen_rect = Rect::from_min_size(
-                canvas_rect.min + (preview.position.to_vec2() + self.pan) * self.zoom,
-                preview.size * self.zoom,
-            );
+            let screen_rect = self.preview_screen_rect(preview, canvas_rect);
             if selection_rect.intersects(screen_rect) && !selected.contains(&preview.id) {
                 selected.push(preview.id);
             }
@@ -2291,11 +2449,14 @@ impl CanvasState {
             && self.drag_state.is_none()
         {
             if let Some(pointer) = input.interact_pos.filter(|pos| canvas_rect.contains(*pos)) {
-                let canvas_pos = self.screen_to_canvas(pointer, canvas_rect);
                 let over_resize_handle = self
                     .get_handle_at(pointer, canvas_rect, preview_manager)
                     .is_some();
-                if !over_resize_handle && preview_manager.get_preview_at(canvas_pos).is_none() {
+                if !over_resize_handle
+                    && self
+                        .preview_at_screen(pointer, canvas_rect, preview_manager)
+                        .is_none()
+                {
                     self.marquee = Some(MarqueeSelection {
                         start: pointer,
                         current: pointer,
@@ -2420,8 +2581,10 @@ impl CanvasState {
         // Click on empty space to deselect
         if bg_response.clicked() && !input.ctrl {
             if let Some(mouse_pos) = input.interact_pos {
-                let canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
-                if preview_manager.get_preview_at(canvas_pos).is_none() {
+                if self
+                    .preview_at_screen(mouse_pos, canvas_rect, preview_manager)
+                    .is_none()
+                {
                     self.selection.clear();
                 }
             }
@@ -2550,7 +2713,7 @@ impl CanvasState {
         let mut visible_count = 0;
         for preview in preview_manager
             .all()
-            .filter(|preview| preview.rect().intersects(viewport))
+            .filter(|preview| preview.viewport_pin.is_some() || preview.rect().intersects(viewport))
         {
             if let Some(info) = preview_info.get_mut(visible_count) {
                 info.update_from(preview);
@@ -2560,7 +2723,9 @@ impl CanvasState {
             visible_count += 1;
         }
         preview_info.truncate(visible_count);
-        preview_info.sort_by_key(|info| info.z_order);
+        // Pinned Spout tiles are a viewport overlay and always paint above
+        // ordinary canvas content while preserving their relative z-order.
+        preview_info.sort_by_key(|info| (info.viewport_pin.is_some(), info.z_order));
 
         let mut any_spawn_or_remove_animating = false;
 
@@ -2580,6 +2745,7 @@ impl CanvasState {
             let is_playlist = info.is_playlist;
             let is_window_capture = info.is_window_capture;
             let is_spout_capture = info.is_spout_capture;
+            let viewport_pin = info.viewport_pin;
             let muted = if is_video {
                 info.video_playback.muted
             } else {
@@ -2594,7 +2760,9 @@ impl CanvasState {
             let manually_frozen = info.manually_frozen;
             let frame_size = info.frame_size;
             let source_frame_size = info.source_frame_size;
-            let screen_rect = self.canvas_rect_to_screen(rect, canvas_rect);
+            let screen_rect = viewport_pin
+                .map(|pin| pin.rect(canvas_rect))
+                .unwrap_or_else(|| self.canvas_rect_to_screen(rect, canvas_rect));
             let screen_rect = if is_window_capture {
                 pixel_aligned_rect(screen_rect, ctx.pixels_per_point())
             } else {
@@ -3428,6 +3596,7 @@ impl CanvasState {
             if preview_response.drag_started() && !input.alt && !input.middle_down {
                 self.preview_dragging = true;
                 self.animation.drag_tracker.clear();
+                self.pinned_drag_origins.clear();
 
                 // Initialize springs for dragged previews at their current position
                 let ids_to_init: Vec<PreviewId> = if self.selection.contains(&id) {
@@ -3438,10 +3607,14 @@ impl CanvasState {
 
                 for sel_id in ids_to_init {
                     if let Some(preview) = preview_manager.get(sel_id) {
-                        let spring = self
-                            .animation
-                            .get_or_create_spring(sel_id, preview.position);
-                        spring.set_immediate_pos(preview.position);
+                        if let Some(pin) = preview.viewport_pin {
+                            self.pinned_drag_origins.push((sel_id, pin));
+                        } else {
+                            let spring = self
+                                .animation
+                                .get_or_create_spring(sel_id, preview.position);
+                            spring.set_immediate_pos(preview.position);
+                        }
                     }
                 }
             }
@@ -3451,30 +3624,44 @@ impl CanvasState {
             if preview_response.dragged() && !input.alt && !input.middle_down {
                 // Only move if we're not in a resize operation
                 if self.drag_state.is_none() {
-                    let delta = preview_response.drag_delta() / self.zoom;
+                    let screen_delta = preview_response.drag_delta();
+                    let canvas_delta = screen_delta / self.zoom;
 
                     // Track velocity for momentum
                     if let Some(mouse_pos) = input.hover_pos {
                         self.animation.drag_tracker.record(mouse_pos, input.time);
                     }
 
-                    // Move previews directly during drag (immediate feedback)
-                    if self.selection.contains(&id) {
-                        for sel_id in &self.selection {
-                            preview_manager.translate(*sel_id, delta);
+                    let dragged_ids = if self.selection.contains(&id) {
+                        self.selection.clone()
+                    } else {
+                        vec![id]
+                    };
+                    // Pinned tiles derive every frame from their original pin
+                    // because egui reports a cumulative drag delta. Ordinary
+                    // canvas tiles retain their existing movement behavior.
+                    for sel_id in dragged_ids {
+                        let pinned_origin = self
+                            .pinned_drag_origins
+                            .iter()
+                            .find(|(drag_id, _)| *drag_id == sel_id)
+                            .map(|(_, pin)| *pin);
+                        if let Some(pin) = pinned_origin {
+                            if let Some(preview) = preview_manager.get_mut(sel_id) {
+                                preview.viewport_pin = Some(ViewportPin::from_rect(
+                                    pin.rect(canvas_rect).translate(screen_delta),
+                                    canvas_rect,
+                                ));
+                            }
+                        } else {
+                            preview_manager.translate(sel_id, canvas_delta);
                             // Keep spring in sync during drag
-                            if let Some(preview) = preview_manager.get(*sel_id) {
-                                if let Some(spring) = self.animation.preview_springs.get_mut(sel_id)
+                            if let Some(preview) = preview_manager.get(sel_id) {
+                                if let Some(spring) =
+                                    self.animation.preview_springs.get_mut(&sel_id)
                                 {
                                     spring.set_immediate_pos(preview.position);
                                 }
-                            }
-                        }
-                    } else {
-                        preview_manager.translate(id, delta);
-                        if let Some(preview) = preview_manager.get(id) {
-                            if let Some(spring) = self.animation.preview_springs.get_mut(&id) {
-                                spring.set_immediate_pos(preview.position);
                             }
                         }
                     }
@@ -3497,6 +3684,9 @@ impl CanvasState {
 
                 for sel_id in ids_to_animate {
                     if let Some(preview) = preview_manager.get(sel_id) {
+                        if preview.viewport_pin.is_some() {
+                            continue;
+                        }
                         // Calculate target with subtle momentum
                         let momentum_offset = velocity * 0.05; // Very subtle momentum
                         let target_pos = preview.position + momentum_offset;
@@ -3518,6 +3708,7 @@ impl CanvasState {
                         spring.add_velocity(velocity * 0.1);
                     }
                 }
+                self.pinned_drag_origins.clear();
             }
 
             // Context menu for preview
@@ -3608,6 +3799,20 @@ impl CanvasState {
                                 preview_manager,
                             );
                         }
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                }
+
+                if is_spout_capture {
+                    if ui
+                        .selectable_label(viewport_pin.is_some(), "Pin to Viewport")
+                        .on_hover_text(
+                            "Keep this Spout tile fixed above the canvas while panning or zooming",
+                        )
+                        .clicked()
+                    {
+                        self.toggle_spout_viewport_pin(id, canvas_rect, preview_manager);
                         ui.close_menu();
                     }
                     ui.separator();
@@ -3886,7 +4091,10 @@ impl CanvasState {
 
                 ui.separator();
 
-                if ui.button("Focus on This Tile").clicked() {
+                if ui
+                    .add_enabled(viewport_pin.is_none(), egui::Button::new("Focus on This Tile"))
+                    .clicked()
+                {
                     self.focus_on_tile(id, rect, canvas_rect);
                     ui.close_menu();
                 }
@@ -4542,6 +4750,7 @@ impl CanvasState {
                 if let Some(preview) = preview_manager.get_mut(id) {
                     preview.set_fps_preset(info.fps_preset);
                     preview.crop_uv = info.crop_uv;
+                    preview.viewport_pin = info.viewport_pin;
                 }
                 capture_coordinator.start_spout_capture(id, sender, info.fps_preset.as_u32());
             } else if let Some(handle) = info.window_handle {
@@ -4595,6 +4804,7 @@ impl CanvasState {
                         p.lock_aspect_ratio,
                         p.crop_uv,
                         p.source_frame_size.or(p.frame_size),
+                        p.viewport_pin,
                         p.is_window_capture(),
                         p.is_browser(),
                         p.is_playlist(),
@@ -4610,12 +4820,15 @@ impl CanvasState {
             lock_aspect_ratio,
             crop_uv,
             frame_size,
+            viewport_pin,
             is_window_capture,
             is_browser,
             is_playlist,
         ) in selection_info
         {
-            let screen_rect = self.canvas_rect_to_screen(preview_rect, canvas_rect);
+            let screen_rect = viewport_pin
+                .map(|pin| pin.rect(canvas_rect))
+                .unwrap_or_else(|| self.canvas_rect_to_screen(preview_rect, canvas_rect));
             let screen_rect = if is_window_capture {
                 pixel_aligned_rect(screen_rect, ui.ctx().pixels_per_point())
             } else {
@@ -4693,9 +4906,14 @@ impl CanvasState {
                         self.drag_state = Some(DragState::Resizing {
                             id,
                             handle: handle_type,
-                            start_rect: preview_rect,
+                            start_rect: if viewport_pin.is_some() {
+                                screen_rect
+                            } else {
+                                preview_rect
+                            },
                             start_mouse: input.interact_pos.unwrap_or(handle_pos),
                             aspect_ratio: lock_aspect_ratio.then_some(aspect_ratio),
+                            screen_space: viewport_pin.is_some(),
                         });
                     }
                 }
@@ -4709,19 +4927,30 @@ impl CanvasState {
                         start_rect,
                         start_mouse,
                         aspect_ratio: ar,
+                        screen_space,
                     }) = &self.drag_state
                     {
                         if *resize_id == id && *handle == handle_type {
                             if let Some(current_pos) = input.interact_pos {
-                                let delta = (current_pos - *start_mouse) / self.zoom;
+                                let screen_delta = current_pos - *start_mouse;
+                                let delta = if *screen_space {
+                                    screen_delta
+                                } else {
+                                    screen_delta / self.zoom
+                                };
                                 let new_rect = apply_resize(*handle, *start_rect, delta, *ar);
 
                                 // Apply minimum size
                                 let min_size = 100.0;
                                 if new_rect.width() >= min_size && new_rect.height() >= min_size {
                                     if let Some(preview) = preview_manager.get_mut(id) {
-                                        preview.position = new_rect.min;
-                                        preview.size = new_rect.size();
+                                        if *screen_space {
+                                            preview.viewport_pin =
+                                                Some(ViewportPin::from_rect(new_rect, canvas_rect));
+                                        } else {
+                                            preview.position = new_rect.min;
+                                            preview.size = new_rect.size();
+                                        }
                                     }
                                 }
                             }

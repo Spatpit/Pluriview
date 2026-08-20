@@ -1,5 +1,6 @@
 use super::{
-    BrowserTileStatus, FpsPreset, Preview, PreviewId, VideoSource, VideoTileStatus, WindowHandle,
+    BrowserTileStatus, FpsPreset, Preview, PreviewId, VideoSource, VideoTileStatus, ViewportPin,
+    WindowHandle,
 };
 use crate::media::MediaFrame;
 use crate::playlist::FolderPlaylist;
@@ -26,6 +27,8 @@ pub struct RemovedPreviewInfo {
     pub stream_audio: bool,
     /// Set when this tile receives a Spout2 sender.
     pub spout_sender: Option<String>,
+    /// Restored when undo recreates a pinned Spout tile.
+    pub viewport_pin: Option<ViewportPin>,
     /// Set for managed image and GIF tiles.
     pub media_path: Option<String>,
     /// Set for mpv-backed local video and Streamlink tiles.
@@ -233,6 +236,7 @@ impl PreviewManager {
                     browser_muted: preview.browser_muted,
                     stream_audio: preview.stream_audio,
                     spout_sender: preview.spout_sender,
+                    viewport_pin: preview.viewport_pin,
                     media_path: preview.media_path,
                     video_source: preview.video_source,
                     folder_playlist: preview.folder_playlist,

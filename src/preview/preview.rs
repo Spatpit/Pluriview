@@ -123,6 +123,79 @@ pub struct WindowHandle {
     pub process_id: u32,
 }
 
+/// Viewport corner used to keep a pinned Spout tile stable when the app window
+/// changes size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewportAnchor {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Screen-space placement for a Spout tile that ignores canvas pan and zoom.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ViewportPin {
+    pub anchor: ViewportAnchor,
+    pub offset: (f32, f32),
+    pub size: (f32, f32),
+}
+
+impl ViewportPin {
+    pub fn from_rect(rect: Rect, viewport: Rect) -> Self {
+        let horizontal_left = rect.center().x <= viewport.center().x;
+        let vertical_top = rect.center().y <= viewport.center().y;
+        let anchor = match (horizontal_left, vertical_top) {
+            (true, true) => ViewportAnchor::TopLeft,
+            (false, true) => ViewportAnchor::TopRight,
+            (true, false) => ViewportAnchor::BottomLeft,
+            (false, false) => ViewportAnchor::BottomRight,
+        };
+        let offset = match anchor {
+            ViewportAnchor::TopLeft => (rect.left() - viewport.left(), rect.top() - viewport.top()),
+            ViewportAnchor::TopRight => {
+                (viewport.right() - rect.right(), rect.top() - viewport.top())
+            }
+            ViewportAnchor::BottomLeft => (
+                rect.left() - viewport.left(),
+                viewport.bottom() - rect.bottom(),
+            ),
+            ViewportAnchor::BottomRight => (
+                viewport.right() - rect.right(),
+                viewport.bottom() - rect.bottom(),
+            ),
+        };
+        Self {
+            anchor,
+            offset,
+            size: (rect.width().max(1.0), rect.height().max(1.0)),
+        }
+    }
+
+    pub fn rect(self, viewport: Rect) -> Rect {
+        let size = self.size_vec2();
+        let offset = Vec2::new(self.offset.0, self.offset.1);
+        let min = match self.anchor {
+            ViewportAnchor::TopLeft => viewport.left_top() + offset,
+            ViewportAnchor::TopRight => Pos2::new(
+                viewport.right() - offset.x - size.x,
+                viewport.top() + offset.y,
+            ),
+            ViewportAnchor::BottomLeft => Pos2::new(
+                viewport.left() + offset.x,
+                viewport.bottom() - offset.y - size.y,
+            ),
+            ViewportAnchor::BottomRight => viewport.right_bottom() - offset - size,
+        };
+        Rect::from_min_size(min, size)
+    }
+
+    pub fn size_vec2(self) -> Vec2 {
+        Vec2::new(self.size.0.max(1.0), self.size.1.max(1.0))
+    }
+}
+
 /// A live preview on the canvas
 pub struct Preview {
     /// Unique ID
@@ -139,6 +212,9 @@ pub struct Preview {
 
     /// Spout2 sender name when this tile receives a GPU texture share.
     pub spout_sender: Option<String>,
+
+    /// Screen-space placement when a Spout tile is pinned above the canvas.
+    pub viewport_pin: Option<ViewportPin>,
 
     /// Display title (cached from window)
     pub title: String,
@@ -266,6 +342,7 @@ impl Preview {
             size,
             window_handle: None,
             spout_sender: None,
+            viewport_pin: None,
             title,
             capture_paused: false,
             manually_frozen: false,
@@ -655,6 +732,9 @@ pub struct PreviewLayout {
     /// Spout2 sender name for tiles that receive a GPU texture share.
     #[serde(default)]
     pub spout_sender: Option<String>,
+    /// Viewport placement for Spout tiles pinned independently of the canvas.
+    #[serde(default)]
+    pub viewport_pin: Option<ViewportPin>,
 }
 
 impl From<&Preview> for PreviewLayout {
@@ -679,6 +759,7 @@ impl From<&Preview> for PreviewLayout {
             playlist_group: preview.playlist_group,
             folder_playlist: preview.folder_playlist.as_ref().map(FolderPlaylist::layout),
             spout_sender: preview.spout_sender.clone(),
+            viewport_pin: preview.viewport_pin,
         }
     }
 }
@@ -872,9 +953,11 @@ fn twitch_label(parsed: &url::Url) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Preview, PreviewId, PreviewLayout, VideoSource, WindowHandle};
+    use super::{
+        Preview, PreviewId, PreviewLayout, VideoSource, ViewportAnchor, ViewportPin, WindowHandle,
+    };
     use crate::media::MediaFrame;
-    use eframe::egui::{Context, Pos2, Vec2};
+    use eframe::egui::{Context, Pos2, Rect, Vec2};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -986,6 +1069,38 @@ mod tests {
     }
 
     #[test]
+    fn older_saved_tiles_default_to_not_pinned() {
+        let preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        value.as_object_mut().unwrap().remove("viewport_pin");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.viewport_pin.is_none());
+    }
+
+    #[test]
+    fn viewport_pin_preserves_its_nearest_corner_offset() {
+        let initial_viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0));
+        let pin = ViewportPin::from_rect(
+            Rect::from_min_size(Pos2::new(700.0, 500.0), Vec2::new(200.0, 200.0)),
+            initial_viewport,
+        );
+        assert_eq!(pin.anchor, ViewportAnchor::BottomRight);
+        assert_eq!(pin.offset, (100.0, 100.0));
+
+        let resized_viewport = Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(1200.0, 900.0));
+        assert_eq!(
+            pin.rect(resized_viewport),
+            Rect::from_min_size(Pos2::new(920.0, 630.0), Vec2::new(200.0, 200.0))
+        );
+    }
+
+    #[test]
     fn older_saved_tiles_default_stream_audio_off() {
         let preview = Preview::new(
             PreviewId(1),
@@ -1019,18 +1134,24 @@ mod tests {
 
     #[test]
     fn spout_tiles_round_trip_and_are_not_window_captures() {
-        let preview = Preview::for_spout(
+        let mut preview = Preview::for_spout(
             PreviewId(1),
             "VTube Studio".to_owned(),
             Pos2::ZERO,
             Vec2::splat(1.0),
         );
+        preview.viewport_pin = Some(ViewportPin {
+            anchor: ViewportAnchor::BottomRight,
+            offset: (24.0, 24.0),
+            size: (320.0, 480.0),
+        });
         assert!(preview.is_spout_capture());
         assert!(!preview.is_window_capture());
         assert!(preview.is_live_capture());
 
         let restored = PreviewLayout::from(&preview);
         assert_eq!(restored.spout_sender.as_deref(), Some("VTube Studio"));
+        assert_eq!(restored.viewport_pin, preview.viewport_pin);
     }
 
     #[test]
