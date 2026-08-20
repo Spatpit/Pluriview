@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-20
+
 ### Added
 - Capture live Spout2 senders (VTube Studio and similar) as canvas tiles. Pluriview receives the shared GPU texture; it does not publish a Spout sender.
 - Spout2 tiles can be pinned to the viewport so their position and size stay fixed while the canvas pans or zooms.
