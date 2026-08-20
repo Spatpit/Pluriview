@@ -3215,11 +3215,6 @@ impl PluriviewApp {
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Settings...").clicked() {
-                    self.show_settings = true;
-                    ui.close_menu();
-                }
-                ui.separator();
                 if self.tray_manager.is_some() {
                     if ui.button("Minimize to Tray").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -3272,14 +3267,28 @@ impl PluriviewApp {
             });
 
             ui.menu_button("View", |ui| {
+                let window_picker_label = format!(
+                    "Window Picker ({})",
+                    self.app_config
+                        .keyboard_shortcuts
+                        .get(HotkeySlot::ToggleWindowPicker)
+                        .display()
+                );
                 if ui
-                    .checkbox(&mut self.picker_open, "Window Picker")
+                    .checkbox(&mut self.picker_open, window_picker_label)
                     .clicked()
                 {
                     ui.close_menu();
                 }
+                let grid_label = format!(
+                    "Show Grid ({})",
+                    self.app_config
+                        .keyboard_shortcuts
+                        .get(HotkeySlot::ToggleGrid)
+                        .display()
+                );
                 if ui
-                    .checkbox(&mut self.canvas.show_grid, "Show Grid (G)")
+                    .checkbox(&mut self.canvas.show_grid, grid_label)
                     .clicked()
                 {
                     ui.close_menu();
@@ -3337,6 +3346,11 @@ impl PluriviewApp {
                     );
                     ui.separator();
                     self.stream_audio_menu(ui);
+                }
+                ui.separator();
+                if ui.button("Settings...").clicked() {
+                    self.show_settings = true;
+                    ui.close_menu();
                 }
             });
 
@@ -4887,6 +4901,9 @@ impl eframe::App for PluriviewApp {
         if shortcut_presses.pressed(HotkeySlot::ToggleGrid) {
             self.canvas.show_grid = !self.canvas.show_grid;
         }
+        if shortcut_presses.pressed(HotkeySlot::ToggleWindowPicker) {
+            self.picker_open = !self.picker_open;
+        }
         if shortcut_presses.pressed(HotkeySlot::ToggleCanvasOnly) {
             self.canvas_only = !self.canvas_only;
         }
@@ -5424,6 +5441,18 @@ impl eframe::App for PluriviewApp {
                                     self.app_config
                                         .keyboard_shortcuts
                                         .get(HotkeySlot::ToggleGrid)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
+                            ui.end_row();
+
+                            ui.label("Toggle Window Picker");
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::ToggleWindowPicker)
                                         .display(),
                                 )
                                 .weak(),

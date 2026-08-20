@@ -67,6 +67,24 @@ mod tests {
     }
 
     #[test]
+    fn older_hotkey_config_gains_window_picker_default() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{
+                "keyboard_shortcuts": {
+                    "toggle_grid": { "first_key": null, "second_key": 81 }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.keyboard_shortcuts.toggle_grid.display(), "Q");
+        assert_eq!(
+            config.keyboard_shortcuts.toggle_window_picker.display(),
+            "W"
+        );
+    }
+
+    #[test]
     fn config_round_trip_preserves_overrides_and_version() {
         let mut config = AppConfig::default();
         config.external_tools.streamlink_path = Some(PathBuf::from(r"D:\Portable\streamlink.exe"));

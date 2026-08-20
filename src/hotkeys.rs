@@ -41,6 +41,7 @@ impl Hotkey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum HotkeySlot {
+    ToggleWindowPicker,
     ToggleGrid,
     ToggleCanvasOnly,
     SelectAll,
@@ -53,7 +54,8 @@ pub enum HotkeySlot {
 }
 
 impl HotkeySlot {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
+        Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
         Self::SelectAll,
@@ -67,6 +69,7 @@ impl HotkeySlot {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::ToggleWindowPicker => "Toggle Window Picker",
             Self::ToggleGrid => "Toggle grid",
             Self::ToggleCanvasOnly => "Canvas-only mode",
             Self::SelectAll => "Select all tiles",
@@ -83,6 +86,7 @@ impl HotkeySlot {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HotkeyBindings {
+    pub toggle_window_picker: Hotkey,
     pub toggle_grid: Hotkey,
     pub toggle_canvas_only: Hotkey,
     pub select_all: Hotkey,
@@ -97,6 +101,7 @@ pub struct HotkeyBindings {
 impl Default for HotkeyBindings {
     fn default() -> Self {
         Self {
+            toggle_window_picker: Hotkey::key(0x57),       // W
             toggle_grid: Hotkey::key(0x47),                // G
             toggle_canvas_only: Hotkey::key(0x48),         // H
             select_all: Hotkey::pair(0x11, 0x41),          // Ctrl+A
@@ -113,6 +118,7 @@ impl Default for HotkeyBindings {
 impl HotkeyBindings {
     pub fn get(&self, slot: HotkeySlot) -> Hotkey {
         match slot {
+            HotkeySlot::ToggleWindowPicker => self.toggle_window_picker,
             HotkeySlot::ToggleGrid => self.toggle_grid,
             HotkeySlot::ToggleCanvasOnly => self.toggle_canvas_only,
             HotkeySlot::SelectAll => self.select_all,
@@ -127,6 +133,7 @@ impl HotkeyBindings {
 
     pub fn set(&mut self, slot: HotkeySlot, hotkey: Hotkey) {
         match slot {
+            HotkeySlot::ToggleWindowPicker => self.toggle_window_picker = hotkey,
             HotkeySlot::ToggleGrid => self.toggle_grid = hotkey,
             HotkeySlot::ToggleCanvasOnly => self.toggle_canvas_only = hotkey,
             HotkeySlot::SelectAll => self.select_all = hotkey,
@@ -407,6 +414,7 @@ mod tests {
     #[test]
     fn defaults_preserve_existing_keyboard_shortcuts() {
         let shortcuts = HotkeyBindings::default();
+        assert_eq!(shortcuts.toggle_window_picker.display(), "W");
         assert_eq!(shortcuts.toggle_grid.display(), "G");
         assert_eq!(shortcuts.select_all.display(), "Ctrl+A");
         assert_eq!(shortcuts.focus_current_tile.display(), "Numpad 2");
@@ -441,10 +449,11 @@ mod tests {
         let configured = shortcuts.configured_keys();
         assert_eq!(
             configured.into_iter().filter(|enabled| *enabled).count(),
-            10
+            11
         );
         assert!(configured[0x11]); // Ctrl
         assert!(configured[0x47]); // G
+        assert!(configured[0x57]); // W
         assert!(!configured[0x51]); // Q
     }
 
