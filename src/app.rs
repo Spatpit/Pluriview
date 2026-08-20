@@ -2845,12 +2845,9 @@ impl PluriviewApp {
         self.window_audio_monitors
             .retain(|pid, monitor| wanted.contains(pid) && monitor.device_id() == device_id);
         for pid in wanted {
-            if !self.window_audio_monitors.contains_key(&pid) {
-                self.window_audio_monitors.insert(
-                    pid,
-                    crate::audio::AudioMonitor::start(pid, device_id.clone()),
-                );
-            }
+            self.window_audio_monitors
+                .entry(pid)
+                .or_insert_with(|| crate::audio::AudioMonitor::start(pid, device_id.clone()));
         }
     }
 
@@ -4855,7 +4852,10 @@ impl eframe::App for PluriviewApp {
             }
         }
 
-        self.hotkey_tracker.sample();
+        self.hotkey_tracker.sample(
+            &self.app_config.keyboard_shortcuts,
+            self.hotkey_recording.is_some(),
+        );
         #[cfg(windows)]
         let owns_foreground = self.owns_foreground();
         #[cfg(not(windows))]

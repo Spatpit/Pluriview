@@ -23,7 +23,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 
 use super::coordinator::CapturedFrame;
-use super::downsample::{downsample_rgba, fitted_capture_size};
+use super::downsample::{fitted_capture_size, RgbaDownsampler};
 
 pub fn capture_spout_loop(
     sender_name: String,
@@ -99,6 +99,7 @@ struct SpoutGpuReceiver {
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    downsampler: RgbaDownsampler,
 }
 
 impl SpoutGpuReceiver {
@@ -130,6 +131,7 @@ impl SpoutGpuReceiver {
             width: 0,
             height: 0,
             format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            downsampler: RgbaDownsampler::default(),
         })
     }
 
@@ -195,34 +197,52 @@ impl SpoutGpuReceiver {
         }
         .map_err(|error| format!("Could not read the Spout texture ({error})"))?;
 
-        let packed = unsafe {
-            copy_mapped_to_rgba(
-                mapped.pData.cast(),
-                mapped.RowPitch as usize,
-                self.width,
-                self.height,
-                is_bgra(self.format),
-            )
+        let row_pitch = mapped.RowPitch as usize;
+        let (out_width, out_height) =
+            fitted_capture_size(self.width, self.height, target_width, target_height);
+        let data = if out_width == self.width && out_height == self.height {
+            Ok(unsafe {
+                copy_mapped_to_rgba(
+                    mapped.pData.cast(),
+                    row_pitch,
+                    self.width,
+                    self.height,
+                    is_bgra(self.format),
+                )
+            })
+        } else {
+            let source_len = row_pitch
+                .checked_mul(self.height as usize)
+                .ok_or_else(|| "The Spout texture is too large to read".to_owned());
+            match source_len {
+                Ok(source_len) => {
+                    let source = unsafe {
+                        std::slice::from_raw_parts(mapped.pData.cast::<u8>(), source_len)
+                    };
+                    match self.downsampler.downsample(
+                        source,
+                        self.width,
+                        self.height,
+                        mapped.RowPitch,
+                        out_width,
+                        out_height,
+                    ) {
+                        Some(mut data) => {
+                            if is_bgra(self.format) {
+                                swap_red_blue(&mut data);
+                            }
+                            Ok(data)
+                        }
+                        None => Err("Could not downscale the Spout frame".to_owned()),
+                    }
+                }
+                Err(error) => Err(error),
+            }
         };
         unsafe {
             self.context.Unmap(&staging_resource, 0);
         }
-
-        let (out_width, out_height) =
-            fitted_capture_size(self.width, self.height, target_width, target_height);
-        let data = if out_width == self.width && out_height == self.height {
-            packed
-        } else {
-            downsample_rgba(
-                &packed,
-                self.width,
-                self.height,
-                self.width * 4,
-                out_width,
-                out_height,
-            )
-            .ok_or_else(|| "Could not downscale the Spout frame".to_owned())?
-        };
+        let data = data?;
 
         Ok(Some(CapturedFrame {
             width: out_width,
@@ -306,6 +326,12 @@ fn is_8bit_rgba(format: DXGI_FORMAT) -> bool {
         || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
 }
 
+fn swap_red_blue(rgba: &mut [u8]) {
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+}
+
 unsafe fn copy_mapped_to_rgba(
     src: *const u8,
     row_pitch: usize,
@@ -338,14 +364,21 @@ unsafe fn copy_mapped_to_rgba(
 
 #[cfg(test)]
 mod tests {
-    use super::copy_mapped_to_rgba;
+    use super::{copy_mapped_to_rgba, swap_red_blue};
 
     #[test]
     fn bgra_rows_swap_to_rgba_and_drop_pitch_padding() {
-        let mut src = vec![0u8; 16];
+        let mut src = [0u8; 16];
         src[0..4].copy_from_slice(&[10, 20, 30, 255]); // BGRA
         src[8..12].copy_from_slice(&[40, 50, 60, 128]);
         let out = unsafe { copy_mapped_to_rgba(src.as_ptr(), 8, 1, 2, true) };
         assert_eq!(out, vec![30, 20, 10, 255, 60, 50, 40, 128]);
+    }
+
+    #[test]
+    fn swaps_only_red_and_blue_channels() {
+        let mut pixels = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        swap_red_blue(&mut pixels);
+        assert_eq!(pixels, [30, 20, 10, 40, 70, 60, 50, 80]);
     }
 }

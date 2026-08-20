@@ -1076,10 +1076,12 @@ fn playlist_font(size: f32, zoom: f32) -> egui::FontId {
     egui::FontId::proportional(playlist_px(size, zoom).max(1.0))
 }
 
+#[cfg(test)]
 fn playlist_chrome_height(zoom: f32) -> f32 {
     playlist_px(PLAYLIST_HEADER_HEIGHT + PLAYLIST_TOOLBAR_HEIGHT, zoom)
 }
 
+#[cfg(test)]
 fn playlist_first_row_center(tile: Rect, zoom: f32) -> Pos2 {
     let row_top = tile.min.y + playlist_chrome_height(zoom);
     Pos2::new(

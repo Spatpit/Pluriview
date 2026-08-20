@@ -144,6 +144,22 @@ impl HotkeyBindings {
             .into_iter()
             .find(|slot| *slot != changed && self.get(*slot) == candidate)
     }
+
+    fn configured_keys(&self) -> [bool; 256] {
+        let mut keys = [false; 256];
+        for slot in HotkeySlot::ALL {
+            let binding = self.get(slot);
+            if let Some(key) = keys.get_mut(usize::from(binding.second_key)) {
+                *key = true;
+            }
+            if let Some(first_key) = binding.first_key {
+                if let Some(key) = keys.get_mut(usize::from(first_key)) {
+                    *key = true;
+                }
+            }
+        }
+        keys
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -170,19 +186,68 @@ impl Default for HotkeyTracker {
 }
 
 impl HotkeyTracker {
-    pub fn sample(&mut self) {
+    pub fn sample(&mut self, bindings: &HotkeyBindings, recording: bool) {
         self.newly_pressed.clear();
         #[cfg(windows)]
-        for &(virtual_key, _) in SUPPORTED_KEYS {
-            let state = key_state(virtual_key);
-            let down = state & 0x8000 != 0;
-            let pressed_since_sample = state & 1 != 0;
-            let index = usize::from(virtual_key);
-            if (down && !self.held[index]) || (!down && pressed_since_sample) {
-                self.newly_pressed.push(virtual_key);
+        {
+            let configured = bindings.configured_keys();
+            let mut sampled = [false; 256];
+
+            if recording {
+                self.sample_supported_keys(&mut sampled, None);
+            } else {
+                for (virtual_key, enabled) in configured.iter().copied().enumerate() {
+                    if enabled {
+                        self.sample_key(virtual_key as u16, &mut sampled);
+                    }
+                }
+
+                // A configured-key edge is the only time a shortcut can fire.
+                // Validate every other supported key on that frame so an extra
+                // held key still suppresses the shortcut, while idle frames poll
+                // only the keys that can actually trigger an action.
+                if !self.newly_pressed.is_empty() {
+                    self.sample_supported_keys(&mut sampled, Some(&configured));
+                }
             }
-            self.held[index] = down;
+
+            for (virtual_key, was_sampled) in sampled.into_iter().enumerate() {
+                if !was_sampled {
+                    self.held[virtual_key] = false;
+                }
+            }
         }
+        #[cfg(not(windows))]
+        {
+            let _ = (bindings, recording);
+            self.held.fill(false);
+        }
+    }
+
+    #[cfg(windows)]
+    fn sample_supported_keys(&mut self, sampled: &mut [bool; 256], skip: Option<&[bool; 256]>) {
+        for &(virtual_key, _) in SUPPORTED_KEYS {
+            if skip.is_some_and(|keys| keys[usize::from(virtual_key)]) {
+                continue;
+            }
+            self.sample_key(virtual_key, sampled);
+        }
+    }
+
+    #[cfg(windows)]
+    fn sample_key(&mut self, virtual_key: u16, sampled: &mut [bool; 256]) {
+        let index = usize::from(virtual_key);
+        if sampled[index] {
+            return;
+        }
+        let state = key_state(virtual_key);
+        let down = state & 0x8000 != 0;
+        let pressed_since_sample = state & 1 != 0;
+        if (down && !self.held[index]) || (!down && pressed_since_sample) {
+            self.newly_pressed.push(virtual_key);
+        }
+        self.held[index] = down;
+        sampled[index] = true;
     }
 
     pub fn presses(&self, bindings: &HotkeyBindings, listening: bool) -> HotkeyPresses {
@@ -368,6 +433,19 @@ mod tests {
         assert_eq!(hotkey.display(), "A+Q");
         let json = serde_json::to_string(&hotkey).unwrap();
         assert_eq!(serde_json::from_str::<Hotkey>(&json).unwrap(), hotkey);
+    }
+
+    #[test]
+    fn configured_key_scan_contains_only_bound_keys() {
+        let shortcuts = HotkeyBindings::default();
+        let configured = shortcuts.configured_keys();
+        assert_eq!(
+            configured.into_iter().filter(|enabled| *enabled).count(),
+            10
+        );
+        assert!(configured[0x11]); // Ctrl
+        assert!(configured[0x47]); // G
+        assert!(!configured[0x51]); // Q
     }
 
     #[test]

@@ -10,7 +10,7 @@ use windows_capture::capture::GraphicsCaptureApiError;
 use windows_capture::graphics_capture_api::GraphicsCaptureApi;
 use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
 
-use super::downsample::{downsample_rgba, fitted_capture_size};
+use super::downsample::{fitted_capture_size, RgbaDownsampler};
 
 /// Frame data sent from capture threads
 pub(crate) struct CapturedFrame {
@@ -391,6 +391,7 @@ fn capture_window_loop(
         target_width: Arc<AtomicU32>,
         target_height: Arc<AtomicU32>,
         last_frame: std::time::Instant,
+        downsampler: RgbaDownsampler,
     }
 
     impl GraphicsCaptureApiHandler for Capture {
@@ -407,6 +408,7 @@ fn capture_window_loop(
                 target_width: ctx.flags.target_width,
                 target_height: ctx.flags.target_height,
                 last_frame: std::time::Instant::now(),
+                downsampler: RgbaDownsampler::default(),
             })
         }
 
@@ -455,7 +457,9 @@ fn capture_window_loop(
             } else {
                 let stride = buffer.row_pitch();
                 let raw = buffer.as_raw_buffer();
-                let Some(data) = downsample_rgba(raw, width, height, stride, out_width, out_height)
+                let Some(data) = self
+                    .downsampler
+                    .downsample(raw, width, height, stride, out_width, out_height)
                 else {
                     return Err("Could not downscale the captured frame".into());
                 };

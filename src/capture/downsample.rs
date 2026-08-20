@@ -65,73 +65,140 @@ pub fn fitted_capture_size(
     }
 }
 
-/// Area-average RGBA8 downsample. `src_stride` is bytes per row and may include
-/// padding. Allocates only the destination buffer.
-pub fn downsample_rgba(
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    src_stride: u32,
-    dst_width: u32,
-    dst_height: u32,
-) -> Option<Vec<u8>> {
-    if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
-        return None;
-    }
-    let src_width = src_width as usize;
-    let src_height = src_height as usize;
-    let src_stride = src_stride as usize;
-    let dst_width = dst_width as usize;
-    let dst_height = dst_height as usize;
-    let row_bytes = src_width.checked_mul(4)?;
-    if src_stride < row_bytes {
-        return None;
-    }
-    let min_len = src_height
-        .checked_sub(1)?
-        .checked_mul(src_stride)?
-        .checked_add(row_bytes)?;
-    if src.len() < min_len {
-        return None;
+/// Cached area-average RGBA8 downsampler. Capture dimensions are normally
+/// stable for many frames, so source ranges are rebuilt only when either the
+/// source or requested output size changes.
+#[derive(Default)]
+pub(crate) struct RgbaDownsampler {
+    plan: Option<DownsamplePlan>,
+}
+
+struct DownsamplePlan {
+    src_width: usize,
+    src_height: usize,
+    dst_width: usize,
+    dst_height: usize,
+    x_ranges: Vec<(usize, usize)>,
+    y_ranges: Vec<(usize, usize)>,
+}
+
+impl DownsamplePlan {
+    fn new(src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Option<Self> {
+        if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
+            return None;
+        }
+        let src_width = src_width as usize;
+        let src_height = src_height as usize;
+        let dst_width = dst_width as usize;
+        let dst_height = dst_height as usize;
+        let x_ranges = (0..dst_width)
+            .map(|x| {
+                let start = x * src_width / dst_width;
+                let end = ((x + 1) * src_width / dst_width).max(start + 1);
+                (start, end)
+            })
+            .collect();
+        let y_ranges = (0..dst_height)
+            .map(|y| {
+                let start = y * src_height / dst_height;
+                let end = ((y + 1) * src_height / dst_height).max(start + 1);
+                (start, end)
+            })
+            .collect();
+        Some(Self {
+            src_width,
+            src_height,
+            dst_width,
+            dst_height,
+            x_ranges,
+            y_ranges,
+        })
     }
 
-    let mut dst = vec![0u8; dst_width.checked_mul(dst_height)?.checked_mul(4)?];
-    for y in 0..dst_height {
-        let src_y0 = y * src_height / dst_height;
-        let src_y1 = ((y + 1) * src_height / dst_height).max(src_y0 + 1);
-        for x in 0..dst_width {
-            let src_x0 = x * src_width / dst_width;
-            let src_x1 = ((x + 1) * src_width / dst_width).max(src_x0 + 1);
-            let mut sum = [0u64; 4];
-            let mut count = 0u64;
-            for src_y in src_y0..src_y1 {
-                let row = src_y * src_stride;
-                for src_x in src_x0..src_x1 {
-                    let i = row + src_x * 4;
-                    sum[0] += u64::from(src[i]);
-                    sum[1] += u64::from(src[i + 1]);
-                    sum[2] += u64::from(src[i + 2]);
-                    sum[3] += u64::from(src[i + 3]);
-                    count += 1;
-                }
-            }
-            let o = (y * dst_width + x) * 4;
-            if count == 0 {
-                continue;
-            }
-            dst[o] = (sum[0] / count) as u8;
-            dst[o + 1] = (sum[1] / count) as u8;
-            dst[o + 2] = (sum[2] / count) as u8;
-            dst[o + 3] = (sum[3] / count) as u8;
-        }
+    fn matches(&self, src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> bool {
+        self.src_width == src_width as usize
+            && self.src_height == src_height as usize
+            && self.dst_width == dst_width as usize
+            && self.dst_height == dst_height as usize
     }
-    Some(dst)
+}
+
+impl RgbaDownsampler {
+    /// Area-average RGBA8 downsample. `src_stride` is bytes per row and may
+    /// include padding. Sample boundaries and output quality are unchanged;
+    /// only their calculation is reused between frames of the same size.
+    pub fn downsample(
+        &mut self,
+        src: &[u8],
+        src_width: u32,
+        src_height: u32,
+        src_stride: u32,
+        dst_width: u32,
+        dst_height: u32,
+    ) -> Option<Vec<u8>> {
+        let rebuild = self
+            .plan
+            .as_ref()
+            .is_none_or(|plan| !plan.matches(src_width, src_height, dst_width, dst_height));
+        if rebuild {
+            self.plan = Some(DownsamplePlan::new(
+                src_width, src_height, dst_width, dst_height,
+            )?);
+        }
+        let plan = self.plan.as_ref()?;
+        let src_stride = src_stride as usize;
+        let row_bytes = plan.src_width.checked_mul(4)?;
+        if src_stride < row_bytes {
+            return None;
+        }
+        let min_len = plan
+            .src_height
+            .checked_sub(1)?
+            .checked_mul(src_stride)?
+            .checked_add(row_bytes)?;
+        if src.len() < min_len {
+            return None;
+        }
+
+        let mut dst = vec![
+            0u8;
+            plan.dst_width
+                .checked_mul(plan.dst_height)?
+                .checked_mul(4)?
+        ];
+        for (y, &(src_y0, src_y1)) in plan.y_ranges.iter().enumerate() {
+            for (x, &(src_x0, src_x1)) in plan.x_ranges.iter().enumerate() {
+                let mut sum = [0u64; 4];
+                let mut count = 0u64;
+                for src_y in src_y0..src_y1 {
+                    let row = src_y * src_stride;
+                    for src_x in src_x0..src_x1 {
+                        let i = row + src_x * 4;
+                        sum[0] += u64::from(src[i]);
+                        sum[1] += u64::from(src[i + 1]);
+                        sum[2] += u64::from(src[i + 2]);
+                        sum[3] += u64::from(src[i + 3]);
+                        count += 1;
+                    }
+                }
+                let o = (y * plan.dst_width + x) * 4;
+                if count == 0 {
+                    continue;
+                }
+                dst[o] = (sum[0] / count) as u8;
+                dst[o + 1] = (sum[1] / count) as u8;
+                dst[o + 2] = (sum[2] / count) as u8;
+                dst[o + 3] = (sum[3] / count) as u8;
+            }
+        }
+        Some(dst)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_lod_factor, downsample_rgba, fitted_capture_size, window_capture_target,
+        capture_lod_factor, fitted_capture_size, window_capture_target, RgbaDownsampler,
         MAX_CAPTURE_HEIGHT, MAX_CAPTURE_WIDTH,
     };
 
@@ -209,14 +276,18 @@ mod tests {
         let src = vec![
             200, 10, 20, 255, 200, 10, 20, 255, 200, 10, 20, 255, 200, 10, 20, 255,
         ];
-        let dst = downsample_rgba(&src, 2, 2, 8, 1, 1).unwrap();
+        let dst = RgbaDownsampler::default()
+            .downsample(&src, 2, 2, 8, 1, 1)
+            .unwrap();
         assert_eq!(dst, vec![200, 10, 20, 255]);
     }
 
     #[test]
     fn averages_distinct_pixels() {
         let src = vec![0, 0, 0, 255, 40, 0, 0, 255, 0, 80, 0, 255, 0, 0, 120, 255];
-        let dst = downsample_rgba(&src, 2, 2, 8, 1, 1).unwrap();
+        let dst = RgbaDownsampler::default()
+            .downsample(&src, 2, 2, 8, 1, 1)
+            .unwrap();
         assert_eq!(dst, vec![10, 20, 30, 255]);
     }
 
@@ -227,7 +298,23 @@ mod tests {
         src[4..8].copy_from_slice(&[30, 0, 0, 255]);
         src[16..20].copy_from_slice(&[10, 0, 0, 255]);
         src[20..24].copy_from_slice(&[30, 0, 0, 255]);
-        let dst = downsample_rgba(&src, 2, 2, 16, 1, 1).unwrap();
+        let dst = RgbaDownsampler::default()
+            .downsample(&src, 2, 2, 16, 1, 1)
+            .unwrap();
         assert_eq!(dst, vec![20, 0, 0, 255]);
+    }
+
+    #[test]
+    fn cached_plan_rebuilds_when_output_size_changes() {
+        let src = vec![100; 4 * 4 * 4];
+        let mut downsampler = RgbaDownsampler::default();
+        assert_eq!(
+            downsampler.downsample(&src, 4, 4, 16, 2, 2).unwrap().len(),
+            16
+        );
+        assert_eq!(
+            downsampler.downsample(&src, 4, 4, 16, 1, 1).unwrap().len(),
+            4
+        );
     }
 }
