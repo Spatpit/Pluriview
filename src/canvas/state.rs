@@ -267,6 +267,67 @@ mod tests {
     }
 
     #[test]
+    fn left_drag_repositions_a_pinned_spout_tile() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_spout(
+            "VTube Studio".to_owned(),
+            Pos2::new(100.0, 80.0),
+            Vec2::new(200.0, 300.0),
+            FpsPreset::Medium,
+        );
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        previews.get_mut(id).unwrap().viewport_pin = Some(crate::preview::ViewportPin::from_rect(
+            Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::new(200.0, 300.0)),
+            screen_rect,
+        ));
+        let mut captures = CaptureCoordinator::new();
+        let mut run_frame = |events| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            );
+        };
+
+        let start = Pos2::new(200.0, 200.0);
+        let end = Pos2::new(280.0, 240.0);
+        run_frame(vec![Event::PointerMoved(start)]);
+        run_frame(vec![Event::PointerButton {
+            pos: start,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerMoved(end)]);
+        run_frame(vec![Event::PointerButton {
+            pos: end,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        let moved = previews
+            .get(id)
+            .unwrap()
+            .viewport_pin
+            .unwrap()
+            .rect(canvas.last_screen_rect.unwrap());
+        assert_eq!(moved.min, Pos2::new(180.0, 120.0));
+        assert!(previews.get(id).unwrap().viewport_pin.is_some());
+    }
+
+    #[test]
     fn unpinning_spout_preserves_its_current_screen_rect() {
         let mut canvas = CanvasState {
             pan: Vec2::new(-60.0, 25.0),
@@ -1076,6 +1137,13 @@ struct MarqueeSelection {
     base_selection: Vec<PreviewId>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PinnedPointerDrag {
+    id: PreviewId,
+    start_pointer: Pos2,
+    start_pin: ViewportPin,
+}
+
 impl MarqueeSelection {
     fn rect(&self) -> Rect {
         Rect::from_two_pos(self.start, self.current)
@@ -1683,6 +1751,10 @@ pub struct CanvasState {
     /// drag, paired with their IDs so egui's cumulative drag delta is stable.
     pinned_drag_origins: Vec<(PreviewId, ViewportPin)>,
 
+    /// Direct left-button capture for repositioning one pinned Spout tile.
+    /// This does not depend on egui's general tile-drag ownership.
+    pinned_pointer_drag: Option<PinnedPointerDrag>,
+
     /// Is the canvas currently being panned?
     canvas_panning: bool,
 
@@ -1785,6 +1857,7 @@ impl Default for CanvasState {
             tile_scratch: Vec::new(),
             preview_dragging: false,
             pinned_drag_origins: Vec::new(),
+            pinned_pointer_drag: None,
             canvas_panning: false,
             pan_drag_tracker: DragTracker::new(),
             pending_region_select: None,
@@ -1827,6 +1900,7 @@ impl CanvasState {
         self.drag_state = None;
         self.marquee = None;
         self.pinned_drag_origins.clear();
+        self.pinned_pointer_drag = None;
         self.animation.preview_springs.clear();
     }
 
@@ -1834,12 +1908,19 @@ impl CanvasState {
     pub fn clear_preview_animations(&mut self) {
         self.animation.preview_springs.clear();
         self.pinned_drag_origins.clear();
+        self.pinned_pointer_drag = None;
     }
 
     fn prune_preview_animations(&mut self, preview_manager: &PreviewManager) {
         self.animation
             .preview_springs
             .retain(|id, _| preview_manager.get(*id).is_some());
+        if self
+            .pinned_pointer_drag
+            .is_some_and(|drag| preview_manager.get(drag.id).is_none())
+        {
+            self.pinned_pointer_drag = None;
+        }
     }
 
     /// Fit one tile in the current canvas without changing its saved geometry.
@@ -1953,6 +2034,9 @@ impl CanvasState {
         self.animation.preview_springs.remove(&id);
         self.pinned_drag_origins
             .retain(|(drag_id, _)| *drag_id != id);
+        if self.pinned_pointer_drag.is_some_and(|drag| drag.id == id) {
+            self.pinned_pointer_drag = None;
+        }
 
         if let Some(pin) = pin {
             let screen_rect = pin.rect(canvas_rect);
@@ -2064,6 +2148,64 @@ impl CanvasState {
             })
             .max_by_key(|preview| (preview.viewport_pin.is_some(), preview.z_order))
             .map(|preview| preview.id)
+    }
+
+    fn handle_pinned_pointer_drag(
+        &mut self,
+        id: PreviewId,
+        pin: ViewportPin,
+        screen_rect: Rect,
+        frame: CanvasFrameScope<'_>,
+        preview_manager: &mut PreviewManager,
+    ) -> bool {
+        let CanvasFrameScope {
+            canvas_rect,
+            input,
+            show_overlays,
+        } = frame;
+        if let Some(drag) = self.pinned_pointer_drag.filter(|drag| drag.id == id) {
+            if let Some(pointer) = input.hover_pos {
+                let moved_rect = drag
+                    .start_pin
+                    .rect(canvas_rect)
+                    .translate(pointer - drag.start_pointer);
+                if let Some(preview) = preview_manager.get_mut(id) {
+                    preview.viewport_pin = Some(ViewportPin::from_rect(moved_rect, canvas_rect));
+                }
+            }
+            if input.primary_released || !input.primary_down {
+                self.pinned_pointer_drag = None;
+            }
+            return true;
+        }
+
+        let Some(pointer) = input.interact_pos.filter(|pointer| {
+            input.primary_pressed
+                && !input.alt
+                && !input.middle_down
+                && screen_rect.contains(*pointer)
+        }) else {
+            return false;
+        };
+        if self.preview_at_screen(pointer, canvas_rect, preview_manager) != Some(id) {
+            return false;
+        }
+        let over_resize_handle = show_overlays
+            && self
+                .get_handle_at(pointer, canvas_rect, preview_manager)
+                .is_some();
+        if over_resize_handle {
+            return false;
+        }
+
+        self.selection = vec![id];
+        self.animation.preview_springs.remove(&id);
+        self.pinned_pointer_drag = Some(PinnedPointerDrag {
+            id,
+            start_pointer: pointer,
+            start_pin: pin,
+        });
+        true
     }
 
     /// Main UI rendering for the canvas
@@ -2820,7 +2962,12 @@ impl CanvasState {
                 Sense::click_and_drag(),
             );
 
-            let is_active = self.selection.contains(&id) || preview_response.dragged();
+            let pinned_pointer_active = viewport_pin.is_some_and(|pin| {
+                self.handle_pinned_pointer_drag(id, pin, screen_rect, frame, preview_manager)
+            });
+
+            let is_active =
+                self.selection.contains(&id) || preview_response.dragged() || pinned_pointer_active;
 
             if show_overlays && !is_spout_capture {
                 // Soft drop shadow underneath the preview, stronger when selected/dragged.
@@ -3593,7 +3740,11 @@ impl CanvasState {
             }
 
             // Handle drag start - initialize spring and tracker
-            if preview_response.drag_started() && !input.alt && !input.middle_down {
+            if preview_response.drag_started()
+                && !input.alt
+                && !input.middle_down
+                && !pinned_pointer_active
+            {
                 self.preview_dragging = true;
                 self.animation.drag_tracker.clear();
                 self.pinned_drag_origins.clear();
@@ -3621,7 +3772,11 @@ impl CanvasState {
 
             // Handle drag to move (only when not panning with Alt or middle mouse)
             // Resize is handled separately in draw_and_interact_selection()
-            if preview_response.dragged() && !input.alt && !input.middle_down {
+            if preview_response.dragged()
+                && !input.alt
+                && !input.middle_down
+                && !pinned_pointer_active
+            {
                 // Only move if we're not in a resize operation
                 if self.drag_state.is_none() {
                     let screen_delta = preview_response.drag_delta();
