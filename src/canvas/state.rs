@@ -54,10 +54,11 @@ pub enum DragState {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_resize, capture_resolution_badge_rect, format_time, live_capture_display_size,
-        native_capture_canvas_size, pixel_aligned_rect, playlist_first_row_center,
-        stream_audio_badge_rect, video_placeholder_content, window_capture_placeholder_content,
-        CanvasState, DragState, PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
+        apply_resize, browser_control_colors, capture_resolution_badge_rect, format_time,
+        live_capture_display_size, native_capture_canvas_size, pixel_aligned_rect,
+        playlist_first_row_center, stream_audio_badge_rect, video_placeholder_content,
+        window_capture_placeholder_content, BrowserAction, CanvasState, DragState, PlaylistAction,
+        ResizeHandle, TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -82,6 +83,22 @@ mod tests {
     #[test]
     fn browser_add_request_starts_empty() {
         assert!(CanvasState::default().pending_browser_add.is_none());
+    }
+
+    #[test]
+    fn browser_history_buttons_keep_a_blue_accent_without_direct_hover() {
+        let (idle_background, idle_icon) =
+            browser_control_colors(BrowserAction::Back, false, false);
+        let (hovered_background, hovered_icon) =
+            browser_control_colors(BrowserAction::Forward, true, false);
+        let (reload_background, reload_icon) =
+            browser_control_colors(BrowserAction::Reload, false, false);
+
+        assert!(idle_background.is_some());
+        assert!(hovered_background.unwrap().a() > idle_background.unwrap().a());
+        assert_ne!(idle_icon, reload_icon);
+        assert_ne!(hovered_icon, reload_icon);
+        assert!(reload_background.is_none());
     }
 
     #[test]
@@ -1102,6 +1119,31 @@ pub enum BrowserAction {
     OpenExternal,
     CopyUrl,
     EditUrl,
+}
+
+fn browser_control_colors(
+    action: BrowserAction,
+    hovered: bool,
+    muted: bool,
+) -> (Option<Color32>, Color32) {
+    if matches!(action, BrowserAction::Back | BrowserAction::Forward) {
+        let background =
+            Color32::from_rgba_unmultiplied(74, 158, 255, if hovered { 130 } else { 70 });
+        let icon = if hovered {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(155, 205, 255)
+        };
+        return (Some(background), icon);
+    }
+
+    let background = hovered.then(|| Color32::from_rgba_unmultiplied(255, 255, 255, 35));
+    let icon = if action == BrowserAction::ToggleMute && muted {
+        Color32::from_rgb(255, 150, 100)
+    } else {
+        Color32::from_rgb(215, 215, 220)
+    };
+    (background, icon)
 }
 
 /// Actions requested from an mpv-backed tile. The canvas queues commands and
@@ -3347,18 +3389,11 @@ impl CanvasState {
                                 Sense::click(),
                             )
                             .on_hover_text(*tip);
-                        if resp.hovered() {
-                            painter.rect_filled(
-                                btn_rect,
-                                6.0,
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 35),
-                            );
+                        let (background, icon_color) =
+                            browser_control_colors(*action, resp.hovered(), muted);
+                        if let Some(background) = background {
+                            painter.rect_filled(btn_rect, 6.0, background);
                         }
-                        let icon_color = if *action == BrowserAction::ToggleMute && muted {
-                            Color32::from_rgb(255, 150, 100)
-                        } else {
-                            Color32::from_rgb(215, 215, 220)
-                        };
                         painter.text(
                             btn_rect.center(),
                             egui::Align2::CENTER_CENTER,
