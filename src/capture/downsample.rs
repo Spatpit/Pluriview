@@ -4,10 +4,12 @@ pub const CAPTURE_SCALE: f32 = 2.0;
 pub const MAX_CAPTURE_WIDTH: u32 = 3840;
 pub const MAX_CAPTURE_HEIGHT: u32 = 2160;
 
-/// Canvas zoom below 100% shrinks capture backing. Zooming in past 100% does
-/// not request more than the 2×-tile budget used at 1.0.
+/// Scale capture backing with the tile's on-screen size. The downstream fit
+/// still caps the result at the source dimensions and 4K, so zooming in asks
+/// for sharper source pixels without ever inventing pixels or growing without
+/// bound.
 pub fn capture_lod_factor(canvas_zoom: f32) -> f32 {
-    canvas_zoom.clamp(0.05, 1.0)
+    canvas_zoom.clamp(0.05, 5.0)
 }
 
 /// 2× the tile's physical pixels, inflated so a crop still has enough source
@@ -139,11 +141,12 @@ mod tests {
     }
 
     #[test]
-    fn capture_lod_never_exceeds_100_percent() {
+    fn capture_lod_tracks_zoom_in_both_directions() {
         assert_eq!(capture_lod_factor(1.0), 1.0);
-        assert_eq!(capture_lod_factor(1.75), 1.0);
+        assert_eq!(capture_lod_factor(1.75), 1.75);
         assert_eq!(capture_lod_factor(0.3), 0.3);
         assert_eq!(capture_lod_factor(0.01), 0.05);
+        assert_eq!(capture_lod_factor(8.0), 5.0);
     }
 
     #[test]
@@ -154,6 +157,15 @@ mod tests {
         assert!(out.0 < full.0);
         assert!(out.1 < full.1);
         assert_eq!(out, window_capture_target(192.0, 108.0, 1.0, None));
+    }
+
+    #[test]
+    fn zoomed_in_window_capture_requests_more_pixels() {
+        let normal = window_capture_target(640.0, 360.0, 1.0, None);
+        let lod = capture_lod_factor(2.0);
+        let close = window_capture_target(640.0 * lod, 360.0 * lod, 1.0, None);
+        assert!(close.0 > normal.0);
+        assert!(close.1 > normal.1);
     }
 
     #[test]

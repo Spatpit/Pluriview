@@ -3,11 +3,12 @@ use crate::browser::{
     self, normalize_url, scrub_url_for_storage, BrowserManager, ExtensionPreparationStatus,
 };
 use crate::canvas::{
-    BrowserAction, CanvasState, CanvasWallpaper, PlaylistAction, TileActivityAction, VideoAction,
-    WallpaperSource, WALLPAPER_VIDEO_ID,
+    BrowserAction, CanvasKeyboardInput, CanvasState, CanvasWallpaper, PlaylistAction,
+    TileActivityAction, VideoAction, WallpaperSource, WALLPAPER_VIDEO_ID,
 };
 use crate::capture::CaptureCoordinator;
 use crate::external_tools::{self, ExternalTools, ToolKind, ToolStatus};
+use crate::hotkeys::{Hotkey, HotkeyBindings, HotkeySlot, HotkeyTracker};
 #[cfg(windows)]
 use crate::libmpv::{SeekPreviewManager, VideoManager, VideoSnapshot};
 use crate::media;
@@ -453,6 +454,19 @@ pub struct PluriviewApp {
     /// Show Keyboard Shortcuts dialog
     show_shortcuts: bool,
 
+    /// Low-level keyboard tracker keeps Numpad keys distinct and continues to
+    /// receive configured shortcuts while an interactive WebView has focus.
+    hotkey_tracker: HotkeyTracker,
+
+    /// Settings row currently waiting for the user's next one- or two-key chord.
+    hotkey_recording: Option<HotkeySlot>,
+
+    /// First key held while the recorder waits to see whether this is a pair.
+    hotkey_recording_first: Option<u16>,
+
+    /// Validation feedback for the keyboard shortcut editor.
+    hotkey_error: Option<String>,
+
     /// Active region selector overlay (if any)
     region_selector: Option<RegionSelector>,
 
@@ -514,11 +528,6 @@ pub struct PluriviewApp {
     /// Per-window process loopbacks for tiles with SA enabled.
     #[cfg(windows)]
     window_audio_monitors: HashMap<u32, crate::audio::AudioMonitor>,
-
-    /// Held state of the polled numpad shortcuts (`[Numpad 1, Numpad 2]`),
-    /// kept so the toggles fire once per press instead of every frame.
-    #[cfg(windows)]
-    numpad_held: [bool; 2],
 }
 
 impl PluriviewApp {
@@ -610,6 +619,10 @@ impl PluriviewApp {
             hwnd_set: false,
             show_about: false,
             show_shortcuts: false,
+            hotkey_tracker: HotkeyTracker::default(),
+            hotkey_recording: None,
+            hotkey_recording_first: None,
+            hotkey_error: None,
             region_selector: None,
             region_select_preview_id: None,
             quick_add: None,
@@ -640,8 +653,6 @@ impl PluriviewApp {
             audio_monitor_checked: None,
             #[cfg(windows)]
             window_audio_monitors: HashMap::new(),
-            #[cfg(windows)]
-            numpad_held: [false; 2],
         };
 
         // Restore the active named workspace (or the migrated legacy autosave).
@@ -1358,13 +1369,14 @@ impl PluriviewApp {
         id: PreviewId,
         action: TileActivityAction,
     ) {
-        let Some((already_frozen, is_browser, is_video, window, title, fps)) =
+        let Some((already_frozen, is_browser, is_video, window, spout_sender, title, fps)) =
             self.preview_manager.get(id).map(|preview| {
                 (
                     preview.manually_frozen,
                     preview.is_browser(),
                     preview.is_video(),
                     preview.window_handle.clone(),
+                    preview.spout_sender.clone(),
                     preview.title.clone(),
                     preview.target_fps,
                 )
@@ -1485,6 +1497,9 @@ impl PluriviewApp {
                 if let Some(hwnd) = resumed_hwnd {
                     self.capture_coordinator.start_capture(id, hwnd, title, fps);
                 }
+            } else if let Some(sender) = spout_sender {
+                self.capture_coordinator
+                    .start_spout_capture(id, sender, fps);
             } else if let Some(window) = window {
                 self.capture_coordinator
                     .start_capture(id, window.hwnd, title, fps);
@@ -2842,7 +2857,7 @@ impl PluriviewApp {
     /// Per-frame browser housekeeping. Runs after the canvas UI so tile
     /// rects and double-click state are fresh.
     #[cfg(windows)]
-    fn browser_frame(&mut self, ctx: &egui::Context) {
+    fn browser_frame(&mut self, ctx: &egui::Context, exit_hotkey_pressed: bool) {
         self.audio_monitor_upkeep();
 
         let frozen: HashSet<_> = self
@@ -2903,7 +2918,7 @@ impl PluriviewApp {
         // Interaction-mode upkeep for the (single) active host.
         if let Some(active_id) = self.browser.active_id() {
             let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-            let escape = browser::escape_pressed();
+            let escape = exit_hotkey_pressed;
             let in_grace = self
                 .browser_activated_at
                 .is_some_and(|at| at.elapsed() < BROWSER_FOCUS_GRACE);
@@ -2978,31 +2993,6 @@ impl PluriviewApp {
             .active_id()
             .and_then(|id| self.browser.get(id))
             .is_some_and(|host| host.owns_foreground())
-    }
-
-    /// Edge-detect the polled numpad shortcuts, returning `[Numpad 1, Numpad 2]`.
-    ///
-    /// These are polled instead of read from egui for two reasons: an
-    /// interactive WebView swallows all keyboard input before egui sees it,
-    /// and egui reports numpad digits identically to the number row. Polling is
-    /// process-wide, so presses only count while Pluriview is in the
-    /// foreground; the held state is still tracked when it is not, so a key
-    /// pressed in another app doesn't fire on the way back.
-    #[cfg(windows)]
-    fn poll_numpad_shortcuts(&mut self, ctx: &egui::Context) -> [bool; 2] {
-        let listening = self.owns_foreground() && !ctx.wants_keyboard_input();
-        if listening {
-            // Polling only sees keys still held at frame time, so tick fast
-            // enough that a quick tap can't fall between two frames.
-            ctx.request_repaint_after(Duration::from_millis(50));
-        }
-        let mut pressed = [false; 2];
-        for (index, digit) in [1u8, 2].into_iter().enumerate() {
-            let down = browser::numpad_digit_down(digit);
-            pressed[index] = down && !self.numpad_held[index] && listening;
-            self.numpad_held[index] = down;
-        }
-        pressed
     }
 
     /// Set the window HWND for the tray manager (call once after window is created)
@@ -3390,50 +3380,171 @@ impl PluriviewApp {
         }
     }
 
-    fn settings_ui(&mut self, ctx: &egui::Context) {
-        if !self.show_settings {
+    fn hotkey_capture_upkeep(&mut self, ctx: &egui::Context) {
+        let Some(slot) = self.hotkey_recording else {
+            return;
+        };
+        ctx.request_repaint_after(Duration::from_millis(30));
+
+        #[cfg(windows)]
+        if !self.owns_foreground() {
             return;
         }
+
+        if let Some(first_key) = self.hotkey_recording_first {
+            if let Some(second_key) = self
+                .hotkey_tracker
+                .newly_pressed_key_except(Some(first_key))
+            {
+                self.assign_recorded_hotkey(slot, Hotkey::pair(first_key, second_key));
+            } else if !self.hotkey_tracker.is_down(first_key) {
+                self.assign_recorded_hotkey(slot, Hotkey::key(first_key));
+            }
+        } else if let Some(first_key) = self.hotkey_tracker.newly_pressed_key_except(None) {
+            let simultaneous_second = self
+                .hotkey_tracker
+                .newly_pressed_key_except(Some(first_key))
+                .filter(|second| self.hotkey_tracker.is_down(*second));
+            if let Some(second_key) = simultaneous_second {
+                self.assign_recorded_hotkey(slot, Hotkey::pair(first_key, second_key));
+            } else if self.hotkey_tracker.is_down(first_key) {
+                self.hotkey_recording_first = Some(first_key);
+                self.hotkey_error = None;
+            } else {
+                // A quick tap can begin and end between polls; Windows retains
+                // the pressed edge, so it is still a valid single-key binding.
+                self.assign_recorded_hotkey(slot, Hotkey::key(first_key));
+            }
+        }
+    }
+
+    fn assign_recorded_hotkey(&mut self, slot: HotkeySlot, hotkey: Hotkey) {
+        if let Some(conflict) = self.app_config.keyboard_shortcuts.conflict(slot, hotkey) {
+            self.hotkey_error = Some(format!(
+                "{} is already assigned to {}.",
+                hotkey.display(),
+                conflict.label()
+            ));
+            self.hotkey_recording_first = None;
+        } else {
+            self.app_config.keyboard_shortcuts.set(slot, hotkey);
+            self.hotkey_recording = None;
+            self.hotkey_recording_first = None;
+            self.hotkey_error = None;
+            self.save_app_config();
+        }
+    }
+
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            self.hotkey_recording = None;
+            self.hotkey_recording_first = None;
+            return;
+        }
+
+        self.hotkey_capture_upkeep(ctx);
 
         let mut open = self.show_settings;
         let mut close = false;
         let mut action = None;
+        let mut restore_hotkeys = false;
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .default_width(600.0)
+            .default_height(680.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(
                 egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 28)),
             )
             .show(ctx, |ui| {
-                ui.heading("External tools");
-                ui.label(
-                    egui::RichText::new(
-                        "Video files play with bundled libmpv. Streamlink is only needed for live stream URLs.",
-                    )
-                    .weak(),
-                );
-                ui.add_space(8.0);
-
-                for kind in ToolKind::SETTINGS {
-                    ui.group(|ui| {
-                        Self::external_tool_settings_row(
-                            ui,
-                            kind,
-                            &self.external_tools,
-                            &mut action,
+                egui::ScrollArea::vertical()
+                    .max_height(580.0)
+                    .show(ui, |ui| {
+                        ui.heading("Keyboard shortcuts");
+                        ui.label(
+                            egui::RichText::new(
+                                "Click a shortcut, then tap one key, or hold one key and press a second. Mouse controls are not changed here.",
+                            )
+                            .weak(),
                         );
+                        ui.add_space(8.0);
+
+                        egui::Grid::new("settings_hotkeys_grid")
+                            .num_columns(2)
+                            .spacing([24.0, 7.0])
+                            .show(ui, |ui| {
+                                for slot in HotkeySlot::ALL {
+                                    ui.label(slot.label());
+                                    let recording = self.hotkey_recording == Some(slot);
+                                    let text = if recording {
+                                        self.hotkey_recording_first.map_or_else(
+                                            || "Press a key…".to_owned(),
+                                            |first| format!("{} + …", Hotkey::key(first).display()),
+                                        )
+                                    } else {
+                                        self.app_config.keyboard_shortcuts.get(slot).display()
+                                    };
+                                    let button = egui::Button::new(text).min_size(Vec2::new(180.0, 24.0));
+                                    if ui.add(button).clicked() {
+                                        self.hotkey_recording = Some(slot);
+                                        self.hotkey_recording_first = None;
+                                        self.hotkey_error = None;
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+
+                        if let Some(error) = &self.hotkey_error {
+                            ui.add_space(6.0);
+                            ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
+                        } else if self.hotkey_recording.is_some() {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Listening… release for one key, or hold it and press another for a two-key shortcut.",
+                                )
+                                .weak(),
+                            );
+                        }
+
+                        ui.add_space(8.0);
+                        if ui.button("Restore Default Keys").clicked() {
+                            restore_hotkeys = true;
+                        }
+
+                        ui.add_space(18.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        ui.heading("External tools");
+                        ui.label(
+                            egui::RichText::new(
+                                "Video files play with bundled libmpv. Streamlink is only needed for live stream URLs.",
+                            )
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+
+                        for kind in ToolKind::SETTINGS {
+                            ui.group(|ui| {
+                                Self::external_tool_settings_row(
+                                    ui,
+                                    kind,
+                                    &self.external_tools,
+                                    &mut action,
+                                );
+                            });
+                            ui.add_space(8.0);
+                        }
+
+                        if let Some(error) = &self.config_error {
+                            ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
+                            ui.add_space(6.0);
+                        }
                     });
-                    ui.add_space(8.0);
-                }
 
-                if let Some(error) = &self.config_error {
-                    ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
-                    ui.add_space(6.0);
-                }
-
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Re-scan All").clicked() {
                         self.external_tools.rescan_all();
@@ -3446,6 +3557,19 @@ impl PluriviewApp {
                 });
             });
         self.show_settings = open && !close;
+        if !self.show_settings {
+            self.hotkey_recording = None;
+            self.hotkey_recording_first = None;
+            self.hotkey_error = None;
+        }
+
+        if restore_hotkeys {
+            self.app_config.keyboard_shortcuts = HotkeyBindings::default();
+            self.hotkey_recording = None;
+            self.hotkey_recording_first = None;
+            self.hotkey_error = None;
+            self.save_app_config();
+        }
 
         match action {
             Some(SettingsAction::Browse(kind)) => {
@@ -3713,7 +3837,7 @@ impl PluriviewApp {
             None => "Stream Audio Monitor: Off".to_owned(),
         };
         ui.menu_button(label, |ui| {
-            ui.label("Replay tile audio to a device so Discord/OBS\nwindow shares carry sound. Pick one you don't\nlisten to (virtual cable, unused output).\nBrowser tiles replay automatically; window\ntiles use the SA toggle on hover.");
+            ui.label("Replay tile audio to a device so Discord/OBS\nwindow shares carry sound. Pick one you don't\nlisten to (virtual cable, unused output).\nBrowser tiles replay automatically; window\ntiles use the Stream Audio toggle on hover.");
             ui.separator();
             if ui
                 .radio(self.monitor_device.is_none(), "Off")
@@ -4365,6 +4489,27 @@ impl PluriviewApp {
                 continue;
             }
 
+            if let Some(sender) = &preview_layout.spout_sender {
+                let id = self.preview_manager.add_for_spout(
+                    sender.clone(),
+                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
+                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
+                    preview_layout.fps_preset,
+                );
+                self.preview_manager.set_z_order(id, preview_layout.z_order);
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.lock_aspect_ratio = preview_layout.lock_aspect_ratio;
+                    preview.crop_uv = preview_layout.crop_uv;
+                    preview.created_at = Instant::now() - Duration::from_secs(1);
+                }
+                self.capture_coordinator.start_spout_capture(
+                    id,
+                    sender.clone(),
+                    preview_layout.fps_preset.as_u32(),
+                );
+                continue;
+            }
+
             // Try to find a matching window by title
             let matching_window = current_windows
                 .iter()
@@ -4710,6 +4855,47 @@ impl eframe::App for PluriviewApp {
             }
         }
 
+        self.hotkey_tracker.sample();
+        #[cfg(windows)]
+        let owns_foreground = self.owns_foreground();
+        #[cfg(not(windows))]
+        let owns_foreground = true;
+        let shortcut_listening = owns_foreground
+            && !ctx.wants_keyboard_input()
+            && !self.show_settings
+            && !self.show_shortcuts
+            && !self.show_about
+            && self.hotkey_recording.is_none();
+        let shortcut_presses = self
+            .hotkey_tracker
+            .presses(&self.app_config.keyboard_shortcuts, shortcut_listening);
+
+        #[cfg(windows)]
+        let webview_active = self.browser.active_id().is_some();
+        #[cfg(not(windows))]
+        let webview_active = false;
+        if owns_foreground && (self.hotkey_recording.is_some() || webview_active) {
+            // Native WebViews do not wake egui for keyboard events. A short
+            // poll interval keeps remapped shortcuts responsive there and in
+            // the shortcut recorder.
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
+
+        if shortcut_presses.pressed(HotkeySlot::ToggleGrid) {
+            self.canvas.show_grid = !self.canvas.show_grid;
+        }
+        if shortcut_presses.pressed(HotkeySlot::ToggleCanvasOnly) {
+            self.canvas_only = !self.canvas_only;
+        }
+        if shortcut_presses.pressed(HotkeySlot::ShowShortcutHelp) {
+            self.show_shortcuts = true;
+        }
+        self.canvas.set_keyboard_input(CanvasKeyboardInput {
+            delete_selected: shortcut_presses.pressed(HotkeySlot::DeleteSelected),
+            select_all: shortcut_presses.pressed(HotkeySlot::SelectAll),
+            exit_tile_focus: shortcut_presses.pressed(HotkeySlot::ExitTileOrBrowser),
+        });
+
         if self.external_tools.poll() {
             #[cfg(windows)]
             for (id, pending) in &mut self.pending_video_tiles {
@@ -4885,28 +5071,26 @@ impl eframe::App for PluriviewApp {
 
         #[cfg(windows)]
         {
-            let [numpad_interact, numpad_focus] = self.poll_numpad_shortcuts(ctx);
-
             let browser_double_clicked = self
                 .canvas
                 .last_double_clicked
                 .filter(|id| self.browser.contains(*id));
 
-            let browser_shortcut = ((!ctx.wants_keyboard_input()
-                && ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::B)))
-                || numpad_interact)
-                .then(|| {
-                    // The live tile first, so Numpad 1 toggles interaction back off
-                    // even if the selection drifted while the page had focus.
-                    self.browser.active_id().or_else(|| {
-                        self.canvas
-                            .selection
-                            .iter()
-                            .copied()
-                            .find(|id| self.browser.contains(*id))
-                    })
+            let browser_shortcut = (shortcut_presses.pressed(HotkeySlot::InteractBrowser)
+                || shortcut_presses.pressed(HotkeySlot::InteractBrowserAlternate))
+            .then(|| {
+                // The live tile first, so the configured shortcut toggles
+                // interaction off even if selection drifted while the page
+                // had focus.
+                self.browser.active_id().or_else(|| {
+                    self.canvas
+                        .selection
+                        .iter()
+                        .copied()
+                        .find(|id| self.browser.contains(*id))
                 })
-                .flatten();
+            })
+            .flatten();
 
             if let Some(id) = browser_double_clicked.or(browser_shortcut) {
                 let active = self.browser.get(id).is_some_and(|host| host.is_active());
@@ -4953,9 +5137,9 @@ impl eframe::App for PluriviewApp {
             }
             self.canvas.last_double_clicked = None;
 
-            // Numpad 2: fit the current tile to the canvas, or restore the
-            // pre-focus view if a tile is already focused (same as Escape).
-            if numpad_focus && !self.canvas.exit_focus() {
+            // Fit the current tile to the canvas, or restore the pre-focus
+            // view if a tile is already focused.
+            if shortcut_presses.pressed(HotkeySlot::FocusCurrentTile) && !self.canvas.exit_focus() {
                 let target = self
                     .browser
                     .active_id()
@@ -4977,7 +5161,7 @@ impl eframe::App for PluriviewApp {
             // tiles, exit interaction mode on Escape/focus loss/minimize,
             // and keep the live host glued to its tile through pan/zoom
             // and window moves.
-            self.browser_frame(ctx);
+            self.browser_frame(ctx, shortcut_presses.pressed(HotkeySlot::ExitTileOrBrowser));
         }
 
         // Canvas right-click "Add Window..." was selected: open the
@@ -5179,24 +5363,6 @@ impl eframe::App for PluriviewApp {
             self.video_manager.schedule_cleanup(ctx);
         }
 
-        // Handle global keyboard shortcuts (skip while typing in a text field)
-        if !ctx.wants_keyboard_input() {
-            ctx.input(|i| {
-                // G - Toggle grid
-                if i.key_pressed(egui::Key::G) && !i.modifiers.ctrl && !i.modifiers.alt {
-                    self.canvas.show_grid = !self.canvas.show_grid;
-                }
-                // H - Toggle canvas-only mode
-                if i.key_pressed(egui::Key::H) && !i.modifiers.ctrl && !i.modifiers.alt {
-                    self.canvas_only = !self.canvas_only;
-                }
-                // F1 - Show keyboard shortcuts
-                if i.key_pressed(egui::Key::F1) {
-                    self.show_shortcuts = true;
-                }
-            });
-        }
-
         // About dialog
         if self.show_about {
             egui::Window::new("About Pluriview")
@@ -5250,19 +5416,56 @@ impl eframe::App for PluriviewApp {
                             ui.end_row();
 
                             ui.label("Toggle grid");
-                            ui.label(egui::RichText::new("G").weak());
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::ToggleGrid)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
                             ui.end_row();
 
                             ui.label("Canvas-only mode");
-                            ui.label(egui::RichText::new("H").weak());
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::ToggleCanvasOnly)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
                             ui.end_row();
 
                             ui.label("Focus current tile");
-                            ui.label(egui::RichText::new("Numpad 2").weak());
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::FocusCurrentTile)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
                             ui.end_row();
 
                             ui.label("Exit tile focus");
-                            ui.label(egui::RichText::new("Numpad 2 / Esc").weak());
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} / {}",
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::FocusCurrentTile)
+                                        .display(),
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::ExitTileOrBrowser)
+                                        .display()
+                                ))
+                                .weak(),
+                            );
                             ui.end_row();
 
                             ui.add_space(10.0);
@@ -5273,7 +5476,15 @@ impl eframe::App for PluriviewApp {
                             ui.end_row();
 
                             ui.label("Select all");
-                            ui.label(egui::RichText::new("Ctrl+A").weak());
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::SelectAll)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
                             ui.end_row();
 
                             ui.label("Multi-select");
@@ -5281,7 +5492,15 @@ impl eframe::App for PluriviewApp {
                             ui.end_row();
 
                             ui.label("Delete selected");
-                            ui.label(egui::RichText::new("Delete").weak());
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::DeleteSelected)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
                             ui.end_row();
 
                             ui.add_space(10.0);
@@ -5316,18 +5535,40 @@ impl eframe::App for PluriviewApp {
 
                             ui.label("Interact with page");
                             ui.label(
-                                egui::RichText::new("Numpad 1 / Double-click / Ctrl+B").weak(),
+                                egui::RichText::new(format!(
+                                    "{} / {} / Double-click",
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::InteractBrowser)
+                                        .display(),
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::InteractBrowserAlternate)
+                                        .display()
+                                ))
+                                .weak(),
                             );
                             ui.end_row();
 
                             ui.label("Exit interaction");
-                            ui.label(egui::RichText::new("Numpad 1 / Esc / click outside").weak());
-                            ui.end_row();
-
                             ui.label(
-                                egui::RichText::new("Numpad shortcuts need NumLock on").weak(),
+                                egui::RichText::new(format!(
+                                    "{} / {} / {} / click outside",
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::InteractBrowser)
+                                        .display(),
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::InteractBrowserAlternate)
+                                        .display(),
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::ExitTileOrBrowser)
+                                        .display()
+                                ))
+                                .weak(),
                             );
-                            ui.label("");
                             ui.end_row();
 
                             ui.add_space(10.0);
@@ -5338,7 +5579,15 @@ impl eframe::App for PluriviewApp {
                             ui.end_row();
 
                             ui.label("Show this help");
-                            ui.label(egui::RichText::new("F1").weak());
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::ShowShortcutHelp)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
                             ui.end_row();
                         });
 

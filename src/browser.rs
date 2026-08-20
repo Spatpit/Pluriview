@@ -31,14 +31,11 @@ use windows::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
         Graphics::Gdi::ClientToScreen,
         System::LibraryLoader::GetModuleHandleW,
-        UI::{
-            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_NUMPAD0},
-            WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, IsChild,
-                RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_BOTTOM,
-                HWND_TOP, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WNDCLASSW,
-                WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_POPUP,
-            },
+        UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, IsChild,
+            RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_BOTTOM, HWND_TOP,
+            SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WNDCLASSW, WS_CLIPCHILDREN,
+            WS_EX_TOOLWINDOW, WS_POPUP,
         },
     },
 };
@@ -242,24 +239,6 @@ fn is_sensitive_query_key(key: &str) -> bool {
 fn is_allowed_navigation(url: &str) -> bool {
     url::Url::parse(url)
         .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data"))
-}
-
-/// True while the virtual key is held. Once the WebView has focus, egui never
-/// sees keyboard input, so keys that must work in interaction mode are polled.
-fn key_down(vk: i32) -> bool {
-    (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
-}
-
-/// True while the Escape key is held. Used to exit interaction mode.
-pub fn escape_pressed() -> bool {
-    key_down(VK_ESCAPE.0 as i32)
-}
-
-/// True while the numpad `digit` key is held. Requires NumLock on: with it off
-/// Windows reports the navigation keys (End, Down, ...) instead, which we must
-/// not steal.
-pub fn numpad_digit_down(digit: u8) -> bool {
-    key_down(VK_NUMPAD0.0 as i32 + i32::from(digit))
 }
 
 #[derive(Clone, Copy)]

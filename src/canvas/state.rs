@@ -88,6 +88,41 @@ mod tests {
     }
 
     #[test]
+    fn configurable_select_all_action_reaches_the_canvas() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        canvas.set_keyboard_input(super::CanvasKeyboardInput {
+            select_all: true,
+            ..Default::default()
+        });
+        let mut previews = PreviewManager::new();
+        let first = previews.add("first".to_owned(), Pos2::ZERO, Vec2::splat(50.0));
+        let second = previews.add(
+            "second".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::splat(50.0),
+        );
+        let mut captures = CaptureCoordinator::new();
+
+        let _ = context.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+                events: vec![Event::PointerMoved(Pos2::new(250.0, 250.0))],
+                ..Default::default()
+            },
+            |context| {
+                CentralPanel::default().show(context, |ui| {
+                    canvas.ui(ui, &mut previews, &mut captures, context, true);
+                });
+            },
+        );
+
+        assert_eq!(canvas.selection.len(), 2);
+        assert!(canvas.selection.contains(&first));
+        assert!(canvas.selection.contains(&second));
+    }
+
+    #[test]
     fn stream_audio_badge_sits_left_of_fps_when_hovered() {
         let tile = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 120.0));
         let fps = Rect::from_min_size(
@@ -889,6 +924,15 @@ struct FrameInput {
     escape_pressed: bool,
 }
 
+/// Keyboard actions resolved by the app's configurable hotkey layer. `None`
+/// means a direct CanvasState test/embedding, which retains the legacy defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CanvasKeyboardInput {
+    pub delete_selected: bool,
+    pub select_all: bool,
+    pub exit_tile_focus: bool,
+}
+
 #[derive(Clone, Debug)]
 struct MarqueeSelection {
     start: Pos2,
@@ -933,6 +977,7 @@ struct TileInfo {
     is_video: bool,
     is_playlist: bool,
     is_window_capture: bool,
+    is_spout_capture: bool,
     muted: bool,
     stream_audio: bool,
     capture_failed: bool,
@@ -962,6 +1007,7 @@ impl TileInfo {
             is_video: preview.is_video(),
             is_playlist: preview.is_playlist(),
             is_window_capture: preview.is_window_capture(),
+            is_spout_capture: preview.is_spout_capture(),
             muted: preview.browser_muted,
             stream_audio: preview.stream_audio,
             capture_failed: preview.capture_error.is_some(),
@@ -990,6 +1036,7 @@ impl TileInfo {
         self.is_video = preview.is_video();
         self.is_playlist = preview.is_playlist();
         self.is_window_capture = preview.is_window_capture();
+        self.is_spout_capture = preview.is_spout_capture();
         self.muted = preview.browser_muted;
         self.stream_audio = preview.stream_audio;
         self.capture_failed = preview.capture_error.is_some();
@@ -1093,7 +1140,7 @@ fn paint_truncated_text(
     painter.galley(anchor.anchor_size(pos, galley.size()).min, galley, color);
 }
 
-/// Hover capture-resolution pill sits 4px left of FPS, or of the SA badge
+/// Hover capture-resolution pill sits 4px left of FPS, or of the Stream Audio badge
 /// when that is shown beside FPS.
 const CAPTURE_RESOLUTION_BADGE_WIDTH: f32 = 70.0;
 
@@ -1107,9 +1154,9 @@ fn capture_resolution_badge_rect(left_of: Rect) -> Rect {
     )
 }
 
-/// Hover FPS pill sits at x=-72 with width 36; SA is 4px to its left.
+/// Hover FPS pill sits at x=-72 with width 36; Stream Audio is 4px to its left.
 fn stream_audio_badge_rect(screen_rect: Rect, enabled: bool, beside_fps: bool) -> Rect {
-    let width = if enabled { 54.0 } else { 32.0 };
+    let width = if enabled { 104.0 } else { 82.0 };
     let x = if beside_fps {
         -76.0 - width
     } else {
@@ -1124,7 +1171,7 @@ fn stream_audio_badge_rect(screen_rect: Rect, enabled: bool, beside_fps: bool) -
 fn stream_audio_tooltip(enabled: bool, monitor_ready: bool) -> &'static str {
     match (enabled, monitor_ready) {
         (true, true) => "Streaming audio — click to stop",
-        (true, false) => "SA is on — pick a device under View → Stream Audio Monitor",
+        (true, false) => "Stream Audio is on — pick a device under View → Stream Audio Monitor",
         (false, true) => "Stream audio to Discord/OBS",
         (false, false) => "Pick a Stream Audio Monitor device in View first",
     }
@@ -1528,6 +1575,9 @@ pub struct CanvasState {
 
     /// Left-button selection box started on empty canvas.
     marquee: Option<MarqueeSelection>,
+
+    /// Configurable keyboard actions queued by the app for the next UI pass.
+    keyboard_input: Option<CanvasKeyboardInput>,
 }
 
 impl Default for CanvasState {
@@ -1573,11 +1623,16 @@ impl Default for CanvasState {
             last_double_clicked: None,
             focus: None,
             marquee: None,
+            keyboard_input: None,
         }
     }
 }
 
 impl CanvasState {
+    pub fn set_keyboard_input(&mut self, input: CanvasKeyboardInput) {
+        self.keyboard_input = Some(input);
+    }
+
     /// Reset canvas to default view
     pub fn reset(&mut self) {
         self.pan = Vec2::ZERO;
@@ -1732,6 +1787,22 @@ impl CanvasState {
         let canvas_rect = ui.available_rect_before_wrap();
         self.last_screen_rect = Some(canvas_rect);
 
+        let configured_keyboard = self.keyboard_input.take();
+        let (delete_pressed, select_all, escape_pressed) = match configured_keyboard {
+            Some(input) => (
+                input.delete_selected,
+                input.select_all,
+                input.exit_tile_focus,
+            ),
+            None => ui.input(|input| {
+                (
+                    input.key_pressed(egui::Key::Delete),
+                    input.modifiers.ctrl && input.key_pressed(egui::Key::A),
+                    input.key_pressed(egui::Key::Escape),
+                )
+            }),
+        };
+
         // Snapshot the input fields we need once, instead of cloning the
         // whole InputState in every interaction pass.
         let input = ui.input(|i| FrameInput {
@@ -1746,9 +1817,9 @@ impl CanvasState {
             primary_pressed: i.pointer.primary_pressed(),
             primary_released: i.pointer.primary_released(),
             time: i.time,
-            delete_pressed: i.key_pressed(egui::Key::Delete),
-            select_all: i.modifiers.ctrl && i.key_pressed(egui::Key::A),
-            escape_pressed: i.key_pressed(egui::Key::Escape),
+            delete_pressed,
+            select_all,
+            escape_pressed,
         });
 
         if input.escape_pressed {
@@ -1910,7 +1981,7 @@ impl CanvasState {
         let pixels_per_point = ctx.pixels_per_point();
         let lod = capture_lod_factor(self.zoom);
         for preview in preview_manager.all() {
-            if !preview.is_window_capture() || preview.manually_frozen {
+            if !preview.is_live_capture() || preview.manually_frozen {
                 continue;
             }
             let (width, height) = window_capture_target(
@@ -2018,7 +2089,11 @@ impl CanvasState {
         painter.text(
             badge_rect.center(),
             egui::Align2::CENTER_CENTER,
-            if enabled { "SA: On" } else { "SA" },
+            if enabled {
+                "Stream Audio: On"
+            } else {
+                "Stream Audio"
+            },
             egui::FontId::proportional(10.0),
             if enabled {
                 Color32::from_rgb(140, 200, 255)
@@ -2305,19 +2380,19 @@ impl CanvasState {
             }
         });
 
-        // Keyboard shortcuts
-        if bg_response.has_focus() || bg_response.hovered() {
-            if input.delete_pressed {
-                for id in self.selection.clone() {
-                    capture_coordinator.stop_capture(id);
-                    preview_manager.start_removal(id);
-                }
-                self.selection.clear();
+        // Keyboard shortcuts are app-wide while Pluriview owns focus. They do
+        // not depend on pointer position; the app suppresses them while a text
+        // field or shortcut recorder owns keyboard input.
+        if input.delete_pressed {
+            for id in self.selection.clone() {
+                capture_coordinator.stop_capture(id);
+                preview_manager.start_removal(id);
             }
+            self.selection.clear();
+        }
 
-            if input.select_all {
-                self.selection = preview_manager.all_ids();
-            }
+        if input.select_all {
+            self.selection = preview_manager.all_ids();
         }
     }
 
@@ -2369,6 +2444,7 @@ impl CanvasState {
             let is_video = info.is_video;
             let is_playlist = info.is_playlist;
             let is_window_capture = info.is_window_capture;
+            let is_spout_capture = info.is_spout_capture;
             let muted = if is_video {
                 info.video_playback.muted
             } else {
@@ -2432,8 +2508,10 @@ impl CanvasState {
 
             let is_active = self.selection.contains(&id) || preview_response.dragged();
 
-            if show_overlays {
+            if show_overlays && !is_spout_capture {
                 // Soft drop shadow underneath the preview, stronger when selected/dragged.
+                // Spout tiles often have a real alpha channel (VTube Studio), so a
+                // filled shadow rect would show through as a dark plate.
                 let shadow_alpha = ((if is_active { 90.0 } else { 40.0 }) * alpha) as u8;
                 let shadow_offset = if is_active {
                     Vec2::new(0.0, 6.0)
@@ -2553,7 +2631,7 @@ impl CanvasState {
             if show_overlays && pointer_over_tile {
                 // Playlist tiles already have a designed header; a second title
                 // bar would cover the folder name and transport controls.
-                if !is_playlist {
+                if !is_playlist && !is_spout_capture {
                     let overlay_rect =
                         Rect::from_min_size(screen_rect.min, Vec2::new(screen_rect.width(), 40.0));
                     painter.rect_filled(
@@ -2635,7 +2713,7 @@ impl CanvasState {
                             true,
                         );
                     }
-                    if is_browser || is_window_capture {
+                    if is_browser || is_window_capture || is_spout_capture {
                         if let Some((width, height)) = frame_size {
                             let left_of = if is_window_capture {
                                 stream_audio_badge_rect(screen_rect, stream_audio, true)
@@ -2669,7 +2747,7 @@ impl CanvasState {
                 if !is_playlist {
                     // Title (truncated, on the left) - handle UTF-8 properly
                     let title_text = compact_title(title, 25);
-                    let title_pos = if is_browser || is_media || is_video {
+                    let title_pos = if is_browser || is_media || is_video || is_spout_capture {
                         // Source badge marks app-owned tiles; shift the title right.
                         painter.text(
                             screen_rect.left_top() + Vec2::new(12.0, 20.0),
@@ -2678,6 +2756,8 @@ impl CanvasState {
                                 egui_phosphor::regular::GLOBE
                             } else if is_video {
                                 egui_phosphor::regular::VIDEO
+                            } else if is_spout_capture {
+                                egui_phosphor::regular::BROADCAST
                             } else {
                                 egui_phosphor::regular::IMAGE
                             },
@@ -3597,7 +3677,7 @@ impl CanvasState {
 
                     ui.separator();
                     ui.menu_button("Crop", |ui| {
-                        if ui.button("Select Region...").clicked() {
+                        if !is_spout_capture && ui.button("Select Region...").clicked() {
                             self.pending_region_select = Some(id);
                             ui.close_menu();
                         }
@@ -3611,8 +3691,7 @@ impl CanvasState {
                 } else {
                     // Crop section
                     ui.menu_button("Crop", |ui| {
-                        // Select Region button (ShareX-style)
-                        if ui.button("Select Region...").clicked() {
+                        if !is_spout_capture && ui.button("Select Region...").clicked() {
                             self.pending_region_select = Some(id);
                             ui.close_menu();
                         }
@@ -4283,6 +4362,18 @@ impl CanvasState {
                 self.pending_media_restore = Some(info);
             } else if info.video_source.is_some() {
                 self.pending_video_restore = Some(info);
+            } else if let Some(sender) = info.spout_sender {
+                let id = preview_manager.add_for_spout(
+                    sender.clone(),
+                    info.position,
+                    info.size,
+                    info.fps_preset,
+                );
+                if let Some(preview) = preview_manager.get_mut(id) {
+                    preview.set_fps_preset(info.fps_preset);
+                    preview.crop_uv = info.crop_uv;
+                }
+                capture_coordinator.start_spout_capture(id, sender, info.fps_preset.as_u32());
             } else if let Some(handle) = info.window_handle {
                 let capture_title = info.title.clone();
                 let id = preview_manager.add_for_window(

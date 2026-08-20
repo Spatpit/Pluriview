@@ -13,7 +13,7 @@ use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
 use super::downsample::{downsample_rgba, fitted_capture_size};
 
 /// Frame data sent from capture threads
-struct CapturedFrame {
+pub(crate) struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
@@ -138,6 +138,61 @@ impl CaptureCoordinator {
         };
 
         self.sessions.insert(preview_id, session);
+    }
+
+    /// Receive a Spout2 sender into a preview tile.
+    pub fn start_spout_capture(
+        &mut self,
+        preview_id: PreviewId,
+        sender_name: String,
+        target_fps: u32,
+    ) {
+        self.retire_session(preview_id, true);
+
+        let active = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
+        let fps = Arc::new(AtomicU32::new(target_fps.max(1)));
+        let target_width = Arc::new(AtomicU32::new(0));
+        let target_height = Arc::new(AtomicU32::new(0));
+        let latest_frame = Arc::new(Mutex::new(None));
+        let failure = Arc::new(Mutex::new(None));
+        let active_clone = active.clone();
+        let paused_clone = paused.clone();
+        let fps_clone = fps.clone();
+        let target_width_clone = target_width.clone();
+        let target_height_clone = target_height.clone();
+        let worker_frame = latest_frame.clone();
+        let worker_failure = failure.clone();
+        let (stop_sender, stop_receiver) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            super::spout::capture_spout_loop(
+                sender_name,
+                fps_clone,
+                target_width_clone,
+                target_height_clone,
+                active_clone,
+                paused_clone,
+                worker_frame,
+                worker_failure,
+                stop_receiver,
+            );
+        });
+
+        self.sessions.insert(
+            preview_id,
+            CaptureSession {
+                target_fps: fps,
+                target_width,
+                target_height,
+                active,
+                paused,
+                latest_frame,
+                failure,
+                stop_sender,
+                worker: Some(worker),
+            },
+        );
     }
 
     /// Stop capturing for a preview

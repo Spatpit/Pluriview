@@ -23,6 +23,7 @@
 | Feature | Description |
 |---------|-------------|
 | **Live Capture** | Real-time window previews using Windows Graphics Capture |
+| **Spout2 Capture** | Receive senders from apps such as VTube Studio as live canvas tiles |
 | **Browser Tiles** | Live web pages (YouTube, Twitch, anything) on the canvas with their own audio |
 | **Video Tiles** | Drop local videos onto the canvas; play, seek, volume, tracks, loop, reload |
 | **Folder Playlists** | Drop a folder to get a player plus a playlist tile (next/prev, shuffle, repeat) |
@@ -141,7 +142,7 @@ contain local paths.
 ## Usage
 
 1. **Launch** `pluriview.exe`
-2. **Add windows** from the Window Picker (left side)
+2. **Add windows** from the Window Picker (left side). Live Spout2 senders such as VTube Studio appear in the same list; add them to capture the shared texture.
 3. **Add browsers** by right-clicking the canvas → Add Browser...
 4. **Add images or GIFs** with File → Add Image... or the canvas context menu
 5. **Add videos** by dropping a file or folder, or File → Add Video...
@@ -155,6 +156,11 @@ The **Workspace** menu holds separate setups. Existing installs are migrated
 into a workspace named **Default** the first time workspaces run.
 
 ## Keyboard Shortcuts
+
+Keyboard shortcuts can be changed under **File → Settings → Keyboard
+shortcuts**. A binding can be one key or any two keys held together. Mouse
+controls remain fixed. **Restore Default Keys** returns the keyboard bindings
+to those shown below.
 
 | Action | Shortcut |
 |--------|----------|
@@ -194,7 +200,8 @@ Pluriview/
 │   ├── persistence/        # Layout, workspaces, settings
 │   ├── preview/            # Preview window management
 │   ├── tray/               # System tray integration
-│   └── window_picker/      # Window enumeration and picker UI
+│   ├── window_picker/      # Window enumeration and picker UI
+│   └── spout.rs            # Spout2 sender detection
 ├── assets/
 │   ├── icon.ico                  # Application icon
 │   ├── pluriview-preview.gif     # README preview
@@ -222,6 +229,7 @@ Bundled third-party components keep their own licenses; see
 
 - Built with [egui](https://github.com/emilk/egui)
 - Window capture via [windows-rs](https://github.com/microsoft/windows-rs)
+- Spout2 sender capture via the public [Spout](https://spout.zeal.co/) shared-memory registry and DirectX 11
 - Browser tiles via [wry](https://github.com/tauri-apps/wry) (WebView2)
 - Video playback via [libmpv](https://github.com/mpv-player/mpv) (shinchiro Windows builds)
 - Ad and tracker blocking via [uBlock Origin Lite](https://github.com/gorhill/uBlock) (GPL-3.0)

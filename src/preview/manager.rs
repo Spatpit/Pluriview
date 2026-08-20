@@ -24,6 +24,8 @@ pub struct RemovedPreviewInfo {
     pub browser_muted: bool,
     /// Reapplied when undo recreates a window-capture tile.
     pub stream_audio: bool,
+    /// Set when this tile receives a Spout2 sender.
+    pub spout_sender: Option<String>,
     /// Set for managed image and GIF tiles.
     pub media_path: Option<String>,
     /// Set for mpv-backed local video and Streamlink tiles.
@@ -88,6 +90,24 @@ impl PreviewManager {
         let mut preview = Preview::for_window(id, hwnd, process_id, title, position, size);
         preview.z_order = self.max_z_order;
 
+        self.previews.insert(id, preview);
+        id
+    }
+
+    /// Add a preview that receives a named Spout2 sender.
+    pub fn add_for_spout(
+        &mut self,
+        sender_name: String,
+        position: Pos2,
+        size: Vec2,
+        fps: FpsPreset,
+    ) -> PreviewId {
+        let id = self.generate_id();
+        self.max_z_order += 1;
+
+        let mut preview = Preview::for_spout(id, sender_name, position, size);
+        preview.z_order = self.max_z_order;
+        preview.set_fps_preset(fps);
         self.previews.insert(id, preview);
         id
     }
@@ -212,6 +232,7 @@ impl PreviewManager {
                     browser_url: preview.browser_url,
                     browser_muted: preview.browser_muted,
                     stream_audio: preview.stream_audio,
+                    spout_sender: preview.spout_sender,
                     media_path: preview.media_path,
                     video_source: preview.video_source,
                     folder_playlist: preview.folder_playlist,

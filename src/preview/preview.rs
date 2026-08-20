@@ -137,6 +137,9 @@ pub struct Preview {
     /// Window being captured
     pub window_handle: Option<WindowHandle>,
 
+    /// Spout2 sender name when this tile receives a GPU texture share.
+    pub spout_sender: Option<String>,
+
     /// Display title (cached from window)
     pub title: String,
 
@@ -258,6 +261,7 @@ impl Preview {
             position,
             size,
             window_handle: None,
+            spout_sender: None,
             title,
             capture_paused: false,
             manually_frozen: false,
@@ -315,13 +319,23 @@ impl Preview {
         self.folder_playlist.is_some()
     }
 
-    /// Captured OS window/game — not a browser, video, image, or playlist tile.
+    /// Captured OS window/game — not a browser, video, image, playlist, or Spout tile.
     pub fn is_window_capture(&self) -> bool {
         self.window_handle.is_some()
+            && self.spout_sender.is_none()
             && !self.is_browser()
             && !self.is_media()
             && !self.is_video()
             && !self.is_playlist()
+    }
+
+    pub fn is_spout_capture(&self) -> bool {
+        self.spout_sender.is_some()
+    }
+
+    /// Window Graphics Capture or a Spout sender feeding this tile.
+    pub fn is_live_capture(&self) -> bool {
+        self.is_window_capture() || self.is_spout_capture()
     }
 
     /// Record that Windows Graphics Capture could not start for this tile.
@@ -401,6 +415,13 @@ impl Preview {
             self.frame_size = Some((frame.width, frame.height));
             self.source_aspect_ratio = frame.width as f32 / frame.height as f32;
         }
+    }
+
+    /// Create a preview that receives a Spout2 sender.
+    pub fn for_spout(id: PreviewId, sender_name: String, position: Pos2, size: Vec2) -> Self {
+        let mut preview = Self::new(id, sender_name.clone(), position, size);
+        preview.spout_sender = Some(sender_name);
+        preview
     }
 
     /// Create a preview for a specific window
@@ -612,6 +633,9 @@ pub struct PreviewLayout {
     /// Persisted folder playlist state; entries are rescanned on restore.
     #[serde(default)]
     pub folder_playlist: Option<FolderPlaylistLayout>,
+    /// Spout2 sender name for tiles that receive a GPU texture share.
+    #[serde(default)]
+    pub spout_sender: Option<String>,
 }
 
 impl From<&Preview> for PreviewLayout {
@@ -635,6 +659,7 @@ impl From<&Preview> for PreviewLayout {
             video_source: preview.video_source.as_ref().map(scrub_video_source),
             playlist_group: preview.playlist_group,
             folder_playlist: preview.folder_playlist.as_ref().map(FolderPlaylist::layout),
+            spout_sender: preview.spout_sender.clone(),
         }
     }
 }
@@ -927,6 +952,21 @@ mod tests {
     }
 
     #[test]
+    fn older_saved_tiles_default_to_no_spout_sender() {
+        let preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        value.as_object_mut().unwrap().remove("spout_sender");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.spout_sender.is_none());
+    }
+
+    #[test]
     fn older_saved_tiles_default_stream_audio_off() {
         let preview = Preview::new(
             PreviewId(1),
@@ -956,6 +996,22 @@ mod tests {
         let restored = PreviewLayout::from(&preview);
         assert!(restored.stream_audio);
         assert!(preview.is_window_capture());
+    }
+
+    #[test]
+    fn spout_tiles_round_trip_and_are_not_window_captures() {
+        let preview = Preview::for_spout(
+            PreviewId(1),
+            "VTube Studio".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        assert!(preview.is_spout_capture());
+        assert!(!preview.is_window_capture());
+        assert!(preview.is_live_capture());
+
+        let restored = PreviewLayout::from(&preview);
+        assert_eq!(restored.spout_sender.as_deref(), Some("VTube Studio"));
     }
 
     #[test]

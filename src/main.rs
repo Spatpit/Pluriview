@@ -8,6 +8,7 @@ mod browser;
 mod canvas;
 mod capture;
 mod external_tools;
+mod hotkeys;
 #[cfg(windows)]
 mod libmpv;
 mod media;
@@ -16,6 +17,7 @@ mod persistence;
 mod playlist;
 mod preview;
 mod privacy;
+mod spout;
 mod tray;
 #[cfg(windows)]
 mod video;

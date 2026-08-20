@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::hotkeys::HotkeyBindings;
+
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 
 /// App-global preferences, stored separately from workspace layouts.
@@ -12,6 +14,8 @@ pub struct AppConfig {
     /// When true (default), the custom title bar stays on screen. When false,
     /// it hides until the pointer is at the top of the window.
     pub always_show_title_bar: bool,
+    /// App-global, user-editable keyboard bindings. Mouse gestures are fixed.
+    pub keyboard_shortcuts: HotkeyBindings,
 }
 
 impl Default for AppConfig {
@@ -20,6 +24,7 @@ impl Default for AppConfig {
             version: CURRENT_CONFIG_VERSION,
             external_tools: ExternalToolsConfig::default(),
             always_show_title_bar: true,
+            keyboard_shortcuts: HotkeyBindings::default(),
         }
     }
 }
@@ -33,6 +38,7 @@ pub struct ExternalToolsConfig {
 #[cfg(test)]
 mod tests {
     use super::{AppConfig, CURRENT_CONFIG_VERSION};
+    use crate::hotkeys::HotkeyBindings;
     use std::path::PathBuf;
 
     #[test]
@@ -42,6 +48,7 @@ mod tests {
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
         assert!(config.always_show_title_bar);
         assert!(config.external_tools.streamlink_path.is_none());
+        assert_eq!(config.keyboard_shortcuts, HotkeyBindings::default());
     }
 
     #[test]
@@ -56,6 +63,7 @@ mod tests {
 
         assert!(config.external_tools.streamlink_path.is_none());
         assert!(config.always_show_title_bar);
+        assert_eq!(config.keyboard_shortcuts, HotkeyBindings::default());
     }
 
     #[test]
@@ -63,12 +71,14 @@ mod tests {
         let mut config = AppConfig::default();
         config.external_tools.streamlink_path = Some(PathBuf::from(r"D:\Portable\streamlink.exe"));
         config.always_show_title_bar = false;
+        config.keyboard_shortcuts.toggle_grid = crate::hotkeys::Hotkey::key(0x51);
 
         let json = serde_json::to_string(&config).unwrap();
         let restored: AppConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.version, CURRENT_CONFIG_VERSION);
         assert!(!restored.always_show_title_bar);
+        assert_eq!(restored.keyboard_shortcuts.toggle_grid.display(), "Q");
         assert_eq!(
             restored.external_tools.streamlink_path,
             config.external_tools.streamlink_path
