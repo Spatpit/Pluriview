@@ -236,6 +236,55 @@ mod tests {
     }
 
     #[test]
+    fn enabled_stream_audio_badge_is_visible_only_while_hovering_the_tile() {
+        fn render_with_pointer(pointer: Pos2) -> eframe::egui::FullOutput {
+            let context = Context::default();
+            let mut canvas = CanvasState::default();
+            let mut previews = PreviewManager::new();
+            let id = previews.add_for_window(
+                1,
+                42,
+                "window".to_owned(),
+                Pos2::new(100.0, 100.0),
+                Vec2::new(240.0, 160.0),
+            );
+            previews.get_mut(id).unwrap().stream_audio = true;
+            let mut captures = CaptureCoordinator::new();
+
+            context.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0))),
+                    events: vec![Event::PointerMoved(pointer)],
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            )
+        }
+
+        let hovered = render_with_pointer(Pos2::new(150.0, 150.0));
+        assert!(hovered.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                Shape::Text(text) if text.galley.text() == "Stream Audio: On"
+            )
+        }));
+
+        let not_hovered = render_with_pointer(Pos2::new(500.0, 500.0));
+        assert!(!not_hovered.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                Shape::Text(text) if text.galley.text().starts_with("Stream Audio")
+            )
+        }));
+    }
+
+    #[test]
     fn pinned_spout_stays_fixed_through_canvas_pan_and_zoom() {
         let mut canvas = CanvasState {
             pan: Vec2::new(20.0, -10.0),
@@ -3647,10 +3696,6 @@ impl CanvasState {
                     egui::FontId::proportional(12.0),
                     Color32::from_rgb(255, 150, 100),
                 );
-            }
-
-            if show_overlays && is_window_capture && stream_audio && !pointer_over_tile {
-                self.paint_stream_audio_badge(ui, &painter, id, screen_rect, true, false);
             }
 
             if show_overlays && manually_frozen {
