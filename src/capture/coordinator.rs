@@ -24,6 +24,7 @@ pub(crate) struct CaptureWorkerState {
     pub target_fps: Arc<AtomicU32>,
     pub target_width: Arc<AtomicU32>,
     pub target_height: Arc<AtomicU32>,
+    pub target_generation: Arc<AtomicU32>,
     pub active: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
     pub latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
@@ -50,6 +51,14 @@ struct CaptureSession {
     /// without upscaling. Zero means native source size.
     target_width: Arc<AtomicU32>,
     target_height: Arc<AtomicU32>,
+
+    /// Incremented whenever the requested output size changes. Window capture
+    /// uses it to bypass FPS throttling for the next available source frame.
+    target_generation: Arc<AtomicU32>,
+
+    /// Source HWND for window captures. Spout sessions do not need a source
+    /// repaint request because they are polled continuously.
+    window_hwnd: Option<isize>,
 
     /// Is capture active?
     active: Arc<AtomicBool>,
@@ -108,12 +117,14 @@ impl CaptureCoordinator {
         let fps = Arc::new(AtomicU32::new(target_fps.max(1)));
         let target_width = Arc::new(AtomicU32::new(0));
         let target_height = Arc::new(AtomicU32::new(0));
+        let target_generation = Arc::new(AtomicU32::new(0));
         let latest_frame = Arc::new(Mutex::new(None));
         let failure = Arc::new(Mutex::new(None));
         let worker_state = CaptureWorkerState {
             target_fps: fps.clone(),
             target_width: target_width.clone(),
             target_height: target_height.clone(),
+            target_generation: target_generation.clone(),
             active: active.clone(),
             paused: paused.clone(),
             latest_frame: latest_frame.clone(),
@@ -130,6 +141,8 @@ impl CaptureCoordinator {
             target_fps: fps,
             target_width,
             target_height,
+            target_generation,
+            window_hwnd: Some(hwnd),
             active,
             paused,
             latest_frame,
@@ -155,12 +168,14 @@ impl CaptureCoordinator {
         let fps = Arc::new(AtomicU32::new(target_fps.max(1)));
         let target_width = Arc::new(AtomicU32::new(0));
         let target_height = Arc::new(AtomicU32::new(0));
+        let target_generation = Arc::new(AtomicU32::new(0));
         let latest_frame = Arc::new(Mutex::new(None));
         let failure = Arc::new(Mutex::new(None));
         let worker_state = CaptureWorkerState {
             target_fps: fps.clone(),
             target_width: target_width.clone(),
             target_height: target_height.clone(),
+            target_generation: target_generation.clone(),
             active: active.clone(),
             paused: paused.clone(),
             latest_frame: latest_frame.clone(),
@@ -178,6 +193,8 @@ impl CaptureCoordinator {
                 target_fps: fps,
                 target_width,
                 target_height,
+                target_generation,
+                window_hwnd: None,
                 active,
                 paused,
                 latest_frame,
@@ -231,8 +248,24 @@ impl CaptureCoordinator {
     /// on the next frame; it never upscales a smaller source.
     pub fn set_target_size(&mut self, preview_id: PreviewId, width: u32, height: u32) {
         if let Some(session) = self.sessions.get_mut(&preview_id) {
-            session.target_width.store(width, Ordering::Relaxed);
-            session.target_height.store(height, Ordering::Relaxed);
+            let old_width = session.target_width.swap(width, Ordering::Relaxed);
+            let old_height = session.target_height.swap(height, Ordering::Relaxed);
+            if old_width == width && old_height == height {
+                return;
+            }
+
+            // Publish both dimensions before the generation change. The
+            // capture callback acquires this generation before reading them.
+            session.target_generation.fetch_add(1, Ordering::Release);
+
+            // Windows Graphics Capture may not emit another callback for a
+            // static source. Invalidating it is asynchronous and coalesced by
+            // Windows, but prompts traditional windows to paint a fresh frame.
+            if (width > old_width || height > old_height)
+                && session.window_hwnd.is_some_and(request_capture_repaint)
+            {
+                log::trace!("Requested a source repaint for capture resolution upgrade");
+            }
         }
     }
 
@@ -339,6 +372,31 @@ fn capture_target_from_hwnd(hwnd: isize) -> windows_capture::window::Window {
     windows_capture::window::Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void)
 }
 
+fn request_capture_repaint(hwnd: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
+
+    unsafe {
+        RedrawWindow(
+            HWND(hwnd as *mut _),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ALLCHILDREN,
+        )
+        .as_bool()
+    }
+}
+
+fn capture_frame_due(
+    elapsed: std::time::Duration,
+    fps: u32,
+    requested_generation: u32,
+    handled_generation: u32,
+) -> bool {
+    let frame_interval = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+    requested_generation != handled_generation || elapsed >= frame_interval
+}
+
 /// Capture loop running in a separate thread
 fn capture_window_loop(
     preview_id: PreviewId,
@@ -361,6 +419,7 @@ fn capture_window_loop(
         target_fps,
         target_width,
         target_height,
+        target_generation,
         active,
         paused,
         latest_frame,
@@ -377,6 +436,7 @@ fn capture_window_loop(
         fps: Arc<AtomicU32>,
         target_width: Arc<AtomicU32>,
         target_height: Arc<AtomicU32>,
+        target_generation: Arc<AtomicU32>,
     }
 
     struct Capture {
@@ -387,7 +447,9 @@ fn capture_window_loop(
         fps: Arc<AtomicU32>,
         target_width: Arc<AtomicU32>,
         target_height: Arc<AtomicU32>,
+        target_generation: Arc<AtomicU32>,
         last_frame: std::time::Instant,
+        handled_target_generation: u32,
         downsampler: RgbaDownsampler,
     }
 
@@ -404,7 +466,11 @@ fn capture_window_loop(
                 fps: ctx.flags.fps,
                 target_width: ctx.flags.target_width,
                 target_height: ctx.flags.target_height,
+                target_generation: ctx.flags.target_generation,
                 last_frame: std::time::Instant::now(),
+                // Generation zero is a valid initial request. Start at a
+                // sentinel so the first callback is never FPS-throttled.
+                handled_target_generation: u32::MAX,
                 downsampler: RgbaDownsampler::default(),
             })
         }
@@ -425,11 +491,18 @@ fn capture_window_loop(
                 return Ok(());
             }
 
-            // Throttle frame rate (read live so preset changes apply instantly)
+            // Throttle frame rate (read live so preset changes apply instantly).
+            // A target-size change must win over this throttle: a static source
+            // may produce only one repaint callback for the resolution upgrade.
+            let requested_generation = self.target_generation.load(Ordering::Acquire);
             let fps = self.fps.load(Ordering::Relaxed).max(1);
-            let frame_interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
             let elapsed = self.last_frame.elapsed();
-            if elapsed < frame_interval {
+            if !capture_frame_due(
+                elapsed,
+                fps,
+                requested_generation,
+                self.handled_target_generation,
+            ) {
                 return Ok(());
             }
             self.last_frame = std::time::Instant::now();
@@ -467,6 +540,7 @@ fn capture_window_loop(
                 }
             };
             *self.latest_frame.lock() = Some(captured_frame);
+            self.handled_target_generation = requested_generation;
 
             Ok(())
         }
@@ -497,6 +571,7 @@ fn capture_window_loop(
         fps: target_fps,
         target_width,
         target_height,
+        target_generation,
     };
 
     // Request WithoutCursor / WithoutBorder only when those Graphics Capture
@@ -605,7 +680,10 @@ fn capture_settings_unsupported<E>(error: &GraphicsCaptureApiError<E>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_target_from_hwnd, CaptureCoordinator, CaptureSession, CapturedFrame};
+    use super::{
+        capture_frame_due, capture_target_from_hwnd, CaptureCoordinator, CaptureSession,
+        CapturedFrame,
+    };
     use crate::preview::{PreviewId, PreviewManager};
     use eframe::egui::{Pos2, Vec2};
     use parking_lot::Mutex;
@@ -619,6 +697,8 @@ mod tests {
             target_fps: Arc::new(AtomicU32::new(fps)),
             target_width: Arc::new(AtomicU32::new(0)),
             target_height: Arc::new(AtomicU32::new(0)),
+            target_generation: Arc::new(AtomicU32::new(0)),
+            window_hwnd: None,
             active: Arc::new(AtomicBool::new(active)),
             paused: Arc::new(AtomicBool::new(paused)),
             latest_frame: Arc::new(Mutex::new(None)),
@@ -633,6 +713,30 @@ mod tests {
         let hwnd = 0x1234isize;
         let target = capture_target_from_hwnd(hwnd);
         assert_eq!(target.as_raw_hwnd() as isize, hwnd);
+    }
+
+    #[test]
+    fn target_change_bypasses_frame_rate_throttle() {
+        let too_soon = std::time::Duration::from_millis(1);
+        assert!(capture_frame_due(too_soon, 30, 0, u32::MAX));
+        assert!(!capture_frame_due(too_soon, 30, 4, 4));
+        assert!(capture_frame_due(too_soon, 30, 5, 4));
+    }
+
+    #[test]
+    fn target_generation_changes_only_with_dimensions() {
+        let preview_id = PreviewId(7);
+        let capture = session(30, true, false);
+        let generation = capture.target_generation.clone();
+        let mut coordinator = CaptureCoordinator::new();
+        coordinator.sessions.insert(preview_id, capture);
+
+        coordinator.set_target_size(preview_id, 640, 360);
+        assert_eq!(generation.load(std::sync::atomic::Ordering::Acquire), 1);
+        coordinator.set_target_size(preview_id, 640, 360);
+        assert_eq!(generation.load(std::sync::atomic::Ordering::Acquire), 1);
+        coordinator.set_target_size(preview_id, 1280, 720);
+        assert_eq!(generation.load(std::sync::atomic::Ordering::Acquire), 2);
     }
 
     #[test]
@@ -715,6 +819,8 @@ mod tests {
                 target_fps: Arc::new(AtomicU32::new(30)),
                 target_width: Arc::new(AtomicU32::new(0)),
                 target_height: Arc::new(AtomicU32::new(0)),
+                target_generation: Arc::new(AtomicU32::new(0)),
+                window_hwnd: None,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
@@ -742,6 +848,8 @@ mod tests {
                 target_fps: Arc::new(AtomicU32::new(30)),
                 target_width: Arc::new(AtomicU32::new(0)),
                 target_height: Arc::new(AtomicU32::new(0)),
+                target_generation: Arc::new(AtomicU32::new(0)),
+                window_hwnd: None,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
@@ -813,6 +921,8 @@ mod tests {
                 target_fps: Arc::new(AtomicU32::new(30)),
                 target_width: Arc::new(AtomicU32::new(0)),
                 target_height: Arc::new(AtomicU32::new(0)),
+                target_generation: Arc::new(AtomicU32::new(0)),
+                window_hwnd: None,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),

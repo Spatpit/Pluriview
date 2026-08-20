@@ -32,6 +32,7 @@ pub fn capture_spout_loop(
         target_fps,
         target_width,
         target_height,
+        target_generation: _,
         active,
         paused,
         latest_frame,
