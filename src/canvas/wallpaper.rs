@@ -26,6 +26,10 @@ pub struct CanvasWallpaper {
     texture: Option<TextureHandle>,
     #[cfg(windows)]
     pub video_renderer: Option<std::sync::Arc<crate::libmpv::VideoRenderer>>,
+    /// The renderer is intentionally absent while the app is minimized.
+    /// Suppress the normal startup repaint loop until the window is restored.
+    #[cfg(windows)]
+    pub video_sleeping: bool,
     pub error: Option<String>,
 }
 
@@ -40,6 +44,8 @@ impl CanvasWallpaper {
             texture: None,
             #[cfg(windows)]
             video_renderer: None,
+            #[cfg(windows)]
+            video_sleeping: false,
             error: None,
         }
     }
@@ -54,6 +60,8 @@ impl CanvasWallpaper {
             texture: None,
             #[cfg(windows)]
             video_renderer: None,
+            #[cfg(windows)]
+            video_sleeping: false,
             error: None,
         }
     }
@@ -84,7 +92,9 @@ impl CanvasWallpaper {
                 }
             } else {
                 self.paint_video_status(painter, canvas_rect);
-                ctx.request_repaint();
+                if !self.video_sleeping {
+                    ctx.request_repaint();
+                }
             }
             return;
         }

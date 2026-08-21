@@ -9,7 +9,7 @@ use crate::preview::{
 use crate::privacy;
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How long the "Removed '...' · Undo" toast stays on screen.
 const UNDO_TOAST_SECS: f32 = 4.0;
@@ -20,6 +20,14 @@ const PLAYLIST_CORNER: f32 = 10.0;
 const PLAYLIST_HEADER_HEIGHT: f32 = 52.0;
 const PLAYLIST_TOOLBAR_HEIGHT: f32 = 36.0;
 const PLAYLIST_ROW_HEIGHT: f32 = 60.0;
+
+/// A short pan away should pause frame processing, but should not destroy and
+/// recreate Windows Graphics Capture. Long-off-screen captures release their
+/// sessions while their independent process-audio monitors remain alive.
+const CAPTURE_HIBERNATE_AFTER: Duration = Duration::from_secs(30);
+/// Screen-space hysteresis around the viewport. A tile just beyond an edge is
+/// cheap to return to and should not start the hibernation timer.
+const CAPTURE_HIBERNATE_MARGIN_POINTS: f32 = 128.0;
 
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
@@ -769,6 +777,61 @@ mod tests {
         );
 
         assert!(previews.get(id).unwrap().capture_paused);
+    }
+
+    #[test]
+    fn distant_window_capture_hibernates_without_changing_audio_intent() {
+        let canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_window(
+            1,
+            42,
+            "podcast".to_owned(),
+            Pos2::new(2_000.0, 2_000.0),
+            Vec2::splat(100.0),
+        );
+        let preview = previews.get_mut(id).unwrap();
+        preview.stream_audio = true;
+        preview.capture_paused = true;
+        preview.capture_offscreen_since =
+            Some(Instant::now() - super::CAPTURE_HIBERNATE_AFTER - Duration::from_secs(1));
+        let mut captures = CaptureCoordinator::new();
+
+        canvas.update_viewport_culling(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0)),
+            &mut previews,
+            &mut captures,
+        );
+
+        let preview = previews.get(id).unwrap();
+        assert!(preview.capture_hibernated);
+        assert!(preview.capture_paused);
+        assert!(preview.stream_audio);
+    }
+
+    #[test]
+    fn nearby_offscreen_capture_pauses_without_starting_hibernation_timer() {
+        let canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_window(
+            1,
+            42,
+            "near edge".to_owned(),
+            Pos2::new(510.0, 100.0),
+            Vec2::splat(100.0),
+        );
+        let mut captures = CaptureCoordinator::new();
+
+        canvas.update_viewport_culling(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0)),
+            &mut previews,
+            &mut captures,
+        );
+
+        let preview = previews.get(id).unwrap();
+        assert!(preview.capture_paused);
+        assert!(!preview.capture_hibernated);
+        assert!(preview.capture_offscreen_since.is_none());
     }
 
     #[test]
@@ -2470,10 +2533,11 @@ impl CanvasState {
         // Apply pending FPS changes
         self.apply_pending_fps_changes(preview_manager, capture_coordinator);
         self.apply_pending_stream_audio_toggles(preview_manager);
-        self.sync_window_capture_targets(ctx, preview_manager, capture_coordinator);
-
-        // Viewport culling: pause/resume captures based on visibility
+        // Viewport culling may recreate a hibernated capture. Run it before
+        // target synchronization so the new session receives its downsampled
+        // output size in the same UI frame.
         self.update_viewport_culling(canvas_rect, preview_manager, capture_coordinator);
+        self.sync_window_capture_targets(ctx, preview_manager, capture_coordinator);
 
         // Request repaint if animations are active
         if self.animation.is_animating() {
@@ -2517,7 +2581,9 @@ impl CanvasState {
         }
     }
 
-    /// Update viewport culling - pause captures for off-screen previews
+    /// Pause off-screen captures immediately, then fully release Windows
+    /// capture sessions that remain far from the viewport. Process-loopback
+    /// audio is owned by the app layer and intentionally stays independent.
     fn update_viewport_culling(
         &self,
         canvas_rect: Rect,
@@ -2525,30 +2591,84 @@ impl CanvasState {
         capture_coordinator: &mut CaptureCoordinator,
     ) {
         let viewport = self.get_viewport(canvas_rect);
+        let hibernation_margin = CAPTURE_HIBERNATE_MARGIN_POINTS / self.zoom.max(0.01);
+        let nearby_viewport = viewport.expand(hibernation_margin);
+        let now = Instant::now();
 
         // Check each preview for visibility
         for preview in preview_manager.all_mut() {
             let id = preview.id;
             let preview_rect = preview.rect();
             let is_visible = preview.viewport_pin.is_some() || viewport.intersects(preview_rect);
+            let is_nearby =
+                preview.viewport_pin.is_some() || nearby_viewport.intersects(preview_rect);
 
-            // Update pause state based on visibility
-            if is_visible && preview.capture_paused && !preview.manually_frozen {
-                // Resume capture - preview is now visible
-                capture_coordinator.resume_capture(id);
-                preview.capture_paused = false;
-                #[cfg(debug_assertions)]
-                println!(
-                    "Viewport culling: Resumed capture for '{}'",
-                    privacy::redact_title(&preview.title)
-                );
-            } else if (!is_visible || preview.manually_frozen) && !preview.capture_paused {
-                // Pause capture - preview is now off-screen
+            if preview.manually_frozen {
+                preview.capture_offscreen_since = None;
+                continue;
+            }
+
+            if is_visible {
+                preview.capture_offscreen_since = None;
+                if preview.capture_hibernated {
+                    if let Some(window) = preview.window_handle.as_ref() {
+                        capture_coordinator.start_capture(
+                            id,
+                            window.hwnd,
+                            preview.title.clone(),
+                            preview.target_fps,
+                        );
+                    }
+                    preview.capture_hibernated = false;
+                    preview.capture_paused = false;
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "Viewport hibernation: Restarted capture for '{}'",
+                        privacy::redact_title(&preview.title)
+                    );
+                } else if preview.capture_paused {
+                    capture_coordinator.resume_capture(id);
+                    preview.capture_paused = false;
+                    #[cfg(debug_assertions)]
+                    println!(
+                        "Viewport culling: Resumed capture for '{}'",
+                        privacy::redact_title(&preview.title)
+                    );
+                }
+                continue;
+            }
+
+            if !preview.capture_paused {
                 capture_coordinator.pause_capture(id);
                 preview.capture_paused = true;
                 #[cfg(debug_assertions)]
                 println!(
                     "Viewport culling: Paused capture for '{}'",
+                    privacy::redact_title(&preview.title)
+                );
+            }
+
+            // Browser and Spout sources have different audio/render ownership.
+            // Start with ordinary HWND captures, whose audio is independent.
+            if !preview.is_window_capture() || preview.capture_hibernated {
+                preview.capture_offscreen_since = None;
+                continue;
+            }
+
+            if is_nearby {
+                preview.capture_offscreen_since = None;
+                continue;
+            }
+
+            let offscreen_since = preview.capture_offscreen_since.get_or_insert(now);
+            if now.duration_since(*offscreen_since) >= CAPTURE_HIBERNATE_AFTER {
+                capture_coordinator.stop_capture(id);
+                preview.discard_pending_capture_frame();
+                preview.capture_hibernated = true;
+                preview.capture_offscreen_since = None;
+                #[cfg(debug_assertions)]
+                println!(
+                    "Viewport hibernation: Released capture for '{}'",
                     privacy::redact_title(&preview.title)
                 );
             }

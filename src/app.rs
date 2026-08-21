@@ -55,6 +55,10 @@ const BROWSER_FOCUS_GRACE: Duration = Duration::from_millis(300);
 const RESTORED_BROWSER_START_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const RESTORED_VIDEO_START_INTERVAL: Duration = Duration::from_secs(2);
+/// Pause a hidden video wallpaper immediately, then release its libmpv core
+/// after a grace period so quick minimize/restore cycles do not churn decoders.
+#[cfg(windows)]
+const WALLPAPER_HIBERNATE_AFTER: Duration = Duration::from_secs(10);
 
 /// How many recent browser URLs to keep for the Add Browser dialog.
 const MAX_RECENT_URLS: usize = 8;
@@ -341,6 +345,11 @@ fn video_session_is_stale(
 }
 
 #[cfg(windows)]
+fn wallpaper_hibernation_due(since: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(since) >= WALLPAPER_HIBERNATE_AFTER
+}
+
+#[cfg(windows)]
 fn restored_browser_ready(
     pending: &PendingBrowserTile,
     tile_rect: Option<egui::Rect>,
@@ -370,6 +379,14 @@ pub struct PluriviewApp {
     /// Windows-only in-process libmpv playback cores and renderers.
     #[cfg(windows)]
     video_manager: VideoManager,
+    /// Minimized-window grace period before the muted wallpaper decoder is
+    /// destroyed. While present, playback is already paused.
+    #[cfg(windows)]
+    wallpaper_sleep_since: Option<Instant>,
+    /// Prevent `ensure_wallpaper_video` from immediately recreating a decoder
+    /// intentionally released while the window is minimized.
+    #[cfg(windows)]
+    wallpaper_hibernated: bool,
     /// Video placeholders waiting for optional tools to finish validation.
     #[cfg(windows)]
     pending_video_tiles: HashMap<PreviewId, PendingVideoTile>,
@@ -582,6 +599,10 @@ impl PluriviewApp {
             capture_coordinator: CaptureCoordinator::new(),
             #[cfg(windows)]
             video_manager: VideoManager::new(),
+            #[cfg(windows)]
+            wallpaper_sleep_since: None,
+            #[cfg(windows)]
+            wallpaper_hibernated: false,
             #[cfg(windows)]
             pending_video_tiles: HashMap::new(),
             #[cfg(windows)]
@@ -1239,6 +1260,11 @@ impl PluriviewApp {
 
     #[cfg(windows)]
     fn poll_seek_previews(&mut self, ctx: &egui::Context) {
+        for id in self.seek_preview_manager.expire_idle() {
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.clear_seek_preview();
+            }
+        }
         for (id, thumbnail) in self.seek_preview_manager.poll() {
             if let Some(preview) = self.preview_manager.get_mut(id) {
                 preview.update_seek_preview(
@@ -1392,6 +1418,12 @@ impl PluriviewApp {
 
         if freeze {
             if is_video {
+                // Hover thumbnails own a separate libmpv core. A frozen video
+                // must release that auxiliary decoder as well as playback.
+                self.seek_preview_manager.remove(id);
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.clear_seek_preview();
+                }
                 let pending_was_playing = self
                     .pending_video_tiles
                     .get(&id)
@@ -1433,6 +1465,9 @@ impl PluriviewApp {
                 // A manually frozen capture is fully stopped, not merely
                 // throttled like an off-screen capture.
                 self.capture_coordinator.stop_capture(id);
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.discard_pending_capture_frame();
+                }
                 if is_browser {
                     if let Some(host) = self.browser.get_mut(id) {
                         if let Err(error) = host.suspend() {
@@ -1445,6 +1480,8 @@ impl PluriviewApp {
             if let Some(preview) = self.preview_manager.get_mut(id) {
                 preview.manually_frozen = true;
                 preview.capture_paused = true;
+                preview.capture_hibernated = false;
+                preview.capture_offscreen_since = None;
                 if is_video {
                     preview.video_playback.paused = true;
                 }
@@ -1453,6 +1490,8 @@ impl PluriviewApp {
             if let Some(preview) = self.preview_manager.get_mut(id) {
                 preview.manually_frozen = false;
                 preview.capture_paused = false;
+                preview.capture_hibernated = false;
+                preview.capture_offscreen_since = None;
             }
 
             if is_video {
@@ -2178,8 +2217,12 @@ impl PluriviewApp {
 
     fn clear_wallpaper(&mut self) {
         #[cfg(windows)]
-        if self.video_manager.contains(WALLPAPER_VIDEO_ID) {
-            self.video_manager.remove(WALLPAPER_VIDEO_ID);
+        {
+            if self.video_manager.contains(WALLPAPER_VIDEO_ID) {
+                self.video_manager.remove(WALLPAPER_VIDEO_ID);
+            }
+            self.wallpaper_sleep_since = None;
+            self.wallpaper_hibernated = false;
         }
         self.canvas.wallpaper = None;
     }
@@ -2266,6 +2309,9 @@ impl PluriviewApp {
     /// Attach libmpv to the current video wallpaper when the file is ready.
     #[cfg(windows)]
     fn ensure_wallpaper_video(&mut self) -> Result<bool, String> {
+        if self.wallpaper_hibernated || self.wallpaper_sleep_since.is_some() {
+            return Ok(false);
+        }
         let path = match self.canvas.wallpaper.as_ref() {
             Some(wallpaper) if wallpaper.video_renderer.is_none() => match &wallpaper.source {
                 WallpaperSource::Video { path } => path.clone(),
@@ -2277,6 +2323,7 @@ impl PluriviewApp {
             let renderer = tile.session.renderer();
             if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
                 wallpaper.video_renderer = Some(renderer);
+                wallpaper.video_sleeping = false;
             }
             return Ok(true);
         }
@@ -2308,16 +2355,61 @@ impl PluriviewApp {
         }
         if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
             wallpaper.video_renderer = Some(renderer);
+            wallpaper.video_sleeping = false;
             wallpaper.error = None;
         }
         Ok(true)
+    }
+
+    /// Keep a muted video wallpaper from consuming decoder/GPU resources while
+    /// the window cannot display it. This reuses normal libmpv cleanup and adds
+    /// no polling thread; the existing egui upkeep tick drives the deadline.
+    #[cfg(windows)]
+    fn wallpaper_memory_upkeep(&mut self, ctx: &egui::Context) {
+        let is_video = self
+            .canvas
+            .wallpaper
+            .as_ref()
+            .is_some_and(|wallpaper| matches!(wallpaper.source, WallpaperSource::Video { .. }));
+        if !is_video {
+            self.wallpaper_sleep_since = None;
+            self.wallpaper_hibernated = false;
+            return;
+        }
+
+        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        let hidden = minimized || self.canvas.is_focusing_tile();
+        if !hidden {
+            self.wallpaper_sleep_since = None;
+            self.wallpaper_hibernated = false;
+            if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
+                wallpaper.video_sleeping = false;
+            }
+            return;
+        }
+
+        let now = Instant::now();
+        let since = *self.wallpaper_sleep_since.get_or_insert(now);
+        if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
+            wallpaper.video_sleeping = true;
+        }
+        if let Err(error) = self.video_manager.set_paused(WALLPAPER_VIDEO_ID, true) {
+            log::warn!("Could not pause minimized wallpaper: {error}");
+        }
+        if !self.wallpaper_hibernated && wallpaper_hibernation_due(since, now) {
+            if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
+                wallpaper.video_renderer = None;
+            }
+            self.video_manager.remove(WALLPAPER_VIDEO_ID);
+            self.wallpaper_hibernated = true;
+        }
     }
 
     /// Video wallpaper keeps decoding while focused tiles cover it. Pause the
     /// player (and skip painting) until tile focus is cleared.
     #[cfg(windows)]
     fn sync_wallpaper_under_tile_focus(&mut self) {
-        let covered = self.canvas.is_focusing_tile();
+        let covered = self.canvas.is_focusing_tile() || self.wallpaper_sleep_since.is_some();
         if let Err(error) = self.video_manager.set_paused(WALLPAPER_VIDEO_ID, covered) {
             log::warn!("Could not pause wallpaper under a focused tile: {error}");
         }
@@ -4596,14 +4688,30 @@ impl PluriviewApp {
 mod tests {
     use super::{
         preview_playback_state, preview_video_status, restored_browser_ready, restored_video_ready,
-        resumable_video_position, video_launch_for_source, video_session_is_stale, FpsPreset,
-        PendingBrowserTile, PendingVideoTile, VideoSource, VideoTileStatus, WALLPAPER_VIDEO_ID,
+        resumable_video_position, video_launch_for_source, video_session_is_stale,
+        wallpaper_hibernation_due, FpsPreset, PendingBrowserTile, PendingVideoTile, VideoSource,
+        VideoTileStatus, WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID,
     };
     use crate::external_tools::{DiscoverySource, ToolStatus};
     use crate::preview::VideoPlaybackState;
     use crate::video::{LoopMode, TrackInfo, TrackSelection, VideoState};
     use eframe::egui::{Pos2, Rect, Vec2};
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn wallpaper_hibernation_keeps_a_quick_minimize_warm() {
+        let now = Instant::now();
+        assert!(!wallpaper_hibernation_due(now, now));
+        assert!(!wallpaper_hibernation_due(
+            now - WALLPAPER_HIBERNATE_AFTER + Duration::from_millis(1),
+            now
+        ));
+        assert!(wallpaper_hibernation_due(
+            now - WALLPAPER_HIBERNATE_AFTER,
+            now
+        ));
+    }
 
     fn restored_pending(shown_once: bool) -> PendingBrowserTile {
         PendingBrowserTile {
@@ -4954,6 +5062,8 @@ impl eframe::App for PluriviewApp {
         self.browser_preparation_upkeep(ctx);
         #[cfg(windows)]
         self.poll_video_freezes(ctx);
+        #[cfg(windows)]
+        self.wallpaper_memory_upkeep(ctx);
         #[cfg(windows)]
         self.poll_video_manager(ctx);
         #[cfg(windows)]

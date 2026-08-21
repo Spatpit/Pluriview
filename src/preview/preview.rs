@@ -222,6 +222,15 @@ pub struct Preview {
     /// Is capture paused (e.g., for viewport culling)?
     pub capture_paused: bool,
 
+    /// Automatic visual sleep for an off-screen Windows capture. Unlike a
+    /// manual freeze, this is transparent and does not affect process audio.
+    /// The capture session is recreated when the tile returns to the viewport.
+    pub capture_hibernated: bool,
+
+    /// When this Windows capture moved far enough outside the viewport to be
+    /// eligible for hibernation. Runtime-only so saved workspaces reopen live.
+    pub capture_offscreen_since: Option<Instant>,
+
     /// User-requested freeze. Frozen tiles keep their last painted frame but
     /// must not advance media or restart a culled capture until resumed.
     /// This is deliberately runtime-only: saved workspaces start live.
@@ -345,6 +354,8 @@ impl Preview {
             viewport_pin: None,
             title,
             capture_paused: false,
+            capture_hibernated: false,
+            capture_offscreen_since: None,
             manually_frozen: false,
             lock_aspect_ratio: true,
             source_aspect_ratio: aspect_ratio,
@@ -567,6 +578,13 @@ impl Preview {
             height,
             data,
         });
+    }
+
+    /// Release a CPU-side frame that arrived just before a capture was
+    /// stopped. The already-uploaded texture remains as the sleeping tile's
+    /// visual snapshot.
+    pub fn discard_pending_capture_frame(&mut self) {
+        self.frame_buffer = None;
     }
 
     /// Get UV coordinates for rendering (either crop region or full frame)

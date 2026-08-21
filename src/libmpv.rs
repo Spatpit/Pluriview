@@ -121,6 +121,9 @@ const SEEK_PREVIEW_COLD_DEBOUNCE: Duration = Duration::from_millis(140);
 const SEEK_PREVIEW_WARM_DEBOUNCE: Duration = Duration::from_millis(50);
 const SEEK_PREVIEW_PREFETCH_OFFSETS: [i64; 4] = [-1, 1, -2, 2];
 const SEEK_PREVIEW_PREFETCH_GRACE: Duration = Duration::from_millis(250);
+/// Timeline thumbnails use a separate libmpv decoder. Keep it warm briefly,
+/// then release it instead of retaining a decoder for every video ever hovered.
+const SEEK_PREVIEW_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const SEEK_PREVIEW_MATCH_SECS: f64 = 0.5;
 
 const MPV_FORMAT_NONE: c_int = 0;
@@ -1562,6 +1565,10 @@ fn frame_matches_hover(frame_time: f64, hover_time: f64) -> bool {
     (frame_time - hover_time).abs() <= SEEK_PREVIEW_MATCH_SECS
 }
 
+fn seek_preview_is_idle(last_hover: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_hover) >= SEEK_PREVIEW_IDLE_TIMEOUT
+}
+
 #[derive(Default)]
 struct SeekPreviewCache {
     frames: VecDeque<(i64, video::VideoThumbnail)>,
@@ -2308,16 +2315,44 @@ impl SeekPreviewManager {
         })
     }
 
+    /// Drop decoder workers that have not served an active hover recently.
+    /// Returning their ids lets the UI release the corresponding thumbnail
+    /// textures too. No timer thread is needed; normal app upkeep calls this.
+    pub fn expire_idle(&mut self) -> Vec<PreviewId> {
+        let now = Instant::now();
+        let expired = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                seek_preview_is_idle(session.last_hover, now).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in &expired {
+            self.sessions.remove(id);
+        }
+        if self.sessions.is_empty() {
+            self.api = None;
+        }
+        expired
+    }
+
     pub fn remove(&mut self, id: PreviewId) {
         self.sessions.remove(&id);
+        if self.sessions.is_empty() {
+            self.api = None;
+        }
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(PreviewId) -> bool) {
         self.sessions.retain(|id, _| keep(*id));
+        if self.sessions.is_empty() {
+            self.api = None;
+        }
     }
 
     pub fn clear(&mut self) {
         self.sessions.clear();
+        self.api = None;
     }
 }
 
@@ -2366,6 +2401,17 @@ unsafe extern "C" fn get_gl_proc_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seek_preview_idle_timeout_has_a_warm_grace_period() {
+        let now = Instant::now();
+        assert!(!seek_preview_is_idle(now, now));
+        assert!(!seek_preview_is_idle(
+            now - SEEK_PREVIEW_IDLE_TIMEOUT + Duration::from_millis(1),
+            now
+        ));
+        assert!(seek_preview_is_idle(now - SEEK_PREVIEW_IDLE_TIMEOUT, now));
+    }
 
     #[test]
     fn snapshot_rows_are_flipped_from_opengl_order() {
