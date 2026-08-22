@@ -123,7 +123,7 @@ pub struct WindowHandle {
     pub process_id: u32,
 }
 
-/// Viewport corner used to keep a pinned Spout tile stable when the app window
+/// Viewport corner used to keep a pinned tile stable when the app window
 /// changes size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,7 +134,7 @@ pub enum ViewportAnchor {
     BottomRight,
 }
 
-/// Screen-space placement for a Spout tile that ignores canvas pan and zoom.
+/// Screen-space placement for a tile that ignores canvas pan and zoom.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ViewportPin {
     pub anchor: ViewportAnchor,
@@ -213,7 +213,7 @@ pub struct Preview {
     /// Spout2 sender name when this tile receives a GPU texture share.
     pub spout_sender: Option<String>,
 
-    /// Screen-space placement when a Spout tile is pinned above the canvas.
+    /// Screen-space placement when this tile is pinned above the canvas.
     pub viewport_pin: Option<ViewportPin>,
 
     /// Display title (cached from window)
@@ -739,7 +739,7 @@ pub struct PreviewLayout {
     /// Spout2 sender name for tiles that receive a GPU texture share.
     #[serde(default)]
     pub spout_sender: Option<String>,
-    /// Viewport placement for Spout tiles pinned independently of the canvas.
+    /// Viewport placement for tiles pinned independently of the canvas.
     #[serde(default)]
     pub viewport_pin: Option<ViewportPin>,
 }
@@ -1105,6 +1105,25 @@ mod tests {
             pin.rect(resized_viewport),
             Rect::from_min_size(Pos2::new(920.0, 630.0), Vec2::new(200.0, 200.0))
         );
+    }
+
+    #[test]
+    fn regular_tile_viewport_pin_round_trips_through_layout() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "image".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        preview.viewport_pin = Some(ViewportPin {
+            anchor: ViewportAnchor::TopLeft,
+            offset: (18.0, 24.0),
+            size: (320.0, 180.0),
+        });
+
+        let restored = PreviewLayout::from(&preview);
+        assert_eq!(restored.viewport_pin, preview.viewport_pin);
+        assert!(restored.spout_sender.is_none());
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub enum DragState {
         handle: ResizeHandle,
         start_mouse: Pos2,
         /// Tile rectangle when the crop began. Canvas coordinates normally;
-        /// viewport coordinates for pinned Spout tiles.
+        /// viewport coordinates for pinned tiles.
         start_rect: Rect,
         screen_space: bool,
         /// Starting crop UV coordinates (min_u, min_v, max_u, max_v)
@@ -243,6 +243,36 @@ mod tests {
     }
 
     #[test]
+    fn native_capture_action_resizes_a_pinned_tile_in_screen_space() {
+        let mut canvas = CanvasState {
+            zoom: 0.25,
+            pan: Vec2::new(900.0, -400.0),
+            ..Default::default()
+        };
+        let canvas_rect = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::splat(1200.0));
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_window(
+            1,
+            42,
+            "window".to_owned(),
+            Pos2::new(7.0, 9.0),
+            Vec2::splat(100.0),
+        );
+        previews.get_mut(id).unwrap().viewport_pin = Some(crate::preview::ViewportPin::from_rect(
+            Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::splat(100.0)),
+            canvas_rect,
+        ));
+
+        canvas.set_native_capture_size(id, (1920, 1080), canvas_rect, 1.25, &mut previews);
+
+        let preview = previews.get(id).unwrap();
+        let screen = preview.viewport_pin.unwrap().rect(canvas_rect);
+        assert_eq!((screen.width() * 1.25).round() as u32, 1920);
+        assert_eq!((screen.height() * 1.25).round() as u32, 1080);
+        assert!(preview.viewport_pin.is_some());
+    }
+
+    #[test]
     fn stream_audio_on_badge_is_wider_than_off() {
         let tile = Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0));
         let off = stream_audio_badge_rect(tile, false, true);
@@ -315,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_spout_stays_fixed_through_canvas_pan_and_zoom() {
+    fn pinned_tile_stays_fixed_through_canvas_pan_and_zoom() {
         let mut canvas = CanvasState {
             pan: Vec2::new(20.0, -10.0),
             zoom: 1.5,
@@ -331,7 +361,7 @@ mod tests {
         );
         let before = canvas.preview_screen_rect(previews.get(id).unwrap(), viewport);
 
-        canvas.toggle_spout_viewport_pin(id, viewport, &mut previews);
+        canvas.toggle_viewport_pin(id, viewport, &mut previews);
         canvas.pan = Vec2::new(-500.0, 900.0);
         canvas.zoom = 0.25;
 
@@ -346,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn left_drag_repositions_a_pinned_spout_tile() {
+    fn left_drag_repositions_a_pinned_tile() {
         let context = Context::default();
         let mut canvas = CanvasState::default();
         let mut previews = PreviewManager::new();
@@ -407,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn unpinning_spout_preserves_its_current_screen_rect() {
+    fn unpinning_preserves_the_current_screen_rect() {
         let mut canvas = CanvasState {
             pan: Vec2::new(-60.0, 25.0),
             zoom: 0.75,
@@ -421,10 +451,10 @@ mod tests {
             Vec2::new(240.0, 360.0),
             FpsPreset::Medium,
         );
-        canvas.toggle_spout_viewport_pin(id, viewport, &mut previews);
+        canvas.toggle_viewport_pin(id, viewport, &mut previews);
         let pinned_rect = canvas.preview_screen_rect(previews.get(id).unwrap(), viewport);
 
-        canvas.toggle_spout_viewport_pin(id, viewport, &mut previews);
+        canvas.toggle_viewport_pin(id, viewport, &mut previews);
 
         assert!(previews.get(id).unwrap().viewport_pin.is_none());
         assert_eq!(
@@ -434,15 +464,22 @@ mod tests {
     }
 
     #[test]
-    fn viewport_pin_toggle_ignores_non_spout_tiles() {
+    fn viewport_pin_toggle_supports_non_spout_tiles() {
         let mut canvas = CanvasState::default();
         let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
         let mut previews = PreviewManager::new();
         let id = previews.add("image".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
 
-        canvas.toggle_spout_viewport_pin(id, viewport, &mut previews);
+        let before = canvas.preview_screen_rect(previews.get(id).unwrap(), viewport);
+        canvas.toggle_viewport_pin(id, viewport, &mut previews);
 
-        assert!(previews.get(id).unwrap().viewport_pin.is_none());
+        assert!(previews.get(id).unwrap().viewport_pin.is_some());
+        canvas.pan = Vec2::new(400.0, -200.0);
+        canvas.zoom = 2.0;
+        assert_eq!(
+            canvas.preview_screen_rect(previews.get(id).unwrap(), viewport),
+            before
+        );
     }
 
     #[test]
@@ -1638,7 +1675,6 @@ fn native_capture_canvas_size(
 fn live_capture_display_size(preview: &Preview, canvas_lod: f32) -> Vec2 {
     preview
         .viewport_pin
-        .filter(|_| preview.is_spout_capture())
         .map(ViewportPin::size_vec2)
         .unwrap_or(preview.size * canvas_lod)
 }
@@ -2021,11 +2057,11 @@ pub struct CanvasState {
     /// Is a preview currently being dragged?
     preview_dragging: bool,
 
-    /// Original viewport placements for pinned Spout tiles in the active
+    /// Original viewport placements for pinned tiles in the active
     /// drag, paired with their IDs so egui's cumulative drag delta is stable.
     pinned_drag_origins: Vec<(PreviewId, ViewportPin)>,
 
-    /// Direct left-button capture for repositioning one pinned Spout tile.
+    /// Direct left-button capture for repositioning one pinned tile.
     /// This does not depend on egui's general tile-drag ownership.
     pinned_pointer_drag: Option<PinnedPointerDrag>,
 
@@ -2280,7 +2316,6 @@ impl CanvasState {
     fn preview_screen_rect(&self, preview: &Preview, canvas_rect: Rect) -> Rect {
         preview
             .viewport_pin
-            .filter(|_| preview.is_spout_capture())
             .map(|pin| pin.rect(canvas_rect))
             .unwrap_or_else(|| self.canvas_rect_to_screen(preview.rect(), canvas_rect))
     }
@@ -2333,24 +2368,18 @@ impl CanvasState {
         }
     }
 
-    fn toggle_spout_viewport_pin(
+    fn toggle_viewport_pin(
         &mut self,
         id: PreviewId,
         canvas_rect: Rect,
         preview_manager: &mut PreviewManager,
     ) {
-        let Some((is_spout, pin, canvas_preview_rect)) = preview_manager.get(id).map(|preview| {
-            (
-                preview.is_spout_capture(),
-                preview.viewport_pin,
-                preview.rect(),
-            )
-        }) else {
+        let Some((pin, canvas_preview_rect)) = preview_manager
+            .get(id)
+            .map(|preview| (preview.viewport_pin, preview.rect()))
+        else {
             return;
         };
-        if !is_spout {
-            return;
-        }
 
         self.exit_focus();
         self.animation.preview_springs.remove(&id);
@@ -2389,27 +2418,41 @@ impl CanvasState {
         // before calculating a persistent 1:1 tile size.
         self.exit_focus();
 
-        let Some((position, crop_uv)) = preview_manager
-            .get(id)
-            .map(|preview| (preview.position, preview.crop_uv))
-        else {
+        let Some((screen_rect, crop_uv, is_pinned)) = preview_manager.get(id).map(|preview| {
+            (
+                self.preview_screen_rect(preview, canvas_rect),
+                preview.crop_uv,
+                preview.viewport_pin.is_some(),
+            )
+        }) else {
             return;
         };
-        let screen_min = self.canvas_to_screen(position, canvas_rect);
         let aligned_min = pixel_aligned_rect(
-            Rect::from_min_size(screen_min, Vec2::ZERO),
+            Rect::from_min_size(screen_rect.min, Vec2::ZERO),
             pixels_per_point,
         )
         .min;
-        let position = self.screen_to_canvas(aligned_min, canvas_rect);
-        let size = native_capture_canvas_size(source_size, crop_uv, pixels_per_point, self.zoom);
+        let size = native_capture_canvas_size(
+            source_size,
+            crop_uv,
+            pixels_per_point,
+            if is_pinned { 1.0 } else { self.zoom },
+        );
 
         if let Some(preview) = preview_manager.get_mut(id) {
-            preview.position = position;
-            preview.size = size;
-        }
-        if let Some(spring) = self.animation.preview_springs.get_mut(&id) {
-            spring.set_immediate_pos(position);
+            if is_pinned {
+                preview.viewport_pin = Some(ViewportPin::from_rect(
+                    Rect::from_min_size(aligned_min, size),
+                    canvas_rect,
+                ));
+            } else {
+                let position = self.screen_to_canvas(aligned_min, canvas_rect);
+                preview.position = position;
+                preview.size = size;
+                if let Some(spring) = self.animation.preview_springs.get_mut(&id) {
+                    spring.set_immediate_pos(position);
+                }
+            }
         }
     }
 
@@ -3265,7 +3308,7 @@ impl CanvasState {
             visible_count += 1;
         }
         preview_info.truncate(visible_count);
-        // Pinned Spout tiles are a viewport overlay and always paint above
+        // Pinned tiles are a viewport overlay and always paint above
         // ordinary canvas content while preserving their relative z-order.
         preview_info.sort_by_key(|info| (info.viewport_pin.is_some(), info.z_order));
 
@@ -4328,19 +4371,17 @@ impl CanvasState {
                     ui.separator();
                 }
 
-                if is_spout_capture {
-                    if ui
-                        .selectable_label(viewport_pin.is_some(), "Pin to Viewport")
-                        .on_hover_text(
-                            "Keep this Spout tile fixed above the canvas while panning or zooming",
-                        )
-                        .clicked()
-                    {
-                        self.toggle_spout_viewport_pin(id, canvas_rect, preview_manager);
-                        ui.close_menu();
-                    }
-                    ui.separator();
+                if ui
+                    .selectable_label(viewport_pin.is_some(), "Pin to Viewport")
+                    .on_hover_text(
+                        "Keep this tile fixed above the canvas while panning or zooming",
+                    )
+                    .clicked()
+                {
+                    self.toggle_viewport_pin(id, canvas_rect, preview_manager);
+                    ui.close_menu();
                 }
+                ui.separator();
 
                 if is_playlist {
                     ui.label(egui::RichText::new("Folder playlist tile").weak());
@@ -5286,6 +5327,7 @@ impl CanvasState {
                     preview.set_fps_preset(info.fps_preset);
                     preview.crop_uv = info.crop_uv;
                     preview.stream_audio = info.stream_audio;
+                    preview.viewport_pin = info.viewport_pin;
                 }
                 capture_coordinator.start_capture(
                     id,

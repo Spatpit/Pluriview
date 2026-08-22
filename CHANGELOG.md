@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Any tile can be pinned to the viewport so its position and size stay fixed while the canvas pans or zooms.
+
 ## [0.6.3] - 2026-08-20
 
 ### Added

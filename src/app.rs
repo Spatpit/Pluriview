@@ -17,6 +17,8 @@ use crate::persistence::{
     AppConfig, CanvasLayout, SavedLayout, Storage, WallpaperLayout, WindowLayout, WorkspaceIndex,
 };
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout, ThumbnailState};
+#[cfg(windows)]
+use crate::preview::Preview;
 use crate::preview::{
     is_usable_media_title, video_tile_title, BrowserTileStatus, FpsPreset, PreviewId,
     PreviewLayout, PreviewManager, VideoPlaybackState, VideoSource, VideoTileStatus, VideoTrack,
@@ -85,6 +87,26 @@ struct BrowserTilePlacement {
     page_rect: egui::Rect,
     /// Portion of the tile allowed to become a native window inside the canvas.
     visible_rect: egui::Rect,
+}
+
+#[cfg(windows)]
+fn browser_tile_screen_rect(
+    canvas: &CanvasState,
+    preview: &Preview,
+    canvas_rect: egui::Rect,
+) -> egui::Rect {
+    preview
+        .viewport_pin
+        .map(|pin| pin.rect(canvas_rect))
+        .unwrap_or_else(|| canvas.canvas_rect_to_screen(preview.rect(), canvas_rect))
+}
+
+#[cfg(windows)]
+fn browser_capture_display_size(preview: &Preview) -> Vec2 {
+    preview
+        .viewport_pin
+        .map(|pin| pin.size_vec2())
+        .unwrap_or(preview.size)
 }
 
 /// Initial image tile size, fitted inside 640×480 while preserving aspect.
@@ -323,13 +345,15 @@ fn restored_video_ready(
     pending: &PendingVideoTile,
     tile_rect: Option<egui::Rect>,
     viewport: Option<egui::Rect>,
+    viewport_pinned: bool,
 ) -> bool {
     pending.start_paused
         && pending.shown_once
         && pending.retry_ready
-        && tile_rect
-            .zip(viewport)
-            .is_some_and(|(tile, viewport)| tile.intersects(viewport))
+        && (viewport_pinned
+            || tile_rect
+                .zip(viewport)
+                .is_some_and(|(tile, viewport)| tile.intersects(viewport)))
 }
 
 fn video_session_is_stale(
@@ -354,12 +378,14 @@ fn restored_browser_ready(
     pending: &PendingBrowserTile,
     tile_rect: Option<egui::Rect>,
     viewport: Option<egui::Rect>,
+    viewport_pinned: bool,
 ) -> bool {
     pending.shown_once
         && pending.restore_deferred
-        && tile_rect
-            .zip(viewport)
-            .is_some_and(|(tile, viewport)| tile.intersects(viewport))
+        && (viewport_pinned
+            || tile_rect
+                .zip(viewport)
+                .is_some_and(|(tile, viewport)| tile.intersects(viewport)))
 }
 
 /// Main application state
@@ -1042,9 +1068,14 @@ impl PluriviewApp {
                         !preview.manually_frozen
                             && !matches!(preview.video_status, VideoTileStatus::Failed(_))
                     });
-                    restored_video_ready(pending, preview.map(|preview| preview.rect()), viewport)
-                        .then_some(*id)
-                        .filter(|_| eligible)
+                    restored_video_ready(
+                        pending,
+                        preview.map(|preview| preview.rect()),
+                        viewport,
+                        preview.is_some_and(|preview| preview.viewport_pin.is_some()),
+                    )
+                    .then_some(*id)
+                    .filter(|_| eligible)
                 })
             })
             .flatten();
@@ -1062,7 +1093,12 @@ impl PluriviewApp {
             preview.is_some_and(|preview| {
                 !preview.manually_frozen
                     && !matches!(preview.video_status, VideoTileStatus::Failed(_))
-                    && restored_video_ready(pending, Some(preview.rect()), viewport)
+                    && restored_video_ready(
+                        pending,
+                        Some(preview.rect()),
+                        viewport,
+                        preview.viewport_pin.is_some(),
+                    )
             })
         });
         if visible_restored_pending {
@@ -2061,7 +2097,12 @@ impl PluriviewApp {
                         let preview = self.preview_manager.get(*id);
                         let tile_rect = preview.map(|preview| preview.rect());
                         (preview.is_some_and(|preview| !preview.manually_frozen)
-                            && restored_browser_ready(pending, tile_rect, viewport))
+                            && restored_browser_ready(
+                                pending,
+                                tile_rect,
+                                viewport,
+                                preview.is_some_and(|preview| preview.viewport_pin.is_some()),
+                            ))
                         .then_some(*id)
                     })
                 })
@@ -2096,7 +2137,12 @@ impl PluriviewApp {
                     let preview = self.preview_manager.get(*id);
                     let tile_rect = preview.map(|preview| preview.rect());
                     preview.is_some_and(|preview| !preview.manually_frozen)
-                        && restored_browser_ready(pending, tile_rect, viewport)
+                        && restored_browser_ready(
+                            pending,
+                            tile_rect,
+                            viewport,
+                            preview.is_some_and(|preview| preview.viewport_pin.is_some()),
+                        )
                 });
             if visible_restored_pending {
                 let delay = self
@@ -2849,9 +2895,7 @@ impl PluriviewApp {
         canvas_rect: egui::Rect,
     ) -> Option<BrowserTilePlacement> {
         let preview = self.preview_manager.get(id)?;
-        let rect = self
-            .canvas
-            .canvas_rect_to_screen(preview.rect(), canvas_rect);
+        let rect = browser_tile_screen_rect(&self.canvas, preview, canvas_rect);
         if !rect.intersects(canvas_rect) {
             return None;
         }
@@ -2983,8 +3027,9 @@ impl PluriviewApp {
         }
 
         // Give parked browsers a stable supersampled backing derived from the
-        // tile's model size, not the canvas zoom. This keeps previews sharp
-        // without making responsive pages resize while the canvas zooms.
+        // tile's model size, not the canvas zoom. A viewport-pinned browser
+        // uses its fixed screen size. This keeps previews sharp without making
+        // responsive pages resize while the canvas zooms.
         let pixels_per_point = ctx.pixels_per_point();
         let ids: Vec<_> = self.browser.ids().collect();
         for id in ids {
@@ -2994,7 +3039,8 @@ impl PluriviewApp {
             let Some(preview) = self.preview_manager.get(id) else {
                 continue;
             };
-            let physical_size = preview.size * pixels_per_point;
+            let display_size = browser_capture_display_size(preview);
+            let physical_size = display_size * pixels_per_point;
             let capture_size = browser::capture_size_for_tile(
                 physical_size.x.round() as i32,
                 physical_size.y.round() as i32,
@@ -4509,6 +4555,7 @@ impl PluriviewApp {
                         self.preview_manager.set_z_order(id, preview_layout.z_order);
                         if let Some(preview) = self.preview_manager.get_mut(id) {
                             // Restored tiles appear instantly, no spawn animation.
+                            preview.viewport_pin = preview_layout.viewport_pin;
                             preview.created_at = Instant::now() - Duration::from_secs(1);
                         }
                         self.apply_browser_mute(id, preview_layout.browser_muted);
@@ -4532,6 +4579,7 @@ impl PluriviewApp {
                         if let Some(preview) = self.preview_manager.get_mut(id) {
                             preview.lock_aspect_ratio = preview_layout.lock_aspect_ratio;
                             preview.crop_uv = preview_layout.crop_uv;
+                            preview.viewport_pin = preview_layout.viewport_pin;
                             preview.created_at = Instant::now() - Duration::from_secs(1);
                         }
                     }
@@ -4561,6 +4609,7 @@ impl PluriviewApp {
                     Ok(id) => {
                         self.preview_manager.set_z_order(id, preview_layout.z_order);
                         if let Some(preview) = self.preview_manager.get_mut(id) {
+                            preview.viewport_pin = preview_layout.viewport_pin;
                             preview.created_at = Instant::now() - Duration::from_secs(1);
                         }
                     }
@@ -4587,6 +4636,7 @@ impl PluriviewApp {
                     preview.lock_aspect_ratio = preview_layout.lock_aspect_ratio;
                     preview.crop_uv = preview_layout.crop_uv;
                     preview.playlist_group = preview_layout.playlist_group;
+                    preview.viewport_pin = preview_layout.viewport_pin;
                     preview.created_at = Instant::now() - Duration::from_secs(1);
                 }
                 continue;
@@ -4645,6 +4695,7 @@ impl PluriviewApp {
                 if let Some(preview) = self.preview_manager.get_mut(id) {
                     preview.crop_uv = preview_layout.crop_uv;
                     preview.stream_audio = preview_layout.stream_audio;
+                    preview.viewport_pin = preview_layout.viewport_pin;
                 }
 
                 #[cfg(debug_assertions)]
@@ -4687,13 +4738,15 @@ impl PluriviewApp {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        preview_playback_state, preview_video_status, restored_browser_ready, restored_video_ready,
+        browser_capture_display_size, browser_tile_screen_rect, preview_playback_state,
+        preview_video_status, restored_browser_ready, restored_video_ready,
         resumable_video_position, video_launch_for_source, video_session_is_stale,
         wallpaper_hibernation_due, FpsPreset, PendingBrowserTile, PendingVideoTile, VideoSource,
         VideoTileStatus, WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID,
     };
+    use crate::canvas::CanvasState;
     use crate::external_tools::{DiscoverySource, ToolStatus};
-    use crate::preview::VideoPlaybackState;
+    use crate::preview::{Preview, PreviewId, VideoPlaybackState, ViewportPin};
     use crate::video::{LoopMode, TrackInfo, TrackSelection, VideoState};
     use eframe::egui::{Pos2, Rect, Vec2};
     use std::path::PathBuf;
@@ -4711,6 +4764,27 @@ mod tests {
             now - WALLPAPER_HIBERNATE_AFTER,
             now
         ));
+    }
+
+    #[test]
+    fn pinned_browser_uses_viewport_geometry_for_capture_and_interaction() {
+        let canvas = CanvasState::default();
+        let canvas_rect = Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(1000.0, 700.0));
+        let pinned_rect = Rect::from_min_size(Pos2::new(80.0, 90.0), Vec2::new(640.0, 360.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "browser".to_owned(),
+            Pos2::new(200.0, 150.0),
+            Vec2::new(320.0, 180.0),
+        );
+        preview.browser_url = Some("https://example.com".to_owned());
+        preview.viewport_pin = Some(ViewportPin::from_rect(pinned_rect, canvas_rect));
+
+        assert_eq!(
+            browser_tile_screen_rect(&canvas, &preview, canvas_rect),
+            pinned_rect
+        );
+        assert_eq!(browser_capture_display_size(&preview), pinned_rect.size());
     }
 
     fn restored_pending(shown_once: bool) -> PendingBrowserTile {
@@ -4732,22 +4806,32 @@ mod tests {
         assert!(!restored_browser_ready(
             &restored_pending(false),
             Some(visible),
-            Some(viewport)
+            Some(viewport),
+            false,
         ));
         assert!(restored_browser_ready(
             &restored_pending(true),
             Some(visible),
-            Some(viewport)
+            Some(viewport),
+            false,
         ));
         assert!(!restored_browser_ready(
             &restored_pending(true),
             Some(offscreen),
-            Some(viewport)
+            Some(viewport),
+            false,
         ));
         assert!(!restored_browser_ready(
             &restored_pending(true),
             Some(visible),
-            None
+            None,
+            false,
+        ));
+        assert!(restored_browser_ready(
+            &restored_pending(true),
+            Some(offscreen),
+            Some(viewport),
+            true,
         ));
     }
 
@@ -4765,6 +4849,7 @@ mod tests {
             },
             Some(visible),
             Some(viewport),
+            false,
         ));
         assert!(restored_video_ready(
             &PendingVideoTile {
@@ -4774,6 +4859,7 @@ mod tests {
             },
             Some(visible),
             Some(viewport),
+            false,
         ));
         assert!(!restored_video_ready(
             &PendingVideoTile {
@@ -4783,6 +4869,7 @@ mod tests {
             },
             Some(offscreen),
             Some(viewport),
+            false,
         ));
         assert!(!restored_video_ready(
             &PendingVideoTile {
@@ -4792,6 +4879,17 @@ mod tests {
             },
             Some(visible),
             Some(viewport),
+            false,
+        ));
+        assert!(restored_video_ready(
+            &PendingVideoTile {
+                start_paused: true,
+                shown_once: true,
+                retry_ready: true,
+            },
+            Some(offscreen),
+            Some(viewport),
+            true,
         ));
     }
 
@@ -5373,7 +5471,12 @@ impl eframe::App for PluriviewApp {
                 if let Some(url) = info.browser_url.clone() {
                     match self.create_browser_tile(&url, info.position, info.size, info.fps_preset)
                     {
-                        Ok(id) => self.apply_browser_mute(id, info.browser_muted),
+                        Ok(id) => {
+                            if let Some(preview) = self.preview_manager.get_mut(id) {
+                                preview.viewport_pin = info.viewport_pin;
+                            }
+                            self.apply_browser_mute(id, info.browser_muted);
+                        }
                         Err(error) => log::error!("Failed to restore browser tile: {error}"),
                     }
                 }
@@ -5386,6 +5489,7 @@ impl eframe::App for PluriviewApp {
                     Ok(id) => {
                         if let Some(preview) = self.preview_manager.get_mut(id) {
                             preview.crop_uv = info.crop_uv;
+                            preview.viewport_pin = info.viewport_pin;
                         }
                     }
                     Err(error) => {
@@ -5409,6 +5513,7 @@ impl eframe::App for PluriviewApp {
                 );
                 if let Some(preview) = self.preview_manager.get_mut(id) {
                     preview.crop_uv = info.crop_uv;
+                    preview.viewport_pin = info.viewport_pin;
                 }
             }
         }
@@ -5431,7 +5536,12 @@ impl eframe::App for PluriviewApp {
                     group,
                     linked,
                 ) {
-                    Ok(id) => self.canvas.selection = vec![id],
+                    Ok(id) => {
+                        if let Some(preview) = self.preview_manager.get_mut(id) {
+                            preview.viewport_pin = info.viewport_pin;
+                        }
+                        self.canvas.selection = vec![id];
+                    }
                     Err(error) => self.media_error = Some(error),
                 }
             }

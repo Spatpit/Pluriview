@@ -27,7 +27,7 @@ pub struct RemovedPreviewInfo {
     pub stream_audio: bool,
     /// Set when this tile receives a Spout2 sender.
     pub spout_sender: Option<String>,
-    /// Restored when undo recreates a pinned Spout tile.
+    /// Restored when undo recreates a pinned tile.
     pub viewport_pin: Option<ViewportPin>,
     /// Set for managed image and GIF tiles.
     pub media_path: Option<String>,
