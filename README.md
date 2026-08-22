@@ -31,6 +31,7 @@
 | **Live Streams** | Optional Streamlink helper for Twitch and other stream URLs |
 | **Ad & Tracker Blocking** | uBlock Origin Lite is built in for browser tiles and on by default |
 | **Infinite Canvas** | Pan and zoom freely to organize your workspace |
+| **Viewport Pinning** | Pin any tile so it stays fixed on screen while the canvas pans or zooms |
 | **Live Wallpaper** | Image, GIF, or looping muted video behind the canvas; it stays screen-sized |
 | **Tile Freeze** | Pause live work on selected tiles and keep the last frame until you resume |
 | **Stream Audio Monitor** | Copy tile audio into Pluriview so Discord/OBS window shares pick it up |
@@ -88,6 +89,9 @@ WebView2 profile, not your main browser.
 Browser tiles use **uBlock Origin Lite**, on by default. Toggle it under
 **View → Block Ads & Trackers (uBOL)**. WebView2 has no extension toolbar, so
 uBOL's popup is not shown.
+
+Pages with transparent backgrounds stay transparent in browser tiles, which
+makes overlay widgets such as heart-rate monitors blend into the canvas.
 
 **Streaming with audio (Discord/OBS):** browser-tile sound normally belongs to
 WebView2, so sharing the Pluriview window has no tile audio. Enable **View →
@@ -150,7 +154,8 @@ contain local paths.
 7. **Set a wallpaper** with View → Set Wallpaper...
 8. **Arrange** by dragging tiles; **resize** from corners or edges
 9. **Crop** window previews with Alt+drag on corners
-10. **Focus** a tile with right-click → **Focus on This Tile**; `Esc` restores the canvas
+10. **Pin** any tile with right-click → **Pin to Viewport** to keep it fixed while navigating the canvas
+11. **Focus** a tile with right-click → **Focus on This Tile**; `Esc` restores the canvas
 
 The **Workspace** menu holds separate setups. Existing installs are migrated
 into a workspace named **Default** the first time workspaces run.

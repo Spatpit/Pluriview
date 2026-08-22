@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-08-22
+
 ### Added
 - Any tile can be pinned to the viewport so its position and size stay fixed while the canvas pans or zooms.
+
+### Changed
+- Browser tiles preserve transparent page backgrounds for overlay widgets such as Pulsoid.
+- Removed the rectangular drop shadow from every tile type so transparent content has no dark plate behind it.
+- Window captures that remain far outside the viewport release their capture session after a grace period and recreate it when visible again, reducing idle memory without changing Stream Audio intent.
+- Hidden video wallpapers and idle seek-preview decoders release their playback resources after short grace periods and resume on demand.
+- Cropping changes the visible tile bounds without stretching the content, and clearing a crop restores the matching full-frame bounds.
+
+### Fixed
+- Alt-dragging a crop handle no longer pans or zooms the canvas, including for viewport-pinned tiles.
 
 ## [0.6.3] - 2026-08-20
 
