@@ -596,17 +596,6 @@ impl Preview {
         }
     }
 
-    /// Clear crop region (show full frame)
-    pub fn clear_crop(&mut self) {
-        self.crop_uv = None;
-        // Restore aspect ratio from frame size
-        if let Some((w, h)) = self.source_frame_size.or(self.frame_size) {
-            if h > 0 {
-                self.source_aspect_ratio = w as f32 / h as f32;
-            }
-        }
-    }
-
     /// Get or create texture from frame buffer
     pub fn get_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         self.advance_media_animation(ctx);

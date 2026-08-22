@@ -5106,18 +5106,21 @@ impl eframe::App for PluriviewApp {
                 if let Some(selection) = result {
                     // Apply the crop to the preview
                     if let Some(preview_id) = self.region_select_preview_id {
-                        if let Some(preview) = self.preview_manager.get_mut(preview_id) {
-                            // Get source dimensions from frame if available
-                            if let Some((w, h)) = preview.source_frame_size.or(preview.frame_size) {
-                                let crop_uv = selection.to_uv(w, h);
-                                preview.crop_uv = Some(crop_uv);
-                                // Update aspect ratio for the cropped region
-                                let crop_w = (crop_uv.2 - crop_uv.0) * w as f32;
-                                let crop_h = (crop_uv.3 - crop_uv.1) * h as f32;
-                                if crop_h > 0.0 {
-                                    preview.source_aspect_ratio = crop_w / crop_h;
-                                }
-                            }
+                        let crop_uv = self.preview_manager.get(preview_id).and_then(|preview| {
+                            preview
+                                .source_frame_size
+                                .or(preview.frame_size)
+                                .map(|(width, height)| selection.to_uv(width, height))
+                        });
+                        if let (Some(crop_uv), Some(canvas_rect)) =
+                            (crop_uv, self.canvas.last_screen_rect)
+                        {
+                            self.canvas.set_preview_crop(
+                                preview_id,
+                                Some(crop_uv),
+                                canvas_rect,
+                                &mut self.preview_manager,
+                            );
                         }
                     }
                 }

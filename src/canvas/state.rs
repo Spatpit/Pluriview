@@ -54,6 +54,10 @@ pub enum DragState {
         id: PreviewId,
         handle: ResizeHandle,
         start_mouse: Pos2,
+        /// Tile rectangle when the crop began. Canvas coordinates normally;
+        /// viewport coordinates for pinned Spout tiles.
+        start_rect: Rect,
+        screen_space: bool,
         /// Starting crop UV coordinates (min_u, min_v, max_u, max_v)
         start_crop_uv: (f32, f32, f32, f32),
     },
@@ -62,11 +66,12 @@ pub enum DragState {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_resize, browser_control_colors, capture_resolution_badge_rect, format_time,
-        live_capture_display_size, native_capture_canvas_size, pixel_aligned_rect,
-        playlist_first_row_center, stream_audio_badge_rect, video_placeholder_content,
-        window_capture_placeholder_content, BrowserAction, CanvasState, DragState, PlaylistAction,
-        ResizeHandle, TileActivityAction, VideoAction,
+        apply_crop, apply_resize, browser_control_colors, capture_resolution_badge_rect,
+        format_time, live_capture_display_size, native_capture_canvas_size, pixel_aligned_rect,
+        playlist_first_row_center, rect_for_crop_change, stream_audio_badge_rect,
+        video_placeholder_content, window_capture_placeholder_content, window_capture_target,
+        BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle, TileActivityAction,
+        VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -552,6 +557,121 @@ mod tests {
         let resized = apply_resize(ResizeHandle::Right, start, Vec2::new(100.0, 0.0), Some(2.0));
         assert!((resized.width() - 300.0).abs() < f32::EPSILON);
         assert!((resized.height() - 150.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn crop_moves_the_grabbed_edge_without_stretching_or_resizing_capture_backing() {
+        let start = Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::new(200.0, 100.0));
+        let (crop, rect) = apply_crop(
+            ResizeHandle::Right,
+            (0.0, 0.0, 1.0, 1.0),
+            start,
+            Vec2::new(-50.0, 25.0),
+        );
+
+        assert_eq!(crop, (0.0, 0.0, 0.75, 1.0));
+        assert_eq!(rect.min, start.min);
+        assert_eq!(rect.size(), Vec2::new(150.0, 100.0));
+        assert_eq!(
+            window_capture_target(start.width(), start.height(), 1.0, None),
+            window_capture_target(rect.width(), rect.height(), 1.0, Some(crop))
+        );
+        assert_eq!(
+            rect_for_crop_change(crop, (0.0, 0.0, 1.0, 1.0), rect),
+            start
+        );
+    }
+
+    #[test]
+    fn repeated_crop_uses_the_visible_crop_span_as_its_drag_scale() {
+        let start = Rect::from_min_size(Pos2::new(50.0, 40.0), Vec2::new(100.0, 50.0));
+        let (crop, rect) = apply_crop(
+            ResizeHandle::Left,
+            (0.25, 0.25, 0.75, 0.75),
+            start,
+            Vec2::new(25.0, 0.0),
+        );
+
+        assert_eq!(crop, (0.375, 0.25, 0.75, 0.75));
+        assert_eq!(rect.min, Pos2::new(75.0, 40.0));
+        assert_eq!(rect.size(), Vec2::new(75.0, 50.0));
+    }
+
+    #[test]
+    fn alt_crop_drag_does_not_pan_the_canvas() {
+        let context = Context::default();
+        let mut canvas = CanvasState {
+            pan: Vec2::new(17.0, -9.0),
+            ..Default::default()
+        };
+        let original_pan = canvas.pan;
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_window(
+            1,
+            42,
+            "window".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 100.0),
+        );
+        previews
+            .get_mut(id)
+            .unwrap()
+            .update_frame(200, 100, vec![0; 200 * 100 * 4]);
+        canvas.selection = vec![id];
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 500.0));
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let start = canvas
+            .canvas_rect_to_screen(previews.get(id).unwrap().rect(), screen_rect)
+            .right_center();
+        let end = start - Vec2::new(50.0, 0.0);
+        let mut run_frame = |events, modifiers| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    modifiers,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            );
+        };
+
+        run_frame(vec![Event::PointerMoved(start)], alt);
+        run_frame(
+            vec![Event::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: alt,
+            }],
+            alt,
+        );
+        run_frame(vec![Event::PointerMoved(end)], alt);
+        run_frame(
+            vec![Event::PointerButton {
+                pos: end,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: alt,
+            }],
+            alt,
+        );
+
+        let preview = previews.get(id).unwrap();
+        assert_eq!(canvas.pan, original_pan);
+        assert_eq!(preview.crop_uv, Some((0.0, 0.0, 0.75, 1.0)));
+        assert_eq!(preview.size, Vec2::new(150.0, 100.0));
+        assert!((preview.source_aspect_ratio - 1.5).abs() < 0.001);
     }
 
     #[test]
@@ -2165,6 +2285,54 @@ impl CanvasState {
             .unwrap_or_else(|| self.canvas_rect_to_screen(preview.rect(), canvas_rect))
     }
 
+    /// Apply or clear crop UVs while changing the tile bounds by the same
+    /// source-space proportion. This keeps content scale stable for region
+    /// selection and Clear Crop as well as handle dragging.
+    pub fn set_preview_crop(
+        &mut self,
+        id: PreviewId,
+        crop_uv: Option<(f32, f32, f32, f32)>,
+        canvas_rect: Rect,
+        preview_manager: &mut PreviewManager,
+    ) {
+        let Some((current_crop, current_rect, screen_space, source_size)) =
+            preview_manager.get(id).map(|preview| {
+                let screen_space = preview.viewport_pin.is_some();
+                (
+                    preview.crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0)),
+                    if screen_space {
+                        self.preview_screen_rect(preview, canvas_rect)
+                    } else {
+                        preview.rect()
+                    },
+                    screen_space,
+                    preview.source_frame_size.or(preview.frame_size),
+                )
+            })
+        else {
+            return;
+        };
+        let target_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
+        let new_rect = rect_for_crop_change(current_crop, target_crop, current_rect);
+        self.animation.preview_springs.remove(&id);
+        if let Some(preview) = preview_manager.get_mut(id) {
+            preview.crop_uv = crop_uv;
+            if screen_space {
+                preview.viewport_pin = Some(ViewportPin::from_rect(new_rect, canvas_rect));
+            } else {
+                preview.position = new_rect.min;
+                preview.size = new_rect.size();
+            }
+            if let Some((width, height)) = source_size {
+                let cropped_width = (target_crop.2 - target_crop.0) * width as f32;
+                let cropped_height = (target_crop.3 - target_crop.1) * height as f32;
+                if cropped_height > 0.0 {
+                    preview.source_aspect_ratio = cropped_width / cropped_height;
+                }
+            }
+        }
+    }
+
     fn toggle_spout_viewport_pin(
         &mut self,
         id: PreviewId,
@@ -2434,7 +2602,15 @@ impl CanvasState {
         self.animation.update(dt);
 
         // Apply momentum to pan (smooth inertia scrolling)
-        if self.animation.momentum_active {
+        let handle_drag_active = matches!(
+            self.drag_state,
+            Some(DragState::Resizing { .. } | DragState::Cropping { .. })
+        );
+        if self.animation.momentum_active
+            && !handle_drag_active
+            && !input.middle_down
+            && !(input.alt && input.primary_down)
+        {
             let momentum_delta = self.animation.get_momentum_delta();
             self.pan += momentum_delta / self.zoom;
         }
@@ -2866,33 +3042,40 @@ impl CanvasState {
             }
         }
 
+        let handle_drag_active = matches!(
+            self.drag_state,
+            Some(DragState::Resizing { .. } | DragState::Cropping { .. })
+        );
+
         // Zoom with scroll wheel - works anywhere on canvas, even over previews
         // We check canvas_rect.contains() instead of bg_response.hovered() because
         // bg_response.hovered() returns false when the mouse is over a preview widget
-        if let Some(mouse_pos) = input.hover_pos {
-            if canvas_rect.contains(mouse_pos) {
-                let scroll_delta = input.scroll_y;
-                if scroll_delta != 0.0 {
-                    let canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
-                    let playlist_id = preview_manager
-                        .get_preview_at(canvas_pos)
-                        .filter(|id| preview_manager.get(*id).is_some_and(Preview::is_playlist));
-                    if let Some(id) = playlist_id {
-                        if let Some(playlist) = preview_manager
-                            .get_mut(id)
-                            .and_then(|preview| preview.folder_playlist.as_mut())
-                        {
-                            playlist.scroll_offset = (playlist.scroll_offset
-                                - scroll_delta / playlist_zoom(self.zoom))
-                            .max(0.0);
+        if !handle_drag_active {
+            if let Some(mouse_pos) = input.hover_pos {
+                if canvas_rect.contains(mouse_pos) {
+                    let scroll_delta = input.scroll_y;
+                    if scroll_delta != 0.0 {
+                        let canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
+                        let playlist_id = preview_manager.get_preview_at(canvas_pos).filter(|id| {
+                            preview_manager.get(*id).is_some_and(Preview::is_playlist)
+                        });
+                        if let Some(id) = playlist_id {
+                            if let Some(playlist) = preview_manager
+                                .get_mut(id)
+                                .and_then(|preview| preview.folder_playlist.as_mut())
+                            {
+                                playlist.scroll_offset = (playlist.scroll_offset
+                                    - scroll_delta / playlist_zoom(self.zoom))
+                                .max(0.0);
+                            }
+                        } else {
+                            let zoom_factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
+                            let new_zoom =
+                                (self.zoom * zoom_factor).clamp(self.zoom_min, self.zoom_max);
+                            self.zoom = new_zoom;
+                            let new_canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
+                            self.pan += new_canvas_pos.to_vec2() - canvas_pos.to_vec2();
                         }
-                    } else {
-                        let zoom_factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
-                        let new_zoom =
-                            (self.zoom * zoom_factor).clamp(self.zoom_min, self.zoom_max);
-                        self.zoom = new_zoom;
-                        let new_canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
-                        self.pan += new_canvas_pos.to_vec2() - canvas_pos.to_vec2();
                     }
                 }
             }
@@ -2900,10 +3083,16 @@ impl CanvasState {
 
         // Pan with middle mouse button or Alt+Left drag
         // Works anywhere on canvas, even over previews (similar to zoom)
-        let is_panning = (input.middle_down || (input.alt && input.primary_down))
+        let is_panning = !handle_drag_active
+            && (input.middle_down || (input.alt && input.primary_down))
             && canvas_rect.contains(input.hover_pos.unwrap_or_default());
 
-        if is_panning {
+        if handle_drag_active {
+            self.canvas_panning = false;
+            self.pan_drag_tracker.clear();
+            self.animation.momentum_active = false;
+            self.animation.momentum_velocity = Vec2::ZERO;
+        } else if is_panning {
             // Start panning
             if !self.canvas_panning {
                 self.canvas_panning = true;
@@ -3176,26 +3365,6 @@ impl CanvasState {
             let pinned_pointer_active = viewport_pin.is_some_and(|pin| {
                 self.handle_pinned_pointer_drag(id, pin, screen_rect, frame, preview_manager)
             });
-
-            let is_active =
-                self.selection.contains(&id) || preview_response.dragged() || pinned_pointer_active;
-
-            if show_overlays && !is_spout_capture {
-                // Soft drop shadow underneath the preview, stronger when selected/dragged.
-                // Spout tiles often have a real alpha channel (VTube Studio), so a
-                // filled shadow rect would show through as a dark plate.
-                let shadow_alpha = ((if is_active { 90.0 } else { 40.0 }) * alpha) as u8;
-                let shadow_offset = if is_active {
-                    Vec2::new(0.0, 6.0)
-                } else {
-                    Vec2::new(0.0, 3.0)
-                };
-                painter.rect_filled(
-                    anim_rect.translate(shadow_offset),
-                    8.0,
-                    Color32::from_rgba_unmultiplied(0, 0, 0, shadow_alpha),
-                );
-            }
 
             // Minimal Void: No background fill - content fills entire area
             // Draw preview content (full rect, no title bar offset)
@@ -4412,9 +4581,7 @@ impl CanvasState {
                             ui.close_menu();
                         }
                         if has_crop && ui.button("Clear Crop").clicked() {
-                            if let Some(preview) = preview_manager.get_mut(id) {
-                                preview.clear_crop();
-                            }
+                            self.set_preview_crop(id, None, canvas_rect, preview_manager);
                             ui.close_menu();
                         }
                     });
@@ -4428,9 +4595,7 @@ impl CanvasState {
 
                         if has_crop {
                             if ui.button("Clear Crop").clicked() {
-                                if let Some(preview) = preview_manager.get_mut(id) {
-                                    preview.clear_crop();
-                                }
+                                self.set_preview_crop(id, None, canvas_rect, preview_manager);
                                 ui.close_menu();
                             }
                         }
@@ -5250,11 +5415,18 @@ impl CanvasState {
                 if handle_response.drag_started() {
                     if alt_held && frame_size.is_some() && !is_browser && !is_playlist {
                         // Start crop mode
+                        self.animation.preview_springs.remove(&id);
                         let current_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
                         self.drag_state = Some(DragState::Cropping {
                             id,
                             handle: handle_type,
                             start_mouse: input.interact_pos.unwrap_or(handle_pos),
+                            start_rect: if viewport_pin.is_some() {
+                                screen_rect
+                            } else {
+                                preview_rect
+                            },
+                            screen_space: viewport_pin.is_some(),
                             start_crop_uv: current_crop,
                         });
                     } else {
@@ -5317,72 +5489,34 @@ impl CanvasState {
                         id: crop_id,
                         handle,
                         start_mouse,
+                        start_rect,
+                        screen_space,
                         start_crop_uv,
                     }) = &self.drag_state
                     {
                         if *crop_id == id && *handle == handle_type {
                             if let Some(current_pos) = input.interact_pos {
-                                // Calculate delta in screen space, then convert to UV delta
-                                let delta_screen = current_pos - *start_mouse;
-
-                                // Convert screen delta to UV delta
-                                // UV delta = screen delta / (preview screen size)
-                                let preview_screen_size = screen_rect.size();
-                                let uv_delta_x = delta_screen.x / preview_screen_size.x;
-                                let uv_delta_y = delta_screen.y / preview_screen_size.y;
-
-                                // Apply crop adjustment based on handle
-                                let (min_u, min_v, max_u, max_v) = *start_crop_uv;
-                                let mut new_crop = (min_u, min_v, max_u, max_v);
-
-                                match handle {
-                                    ResizeHandle::TopLeft => {
-                                        new_crop.0 =
-                                            (min_u + uv_delta_x).clamp(0.0, new_crop.2 - 0.1);
-                                        new_crop.1 =
-                                            (min_v + uv_delta_y).clamp(0.0, new_crop.3 - 0.1);
-                                    }
-                                    ResizeHandle::Top => {
-                                        new_crop.1 =
-                                            (min_v + uv_delta_y).clamp(0.0, new_crop.3 - 0.1);
-                                    }
-                                    ResizeHandle::TopRight => {
-                                        new_crop.2 =
-                                            (max_u + uv_delta_x).clamp(new_crop.0 + 0.1, 1.0);
-                                        new_crop.1 =
-                                            (min_v + uv_delta_y).clamp(0.0, new_crop.3 - 0.1);
-                                    }
-                                    ResizeHandle::Left => {
-                                        new_crop.0 =
-                                            (min_u + uv_delta_x).clamp(0.0, new_crop.2 - 0.1);
-                                    }
-                                    ResizeHandle::Right => {
-                                        new_crop.2 =
-                                            (max_u + uv_delta_x).clamp(new_crop.0 + 0.1, 1.0);
-                                    }
-                                    ResizeHandle::BottomLeft => {
-                                        new_crop.0 =
-                                            (min_u + uv_delta_x).clamp(0.0, new_crop.2 - 0.1);
-                                        new_crop.3 =
-                                            (max_v + uv_delta_y).clamp(new_crop.1 + 0.1, 1.0);
-                                    }
-                                    ResizeHandle::Bottom => {
-                                        new_crop.3 =
-                                            (max_v + uv_delta_y).clamp(new_crop.1 + 0.1, 1.0);
-                                    }
-                                    ResizeHandle::BottomRight => {
-                                        new_crop.2 =
-                                            (max_u + uv_delta_x).clamp(new_crop.0 + 0.1, 1.0);
-                                        new_crop.3 =
-                                            (max_v + uv_delta_y).clamp(new_crop.1 + 0.1, 1.0);
-                                    }
-                                }
+                                let screen_delta = current_pos - *start_mouse;
+                                let delta = if *screen_space {
+                                    screen_delta
+                                } else {
+                                    screen_delta / self.zoom
+                                };
+                                let (new_crop, new_rect) =
+                                    apply_crop(*handle, *start_crop_uv, *start_rect, delta);
 
                                 // Apply the new crop
                                 if let Some(preview) = preview_manager.get_mut(id) {
                                     preview.crop_uv = Some(new_crop);
+                                    if *screen_space {
+                                        preview.viewport_pin =
+                                            Some(ViewportPin::from_rect(new_rect, canvas_rect));
+                                    } else {
+                                        preview.position = new_rect.min;
+                                        preview.size = new_rect.size();
+                                    }
                                     // Update aspect ratio based on new crop region
-                                    if let Some((w, h)) = preview.frame_size {
+                                    if let Some((w, h)) = frame_size {
                                         let crop_width = (new_crop.2 - new_crop.0) * w as f32;
                                         let crop_height = (new_crop.3 - new_crop.1) * h as f32;
                                         if crop_height > 0.0 {
@@ -5421,6 +5555,76 @@ impl CanvasState {
             }
         }
     }
+}
+
+/// Adjust crop UVs and the tile rectangle together. Keeping one coordinate unit
+/// per source UV unit prevents the cropped image from stretching and also keeps
+/// the capture backing target stable while a handle moves.
+fn apply_crop(
+    handle: ResizeHandle,
+    start_crop: (f32, f32, f32, f32),
+    start_rect: Rect,
+    delta: Vec2,
+) -> ((f32, f32, f32, f32), Rect) {
+    let (min_u, min_v, max_u, max_v) = start_crop;
+    let u_span = (max_u - min_u).max(0.001);
+    let v_span = (max_v - min_v).max(0.001);
+    let uv_delta_x = delta.x / start_rect.width().max(0.001) * u_span;
+    let uv_delta_y = delta.y / start_rect.height().max(0.001) * v_span;
+    let mut crop = start_crop;
+
+    match handle {
+        ResizeHandle::TopLeft => {
+            crop.0 = (min_u + uv_delta_x).clamp(0.0, max_u - 0.1);
+            crop.1 = (min_v + uv_delta_y).clamp(0.0, max_v - 0.1);
+        }
+        ResizeHandle::Top => {
+            crop.1 = (min_v + uv_delta_y).clamp(0.0, max_v - 0.1);
+        }
+        ResizeHandle::TopRight => {
+            crop.2 = (max_u + uv_delta_x).clamp(min_u + 0.1, 1.0);
+            crop.1 = (min_v + uv_delta_y).clamp(0.0, max_v - 0.1);
+        }
+        ResizeHandle::Left => {
+            crop.0 = (min_u + uv_delta_x).clamp(0.0, max_u - 0.1);
+        }
+        ResizeHandle::Right => {
+            crop.2 = (max_u + uv_delta_x).clamp(min_u + 0.1, 1.0);
+        }
+        ResizeHandle::BottomLeft => {
+            crop.0 = (min_u + uv_delta_x).clamp(0.0, max_u - 0.1);
+            crop.3 = (max_v + uv_delta_y).clamp(min_v + 0.1, 1.0);
+        }
+        ResizeHandle::Bottom => {
+            crop.3 = (max_v + uv_delta_y).clamp(min_v + 0.1, 1.0);
+        }
+        ResizeHandle::BottomRight => {
+            crop.2 = (max_u + uv_delta_x).clamp(min_u + 0.1, 1.0);
+            crop.3 = (max_v + uv_delta_y).clamp(min_v + 0.1, 1.0);
+        }
+    }
+
+    (crop, rect_for_crop_change(start_crop, crop, start_rect))
+}
+
+fn rect_for_crop_change(
+    start_crop: (f32, f32, f32, f32),
+    new_crop: (f32, f32, f32, f32),
+    start_rect: Rect,
+) -> Rect {
+    let (min_u, min_v, max_u, max_v) = start_crop;
+    let units_per_u = start_rect.width() / (max_u - min_u).max(0.001);
+    let units_per_v = start_rect.height() / (max_v - min_v).max(0.001);
+    Rect::from_min_max(
+        Pos2::new(
+            start_rect.min.x + (new_crop.0 - min_u) * units_per_u,
+            start_rect.min.y + (new_crop.1 - min_v) * units_per_v,
+        ),
+        Pos2::new(
+            start_rect.max.x + (new_crop.2 - max_u) * units_per_u,
+            start_rect.max.y + (new_crop.3 - max_v) * units_per_v,
+        ),
+    )
 }
 
 /// Apply resize delta based on handle position, optionally maintaining aspect ratio

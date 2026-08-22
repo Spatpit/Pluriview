@@ -397,6 +397,8 @@ impl BrowserHost {
             // be identical on every builder. Runtime 120+ supports the flag;
             // uBOL itself requires Chromium/WebView2 122+.
             .with_browser_extensions_enabled(true)
+            // Preserve transparent page backgrounds for overlay widgets.
+            .with_transparent(true)
             // Wry enables autoplay by default, which passes WebView2 the
             // `no-user-gesture-required` Chromium policy. Do not opt into
             // that policy: restored media pages (notably YouTube watch URLs)
