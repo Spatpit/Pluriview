@@ -31,6 +31,17 @@ pub struct WindowInfo {
 }
 
 impl WindowInfo {
+    pub fn new(hwnd: isize, title: String, process_id: u32, exe_name: String) -> Self {
+        let search_text = format!("{}\n{}", title.to_lowercase(), exe_name.to_lowercase());
+        Self {
+            hwnd,
+            title,
+            process_id,
+            exe_name,
+            search_text,
+        }
+    }
+
     pub fn matches_filter(&self, normalized_filter: &str) -> bool {
         normalized_filter.is_empty() || self.search_text.contains(normalized_filter)
     }
@@ -141,14 +152,12 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
         return BOOL(1);
     }
 
-    let search_text = format!("{}\n{}", title.to_lowercase(), exe_name.to_lowercase());
-    windows.push(WindowInfo {
-        hwnd: hwnd.0 as isize,
+    windows.push(WindowInfo::new(
+        hwnd.0 as isize,
         title,
         process_id,
         exe_name,
-        search_text,
-    });
+    ));
 
     BOOL(1) // Continue enumeration
 }
@@ -192,13 +201,7 @@ mod tests {
 
     #[test]
     fn cached_search_text_matches_titles_and_executables() {
-        let window = WindowInfo {
-            hwnd: 1,
-            title: "Visual Studio Code".to_owned(),
-            process_id: 2,
-            exe_name: "Code.exe".to_owned(),
-            search_text: "visual studio code\ncode.exe".to_owned(),
-        };
+        let window = WindowInfo::new(1, "Visual Studio Code".to_owned(), 2, "Code.exe".to_owned());
 
         assert!(window.matches_filter(""));
         assert!(window.matches_filter("visual studio"));

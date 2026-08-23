@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Image, animated GIF, browser, and libmpv video tiles can be cropped with Alt+drag; cropped browser pages keep capture and interaction coordinates aligned.
+- Saved window tiles remain visible as inactive when their application is closed and reconnect automatically after its window appears.
+
+### Fixed
+- Browser crops persist when a workspace is saved and restored.
+- Browser tiles keep their loading card behind fully transparent startup frames until visible page content arrives.
+
 ## [0.6.4] - 2026-08-22
 
 ### Added

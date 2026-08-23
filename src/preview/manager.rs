@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 pub struct RemovedPreviewInfo {
     pub title: String,
     pub window_handle: Option<WindowHandle>,
+    pub window_exe: Option<String>,
+    pub window_waiting_for_match: bool,
     pub position: Pos2,
     pub size: Vec2,
     pub fps_preset: FpsPreset,
@@ -97,6 +99,31 @@ impl PreviewManager {
         id
     }
 
+    /// Restore a normal window tile whose application is not open yet.
+    pub fn add_inactive_window(
+        &mut self,
+        title: String,
+        window_exe: Option<String>,
+        position: Pos2,
+        size: Vec2,
+        fps_preset: FpsPreset,
+        z_order: u32,
+    ) -> PreviewId {
+        let id = self.generate_id();
+        if z_order > self.max_z_order {
+            self.max_z_order = z_order;
+        }
+
+        let mut preview = Preview::new(id, title, position, size);
+        preview.z_order = z_order;
+        preview.window_exe = window_exe;
+        preview.window_waiting_for_match = true;
+        preview.set_fps_preset(fps_preset);
+        preview.created_at = Instant::now() - Duration::from_secs(1);
+        self.previews.insert(id, preview);
+        id
+    }
+
     /// Add a preview that receives a named Spout2 sender.
     pub fn add_for_spout(
         &mut self,
@@ -129,6 +156,7 @@ impl PreviewManager {
         let mut preview = Preview::new(id, url.clone(), position, size);
         preview.z_order = self.max_z_order;
         preview.browser_url = Some(url);
+        preview.browser_waiting_for_content = true;
         preview.browser_status = BrowserTileStatus::PreparingAdblock { progress: 0.0 };
         preview.set_fps_preset(fps);
         self.previews.insert(id, preview);
@@ -228,6 +256,8 @@ impl PreviewManager {
                 removed.push(RemovedPreviewInfo {
                     title: preview.title,
                     window_handle: preview.window_handle,
+                    window_exe: preview.window_exe,
+                    window_waiting_for_match: preview.window_waiting_for_match,
                     position: preview.position,
                     size: preview.size,
                     fps_preset: preview.fps_preset,

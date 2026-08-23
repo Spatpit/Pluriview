@@ -634,26 +634,15 @@ mod tests {
         assert_eq!(rect.size(), Vec2::new(75.0, 50.0));
     }
 
-    #[test]
-    fn alt_crop_drag_does_not_pan_the_canvas() {
+    fn alt_crop_right_edge(
+        mut previews: PreviewManager,
+        id: PreviewId,
+    ) -> (CanvasState, PreviewManager) {
         let context = Context::default();
         let mut canvas = CanvasState {
             pan: Vec2::new(17.0, -9.0),
             ..Default::default()
         };
-        let original_pan = canvas.pan;
-        let mut previews = PreviewManager::new();
-        let id = previews.add_for_window(
-            1,
-            42,
-            "window".to_owned(),
-            Pos2::new(100.0, 100.0),
-            Vec2::new(200.0, 100.0),
-        );
-        previews
-            .get_mut(id)
-            .unwrap()
-            .update_frame(200, 100, vec![0; 200 * 100 * 4]);
         canvas.selection = vec![id];
         let mut captures = CaptureCoordinator::new();
         let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 500.0));
@@ -704,11 +693,118 @@ mod tests {
             alt,
         );
 
+        (canvas, previews)
+    }
+
+    #[test]
+    fn alt_crop_drag_does_not_pan_the_canvas() {
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_window(
+            1,
+            42,
+            "window".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 100.0),
+        );
+        previews
+            .get_mut(id)
+            .unwrap()
+            .update_frame(200, 100, vec![0; 200 * 100 * 4]);
+        let (canvas, previews) = alt_crop_right_edge(previews, id);
+
         let preview = previews.get(id).unwrap();
-        assert_eq!(canvas.pan, original_pan);
+        assert_eq!(canvas.pan, Vec2::new(17.0, -9.0));
         assert_eq!(preview.crop_uv, Some((0.0, 0.0, 0.75, 1.0)));
         assert_eq!(preview.size, Vec2::new(150.0, 100.0));
         assert!((preview.source_aspect_ratio - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn alt_crop_drag_crops_an_image_tile() {
+        let mut previews = PreviewManager::new();
+        let id = previews.add_media(
+            "image.png".to_owned(),
+            "image".to_owned(),
+            vec![crate::media::MediaFrame {
+                width: 200,
+                height: 100,
+                rgba: vec![0; 200 * 100 * 4],
+                duration: Duration::from_millis(100),
+            }],
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 100.0),
+        );
+        let (mut canvas, mut previews) = alt_crop_right_edge(previews, id);
+
+        let preview = previews.get(id).unwrap();
+        assert_eq!(preview.crop_uv, Some((0.0, 0.0, 0.75, 1.0)));
+        assert_eq!(preview.size, Vec2::new(150.0, 100.0));
+        assert!((preview.source_aspect_ratio - 1.5).abs() < 0.001);
+
+        canvas.set_preview_crop(
+            id,
+            None,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 500.0)),
+            &mut previews,
+        );
+        let preview = previews.get(id).unwrap();
+        assert_eq!(preview.crop_uv, None);
+        assert_eq!(preview.size, Vec2::new(200.0, 100.0));
+        assert!((preview.source_aspect_ratio - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn alt_crop_drag_crops_a_browser_tile() {
+        let mut previews = PreviewManager::new();
+        let id = previews.add_browser_placeholder(
+            "https://example.com".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 100.0),
+            FpsPreset::Medium,
+        );
+        previews
+            .get_mut(id)
+            .unwrap()
+            .update_frame(200, 100, vec![0; 200 * 100 * 4]);
+        let (_, previews) = alt_crop_right_edge(previews, id);
+
+        let preview = previews.get(id).unwrap();
+        assert_eq!(preview.crop_uv, Some((0.0, 0.0, 0.75, 1.0)));
+        assert_eq!(preview.size, Vec2::new(150.0, 100.0));
+        assert!((preview.source_aspect_ratio - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn alt_crop_drag_crops_a_direct_video_without_a_capture_frame() {
+        let mut previews = PreviewManager::new();
+        let id = previews.add_video_placeholder(
+            VideoSource::LocalFile {
+                path: PathBuf::from("video.mp4"),
+            },
+            "video".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 100.0),
+            FpsPreset::Medium,
+            false,
+        );
+        assert!(previews.get(id).unwrap().frame_size.is_none());
+        let (mut canvas, mut previews) = alt_crop_right_edge(previews, id);
+
+        let preview = previews.get(id).unwrap();
+        assert_eq!(preview.crop_uv, Some((0.0, 0.0, 0.75, 1.0)));
+        assert_eq!(preview.size, Vec2::new(150.0, 100.0));
+        assert!((preview.source_aspect_ratio - 1.5).abs() < 0.001);
+
+        canvas.set_preview_crop(
+            id,
+            None,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 500.0)),
+            &mut previews,
+        );
+        let preview = previews.get(id).unwrap();
+        assert_eq!(preview.crop_uv, None);
+        assert_eq!(preview.size, Vec2::new(200.0, 100.0));
+        assert!((preview.source_aspect_ratio - 2.0).abs() < 0.001);
     }
 
     #[test]
@@ -1484,6 +1580,7 @@ struct TileInfo {
     target_fps: u32,
     fps_preset: FpsPreset,
     has_crop: bool,
+    crop_uv: Option<(f32, f32, f32, f32)>,
     is_removing: bool,
     spawn_t: f32,
     remove_t: f32,
@@ -1492,12 +1589,15 @@ struct TileInfo {
     is_video: bool,
     is_playlist: bool,
     is_window_capture: bool,
+    is_inactive_window: bool,
+    window_exe: Option<String>,
     is_spout_capture: bool,
     viewport_pin: Option<ViewportPin>,
     muted: bool,
     stream_audio: bool,
     capture_failed: bool,
     browser_status: BrowserTileStatus,
+    browser_waiting_for_content: bool,
     video_status: VideoTileStatus,
     video_playback: VideoPlaybackState,
     supports_seek_preview: bool,
@@ -1516,6 +1616,7 @@ impl TileInfo {
             target_fps: preview.target_fps,
             fps_preset: preview.fps_preset,
             has_crop: preview.crop_uv.is_some(),
+            crop_uv: preview.crop_uv,
             is_removing: preview.removing.is_some(),
             spawn_t: preview.spawn_progress(),
             remove_t: preview.removal_progress(),
@@ -1524,12 +1625,15 @@ impl TileInfo {
             is_video: preview.is_video(),
             is_playlist: preview.is_playlist(),
             is_window_capture: preview.is_window_capture(),
+            is_inactive_window: preview.is_inactive_window(),
+            window_exe: preview.window_exe.clone(),
             is_spout_capture: preview.is_spout_capture(),
             viewport_pin: preview.viewport_pin,
             muted: preview.browser_muted,
             stream_audio: preview.stream_audio,
             capture_failed: preview.capture_error.is_some(),
             browser_status: preview.browser_status.clone(),
+            browser_waiting_for_content: preview.browser_waiting_for_content,
             video_status: preview.video_status.clone(),
             video_playback: preview.video_playback.clone(),
             supports_seek_preview: preview.supports_seek_preview(),
@@ -1547,6 +1651,7 @@ impl TileInfo {
         self.target_fps = preview.target_fps;
         self.fps_preset = preview.fps_preset;
         self.has_crop = preview.crop_uv.is_some();
+        self.crop_uv = preview.crop_uv;
         self.is_removing = preview.removing.is_some();
         self.spawn_t = preview.spawn_progress();
         self.remove_t = preview.removal_progress();
@@ -1555,12 +1660,15 @@ impl TileInfo {
         self.is_video = preview.is_video();
         self.is_playlist = preview.is_playlist();
         self.is_window_capture = preview.is_window_capture();
+        self.is_inactive_window = preview.is_inactive_window();
+        self.window_exe.clone_from(&preview.window_exe);
         self.is_spout_capture = preview.is_spout_capture();
         self.viewport_pin = preview.viewport_pin;
         self.muted = preview.browser_muted;
         self.stream_audio = preview.stream_audio;
         self.capture_failed = preview.capture_error.is_some();
         self.browser_status.clone_from(&preview.browser_status);
+        self.browser_waiting_for_content = preview.browser_waiting_for_content;
         self.video_status.clone_from(&preview.video_status);
         self.video_playback.clone_from(&preview.video_playback);
         self.supports_seek_preview = preview.supports_seek_preview();
@@ -1810,6 +1918,35 @@ fn paint_window_capture_placeholder(
             Color32::from_rgb(95, 95, 95),
         );
         animated
+    }
+}
+
+fn paint_inactive_window_placeholder(
+    painter: &egui::Painter,
+    rect: Rect,
+    window_exe: Option<&str>,
+) {
+    painter.rect_filled(rect, 8.0, Color32::from_rgb(20, 22, 25));
+    let center = rect.center();
+    painter.text(
+        center + Vec2::new(0.0, -8.0),
+        egui::Align2::CENTER_CENTER,
+        "Not active",
+        egui::FontId::proportional(13.0),
+        Color32::from_rgb(175, 180, 188),
+    );
+    if rect.height() >= 64.0 {
+        let detail = window_exe
+            .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("unknown"))
+            .map(|name| format!("Waiting for {name} to open"))
+            .unwrap_or_else(|| "Waiting for the window to open".to_owned());
+        painter.text(
+            center + Vec2::new(0.0, 12.0),
+            egui::Align2::CENTER_CENTER,
+            detail,
+            egui::FontId::proportional(10.5),
+            Color32::from_rgb(105, 112, 122),
+        );
     }
 }
 
@@ -2364,6 +2501,8 @@ impl CanvasState {
                 if cropped_height > 0.0 {
                     preview.source_aspect_ratio = cropped_width / cropped_height;
                 }
+            } else if new_rect.height() > 0.0 {
+                preview.source_aspect_ratio = new_rect.width() / new_rect.height();
             }
         }
     }
@@ -3321,6 +3460,7 @@ impl CanvasState {
             let target_fps = info.target_fps;
             let current_preset = info.fps_preset;
             let has_crop = info.has_crop;
+            let crop_uv = info.crop_uv;
             let is_removing = info.is_removing;
             let spawn_t = info.spawn_t;
             let remove_t = info.remove_t;
@@ -3329,6 +3469,8 @@ impl CanvasState {
             let is_video = info.is_video;
             let is_playlist = info.is_playlist;
             let is_window_capture = info.is_window_capture;
+            let is_inactive_window = info.is_inactive_window;
+            let window_exe = info.window_exe.as_deref();
             let is_spout_capture = info.is_spout_capture;
             let viewport_pin = info.viewport_pin;
             let muted = if is_video {
@@ -3339,6 +3481,7 @@ impl CanvasState {
             let stream_audio = info.stream_audio;
             let capture_failed = info.capture_failed;
             let browser_status = &info.browser_status;
+            let browser_waiting_for_content = info.browser_waiting_for_content;
             let video_status = &info.video_status;
             let video_playback = &info.video_playback;
             let supports_seek_preview = info.supports_seek_preview;
@@ -3423,7 +3566,7 @@ impl CanvasState {
                             rect: anim_rect,
                             callback: std::sync::Arc::new(eframe::egui_glow::CallbackFn::new(
                                 move |info, painter| {
-                                    renderer.paint(info, painter.gl());
+                                    renderer.paint_cropped(info, painter.gl(), crop_uv);
                                 },
                             )),
                         });
@@ -3440,6 +3583,17 @@ impl CanvasState {
             } else {
                 false
             };
+
+            // A transparent WebView frame is valid for overlay pages, but the
+            // first completely transparent frames look like the tile vanished.
+            // Keep the loading card underneath until capture sees content.
+            let browser_loading_placeholder =
+                is_browser && browser_waiting_for_content && !manually_frozen;
+            if browser_loading_placeholder {
+                paint_browser_placeholder(&painter, anim_rect, browser_status, input.time as f32);
+                any_spawn_or_remove_animating |=
+                    !matches!(browser_status, BrowserTileStatus::Failed(_));
+            }
 
             let has_texture = if has_playlist_content || has_direct_video {
                 true
@@ -3472,7 +3626,7 @@ impl CanvasState {
                         egui::FontId::proportional(12.0),
                         Color32::from_rgb(140, 170, 205),
                     );
-                } else if is_browser {
+                } else if is_browser && !browser_loading_placeholder {
                     paint_browser_placeholder(
                         &painter,
                         anim_rect,
@@ -3488,6 +3642,8 @@ impl CanvasState {
                         video_status,
                         input.time as f32,
                     );
+                } else if is_inactive_window {
+                    paint_inactive_window_placeholder(&painter, anim_rect, window_exe);
                 } else {
                     any_spawn_or_remove_animating |= paint_window_capture_placeholder(
                         &painter,
@@ -4422,9 +4578,20 @@ impl CanvasState {
                     }
                 } else if is_media {
                     ui.label(egui::RichText::new("Image / animated GIF tile").weak());
+                    ui.separator();
+                    ui.menu_button("Crop", |ui| {
+                        if has_crop && ui.button("Clear Crop").clicked() {
+                            self.set_preview_crop(id, None, canvas_rect, preview_manager);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("Tip: Alt+drag edges or corners")
+                                .weak()
+                                .small(),
+                        );
+                    });
                 } else if is_browser {
-                    // Browser tiles: navigation and audio instead of crop
-                    // (a cropped page has ambiguous interactive coordinates).
                     let browser_ready =
                         *browser_status == BrowserTileStatus::Ready && !manually_frozen;
                     if !browser_ready {
@@ -4480,6 +4647,19 @@ impl CanvasState {
                             .push((id, BrowserAction::OpenExternal));
                         ui.close_menu();
                     }
+                    ui.separator();
+                    ui.menu_button("Crop", |ui| {
+                        if has_crop && ui.button("Clear Crop").clicked() {
+                            self.set_preview_crop(id, None, canvas_rect, preview_manager);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("Tip: Alt+drag edges or corners")
+                                .weak()
+                                .small(),
+                        );
+                    });
                 } else if is_video {
                     let controls_enabled = !manually_frozen
                         && video_playback.connected
@@ -5314,6 +5494,20 @@ impl CanvasState {
                     preview.viewport_pin = info.viewport_pin;
                 }
                 capture_coordinator.start_spout_capture(id, sender, info.fps_preset.as_u32());
+            } else if info.window_waiting_for_match {
+                let id = preview_manager.add_inactive_window(
+                    info.title,
+                    info.window_exe,
+                    info.position,
+                    info.size,
+                    info.fps_preset,
+                    0,
+                );
+                if let Some(preview) = preview_manager.get_mut(id) {
+                    preview.crop_uv = info.crop_uv;
+                    preview.stream_audio = info.stream_audio;
+                    preview.viewport_pin = info.viewport_pin;
+                }
             } else if let Some(handle) = info.window_handle {
                 let capture_title = info.title.clone();
                 let id = preview_manager.add_for_window(
@@ -5324,6 +5518,7 @@ impl CanvasState {
                     info.size,
                 );
                 if let Some(preview) = preview_manager.get_mut(id) {
+                    preview.window_exe = info.window_exe;
                     preview.set_fps_preset(info.fps_preset);
                     preview.crop_uv = info.crop_uv;
                     preview.stream_audio = info.stream_audio;
@@ -5368,7 +5563,7 @@ impl CanvasState {
                         p.source_frame_size.or(p.frame_size),
                         p.viewport_pin,
                         p.is_window_capture(),
-                        p.is_browser(),
+                        p.is_video(),
                         p.is_playlist(),
                     )
                 })
@@ -5384,7 +5579,7 @@ impl CanvasState {
             frame_size,
             viewport_pin,
             is_window_capture,
-            is_browser,
+            is_video,
             is_playlist,
         ) in selection_info
         {
@@ -5397,11 +5592,10 @@ impl CanvasState {
                 screen_rect
             };
 
-            // Minimal Void: Selection border with accent color
-            // (browsers can't be cropped, so no orange crop hint for them)
+            // Minimal Void: Selection border with accent color.
             let border_color = if self.interactive_browser == Some(id) {
                 Color32::from_rgb(107, 170, 75) // Green: live interaction mode
-            } else if alt_held && !is_browser && !is_playlist {
+            } else if alt_held && !is_playlist {
                 Color32::from_rgb(255, 150, 100) // Orange for crop mode
             } else {
                 Color32::from_rgb(74, 158, 255) // #4a9eff blue accent
@@ -5431,7 +5625,7 @@ impl CanvasState {
                     Rect::from_center_size(handle_pos, Vec2::splat(RESIZE_HANDLE_HIT_SIZE));
 
                 // Minimal Void: Clean handles matching selection color
-                let handle_fill = if alt_held && !is_browser && !is_playlist {
+                let handle_fill = if alt_held && !is_playlist {
                     Color32::from_rgb(255, 150, 100) // Orange for crop mode
                 } else {
                     Color32::from_rgb(74, 158, 255) // Match accent color
@@ -5451,11 +5645,9 @@ impl CanvasState {
                     ui.ctx().set_cursor_icon(handle_type.cursor());
                 }
 
-                // Handle drag start - check if Alt is held for crop mode
-                // (browser tiles never crop: interactive coordinates would
-                // no longer match the page)
+                // Handle drag start - check if Alt is held for crop mode.
                 if handle_response.drag_started() {
-                    if alt_held && frame_size.is_some() && !is_browser && !is_playlist {
+                    if alt_held && (frame_size.is_some() || is_video) && !is_playlist {
                         // Start crop mode
                         self.animation.preview_springs.remove(&id);
                         let current_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
@@ -5564,6 +5756,9 @@ impl CanvasState {
                                         if crop_height > 0.0 {
                                             preview.source_aspect_ratio = crop_width / crop_height;
                                         }
+                                    } else if new_rect.height() > 0.0 {
+                                        preview.source_aspect_ratio =
+                                            new_rect.width() / new_rect.height();
                                     }
                                 }
                             }

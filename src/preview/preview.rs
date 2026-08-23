@@ -210,6 +210,14 @@ pub struct Preview {
     /// Window being captured
     pub window_handle: Option<WindowHandle>,
 
+    /// Executable name for a normal Windows capture tile. Persisted so a
+    /// saved tile can reconnect even when its window title changes.
+    pub window_exe: Option<String>,
+
+    /// The saved application is not currently exposing a capturable window.
+    /// Runtime-only; the executable identity above is what persists.
+    pub window_waiting_for_match: bool,
+
     /// Spout2 sender name when this tile receives a GPU texture share.
     pub spout_sender: Option<String>,
 
@@ -287,6 +295,10 @@ pub struct Preview {
     /// Loading/error state rendered while a browser host is being prepared.
     pub browser_status: BrowserTileStatus,
 
+    /// Keep the browser loading card behind fully transparent startup frames.
+    /// Cleared after capture produces at least one visible pixel.
+    pub browser_waiting_for_content: bool,
+
     /// Managed filename in `pluriview_data/media` for image and GIF tiles.
     pub media_path: Option<String>,
 
@@ -350,6 +362,8 @@ impl Preview {
             position,
             size,
             window_handle: None,
+            window_exe: None,
+            window_waiting_for_match: false,
             spout_sender: None,
             viewport_pin: None,
             title,
@@ -372,6 +386,7 @@ impl Preview {
             stream_audio: false,
             capture_error: None,
             browser_status: BrowserTileStatus::Ready,
+            browser_waiting_for_content: false,
             media_path: None,
             video_source: None,
             folder_playlist: None,
@@ -415,6 +430,16 @@ impl Preview {
     /// Captured OS window/game — not a browser, video, image, playlist, or Spout tile.
     pub fn is_window_capture(&self) -> bool {
         self.window_handle.is_some()
+            && self.spout_sender.is_none()
+            && !self.is_browser()
+            && !self.is_media()
+            && !self.is_video()
+            && !self.is_playlist()
+    }
+
+    /// Saved Windows capture whose application/window is not currently active.
+    pub fn is_inactive_window(&self) -> bool {
+        self.window_waiting_for_match
             && self.spout_sender.is_none()
             && !self.is_browser()
             && !self.is_media()
@@ -562,6 +587,11 @@ impl Preview {
         data: Vec<u8>,
     ) {
         self.clear_capture_error();
+        if self.browser_waiting_for_content
+            && data.iter().skip(3).step_by(4).any(|alpha| *alpha != 0)
+        {
+            self.browser_waiting_for_content = false;
+        }
         if source_width > 0 && source_height > 0 {
             self.source_frame_size = Some((source_width, source_height));
             // Only update aspect ratio if we don't have a crop region
@@ -706,6 +736,7 @@ pub struct PreviewLayout {
     pub position: (f32, f32),
     pub size: (f32, f32),
     pub window_title: String,
+    #[serde(default)]
     pub window_exe: Option<String>,
     pub lock_aspect_ratio: bool,
     pub z_order: u32,
@@ -753,7 +784,7 @@ impl From<&Preview> for PreviewLayout {
                 Some(source) => video_tile_title(source, Some(&preview.title)),
                 None => preview.title.clone(),
             },
-            window_exe: None, // TODO: Get exe name from window handle
+            window_exe: preview.window_exe.clone(),
             lock_aspect_ratio: preview.lock_aspect_ratio,
             z_order: preview.z_order,
             fps_preset: preview.fps_preset,
@@ -1159,6 +1190,53 @@ mod tests {
     }
 
     #[test]
+    fn window_executable_round_trips_through_layout() {
+        let mut preview = Preview::for_window(
+            PreviewId(1),
+            1,
+            42,
+            "A changing song title".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.window_exe = Some("Spotify.exe".to_owned());
+
+        let restored = PreviewLayout::from(&preview);
+        assert_eq!(restored.window_exe.as_deref(), Some("Spotify.exe"));
+    }
+
+    #[test]
+    fn inactive_saved_window_is_not_a_live_capture() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "Spotify".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.window_exe = Some("Spotify.exe".to_owned());
+        preview.window_waiting_for_match = true;
+
+        assert!(preview.is_inactive_window());
+        assert!(!preview.is_window_capture());
+        assert!(!preview.is_live_capture());
+    }
+
+    #[test]
+    fn older_saved_tiles_default_to_no_window_executable() {
+        let preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        value.as_object_mut().unwrap().remove("window_exe");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.window_exe.is_none());
+    }
+
+    #[test]
     fn spout_tiles_round_trip_and_are_not_window_captures() {
         let mut preview = Preview::for_spout(
             PreviewId(1),
@@ -1194,6 +1272,24 @@ mod tests {
         });
         preview.browser_url = Some("https://example.com".to_owned());
         assert!(!preview.is_window_capture());
+    }
+
+    #[test]
+    fn browser_loading_waits_for_a_visible_capture_pixel() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "browser".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.browser_url = Some("https://example.com".to_owned());
+        preview.browser_waiting_for_content = true;
+
+        preview.update_frame(2, 1, vec![0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(preview.browser_waiting_for_content);
+
+        preview.update_frame(2, 1, vec![0, 0, 0, 0, 255, 255, 255, 1]);
+        assert!(!preview.browser_waiting_for_content);
     }
 
     #[test]

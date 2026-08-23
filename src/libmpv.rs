@@ -125,6 +125,8 @@ const SEEK_PREVIEW_PREFETCH_GRACE: Duration = Duration::from_millis(250);
 /// then release it instead of retaining a decoder for every video ever hovered.
 const SEEK_PREVIEW_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const SEEK_PREVIEW_MATCH_SECS: f64 = 0.5;
+const MAX_VIDEO_RENDER_WIDTH: f32 = 3840.0;
+const MAX_VIDEO_RENDER_HEIGHT: f32 = 2160.0;
 
 const MPV_FORMAT_NONE: c_int = 0;
 const MPV_FORMAT_STRING: c_int = 1;
@@ -443,6 +445,70 @@ struct BlitDestination {
     bottom: i32,
     right: i32,
     top: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlitSource {
+    left: i32,
+    bottom: i32,
+    right: i32,
+    top: i32,
+}
+
+fn valid_crop_uv(crop_uv: Option<(f32, f32, f32, f32)>) -> (f32, f32, f32, f32) {
+    crop_uv
+        .filter(|(min_u, min_v, max_u, max_v)| {
+            min_u.is_finite()
+                && min_v.is_finite()
+                && max_u.is_finite()
+                && max_v.is_finite()
+                && *min_u >= 0.0
+                && *min_v >= 0.0
+                && *max_u <= 1.0
+                && *max_v <= 1.0
+                && *max_u - *min_u >= 0.001
+                && *max_v - *min_v >= 0.001
+        })
+        .unwrap_or((0.0, 0.0, 1.0, 1.0))
+}
+
+fn video_render_target_size(
+    viewport_width: i32,
+    viewport_height: i32,
+    crop_uv: Option<(f32, f32, f32, f32)>,
+) -> (i32, i32) {
+    let (min_u, min_v, max_u, max_v) = valid_crop_uv(crop_uv);
+    let full_width = viewport_width as f32 / (max_u - min_u);
+    let full_height = viewport_height as f32 / (max_v - min_v);
+    let cap_scale = (MAX_VIDEO_RENDER_WIDTH / full_width)
+        .min(MAX_VIDEO_RENDER_HEIGHT / full_height)
+        .min(1.0);
+    let full_width = (full_width * cap_scale).ceil() as i32;
+    let full_height = (full_height * cap_scale).ceil() as i32;
+    (
+        (((full_width.max(1) + 31) / 32) * 32).min(MAX_VIDEO_RENDER_WIDTH as i32),
+        (((full_height.max(1) + 31) / 32) * 32).min(MAX_VIDEO_RENDER_HEIGHT as i32),
+    )
+}
+
+fn video_blit_source(
+    target_width: i32,
+    target_height: i32,
+    crop_uv: Option<(f32, f32, f32, f32)>,
+) -> BlitSource {
+    let (min_u, min_v, max_u, max_v) = valid_crop_uv(crop_uv);
+    let left = (min_u * target_width as f32).round() as i32;
+    let right = (max_u * target_width as f32).round() as i32;
+    // Crop UVs use a top-left origin; OpenGL framebuffer coordinates start at
+    // the bottom-left.
+    let bottom = ((1.0 - max_v) * target_height as f32).round() as i32;
+    let top = ((1.0 - min_v) * target_height as f32).round() as i32;
+    BlitSource {
+        left: left.clamp(0, target_width.saturating_sub(1)),
+        bottom: bottom.clamp(0, target_height.saturating_sub(1)),
+        right: right.clamp(1, target_width),
+        top: top.clamp(1, target_height),
+    }
 }
 
 fn video_blit_destination(
@@ -928,6 +994,7 @@ impl MpvCore {
         &mut self,
         info: egui::PaintCallbackInfo,
         gl: &glow::Context,
+        crop_uv: Option<(f32, f32, f32, f32)>,
     ) -> Result<(), String> {
         if self.destroyed {
             return Ok(());
@@ -949,14 +1016,16 @@ impl MpvCore {
         }
 
         // During an interactive resize, only reallocate at 32-pixel steps.
-        // The final blit scales the cached frame to the exact tile rectangle.
-        let target_width = ((viewport_width + 31) / 32) * 32;
-        let target_height = ((viewport_height + 31) / 32) * 32;
+        // A cropped tile keeps the full uncropped render target, then selects
+        // only its requested source region during the final blit.
+        let (target_width, target_height) =
+            video_render_target_size(viewport_width, viewport_height, crop_uv);
 
         self.render_to_fbo(gl, target_width, target_height)?;
         let Some(target) = self.target.as_ref() else {
             return Ok(());
         };
+        let source = video_blit_source(target.width, target.height, crop_uv);
         let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
         let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
 
@@ -980,10 +1049,10 @@ impl MpvCore {
             // the original source-to-destination scale. Clamping these edges
             // first squashed the whole video into its visible remainder.
             gl.blit_framebuffer(
-                0,
-                0,
-                target.width,
-                target.height,
+                source.left,
+                source.bottom,
+                source.right,
+                source.top,
                 destination.left,
                 destination.bottom,
                 destination.right,
@@ -1075,8 +1144,17 @@ impl VideoRenderer {
     }
 
     pub fn paint(&self, info: egui::PaintCallbackInfo, gl: &glow::Context) {
+        self.paint_cropped(info, gl, None);
+    }
+
+    pub fn paint_cropped(
+        &self,
+        info: egui::PaintCallbackInfo,
+        gl: &glow::Context,
+        crop_uv: Option<(f32, f32, f32, f32)>,
+    ) {
         let mut core = self.core.lock();
-        let result = unsafe { core.paint(info, gl) };
+        let result = unsafe { core.paint(info, gl, crop_uv) };
         if let Err(error) = result {
             if core.error.as_deref() != Some(&error) {
                 log::error!("Direct libmpv rendering failed: {error}");
@@ -2433,6 +2511,46 @@ mod tests {
         let mut pixels = vec![10, 20, 30, 0, 40, 50, 60, 7];
         rgb0_to_rgba(&mut pixels);
         assert_eq!(pixels, vec![10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn cropped_video_keeps_a_full_render_target_and_blits_only_the_crop() {
+        let crop = Some((0.25, 0.25, 0.75, 0.75));
+        let target = video_render_target_size(160, 96, crop);
+
+        assert_eq!(target, (320, 192));
+        assert_eq!(
+            video_blit_source(target.0, target.1, crop),
+            BlitSource {
+                left: 80,
+                bottom: 48,
+                right: 240,
+                top: 144,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_video_crop_falls_back_to_the_full_frame() {
+        let crop = Some((0.8, 0.0, 0.2, 1.0));
+        assert_eq!(video_render_target_size(320, 180, crop), (320, 192));
+        assert_eq!(
+            video_blit_source(320, 192, crop),
+            BlitSource {
+                left: 0,
+                bottom: 0,
+                right: 320,
+                top: 192,
+            }
+        );
+    }
+
+    #[test]
+    fn deep_video_crop_respects_the_render_target_cap() {
+        let target = video_render_target_size(1000, 1000, Some((0.0, 0.0, 0.1, 0.1)));
+        assert!(target.0 <= MAX_VIDEO_RENDER_WIDTH as i32);
+        assert!(target.1 <= MAX_VIDEO_RENDER_HEIGHT as i32);
+        assert_eq!(target, (2176, 2160));
     }
 
     #[test]

@@ -584,6 +584,9 @@ pub fn spawn_preview(
         position,
         size,
     );
+    if let Some(preview) = preview_manager.get_mut(id) {
+        preview.window_exe = Some(window.exe_name.clone());
+    }
 
     capture_coordinator.start_capture(id, window.hwnd, window.title.clone(), 30);
 }

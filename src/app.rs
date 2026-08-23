@@ -57,6 +57,9 @@ const BROWSER_FOCUS_GRACE: Duration = Duration::from_millis(300);
 const RESTORED_BROWSER_START_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const RESTORED_VIDEO_START_INTERVAL: Duration = Duration::from_secs(2);
+/// Polling cadence for saved Windows tiles whose applications are not open.
+#[cfg(windows)]
+const INACTIVE_WINDOW_SCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// Pause a hidden video wallpaper immediately, then release its libmpv core
 /// after a grace period so quick minimize/restore cycles do not churn decoders.
 #[cfg(windows)]
@@ -74,6 +77,38 @@ const TITLE_BAR_COLLAPSED_HEIGHT: f32 = 2.0;
 const TITLE_BAR_HOVER_ZONE: f32 = 12.0;
 /// Slide/fade duration when the title bar auto-hides or comes back.
 const TITLE_BAR_ANIM_SECS: f32 = 0.16;
+
+#[cfg(windows)]
+fn find_saved_window<'a>(
+    saved_title: &str,
+    saved_exe: Option<&str>,
+    windows: &'a [WindowInfo],
+    claimed_hwnds: &HashSet<isize>,
+) -> Option<&'a WindowInfo> {
+    let available = |window: &&WindowInfo| !claimed_hwnds.contains(&window.hwnd);
+    let usable_exe = saved_exe
+        .filter(|name| !name.trim().is_empty() && !name.trim().eq_ignore_ascii_case("unknown"));
+
+    if let Some(saved_exe) = usable_exe {
+        if let Some(window) = windows.iter().filter(available).find(|window| {
+            window.exe_name.eq_ignore_ascii_case(saved_exe) && window.title == saved_title
+        }) {
+            return Some(window);
+        }
+        if let Some(window) = windows
+            .iter()
+            .filter(available)
+            .find(|window| window.exe_name.eq_ignore_ascii_case(saved_exe))
+        {
+            return Some(window);
+        }
+    }
+
+    windows
+        .iter()
+        .filter(available)
+        .find(|window| window.title == saved_title)
+}
 
 fn title_bar_ease(t: f32) -> f32 {
     let inv = 1.0 - t;
@@ -101,12 +136,57 @@ fn browser_tile_screen_rect(
         .unwrap_or_else(|| canvas.canvas_rect_to_screen(preview.rect(), canvas_rect))
 }
 
+/// Recover the full page rectangle behind a cropped browser tile. The visible
+/// tile represents `crop_uv` within this rectangle, so keeping the native
+/// WebView at the full size preserves page layout and aligns pointer input with
+/// the captured texture.
+#[cfg(windows)]
+fn uncropped_rect(visible_rect: egui::Rect, crop_uv: Option<(f32, f32, f32, f32)>) -> egui::Rect {
+    let Some((min_u, min_v, max_u, max_v)) = crop_uv else {
+        return visible_rect;
+    };
+    let u_span = (max_u - min_u).max(0.001);
+    let v_span = (max_v - min_v).max(0.001);
+    let full_size = egui::vec2(
+        visible_rect.width() / u_span,
+        visible_rect.height() / v_span,
+    );
+    egui::Rect::from_min_size(
+        visible_rect.min - egui::vec2(min_u * full_size.x, min_v * full_size.y),
+        full_size,
+    )
+}
+
+#[cfg(windows)]
+fn browser_page_screen_rect(
+    canvas: &CanvasState,
+    preview: &Preview,
+    canvas_rect: egui::Rect,
+) -> egui::Rect {
+    uncropped_rect(
+        browser_tile_screen_rect(canvas, preview, canvas_rect),
+        preview.crop_uv,
+    )
+}
+
 #[cfg(windows)]
 fn browser_capture_display_size(preview: &Preview) -> Vec2 {
-    preview
+    let visible_size = preview
         .viewport_pin
         .map(|pin| pin.size_vec2())
-        .unwrap_or(preview.size)
+        .unwrap_or(preview.size);
+    uncropped_rect(
+        egui::Rect::from_min_size(Pos2::ZERO, visible_size),
+        preview.crop_uv,
+    )
+    .size()
+}
+
+#[cfg(windows)]
+fn restore_browser_geometry(preview: &mut Preview, saved: &PreviewLayout) {
+    preview.lock_aspect_ratio = saved.lock_aspect_ratio;
+    preview.crop_uv = saved.crop_uv;
+    preview.viewport_pin = saved.viewport_pin;
 }
 
 /// Initial image tile size, fitted inside 640×480 while preserving aspect.
@@ -571,6 +651,10 @@ pub struct PluriviewApp {
     /// Per-window process loopbacks for tiles with SA enabled.
     #[cfg(windows)]
     window_audio_monitors: HashMap<u32, crate::audio::AudioMonitor>,
+
+    /// Last scan for applications backing inactive saved window tiles.
+    #[cfg(windows)]
+    last_inactive_window_scan: Option<Instant>,
 }
 
 impl PluriviewApp {
@@ -700,6 +784,8 @@ impl PluriviewApp {
             audio_monitor_checked: None,
             #[cfg(windows)]
             window_audio_monitors: HashMap::new(),
+            #[cfg(windows)]
+            last_inactive_window_scan: None,
         };
 
         // Restore the active named workspace (or the migrated legacy autosave).
@@ -2895,12 +2981,12 @@ impl PluriviewApp {
         canvas_rect: egui::Rect,
     ) -> Option<BrowserTilePlacement> {
         let preview = self.preview_manager.get(id)?;
-        let rect = browser_tile_screen_rect(&self.canvas, preview, canvas_rect);
-        if !rect.intersects(canvas_rect) {
+        let tile_rect = browser_tile_screen_rect(&self.canvas, preview, canvas_rect);
+        if !tile_rect.intersects(canvas_rect) {
             return None;
         }
-        let page_rect = rect;
-        let visible_rect = page_rect.intersect(canvas_rect);
+        let page_rect = browser_page_screen_rect(&self.canvas, preview, canvas_rect);
+        let visible_rect = tile_rect.intersect(canvas_rect);
         (visible_rect.width() >= 1.0 && visible_rect.height() >= 1.0).then_some(
             BrowserTilePlacement {
                 page_rect,
@@ -2984,6 +3070,77 @@ impl PluriviewApp {
             self.window_audio_monitors
                 .entry(pid)
                 .or_insert_with(|| crate::audio::AudioMonitor::start(pid, device_id.clone()));
+        }
+    }
+
+    /// Reconnect saved window tiles when their application later exposes a
+    /// capturable top-level window. Enumeration uses the same privacy filters
+    /// as the window picker.
+    #[cfg(windows)]
+    fn inactive_window_upkeep(&mut self, ctx: &egui::Context) {
+        let has_inactive = self
+            .preview_manager
+            .all()
+            .any(|preview| preview.is_inactive_window() && preview.removing.is_none());
+        if !has_inactive {
+            self.last_inactive_window_scan = None;
+            return;
+        }
+
+        ctx.request_repaint_after(INACTIVE_WINDOW_SCAN_INTERVAL);
+        if self
+            .last_inactive_window_scan
+            .is_some_and(|last| last.elapsed() < INACTIVE_WINDOW_SCAN_INTERVAL)
+        {
+            return;
+        }
+        self.last_inactive_window_scan = Some(Instant::now());
+
+        let windows = enumerate_windows();
+        let mut claimed_hwnds: HashSet<isize> = self
+            .preview_manager
+            .all()
+            .filter_map(|preview| preview.window_handle.as_ref().map(|handle| handle.hwnd))
+            .collect();
+        let inactive = self
+            .preview_manager
+            .all()
+            .filter(|preview| preview.is_inactive_window() && preview.removing.is_none())
+            .map(|preview| {
+                (
+                    preview.id,
+                    preview.title.clone(),
+                    preview.window_exe.clone(),
+                    preview.fps_preset,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (id, saved_title, saved_exe, fps_preset) in inactive {
+            let Some(window) =
+                find_saved_window(&saved_title, saved_exe.as_deref(), &windows, &claimed_hwnds)
+            else {
+                continue;
+            };
+            let hwnd = window.hwnd;
+            let process_id = window.process_id;
+            let title = window.title.clone();
+            let exe_name = window.exe_name.clone();
+            claimed_hwnds.insert(hwnd);
+
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.window_handle = Some(WindowHandle { hwnd, process_id });
+                preview.window_exe = Some(exe_name);
+                preview.window_waiting_for_match = false;
+                preview.capture_paused = false;
+                preview.capture_hibernated = false;
+                preview.capture_offscreen_since = None;
+                preview.title.clone_from(&title);
+                preview.clear_capture_error();
+            }
+            self.capture_coordinator
+                .start_capture(id, hwnd, title, fps_preset.as_u32());
+            ctx.request_repaint();
         }
     }
 
@@ -4494,6 +4651,7 @@ impl PluriviewApp {
             self.audio_monitor = None;
             self.audio_monitor_checked = None;
             self.window_audio_monitors.clear();
+            self.last_inactive_window_scan = None;
         }
 
         // Restore canvas state
@@ -4535,6 +4693,7 @@ impl PluriviewApp {
 
         // Enumerate current windows to find matching ones
         let current_windows = enumerate_windows();
+        let mut claimed_hwnds = HashSet::new();
 
         // Restore previews
         for preview_layout in &layout.previews {
@@ -4555,7 +4714,7 @@ impl PluriviewApp {
                         self.preview_manager.set_z_order(id, preview_layout.z_order);
                         if let Some(preview) = self.preview_manager.get_mut(id) {
                             // Restored tiles appear instantly, no spawn animation.
-                            preview.viewport_pin = preview_layout.viewport_pin;
+                            restore_browser_geometry(preview, preview_layout);
                             preview.created_at = Instant::now() - Duration::from_secs(1);
                         }
                         self.apply_browser_mute(id, preview_layout.browser_muted);
@@ -4664,12 +4823,17 @@ impl PluriviewApp {
                 continue;
             }
 
-            // Try to find a matching window by title
-            let matching_window = current_windows
-                .iter()
-                .find(|w| w.title == preview_layout.window_title);
+            // Prefer the exact saved title, but use the executable identity
+            // when dynamic titles (Spotify tracks, documents, etc.) changed.
+            let matching_window = find_saved_window(
+                &preview_layout.window_title,
+                preview_layout.window_exe.as_deref(),
+                &current_windows,
+                &claimed_hwnds,
+            );
 
             if let Some(window_info) = matching_window {
+                claimed_hwnds.insert(window_info.hwnd);
                 // Create preview with saved position/size
                 let id = self.preview_manager.add_with_window(
                     window_info.title.clone(),
@@ -4693,6 +4857,9 @@ impl PluriviewApp {
 
                 // Restore crop region if it was saved
                 if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.window_exe = Some(window_info.exe_name.clone());
+                    preview.window_waiting_for_match = false;
+                    preview.lock_aspect_ratio = preview_layout.lock_aspect_ratio;
                     preview.crop_uv = preview_layout.crop_uv;
                     preview.stream_audio = preview_layout.stream_audio;
                     preview.viewport_pin = preview_layout.viewport_pin;
@@ -4704,9 +4871,23 @@ impl PluriviewApp {
                     privacy::redact_title(&window_info.title)
                 );
             } else {
+                let id = self.preview_manager.add_inactive_window(
+                    preview_layout.window_title.clone(),
+                    preview_layout.window_exe.clone(),
+                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
+                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
+                    preview_layout.fps_preset,
+                    preview_layout.z_order,
+                );
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.lock_aspect_ratio = preview_layout.lock_aspect_ratio;
+                    preview.crop_uv = preview_layout.crop_uv;
+                    preview.stream_audio = preview_layout.stream_audio;
+                    preview.viewport_pin = preview_layout.viewport_pin;
+                }
                 #[cfg(debug_assertions)]
                 println!(
-                    "Window not found: {}",
+                    "Window inactive; keeping saved tile: {}",
                     privacy::redact_title(&preview_layout.window_title)
                 );
             }
@@ -4738,17 +4919,20 @@ impl PluriviewApp {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        browser_capture_display_size, browser_tile_screen_rect, preview_playback_state,
-        preview_video_status, restored_browser_ready, restored_video_ready,
-        resumable_video_position, video_launch_for_source, video_session_is_stale,
-        wallpaper_hibernation_due, FpsPreset, PendingBrowserTile, PendingVideoTile, VideoSource,
-        VideoTileStatus, WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID,
+        browser_capture_display_size, browser_page_screen_rect, browser_tile_screen_rect,
+        find_saved_window, preview_playback_state, preview_video_status, restore_browser_geometry,
+        restored_browser_ready, restored_video_ready, resumable_video_position,
+        video_launch_for_source, video_session_is_stale, wallpaper_hibernation_due, FpsPreset,
+        PendingBrowserTile, PendingVideoTile, VideoSource, VideoTileStatus,
+        WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID,
     };
     use crate::canvas::CanvasState;
     use crate::external_tools::{DiscoverySource, ToolStatus};
-    use crate::preview::{Preview, PreviewId, VideoPlaybackState, ViewportPin};
+    use crate::preview::{Preview, PreviewId, PreviewLayout, VideoPlaybackState, ViewportPin};
     use crate::video::{LoopMode, TrackInfo, TrackSelection, VideoState};
+    use crate::window_picker::WindowInfo;
     use eframe::egui::{Pos2, Rect, Vec2};
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -4764,6 +4948,37 @@ mod tests {
             now - WALLPAPER_HIBERNATE_AFTER,
             now
         ));
+    }
+
+    #[test]
+    fn saved_window_matching_survives_dynamic_titles() {
+        let windows = vec![WindowInfo::new(
+            100,
+            "A different song".to_owned(),
+            42,
+            "Spotify.exe".to_owned(),
+        )];
+
+        let matched = find_saved_window(
+            "The song from last session",
+            Some("spotify.EXE"),
+            &windows,
+            &HashSet::new(),
+        );
+        assert_eq!(matched.map(|window| window.hwnd), Some(100));
+    }
+
+    #[test]
+    fn saved_window_matching_never_claims_one_window_twice() {
+        let windows = vec![WindowInfo::new(
+            100,
+            "Spotify".to_owned(),
+            42,
+            "Spotify.exe".to_owned(),
+        )];
+        let claimed = HashSet::from([100]);
+
+        assert!(find_saved_window("Spotify", Some("Spotify.exe"), &windows, &claimed).is_none());
     }
 
     #[test]
@@ -4785,6 +5000,59 @@ mod tests {
             pinned_rect
         );
         assert_eq!(browser_capture_display_size(&preview), pinned_rect.size());
+    }
+
+    #[test]
+    fn cropped_browser_keeps_the_full_page_geometry_for_capture_and_interaction() {
+        let canvas = CanvasState::default();
+        let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "browser".to_owned(),
+            Pos2::new(200.0, 150.0),
+            Vec2::new(320.0, 180.0),
+        );
+        preview.browser_url = Some("https://example.com".to_owned());
+        preview.crop_uv = Some((0.25, 0.25, 0.75, 0.75));
+
+        assert_eq!(
+            browser_capture_display_size(&preview),
+            Vec2::new(640.0, 360.0)
+        );
+        assert_eq!(
+            browser_page_screen_rect(&canvas, &preview, canvas_rect),
+            Rect::from_min_size(Pos2::new(40.0, 60.0), Vec2::new(640.0, 360.0))
+        );
+    }
+
+    #[test]
+    fn restored_browser_keeps_its_saved_crop() {
+        let mut saved = Preview::new(
+            PreviewId(1),
+            "browser".to_owned(),
+            Pos2::new(200.0, 150.0),
+            Vec2::new(240.0, 180.0),
+        );
+        saved.browser_url = Some("https://example.com".to_owned());
+        saved.lock_aspect_ratio = false;
+        saved.crop_uv = Some((0.25, 0.0, 1.0, 1.0));
+        saved.viewport_pin = Some(ViewportPin::from_rect(
+            Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(240.0, 180.0)),
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)),
+        ));
+        let layout = PreviewLayout::from(&saved);
+        let mut restored = Preview::new(
+            PreviewId(2),
+            "browser".to_owned(),
+            Pos2::new(layout.position.0, layout.position.1),
+            Vec2::new(layout.size.0, layout.size.1),
+        );
+
+        restore_browser_geometry(&mut restored, &layout);
+
+        assert_eq!(restored.crop_uv, saved.crop_uv);
+        assert_eq!(restored.viewport_pin, saved.viewport_pin);
+        assert_eq!(restored.lock_aspect_ratio, saved.lock_aspect_ratio);
     }
 
     fn restored_pending(shown_once: bool) -> PendingBrowserTile {
@@ -5180,6 +5448,9 @@ impl eframe::App for PluriviewApp {
         if !self.canvas_only {
             self.title_bar_ui(ctx);
         }
+
+        #[cfg(windows)]
+        self.inactive_window_upkeep(ctx);
 
         // Process any pending captured frames
         self.capture_coordinator

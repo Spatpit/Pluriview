@@ -35,9 +35,9 @@
 | **Live Wallpaper** | Image, GIF, or looping muted video behind the canvas; it stays screen-sized |
 | **Tile Freeze** | Pause live work on selected tiles and keep the last frame until you resume |
 | **Stream Audio Monitor** | Copy tile audio into Pluriview so Discord/OBS window shares pick it up |
-| **Crop Regions** | Focus on a part of a captured window with Alt+drag |
+| **Crop Regions** | Focus on part of a window, browser page, image, GIF, or video with Alt+drag |
 | **Adjustable FPS** | 15, 30, or 60 FPS per preview |
-| **Auto-Save** | Layouts persist automatically, including browser URLs and video tiles |
+| **Auto-Save** | Layouts persist automatically, including browser URLs, video tiles, and inactive window tiles that reconnect when their app opens |
 | **Named Workspaces** | Create, duplicate, rename, and switch between reusable canvas setups |
 | **System Tray** | Minimize to tray for background operation |
 | **Quick Focus** | Double-click a preview to bring its source window to the front |
@@ -52,6 +52,7 @@ Keep `libmpv-2.dll` next to `pluriview.exe`. Then:
 - Drop a video file onto the canvas, or use **File → Add Video...**
 - Drop a folder of videos to create a linked player and playlist
 - Use play/pause, seek, volume, mute, speed, loop, audio/subtitle tracks, and reload
+- Crop the visible video region with Alt+drag on tile edges or corners
 - Hover the seek bar to preview a frame without moving the playing video
 - Live streams do not get timeline thumbnails
 
@@ -92,6 +93,9 @@ uBOL's popup is not shown.
 
 Pages with transparent backgrounds stay transparent in browser tiles, which
 makes overlay widgets such as heart-rate monitors blend into the canvas.
+Browser tiles can also be cropped with Alt+drag while in canvas mode; entering
+interaction mode keeps the visible page region and pointer coordinates aligned,
+and the crop is restored with the workspace.
 
 **Streaming with audio (Discord/OBS):** browser-tile sound normally belongs to
 WebView2, so sharing the Pluriview window has no tile audio. Enable **View →
@@ -153,7 +157,7 @@ contain local paths.
 6. **Add a stream** from the canvas menu (needs Streamlink)
 7. **Set a wallpaper** with View → Set Wallpaper...
 8. **Arrange** by dragging tiles; **resize** from corners or edges
-9. **Crop** window previews with Alt+drag on corners
+9. **Crop** window, browser, image, GIF, or video tiles with Alt+drag on edges or corners
 10. **Pin** any tile with right-click → **Pin to Viewport** to keep it fixed while navigating the canvas
 11. **Focus** a tile with right-click → **Focus on This Tile**; `Esc` restores the canvas
 
@@ -180,7 +184,7 @@ to those shown below.
 | Add with box selection | `Ctrl + Left-drag empty canvas` |
 | Freeze or resume selection | `Right-click selected tile or canvas` |
 | Delete selected | `Delete` |
-| Crop preview | `Alt + Drag corners` |
+| Crop tile | `Alt + Drag edges or corners` |
 | Focus current tile | `Numpad 2` or `Double-click preview` |
 | Exit tile focus | `Esc` |
 | Interact with browser tile | `Ctrl + B`, `Numpad 1`, or `Double-click` |
