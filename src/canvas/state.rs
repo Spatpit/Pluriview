@@ -77,8 +77,8 @@ mod tests {
     use crate::playlist::FolderPlaylist;
     use crate::preview::{FpsPreset, PreviewId, PreviewManager, VideoSource, VideoTileStatus};
     use eframe::egui::{
-        CentralPanel, Context, CursorIcon, Event, Modifiers, PointerButton, Pos2, RawInput, Rect,
-        Shape, Vec2,
+        CentralPanel, Context, CursorIcon, Event, Id, Modifiers, MouseWheelUnit, Order,
+        PointerButton, Pos2, RawInput, Rect, Sense, Shape, Vec2,
     };
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -153,6 +153,66 @@ mod tests {
         assert_eq!(canvas.selection.len(), 2);
         assert!(canvas.selection.contains(&first));
         assert!(canvas.selection.contains(&second));
+    }
+
+    #[test]
+    fn foreground_menu_blocks_canvas_scroll_zoom() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        let menu_pos = Pos2::new(150.0, 150.0);
+
+        let mut render = |events| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default().show(context, |ui| {
+                        canvas.ui(ui, &mut previews, &mut captures, context, true);
+                    });
+                    egui::Area::new(Id::new("test_foreground_menu"))
+                        .order(Order::Foreground)
+                        .fixed_pos(Pos2::new(100.0, 100.0))
+                        .show(context, |ui| {
+                            ui.allocate_exact_size(Vec2::splat(100.0), Sense::hover());
+                        });
+                },
+            );
+        };
+
+        // Populate egui's layer hit-test data, which is retained between frames.
+        render(vec![Event::PointerMoved(menu_pos)]);
+        render(vec![Event::PointerMoved(menu_pos)]);
+        assert_eq!(
+            context.layer_id_at(menu_pos).map(|layer| layer.order),
+            Some(Order::Foreground)
+        );
+
+        render(vec![
+            Event::PointerMoved(menu_pos),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, 20.0),
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+
+        render(vec![
+            Event::PointerMoved(Pos2::new(350.0, 350.0)),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, 20.0),
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+
+        // Only the wheel event outside the foreground area may affect zoom.
+        assert!((canvas.zoom - 1.1).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -1514,6 +1574,7 @@ struct FrameInput {
     primary_down: bool,
     primary_pressed: bool,
     primary_released: bool,
+    pointer_blocked: bool,
     time: f64,
     delete_pressed: bool,
     select_all: bool,
@@ -2667,6 +2728,9 @@ impl CanvasState {
             input,
             show_overlays,
         } = frame;
+        if input.pointer_blocked {
+            return false;
+        }
         if let Some(drag) = self.pinned_pointer_drag.filter(|drag| drag.id == id) {
             if let Some(pointer) = input.hover_pos {
                 let moved_rect = drag
@@ -2742,7 +2806,7 @@ impl CanvasState {
 
         // Snapshot the input fields we need once, instead of cloning the
         // whole InputState in every interaction pass.
-        let input = ui.input(|i| FrameInput {
+        let mut input = ui.input(|i| FrameInput {
             hover_pos: i.pointer.hover_pos(),
             interact_pos: i.pointer.interact_pos(),
             pointer_delta: i.pointer.delta(),
@@ -2753,10 +2817,19 @@ impl CanvasState {
             primary_down: i.pointer.primary_down(),
             primary_pressed: i.pointer.primary_pressed(),
             primary_released: i.pointer.primary_released(),
+            pointer_blocked: false,
             time: i.time,
             delete_pressed,
             select_all,
             escape_pressed,
+        });
+        // Canvas gestures intentionally read raw pointer input so zoom and pan
+        // also work over tiles. Do not let that bypass a menu, popup, or other
+        // floating egui area drawn above the canvas.
+        input.pointer_blocked = input.hover_pos.is_some_and(|pointer| {
+            ui.ctx()
+                .layer_id_at(pointer)
+                .is_some_and(|layer| layer != ui.layer_id())
         });
 
         if input.escape_pressed {
@@ -3154,6 +3227,7 @@ impl CanvasState {
         // Left-dragging from empty canvas draws a marquee. Tile drags still
         // move tiles, while Alt+left and middle-button drags remain panning.
         if show_overlays
+            && !input.pointer_blocked
             && input.primary_pressed
             && !input.alt
             && !input.middle_down
@@ -3214,7 +3288,7 @@ impl CanvasState {
         // Update cursor based on drag state or handle hover
         if show_overlays && !self.is_focusing_tile() {
             if let Some(mouse_pos) = input.hover_pos {
-                if canvas_rect.contains(mouse_pos) {
+                if !input.pointer_blocked && canvas_rect.contains(mouse_pos) {
                     if let Some((_, handle)) =
                         self.get_handle_at(mouse_pos, canvas_rect, preview_manager)
                     {
@@ -3232,7 +3306,7 @@ impl CanvasState {
         // Zoom with scroll wheel - works anywhere on canvas, even over previews
         // We check canvas_rect.contains() instead of bg_response.hovered() because
         // bg_response.hovered() returns false when the mouse is over a preview widget
-        if !handle_drag_active {
+        if !handle_drag_active && !input.pointer_blocked {
             if let Some(mouse_pos) = input.hover_pos {
                 if canvas_rect.contains(mouse_pos) {
                     let scroll_delta = input.scroll_y;
@@ -3266,6 +3340,7 @@ impl CanvasState {
         // Pan with middle mouse button or Alt+Left drag
         // Works anywhere on canvas, even over previews (similar to zoom)
         let is_panning = !handle_drag_active
+            && !input.pointer_blocked
             && (input.middle_down || (input.alt && input.primary_down))
             && canvas_rect.contains(input.hover_pos.unwrap_or_default());
 
@@ -3662,12 +3737,13 @@ impl CanvasState {
             // and makes the button appear inert. A geometry/z-order hit test
             // stays stable for the complete click while still limiting the
             // controls to the topmost tile under the pointer.
-            let pointer_over_tile = input.hover_pos.is_some_and(|pointer_pos| {
-                screen_rect.contains(pointer_pos)
-                    && preview_manager
-                        .get_preview_at(self.screen_to_canvas(pointer_pos, canvas_rect))
-                        == Some(id)
-            });
+            let pointer_over_tile = !input.pointer_blocked
+                && input.hover_pos.is_some_and(|pointer_pos| {
+                    screen_rect.contains(pointer_pos)
+                        && preview_manager
+                            .get_preview_at(self.screen_to_canvas(pointer_pos, canvas_rect))
+                            == Some(id)
+                });
             if show_overlays && pointer_over_tile {
                 // Playlist tiles already have a designed header; a second title
                 // bar would cover the folder name and transport controls.
