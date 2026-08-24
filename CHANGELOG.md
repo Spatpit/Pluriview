@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Saved window tiles remain visible as inactive when their application is closed and reconnect automatically after its window appears.
 
 ### Fixed
+- Manually frozen tiles remain frozen after closing and reopening Pluriview without restarting their source resources.
 - Menus and popups block canvas pointer gestures beneath them, so scrolling a menu no longer zooms the canvas.
 - Browser crops persist when a workspace is saved and restored.
 - Browser tiles keep their loading card behind fully transparent startup frames until visible page content arrives.

@@ -241,7 +241,7 @@ pub struct Preview {
 
     /// User-requested freeze. Frozen tiles keep their last painted frame but
     /// must not advance media or restart a culled capture until resumed.
-    /// This is deliberately runtime-only: saved workspaces start live.
+    /// Persisted through `PreviewLayout` so saved workspaces preserve intent.
     pub manually_frozen: bool,
 
     /// Lock aspect ratio when resizing? (always true by default)
@@ -741,6 +741,10 @@ pub struct PreviewLayout {
     pub lock_aspect_ratio: bool,
     pub z_order: u32,
     pub fps_preset: FpsPreset,
+    /// User-requested freeze state. Runtime resources and captured frames are
+    /// still recreated only after the tile is resumed.
+    #[serde(default)]
+    pub manually_frozen: bool,
     /// Crop region in UV coordinates (optional)
     #[serde(default)]
     pub crop_uv: Option<(f32, f32, f32, f32)>,
@@ -788,6 +792,7 @@ impl From<&Preview> for PreviewLayout {
             lock_aspect_ratio: preview.lock_aspect_ratio,
             z_order: preview.z_order,
             fps_preset: preview.fps_preset,
+            manually_frozen: preview.manually_frozen,
             crop_uv: preview.crop_uv,
             browser_url: preview.browser_url.clone(),
             browser_muted: preview.browser_muted,
@@ -1119,6 +1124,35 @@ mod tests {
 
         let restored: PreviewLayout = serde_json::from_value(value).unwrap();
         assert!(restored.viewport_pin.is_none());
+    }
+
+    #[test]
+    fn frozen_state_round_trips_through_layout() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.manually_frozen = true;
+
+        let restored = PreviewLayout::from(&preview);
+        assert!(restored.manually_frozen);
+    }
+
+    #[test]
+    fn older_saved_tiles_default_to_unfrozen() {
+        let preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        value.as_object_mut().unwrap().remove("manually_frozen");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(!restored.manually_frozen);
     }
 
     #[test]

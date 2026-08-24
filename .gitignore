@@ -33,7 +33,7 @@ nul
 .claude/
 .codex/
 .worktrees/
-/CLAUDE_CONTEXT.md
+/AGENTS.md
 /docs/superpowers/
 
 # Design mockups (development only)

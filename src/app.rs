@@ -182,11 +182,22 @@ fn browser_capture_display_size(preview: &Preview) -> Vec2 {
     .size()
 }
 
+fn restore_manual_freeze(preview: &mut Preview, saved: &PreviewLayout) {
+    preview.manually_frozen = saved.manually_frozen;
+    preview.capture_paused = saved.manually_frozen;
+    preview.capture_hibernated = false;
+    preview.capture_offscreen_since = None;
+    if preview.is_video() && saved.manually_frozen {
+        preview.video_playback.paused = true;
+    }
+}
+
 #[cfg(windows)]
 fn restore_browser_geometry(preview: &mut Preview, saved: &PreviewLayout) {
     preview.lock_aspect_ratio = saved.lock_aspect_ratio;
     preview.crop_uv = saved.crop_uv;
     preview.viewport_pin = saved.viewport_pin;
+    restore_manual_freeze(preview, saved);
 }
 
 /// Initial image tile size, fitted inside 640×480 while preserving aspect.
@@ -3078,10 +3089,9 @@ impl PluriviewApp {
     /// as the window picker.
     #[cfg(windows)]
     fn inactive_window_upkeep(&mut self, ctx: &egui::Context) {
-        let has_inactive = self
-            .preview_manager
-            .all()
-            .any(|preview| preview.is_inactive_window() && preview.removing.is_none());
+        let has_inactive = self.preview_manager.all().any(|preview| {
+            preview.is_inactive_window() && !preview.manually_frozen && preview.removing.is_none()
+        });
         if !has_inactive {
             self.last_inactive_window_scan = None;
             return;
@@ -3105,7 +3115,11 @@ impl PluriviewApp {
         let inactive = self
             .preview_manager
             .all()
-            .filter(|preview| preview.is_inactive_window() && preview.removing.is_none())
+            .filter(|preview| {
+                preview.is_inactive_window()
+                    && !preview.manually_frozen
+                    && preview.removing.is_none()
+            })
             .map(|preview| {
                 (
                     preview.id,
@@ -4740,6 +4754,7 @@ impl PluriviewApp {
                             preview.crop_uv = preview_layout.crop_uv;
                             preview.viewport_pin = preview_layout.viewport_pin;
                             preview.created_at = Instant::now() - Duration::from_secs(1);
+                            restore_manual_freeze(preview, preview_layout);
                         }
                     }
                     Err(error) => {
@@ -4770,6 +4785,7 @@ impl PluriviewApp {
                         if let Some(preview) = self.preview_manager.get_mut(id) {
                             preview.viewport_pin = preview_layout.viewport_pin;
                             preview.created_at = Instant::now() - Duration::from_secs(1);
+                            restore_manual_freeze(preview, preview_layout);
                         }
                     }
                     Err(error) => {
@@ -4797,6 +4813,7 @@ impl PluriviewApp {
                     preview.playlist_group = preview_layout.playlist_group;
                     preview.viewport_pin = preview_layout.viewport_pin;
                     preview.created_at = Instant::now() - Duration::from_secs(1);
+                    restore_manual_freeze(preview, preview_layout);
                 }
                 continue;
             }
@@ -4814,12 +4831,15 @@ impl PluriviewApp {
                     preview.crop_uv = preview_layout.crop_uv;
                     preview.viewport_pin = preview_layout.viewport_pin;
                     preview.created_at = Instant::now() - Duration::from_secs(1);
+                    restore_manual_freeze(preview, preview_layout);
                 }
-                self.capture_coordinator.start_spout_capture(
-                    id,
-                    sender.clone(),
-                    preview_layout.fps_preset.as_u32(),
-                );
+                if !preview_layout.manually_frozen {
+                    self.capture_coordinator.start_spout_capture(
+                        id,
+                        sender.clone(),
+                        preview_layout.fps_preset.as_u32(),
+                    );
+                }
                 continue;
             }
 
@@ -4847,14 +4867,6 @@ impl PluriviewApp {
                     preview_layout.z_order,
                 );
 
-                // Start capture
-                self.capture_coordinator.start_capture(
-                    id,
-                    window_info.hwnd,
-                    window_info.title.clone(),
-                    preview_layout.fps_preset.as_u32(),
-                );
-
                 // Restore crop region if it was saved
                 if let Some(preview) = self.preview_manager.get_mut(id) {
                     preview.window_exe = Some(window_info.exe_name.clone());
@@ -4863,6 +4875,16 @@ impl PluriviewApp {
                     preview.crop_uv = preview_layout.crop_uv;
                     preview.stream_audio = preview_layout.stream_audio;
                     preview.viewport_pin = preview_layout.viewport_pin;
+                    restore_manual_freeze(preview, preview_layout);
+                }
+
+                if !preview_layout.manually_frozen {
+                    self.capture_coordinator.start_capture(
+                        id,
+                        window_info.hwnd,
+                        window_info.title.clone(),
+                        preview_layout.fps_preset.as_u32(),
+                    );
                 }
 
                 #[cfg(debug_assertions)]
@@ -4884,6 +4906,7 @@ impl PluriviewApp {
                     preview.crop_uv = preview_layout.crop_uv;
                     preview.stream_audio = preview_layout.stream_audio;
                     preview.viewport_pin = preview_layout.viewport_pin;
+                    restore_manual_freeze(preview, preview_layout);
                 }
                 #[cfg(debug_assertions)]
                 println!(
@@ -5036,6 +5059,7 @@ mod tests {
         saved.browser_url = Some("https://example.com".to_owned());
         saved.lock_aspect_ratio = false;
         saved.crop_uv = Some((0.25, 0.0, 1.0, 1.0));
+        saved.manually_frozen = true;
         saved.viewport_pin = Some(ViewportPin::from_rect(
             Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(240.0, 180.0)),
             Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)),
@@ -5053,6 +5077,8 @@ mod tests {
         assert_eq!(restored.crop_uv, saved.crop_uv);
         assert_eq!(restored.viewport_pin, saved.viewport_pin);
         assert_eq!(restored.lock_aspect_ratio, saved.lock_aspect_ratio);
+        assert!(restored.manually_frozen);
+        assert!(restored.capture_paused);
     }
 
     fn restored_pending(shown_once: bool) -> PendingBrowserTile {

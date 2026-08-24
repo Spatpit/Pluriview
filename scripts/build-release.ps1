@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$ExecutableOnly
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -87,6 +89,13 @@ try {
     }
 
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $executable).Hash
+    if ($ExecutableOnly) {
+        Write-Host "Privacy-safe release executable: $executable"
+        Write-Host "Executable SHA-256: $hash"
+        Write-Warning "Do not publish pluriview.pdb; debug symbols can contain local source paths."
+        return
+    }
+
     $distDirectory = Join-Path $workspace "dist"
     $distExecutable = Join-Path $distDirectory "pluriview.exe"
     $libmpvSource = Join-Path $workspace "vendor\libmpv-2.dll"
