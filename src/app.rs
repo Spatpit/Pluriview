@@ -200,6 +200,14 @@ fn restore_browser_geometry(preview: &mut Preview, saved: &PreviewLayout) {
     restore_manual_freeze(preview, saved);
 }
 
+fn original_image_path(source: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if !source.is_file() {
+        return Err(format!("Image file does not exist: {}", source.display()));
+    }
+    std::path::absolute(source)
+        .map_err(|error| format!("Could not resolve the original image path: {error}"))
+}
+
 /// Initial image tile size, fitted inside 640×480 while preserving aspect.
 fn media_tile_size(width: u32, height: u32) -> Vec2 {
     let width = width.max(1) as f32;
@@ -2293,23 +2301,15 @@ impl PluriviewApp {
         self.recent_urls.truncate(MAX_RECENT_URLS);
     }
 
-    /// Import an external image into portable managed storage and create its tile.
+    /// Decode an external image in place and retain its original local path.
     fn import_media_tile(
         &mut self,
         source: &std::path::Path,
         position: Pos2,
     ) -> Result<PreviewId, String> {
-        // Decode first so an unsupported or damaged file is not copied into
-        // managed storage as an unusable orphan.
-        let asset = media::load(source)?;
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "Pluriview storage is unavailable".to_owned())?;
-        let managed_path = storage
-            .import_media(source)
-            .map_err(|error| format!("Could not copy image into managed storage: {error}"))?;
-        let title = source
+        let path = original_image_path(source)?;
+        let asset = media::load(&path)?;
+        let title = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("Image")
@@ -2317,35 +2317,54 @@ impl PluriviewApp {
         let size = media_tile_size(asset.width, asset.height);
         Ok(self
             .preview_manager
-            .add_media(managed_path, title, asset.frames, position, size))
+            .add_media(path, title, asset.frames, position, size))
     }
 
-    /// Recreate a tile from a relative filename already in managed storage.
+    /// Recreate a tile from its original path. Relative filenames from older
+    /// layouts still resolve through the legacy managed-media directory.
     fn restore_media_tile(
         &mut self,
-        managed_path: &str,
+        saved_path: &std::path::Path,
         title: String,
         position: Pos2,
         size: Vec2,
     ) -> Result<PreviewId, String> {
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "Pluriview storage is unavailable".to_owned())?;
-        let path = storage
-            .resolve_media(managed_path)
-            .ok_or_else(|| "Saved image path is invalid".to_owned())?;
-        if !path.is_file() {
-            return Err(format!("Saved image is missing: {}", path.display()));
+        let path = self.resolve_saved_image_path(saved_path)?;
+        let missing = !path.is_file();
+        let frames = if missing {
+            Vec::new()
+        } else {
+            media::load(&path)?.frames
+        };
+        let id = self
+            .preview_manager
+            .add_media(path, title, frames, position, size);
+        if missing {
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.set_capture_error(
+                    "Can't find image; the original file may have moved or its path changed"
+                        .to_owned(),
+                );
+            }
         }
-        let asset = media::load(&path)?;
-        Ok(self.preview_manager.add_media(
-            managed_path.to_owned(),
-            title,
-            asset.frames,
-            position,
-            size,
-        ))
+        Ok(id)
+    }
+
+    fn resolve_saved_image_path(
+        &self,
+        saved_path: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String> {
+        if saved_path.is_absolute() {
+            return Ok(saved_path.to_owned());
+        }
+        let filename = saved_path
+            .to_str()
+            .ok_or_else(|| "Saved legacy image path is invalid".to_owned())?;
+        self.storage
+            .as_ref()
+            .ok_or_else(|| "Pluriview storage is unavailable".to_owned())?
+            .resolve_media(filename)
+            .ok_or_else(|| "Saved legacy image path is invalid".to_owned())
     }
 
     fn pick_wallpaper(&mut self) {
@@ -2383,36 +2402,28 @@ impl PluriviewApp {
     }
 
     fn set_image_wallpaper(&mut self, source: &std::path::Path) -> Result<(), String> {
-        let asset = media::load(source)?;
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "Pluriview storage is unavailable".to_owned())?;
-        let managed_path = storage
-            .import_media(source)
-            .map_err(|error| format!("Could not copy wallpaper into managed storage: {error}"))?;
+        let path = original_image_path(source)?;
+        let asset = media::load(&path)?;
         self.clear_wallpaper();
-        self.canvas.wallpaper = Some(CanvasWallpaper::from_image(managed_path, asset.frames));
+        self.canvas.wallpaper = Some(CanvasWallpaper::from_image(path, asset.frames));
         Ok(())
     }
 
-    fn restore_image_wallpaper(&mut self, managed_path: &str) -> Result<(), String> {
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "Pluriview storage is unavailable".to_owned())?;
-        let path = storage
-            .resolve_media(managed_path)
-            .ok_or_else(|| "Saved wallpaper path is invalid".to_owned())?;
+    fn restore_image_wallpaper(&mut self, saved_path: &std::path::Path) -> Result<(), String> {
+        let path = self.resolve_saved_image_path(saved_path)?;
         if !path.is_file() {
-            return Err(format!("Saved wallpaper is missing: {}", path.display()));
+            self.clear_wallpaper();
+            let mut wallpaper = CanvasWallpaper::from_image(path, Vec::new());
+            wallpaper.error = Some(
+                "Can't find wallpaper image\nThe original file may have moved or its path changed"
+                    .to_owned(),
+            );
+            self.canvas.wallpaper = Some(wallpaper);
+            return Ok(());
         }
         let asset = media::load(&path)?;
         self.clear_wallpaper();
-        self.canvas.wallpaper = Some(CanvasWallpaper::from_image(
-            managed_path.to_owned(),
-            asset.frames,
-        ));
+        self.canvas.wallpaper = Some(CanvasWallpaper::from_image(path, asset.frames));
         Ok(())
     }
 

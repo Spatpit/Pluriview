@@ -11,7 +11,7 @@ pub const WALLPAPER_VIDEO_ID: PreviewId = PreviewId(0);
 /// Persistent source for the canvas wallpaper.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WallpaperSource {
-    Image { managed_path: String },
+    Image { path: PathBuf },
     Video { path: PathBuf },
 }
 
@@ -34,9 +34,9 @@ pub struct CanvasWallpaper {
 }
 
 impl CanvasWallpaper {
-    pub fn from_image(managed_path: String, frames: Vec<MediaFrame>) -> Self {
+    pub fn from_image(path: PathBuf, frames: Vec<MediaFrame>) -> Self {
         Self {
-            source: WallpaperSource::Image { managed_path },
+            source: WallpaperSource::Image { path },
             frames,
             frame_index: 0,
             frame_dirty: true,
@@ -68,9 +68,7 @@ impl CanvasWallpaper {
 
     pub fn to_layout(&self) -> WallpaperLayout {
         match &self.source {
-            WallpaperSource::Image { managed_path } => WallpaperLayout::Image {
-                path: managed_path.clone(),
-            },
+            WallpaperSource::Image { path } => WallpaperLayout::Image { path: path.clone() },
             WallpaperSource::Video { path } => WallpaperLayout::Video { path: path.clone() },
         }
     }
@@ -95,6 +93,19 @@ impl CanvasWallpaper {
                 if !self.video_sleeping {
                     ctx.request_repaint();
                 }
+            }
+            return;
+        }
+
+        if self.frames.is_empty() {
+            if let Some(error) = &self.error {
+                painter.text(
+                    canvas_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    error,
+                    egui::FontId::proportional(16.0),
+                    Color32::from_rgb(190, 150, 140),
+                );
             }
             return;
         }
@@ -194,8 +205,10 @@ pub fn cover_uv(viewport: Rect, content_width: f32, content_height: f32) -> Rect
 
 #[cfg(test)]
 mod tests {
-    use super::cover_uv;
+    use super::{cover_uv, CanvasWallpaper};
+    use crate::persistence::WallpaperLayout;
     use eframe::egui::{Pos2, Rect, Vec2};
+    use std::path::PathBuf;
 
     #[test]
     fn wide_content_crops_the_sides() {
@@ -223,5 +236,14 @@ mod tests {
         let uv = cover_uv(viewport, 1920.0, 1080.0);
         assert_eq!(uv.min, Pos2::ZERO);
         assert_eq!(uv.max, Pos2::new(1.0, 1.0));
+    }
+
+    #[test]
+    fn missing_image_wallpaper_keeps_its_original_path() {
+        let path = PathBuf::from(r"C:\Pictures\missing.png");
+        let mut wallpaper = CanvasWallpaper::from_image(path.clone(), Vec::new());
+        wallpaper.error = Some("missing".to_owned());
+
+        assert_eq!(wallpaper.to_layout(), WallpaperLayout::Image { path });
     }
 }

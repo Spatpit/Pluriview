@@ -68,8 +68,9 @@ impl Default for WindowLayout {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WallpaperLayout {
-    /// Managed image or GIF filename inside `pluriview_data/media`.
-    Image { path: String },
+    /// Original image or GIF path. Relative paths are retained for backwards
+    /// compatibility with the former managed-media directory.
+    Image { path: PathBuf },
     /// Original local video path, matching how video tiles are stored.
     Video { path: PathBuf },
 }
@@ -124,6 +125,7 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{SavedLayout, WindowLayout};
+    use std::path::PathBuf;
 
     #[test]
     fn older_layouts_default_adblocking_to_enabled() {
@@ -188,7 +190,7 @@ mod tests {
     fn wallpaper_survives_a_round_trip() {
         let mut layout = SavedLayout::new();
         layout.canvas.wallpaper = Some(super::WallpaperLayout::Image {
-            path: "bg.gif".to_owned(),
+            path: PathBuf::from("bg.gif"),
         });
         let json = serde_json::to_string(&layout).unwrap();
 
@@ -196,7 +198,7 @@ mod tests {
         assert_eq!(
             restored.canvas.wallpaper,
             Some(super::WallpaperLayout::Image {
-                path: "bg.gif".to_owned(),
+                path: PathBuf::from("bg.gif"),
             })
         );
     }

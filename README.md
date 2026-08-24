@@ -63,9 +63,10 @@ You do **not** need a separate mpv install for playback. Stream URLs need
 
 Choose **File → Add Image...** or right-click the canvas → **Add Image...**.
 Pluriview supports PNG, JPEG, GIF, WebP, and BMP. Animated GIFs keep their
-original timing. Imported files are copied into `pluriview_data/media` so the
-exe and its data folder can move together. You can also drag files from
-Explorer onto the canvas.
+original timing. Tiles use the image's original path and do not create a copy
+inside `pluriview_data`. If the original is moved or removed, the tile remains
+on the canvas and explains that its saved path can no longer be found. You can
+also drag files from Explorer onto the canvas.
 
 Development builds keep `pluriview_data` at the repo root. Release builds keep
 it beside the executable.
@@ -74,10 +75,10 @@ it beside the executable.
 
 **View → Set Wallpaper...** or right-click the canvas. Images, GIFs, and local
 videos fill the window and do not pan or zoom with the canvas. Video wallpaper
-needs `libmpv-2.dll` and loops muted. Image wallpapers are copied into
-`pluriview_data/media`; video wallpapers keep their original path. The
-wallpaper is saved per workspace. While a tile is in focus mode, video
-wallpaper pauses.
+needs `libmpv-2.dll` and loops muted. Image, GIF, and video wallpapers keep
+their original paths instead of creating managed copies. A missing image
+wallpaper shows a path-change message. The wallpaper is saved per workspace.
+While a tile is in focus mode, video wallpaper pauses.
 
 ### Browser tiles
 

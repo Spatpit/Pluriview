@@ -6,6 +6,7 @@ use crate::media::MediaFrame;
 use crate::playlist::FolderPlaylist;
 use eframe::egui::{Pos2, Vec2};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Snapshot of a preview captured right before it's actually dropped from
@@ -31,8 +32,8 @@ pub struct RemovedPreviewInfo {
     pub spout_sender: Option<String>,
     /// Restored when undo recreates a pinned tile.
     pub viewport_pin: Option<ViewportPin>,
-    /// Set for managed image and GIF tiles.
-    pub media_path: Option<String>,
+    /// Original local path for image and GIF tiles.
+    pub media_path: Option<PathBuf>,
     /// Set for mpv-backed local video and Streamlink tiles.
     pub video_source: Option<VideoSource>,
     pub folder_playlist: Option<FolderPlaylist>,
@@ -166,7 +167,7 @@ impl PreviewManager {
     /// Add a decoded image or GIF tile.
     pub fn add_media(
         &mut self,
-        managed_path: String,
+        path: PathBuf,
         title: String,
         frames: Vec<MediaFrame>,
         position: Pos2,
@@ -177,7 +178,7 @@ impl PreviewManager {
 
         let mut preview = Preview::new(id, title, position, size);
         preview.z_order = self.max_z_order;
-        preview.set_media(managed_path, frames);
+        preview.set_media(path, frames);
         self.previews.insert(id, preview);
         id
     }

@@ -67,11 +67,11 @@ pub enum DragState {
 mod tests {
     use super::{
         apply_crop, apply_resize, browser_control_colors, capture_resolution_badge_rect,
-        format_time, live_capture_display_size, native_capture_canvas_size, pixel_aligned_rect,
-        playlist_first_row_center, rect_for_crop_change, stream_audio_badge_rect,
-        video_placeholder_content, window_capture_placeholder_content, window_capture_target,
-        BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle, TileActivityAction,
-        VideoAction,
+        format_time, live_capture_display_size, media_placeholder_content,
+        native_capture_canvas_size, pixel_aligned_rect, playlist_first_row_center,
+        rect_for_crop_change, stream_audio_badge_rect, video_placeholder_content,
+        window_capture_placeholder_content, window_capture_target, BrowserAction, CanvasState,
+        DragState, PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -571,6 +571,14 @@ mod tests {
     }
 
     #[test]
+    fn missing_image_placeholder_explains_that_the_original_path_changed() {
+        let (title, detail) = media_placeholder_content();
+        assert_eq!(title, "Can't find image");
+        assert!(detail.contains("moved"));
+        assert!(detail.contains("path"));
+    }
+
+    #[test]
     fn stale_preview_springs_are_pruned() {
         let mut canvas = CanvasState::default();
         let mut previews = PreviewManager::new();
@@ -783,7 +791,7 @@ mod tests {
     fn alt_crop_drag_crops_an_image_tile() {
         let mut previews = PreviewManager::new();
         let id = previews.add_media(
-            "image.png".to_owned(),
+            PathBuf::from("image.png"),
             "image".to_owned(),
             vec![crate::media::MediaFrame {
                 width: 200,
@@ -1938,6 +1946,34 @@ fn window_capture_placeholder_content(failed: bool) -> (&'static str, &'static s
         ("Capture failed", "This window could not be captured", false)
     } else {
         ("Connecting...", "", true)
+    }
+}
+
+fn media_placeholder_content() -> (&'static str, &'static str) {
+    (
+        "Can't find image",
+        "The original file may have moved or its path changed",
+    )
+}
+
+fn paint_missing_media_placeholder(painter: &egui::Painter, rect: Rect) {
+    let (title, detail) = media_placeholder_content();
+    painter.rect_filled(rect, 8.0, Color32::from_rgb(24, 20, 20));
+    painter.text(
+        rect.center() + Vec2::new(0.0, -9.0),
+        egui::Align2::CENTER_CENTER,
+        title,
+        egui::FontId::proportional(13.0),
+        Color32::from_rgb(225, 130, 110),
+    );
+    if rect.height() >= 72.0 {
+        painter.text(
+            rect.center() + Vec2::new(0.0, 12.0),
+            egui::Align2::CENTER_CENTER,
+            detail,
+            egui::FontId::proportional(10.5),
+            Color32::from_rgb(160, 125, 118),
+        );
     }
 }
 
@@ -3692,7 +3728,9 @@ impl CanvasState {
             };
 
             if !has_texture {
-                if manually_frozen {
+                if is_media && capture_failed {
+                    paint_missing_media_placeholder(&painter, anim_rect);
+                } else if manually_frozen {
                     painter.rect_filled(anim_rect, 8.0, Color32::from_rgb(22, 26, 32));
                     painter.text(
                         anim_rect.center(),

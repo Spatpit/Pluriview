@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Image, animated GIF, browser, and libmpv video tiles can be cropped with Alt+drag; cropped browser pages keep capture and interaction coordinates aligned.
 - Saved window tiles remain visible as inactive when their application is closed and reconnect automatically after its window appears.
 
+### Changed
+- Image/GIF tiles and image wallpapers use their original file paths instead of creating copies in `pluriview_data/media`; missing originals remain visible with a path-change message.
+
 ### Fixed
 - Manually frozen tiles remain frozen after closing and reopening Pluriview without restarting their source resources.
 - Menus and popups block canvas pointer gestures beneath them, so scrolling a menu no longer zooms the canvas.

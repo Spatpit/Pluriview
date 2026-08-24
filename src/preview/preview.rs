@@ -299,8 +299,9 @@ pub struct Preview {
     /// Cleared after capture produces at least one visible pixel.
     pub browser_waiting_for_content: bool,
 
-    /// Managed filename in `pluriview_data/media` for image and GIF tiles.
-    pub media_path: Option<String>,
+    /// Original local path for image and GIF tiles. Legacy layouts may still
+    /// point into Pluriview's former managed-media directory.
+    pub media_path: Option<PathBuf>,
 
     /// Local file or Streamlink URL when this is an mpv-backed video tile.
     pub video_source: Option<VideoSource>,
@@ -523,8 +524,8 @@ impl Preview {
     }
 
     /// Attach decoded image data to this preview.
-    pub fn set_media(&mut self, managed_path: String, frames: Vec<MediaFrame>) {
-        self.media_path = Some(managed_path);
+    pub fn set_media(&mut self, path: PathBuf, frames: Vec<MediaFrame>) {
+        self.media_path = Some(path);
         self.media_frames = frames;
         self.media_frame_index = 0;
         self.media_frame_dirty = true;
@@ -758,10 +759,10 @@ pub struct PreviewLayout {
     /// Replay this captured window's audio through the stream monitor.
     #[serde(default)]
     pub stream_audio: bool,
-    /// Managed filename for an image/GIF tile. Kept relative so portable
-    /// installs can be moved as a unit.
+    /// Original local path for an image/GIF tile. Relative values from older
+    /// layouts are resolved against the legacy managed-media directory.
     #[serde(default)]
-    pub media_path: Option<String>,
+    pub media_path: Option<PathBuf>,
     /// Optional mpv-backed local file or Streamlink source.
     #[serde(default)]
     pub video_source: Option<VideoSource>,
@@ -1001,6 +1002,7 @@ mod tests {
     };
     use crate::media::MediaFrame;
     use eframe::egui::{Context, Pos2, Rect, Vec2};
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1031,7 +1033,7 @@ mod tests {
             Vec2::splat(1.0),
         );
         preview.set_media(
-            "test.gif".to_owned(),
+            PathBuf::from("test.gif"),
             vec![MediaFrame {
                 width: 1,
                 height: 1,
@@ -1057,7 +1059,7 @@ mod tests {
             Vec2::splat(1.0),
         );
         preview.set_media(
-            "test.gif".to_owned(),
+            PathBuf::from("test.gif"),
             vec![
                 MediaFrame {
                     width: 1,
@@ -1094,6 +1096,23 @@ mod tests {
 
         let restored: PreviewLayout = serde_json::from_value(value).unwrap();
         assert!(restored.media_path.is_none());
+    }
+
+    #[test]
+    fn original_image_path_round_trips_through_layout() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "image".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        let original = PathBuf::from(r"C:\Pictures\sample.png");
+        preview.media_path = Some(original.clone());
+
+        let json = serde_json::to_string(&PreviewLayout::from(&preview)).unwrap();
+        let restored: PreviewLayout = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.media_path, Some(original));
     }
 
     #[test]
