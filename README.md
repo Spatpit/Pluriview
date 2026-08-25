@@ -93,6 +93,9 @@ Browser tiles use **uBlock Origin Lite**, on by default. Toggle it under
 **View → Block Ads & Trackers (uBOL)**. WebView2 has no extension toolbar, so
 uBOL's popup is not shown.
 
+Turn off **Lock Aspect Ratio** from a browser tile's right-click menu to resize
+its WebView into portrait, square, ultrawide, or another custom viewport shape.
+
 Pages with transparent backgrounds stay transparent in browser tiles, which
 makes overlay widgets such as heart-rate monitors blend into the canvas.
 Browser tiles can also be cropped with Alt+drag while in canvas mode; entering

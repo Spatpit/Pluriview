@@ -758,6 +758,27 @@ mod tests {
     }
 
     #[test]
+    fn browser_aspect_lock_can_preserve_a_portrait_shape() {
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add_browser_placeholder(
+            "https://example.com".to_owned(),
+            Pos2::ZERO,
+            Vec2::new(320.0, 180.0),
+            FpsPreset::Medium,
+        );
+
+        canvas.toggle_aspect_ratio_lock(id, &mut previews);
+        assert!(!previews.get(id).unwrap().lock_aspect_ratio);
+
+        previews.get_mut(id).unwrap().size = Vec2::new(180.0, 320.0);
+        canvas.toggle_aspect_ratio_lock(id, &mut previews);
+        let preview = previews.get(id).unwrap();
+        assert!(preview.lock_aspect_ratio);
+        assert!((preview.source_aspect_ratio - 180.0 / 320.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn video_time_format_handles_hours_and_missing_values() {
         assert_eq!(format_time(None), "0:00");
         assert_eq!(format_time(Some(65.9)), "1:05");
@@ -1887,6 +1908,7 @@ struct TileInfo {
     window_exe: Option<String>,
     is_spout_capture: bool,
     viewport_pin: Option<ViewportPin>,
+    lock_aspect_ratio: bool,
     left_click_disabled: bool,
     muted: bool,
     stream_audio: bool,
@@ -1924,6 +1946,7 @@ impl TileInfo {
             window_exe: preview.window_exe.clone(),
             is_spout_capture: preview.is_spout_capture(),
             viewport_pin: preview.viewport_pin,
+            lock_aspect_ratio: preview.lock_aspect_ratio,
             left_click_disabled: preview.left_click_disabled,
             muted: preview.browser_muted,
             stream_audio: preview.stream_audio,
@@ -1960,6 +1983,7 @@ impl TileInfo {
         self.window_exe.clone_from(&preview.window_exe);
         self.is_spout_capture = preview.is_spout_capture();
         self.viewport_pin = preview.viewport_pin;
+        self.lock_aspect_ratio = preview.lock_aspect_ratio;
         self.left_click_disabled = preview.left_click_disabled;
         self.muted = preview.browser_muted;
         self.stream_audio = preview.stream_audio;
@@ -2928,6 +2952,22 @@ impl CanvasState {
                 // The app consumes this runtime request and parks the native
                 // WebView host so it cannot continue intercepting pointer input.
                 self.last_double_clicked = Some(id);
+            }
+        }
+    }
+
+    fn toggle_aspect_ratio_lock(&mut self, id: PreviewId, preview_manager: &mut PreviewManager) {
+        let Some(preview) = preview_manager.get_mut(id) else {
+            return;
+        };
+        preview.lock_aspect_ratio = !preview.lock_aspect_ratio;
+        if preview.lock_aspect_ratio {
+            let size = preview
+                .viewport_pin
+                .map(ViewportPin::size_vec2)
+                .unwrap_or(preview.size);
+            if size.y > 0.0 {
+                preview.source_aspect_ratio = size.x / size.y;
             }
         }
     }
@@ -3930,6 +3970,7 @@ impl CanvasState {
             let window_exe = info.window_exe.as_deref();
             let is_spout_capture = info.is_spout_capture;
             let viewport_pin = info.viewport_pin;
+            let lock_aspect_ratio = info.lock_aspect_ratio;
             let left_click_disabled = info.left_click_disabled;
             let muted = if is_video {
                 info.video_playback.muted
@@ -5078,6 +5119,18 @@ impl CanvasState {
                     .clicked()
                 {
                     self.toggle_viewport_pin(id, canvas_rect, preview_manager);
+                    ui.close_menu();
+                }
+
+                if is_browser
+                    && ui
+                        .selectable_label(lock_aspect_ratio, "Lock Aspect Ratio")
+                        .on_hover_text(
+                            "Turn this off to resize the browser into portrait or any custom shape",
+                        )
+                        .clicked()
+                {
+                    self.toggle_aspect_ratio_lock(id, preview_manager);
                     ui.close_menu();
                 }
 
