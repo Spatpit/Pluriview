@@ -27,7 +27,7 @@
 | **Browser Tiles** | Live web pages (YouTube, Twitch, anything) on the canvas with their own audio |
 | **Video Tiles** | Drop local videos onto the canvas; play, seek, volume, tracks, loop, reload |
 | **Folder Playlists** | Drop a folder to get a player plus a playlist tile (next/prev, shuffle, repeat) |
-| **Image & GIF Tiles** | Static images or animated GIFs; portable copies live beside the executable |
+| **Image & GIF Tiles** | Static images or animated GIFs loaded directly from their original local paths |
 | **Live Streams** | Optional Streamlink helper for Twitch and other stream URLs |
 | **Ad & Tracker Blocking** | uBlock Origin Lite is built in for browser tiles and on by default |
 | **Infinite Canvas** | Pan and zoom freely to organize your workspace |

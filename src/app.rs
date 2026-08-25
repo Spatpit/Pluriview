@@ -5787,8 +5787,8 @@ impl eframe::App for PluriviewApp {
             });
         }
 
-        // Image files are copied into `pluriview_data/media` so the saved
-        // relative path remains valid when a portable install is moved.
+        // Image tiles retain their validated original path. If that source is
+        // later moved, the saved tile remains as a recoverable placeholder.
         if let Some(position) = self.canvas.pending_media_add.take() {
             if let Some(path) = media::pick_file(self.main_hwnd) {
                 if let Err(error) = self.import_media_tile(&path, position) {

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-08-24
+
 ### Added
 - Image, animated GIF, browser, and libmpv video tiles can be cropped with Alt+drag; cropped browser pages keep capture and interaction coordinates aligned.
 - Browser tiles can unlock their aspect ratio from the context menu for portrait, square, ultrawide, and other custom viewport shapes.
