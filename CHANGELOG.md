@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Image/GIF tiles and image wallpapers use their original file paths instead of creating copies in `pluriview_data/media`; missing originals remain visible with a path-change message.
+- Libmpv video tiles show a vertical volume slider above the speaker icon on hover and use a larger time readout.
 
 ### Fixed
 - Manually frozen tiles remain frozen after closing and reopening Pluriview without restarting their source resources.

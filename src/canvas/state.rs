@@ -69,9 +69,10 @@ mod tests {
         apply_crop, apply_resize, browser_control_colors, capture_resolution_badge_rect,
         format_time, live_capture_display_size, media_placeholder_content,
         native_capture_canvas_size, pixel_aligned_rect, playlist_first_row_center,
-        rect_for_crop_change, stream_audio_badge_rect, video_placeholder_content,
-        window_capture_placeholder_content, window_capture_target, BrowserAction, CanvasState,
-        DragState, PlaylistAction, ResizeHandle, TileActivityAction, VideoAction,
+        rect_for_crop_change, stream_audio_badge_rect, video_placeholder_content, video_time_style,
+        video_volume_popover_rect, video_volume_slider_rect, window_capture_placeholder_content,
+        window_capture_target, BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle,
+        TileActivityAction, VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -118,6 +119,32 @@ mod tests {
     fn video_action_queue_starts_empty() {
         let canvas = CanvasState::default();
         assert!(canvas.pending_video_actions.is_empty());
+    }
+
+    #[test]
+    fn video_volume_popover_fits_the_tile_and_stays_above_the_mute_control() {
+        let tile = Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::new(400.0, 240.0));
+        let mute = Rect::from_min_size(Pos2::new(466.0, 287.0), Vec2::splat(26.0));
+
+        let popover = video_volume_popover_rect(tile, mute);
+
+        assert!(tile.contains(popover.min));
+        assert!(tile.contains(popover.max));
+        assert_eq!(popover.width(), 36.0);
+        assert!((popover.center().x - mute.center().x).abs() <= 1.0);
+        assert!((tile.right() - popover.right() - 3.0).abs() < f32::EPSILON);
+        assert!((mute.top() - popover.bottom() - 6.0).abs() < f32::EPSILON);
+
+        let slider = video_volume_slider_rect(popover);
+        assert!(popover.contains(slider.min));
+        assert!(popover.contains(slider.max));
+        assert!((popover.bottom() - slider.bottom() - 8.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn video_time_readout_uses_larger_fonts_without_crowding_the_label() {
+        assert_eq!(video_time_style(360.0), (108.0, 12.0));
+        assert_eq!(video_time_style(359.0), (82.0, 10.0));
     }
 
     #[test]
@@ -1762,6 +1789,35 @@ fn format_time(seconds: Option<f64>) -> String {
     }
 }
 
+fn video_volume_popover_rect(tile_rect: Rect, mute_rect: Rect) -> Rect {
+    const WIDTH: f32 = 36.0;
+    const HEIGHT: f32 = 116.0;
+    const TOP_MARGIN: f32 = 4.0;
+    const SIDE_MARGIN: f32 = 3.0;
+
+    let left_limit = tile_rect.left() + SIDE_MARGIN;
+    let right_limit = (tile_rect.right() - WIDTH - SIDE_MARGIN).max(left_limit);
+    let left = (mute_rect.center().x - WIDTH * 0.5).clamp(left_limit, right_limit);
+    let bottom = mute_rect.top() - 6.0;
+    let top = (bottom - HEIGHT).max(tile_rect.top() + TOP_MARGIN);
+    Rect::from_min_max(Pos2::new(left, top), Pos2::new(left + WIDTH, bottom))
+}
+
+fn video_volume_slider_rect(popover: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(popover.left() + 8.0, popover.top() + 24.0),
+        popover.right_bottom() - Vec2::new(8.0, 8.0),
+    )
+}
+
+fn video_time_style(tile_width: f32) -> (f32, f32) {
+    if tile_width >= 360.0 {
+        (108.0, 12.0)
+    } else {
+        (82.0, 10.0)
+    }
+}
+
 fn playlist_zoom(zoom: f32) -> f32 {
     zoom.max(0.05)
 }
@@ -2339,6 +2395,9 @@ pub struct CanvasState {
     /// Video tile actions queued by hover controls / context menus.
     pub pending_video_actions: Vec<(PreviewId, VideoAction)>,
 
+    /// Video tile whose speaker control currently owns the hover volume slider.
+    video_volume_hover: Option<PreviewId>,
+
     /// Freeze/resume requests queued by tile or background context menus.
     pub pending_tile_activity_actions: Vec<(PreviewId, TileActivityAction)>,
 
@@ -2414,6 +2473,7 @@ impl Default for CanvasState {
             pending_stream_add: None,
             pending_browser_actions: Vec::new(),
             pending_video_actions: Vec::new(),
+            video_volume_hover: None,
             pending_tile_activity_actions: Vec::new(),
             pending_playlist_actions: Vec::new(),
             pending_browser_restore: None,
@@ -2445,6 +2505,7 @@ impl CanvasState {
         self.marquee = None;
         self.pinned_drag_origins.clear();
         self.pinned_pointer_drag = None;
+        self.video_volume_hover = None;
         self.animation.preview_springs.clear();
     }
 
@@ -2453,6 +2514,7 @@ impl CanvasState {
         self.animation.preview_springs.clear();
         self.pinned_drag_origins.clear();
         self.pinned_pointer_drag = None;
+        self.video_volume_hover = None;
     }
 
     fn prune_preview_animations(&mut self, preview_manager: &PreviewManager) {
@@ -4111,13 +4173,11 @@ impl CanvasState {
                         bottom_overlay.right_top() + Vec2::new(-34.0, 13.0),
                         Vec2::splat(26.0),
                     );
-                    let mute_response = ui
-                        .interact(
-                            mute_rect,
-                            ui.id().with(("video_mute", id.0)),
-                            Sense::click(),
-                        )
-                        .on_hover_text(if muted { "Unmute" } else { "Mute" });
+                    let mute_response = ui.interact(
+                        mute_rect,
+                        ui.id().with(("video_mute", id.0)),
+                        Sense::click(),
+                    );
                     painter.text(
                         mute_rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -4140,16 +4200,73 @@ impl CanvasState {
                             .push((id, VideoAction::ToggleMute));
                     }
 
+                    let volume_popover = video_volume_popover_rect(screen_rect, mute_rect);
+                    let pointer_over_volume_controls = input
+                        .hover_pos
+                        .is_some_and(|pointer| mute_rect.union(volume_popover).contains(pointer));
+                    if mute_response.hovered()
+                        || (self.video_volume_hover == Some(id) && pointer_over_volume_controls)
+                    {
+                        self.video_volume_hover = Some(id);
+                    } else if self.video_volume_hover == Some(id) {
+                        self.video_volume_hover = None;
+                    }
+
+                    if self.video_volume_hover == Some(id) {
+                        painter.rect_filled(
+                            volume_popover,
+                            7.0,
+                            Color32::from_rgba_unmultiplied(18, 18, 23, 238),
+                        );
+                        painter.rect_stroke(
+                            volume_popover,
+                            7.0,
+                            Stroke::new(1.0, Color32::from_rgb(70, 70, 78)),
+                        );
+
+                        let mut volume = video_playback.volume;
+                        let label_rect = Rect::from_min_max(
+                            volume_popover.min + Vec2::new(4.0, 4.0),
+                            Pos2::new(volume_popover.right() - 4.0, volume_popover.top() + 22.0),
+                        );
+                        painter.text(
+                            label_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{volume:.0}%"),
+                            egui::FontId::monospace(10.0),
+                            Color32::from_rgb(215, 215, 222),
+                        );
+                        let slider_rect = video_volume_slider_rect(volume_popover);
+                        let volume_response = ui
+                            .allocate_new_ui(
+                                egui::UiBuilder::new().max_rect(slider_rect).layout(
+                                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                                ),
+                                |ui| {
+                                    // Vertical sliders otherwise keep egui's default 100-point
+                                    // track and can overflow a compact popup.
+                                    ui.spacing_mut().slider_width = slider_rect.height();
+                                    ui.add(
+                                        egui::Slider::new(&mut volume, 0.0..=100.0)
+                                            .vertical()
+                                            .show_value(false)
+                                            .trailing_fill(true),
+                                    )
+                                },
+                            )
+                            .inner;
+                        if controls_enabled && volume_response.changed() {
+                            self.pending_video_actions
+                                .push((id, VideoAction::SetVolume(volume)));
+                        }
+                    }
+
                     let time_text = format!(
                         "{} / {}",
                         format_time(video_playback.time_pos),
                         format_time(video_playback.duration),
                     );
-                    let time_width = if screen_rect.width() >= 360.0 {
-                        94.0
-                    } else {
-                        72.0
-                    };
+                    let (time_width, time_font_size) = video_time_style(screen_rect.width());
                     let time_rect = Rect::from_min_size(
                         Pos2::new(
                             mute_rect.left() - time_width - 4.0,
@@ -4161,11 +4278,7 @@ impl CanvasState {
                         time_rect.center(),
                         egui::Align2::CENTER_CENTER,
                         time_text,
-                        egui::FontId::monospace(if screen_rect.width() >= 360.0 {
-                            10.0
-                        } else {
-                            8.5
-                        }),
+                        egui::FontId::monospace(time_font_size),
                         Color32::from_rgb(190, 190, 198),
                     );
 

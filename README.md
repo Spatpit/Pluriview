@@ -51,7 +51,7 @@ Keep `libmpv-2.dll` next to `pluriview.exe`. Then:
 
 - Drop a video file onto the canvas, or use **File → Add Video...**
 - Drop a folder of videos to create a linked player and playlist
-- Use play/pause, seek, volume, mute, speed, loop, audio/subtitle tracks, and reload
+- Use play/pause, seek, mute, speed, loop, audio/subtitle tracks, and reload; hover the speaker icon for a vertical volume slider
 - Crop the visible video region with Alt+drag on tile edges or corners
 - Hover the seek bar to preview a frame without moving the playing video
 - Live streams do not get timeline thumbnails
