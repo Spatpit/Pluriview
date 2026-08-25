@@ -28,6 +28,12 @@ const CAPTURE_HIBERNATE_AFTER: Duration = Duration::from_secs(30);
 /// Screen-space hysteresis around the viewport. A tile just beyond an edge is
 /// cheap to return to and should not start the hibernation timer.
 const CAPTURE_HIBERNATE_MARGIN_POINTS: f32 = 128.0;
+/// A source that has not delivered its first frame should remain visibly in a
+/// connecting state without forcing the entire canvas into an uncapped loop.
+const WINDOW_CONNECTING_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+/// Browser overlays may stay transparent until their external data arrives.
+/// Their loading card needs motion, but not an uncapped canvas repaint loop.
+const TRANSPARENT_BROWSER_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
@@ -162,6 +168,12 @@ mod tests {
             Pos2::new(100.0, 100.0),
             Vec2::splat(50.0),
         );
+        let disabled = previews.add(
+            "disabled".to_owned(),
+            Pos2::new(200.0, 200.0),
+            Vec2::splat(50.0),
+        );
+        previews.get_mut(disabled).unwrap().left_click_disabled = true;
         let mut captures = CaptureCoordinator::new();
 
         let _ = context.run(
@@ -180,6 +192,159 @@ mod tests {
         assert_eq!(canvas.selection.len(), 2);
         assert!(canvas.selection.contains(&first));
         assert!(canvas.selection.contains(&second));
+        assert!(!canvas.selection.contains(&disabled));
+    }
+
+    #[test]
+    fn left_click_hit_testing_skips_disabled_tiles_but_secondary_targeting_does_not() {
+        let canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let lower = previews.add("lower".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let upper = previews.add("upper".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        previews.get_mut(upper).unwrap().left_click_disabled = true;
+        let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        let pointer = Pos2::new(50.0, 50.0);
+
+        assert_eq!(
+            canvas.preview_at_screen(pointer, canvas_rect, &previews),
+            Some(upper)
+        );
+        assert_eq!(
+            canvas.left_click_preview_at_screen(pointer, canvas_rect, &previews),
+            Some(lower)
+        );
+    }
+
+    #[test]
+    fn disabled_tile_passes_primary_drag_to_the_tile_underneath() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let lower = previews.add(
+            "lower".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 120.0),
+        );
+        let upper = previews.add(
+            "upper".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 120.0),
+        );
+        previews.get_mut(upper).unwrap().left_click_disabled = true;
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+
+        let mut run_frame = |events| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            );
+        };
+
+        let start = Pos2::new(200.0, 160.0);
+        let end = Pos2::new(240.0, 160.0);
+        run_frame(vec![Event::PointerMoved(start)]);
+        run_frame(vec![Event::PointerButton {
+            pos: start,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerButton {
+            pos: start,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerButton {
+            pos: start,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerMoved(end)]);
+        run_frame(vec![Event::PointerButton {
+            pos: end,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        assert!(previews.get(lower).unwrap().position.x > 100.0);
+        assert_eq!(
+            previews.get(upper).unwrap().position,
+            Pos2::new(100.0, 100.0)
+        );
+        assert_eq!(canvas.selection, vec![lower]);
+    }
+
+    #[test]
+    fn disabled_tile_keeps_its_right_click_context_menu() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let _lower = previews.add(
+            "lower".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 120.0),
+        );
+        let upper = previews.add(
+            "upper".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 120.0),
+        );
+        previews.get_mut(upper).unwrap().left_click_disabled = true;
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0));
+        let pointer = Pos2::new(200.0, 160.0);
+
+        let mut run_frame = |events| {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, &mut previews, &mut captures, context, true);
+                        });
+                },
+            );
+        };
+
+        run_frame(vec![Event::PointerMoved(pointer)]);
+        run_frame(vec![Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Secondary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        run_frame(vec![Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Secondary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
+        assert_eq!(canvas.selection, vec![upper]);
+        assert!(canvas.last_secondary_click.is_none());
+        assert_eq!(
+            context.layer_id_at(pointer).map(|layer| layer.order),
+            Some(Order::Foreground)
+        );
     }
 
     #[test]
@@ -567,6 +732,29 @@ mod tests {
             canvas.preview_screen_rect(previews.get(id).unwrap(), viewport),
             before
         );
+    }
+
+    #[test]
+    fn disabling_left_click_clears_selection_and_requests_browser_interaction_exit() {
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add_browser_placeholder(
+            "https://example.com".to_owned(),
+            Pos2::ZERO,
+            Vec2::new(320.0, 180.0),
+            FpsPreset::Medium,
+        );
+        canvas.selection = vec![id];
+        canvas.interactive_browser = Some(id);
+
+        canvas.toggle_left_click_disabled(id, &mut previews);
+
+        assert!(previews.get(id).unwrap().left_click_disabled);
+        assert!(canvas.selection.is_empty());
+        assert_eq!(canvas.last_double_clicked, Some(id));
+
+        canvas.toggle_left_click_disabled(id, &mut previews);
+        assert!(!previews.get(id).unwrap().left_click_disabled);
     }
 
     #[test]
@@ -1532,6 +1720,16 @@ pub enum BrowserAction {
     EditUrl,
 }
 
+fn show_context_menu_if(
+    response: &egui::Response,
+    active: bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    if active {
+        let _ = response.context_menu(add_contents);
+    }
+}
+
 fn browser_control_colors(
     action: BrowserAction,
     hovered: bool,
@@ -1689,6 +1887,7 @@ struct TileInfo {
     window_exe: Option<String>,
     is_spout_capture: bool,
     viewport_pin: Option<ViewportPin>,
+    left_click_disabled: bool,
     muted: bool,
     stream_audio: bool,
     capture_failed: bool,
@@ -1725,6 +1924,7 @@ impl TileInfo {
             window_exe: preview.window_exe.clone(),
             is_spout_capture: preview.is_spout_capture(),
             viewport_pin: preview.viewport_pin,
+            left_click_disabled: preview.left_click_disabled,
             muted: preview.browser_muted,
             stream_audio: preview.stream_audio,
             capture_failed: preview.capture_error.is_some(),
@@ -1760,6 +1960,7 @@ impl TileInfo {
         self.window_exe.clone_from(&preview.window_exe);
         self.is_spout_capture = preview.is_spout_capture();
         self.viewport_pin = preview.viewport_pin;
+        self.left_click_disabled = preview.left_click_disabled;
         self.muted = preview.browser_muted;
         self.stream_audio = preview.stream_audio;
         self.capture_failed = preview.capture_error.is_some();
@@ -2704,6 +2905,33 @@ impl CanvasState {
         }
     }
 
+    fn toggle_left_click_disabled(&mut self, id: PreviewId, preview_manager: &mut PreviewManager) {
+        let Some(disabled) = preview_manager.get_mut(id).map(|preview| {
+            preview.left_click_disabled = !preview.left_click_disabled;
+            preview.left_click_disabled
+        }) else {
+            return;
+        };
+
+        if disabled {
+            if self.focus.as_ref().is_some_and(|focus| focus.id == id) {
+                self.exit_focus();
+            }
+            self.selection.retain(|selected| *selected != id);
+            self.animation.preview_springs.remove(&id);
+            self.pinned_drag_origins
+                .retain(|(drag_id, _)| *drag_id != id);
+            if self.pinned_pointer_drag.is_some_and(|drag| drag.id == id) {
+                self.pinned_pointer_drag = None;
+            }
+            if self.interactive_browser == Some(id) {
+                // The app consumes this runtime request and parks the native
+                // WebView host so it cannot continue intercepting pointer input.
+                self.last_double_clicked = Some(id);
+            }
+        }
+    }
+
     fn set_native_capture_size(
         &mut self,
         id: PreviewId,
@@ -2770,6 +2998,9 @@ impl CanvasState {
     ) -> Option<(PreviewId, ResizeHandle)> {
         for id in &self.selection {
             if let Some(preview) = preview_manager.get(*id) {
+                if preview.left_click_disabled {
+                    continue;
+                }
                 let screen_rect = self.preview_screen_rect(preview, canvas_rect);
 
                 let handles = [
@@ -2813,6 +3044,25 @@ impl CanvasState {
             .map(|preview| preview.id)
     }
 
+    fn left_click_preview_at_screen(
+        &self,
+        screen_pos: Pos2,
+        canvas_rect: Rect,
+        preview_manager: &PreviewManager,
+    ) -> Option<PreviewId> {
+        preview_manager
+            .all()
+            .filter(|preview| {
+                preview.removing.is_none()
+                    && !preview.left_click_disabled
+                    && self
+                        .preview_screen_rect(preview, canvas_rect)
+                        .contains(screen_pos)
+            })
+            .max_by_key(|preview| (preview.viewport_pin.is_some(), preview.z_order))
+            .map(|preview| preview.id)
+    }
+
     fn handle_pinned_pointer_drag(
         &mut self,
         id: PreviewId,
@@ -2826,7 +3076,11 @@ impl CanvasState {
             input,
             show_overlays,
         } = frame;
-        if input.pointer_blocked {
+        if input.pointer_blocked
+            || preview_manager
+                .get(id)
+                .is_some_and(|preview| preview.left_click_disabled)
+        {
             return false;
         }
         if let Some(drag) = self.pinned_pointer_drag.filter(|drag| drag.id == id) {
@@ -2853,7 +3107,7 @@ impl CanvasState {
         }) else {
             return false;
         };
-        if self.preview_at_screen(pointer, canvas_rect, preview_manager) != Some(id) {
+        if self.left_click_preview_at_screen(pointer, canvas_rect, preview_manager) != Some(id) {
             return false;
         }
         let over_resize_handle = show_overlays
@@ -3305,7 +3559,7 @@ impl CanvasState {
         let mut selected = marquee.base_selection.clone();
         for preview in preview_manager
             .all()
-            .filter(|preview| preview.removing.is_none())
+            .filter(|preview| preview.removing.is_none() && !preview.left_click_disabled)
         {
             let screen_rect = self.preview_screen_rect(preview, canvas_rect);
             if selection_rect.intersects(screen_rect) && !selected.contains(&preview.id) {
@@ -3337,7 +3591,7 @@ impl CanvasState {
                     .is_some();
                 if !over_resize_handle
                     && self
-                        .preview_at_screen(pointer, canvas_rect, preview_manager)
+                        .left_click_preview_at_screen(pointer, canvas_rect, preview_manager)
                         .is_none()
                 {
                     self.marquee = Some(MarqueeSelection {
@@ -3479,7 +3733,7 @@ impl CanvasState {
         if bg_response.clicked() && !input.ctrl {
             if let Some(mouse_pos) = input.interact_pos {
                 if self
-                    .preview_at_screen(mouse_pos, canvas_rect, preview_manager)
+                    .left_click_preview_at_screen(mouse_pos, canvas_rect, preview_manager)
                     .is_none()
                 {
                     self.selection.clear();
@@ -3487,90 +3741,114 @@ impl CanvasState {
             }
         }
 
-        // Canvas context menu (right-click on empty space)
-        if bg_response.secondary_clicked() {
+        // Canvas context menu (right-click on empty space). Disabled tiles do
+        // not own primary interaction, so the background response may also
+        // report their secondary click; exclude every visible tile explicitly.
+        let background_secondary_target = ui
+            .input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary))
+            && input.interact_pos.is_some_and(|pointer| {
+                self.preview_at_screen(pointer, canvas_rect, preview_manager)
+                    .is_none()
+            });
+        let mut background_context_response = bg_response.clone();
+        if background_secondary_target {
+            background_context_response.sense = Sense::click();
+            background_context_response.contains_pointer = true;
+            background_context_response.hovered = true;
+            background_context_response.clicked = true;
+            background_context_response.interact_pointer_pos = input.interact_pos;
             self.last_secondary_click = input.interact_pos;
         }
 
-        bg_response.context_menu(|ui| {
-            if ui.button("Add Window...").clicked() {
-                if let Some(screen_pos) = self.last_secondary_click {
-                    let canvas_pos = self.screen_to_canvas(screen_pos, canvas_rect);
-                    self.pending_quick_add = Some((canvas_pos, screen_pos));
-                }
-                ui.close_menu();
-            }
-            if ui.button("Add Browser...").clicked() {
-                if let Some(screen_pos) = self.last_secondary_click {
-                    self.pending_browser_add = Some(self.screen_to_canvas(screen_pos, canvas_rect));
-                }
-                ui.close_menu();
-            }
-            if ui.button("Add Image...").clicked() {
-                if let Some(screen_pos) = self.last_secondary_click {
-                    self.pending_media_add = Some(self.screen_to_canvas(screen_pos, canvas_rect));
-                }
-                ui.close_menu();
-            }
-            if ui.button("Add Video...").clicked() {
-                if let Some(screen_pos) = self.last_secondary_click {
-                    self.pending_video_add = Some(self.screen_to_canvas(screen_pos, canvas_rect));
-                }
-                ui.close_menu();
-            }
-            if ui.button("Add Stream...").clicked() {
-                if let Some(screen_pos) = self.last_secondary_click {
-                    self.pending_stream_add = Some(self.screen_to_canvas(screen_pos, canvas_rect));
-                }
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui.button("Reset View").clicked() {
-                self.reset();
-                ui.close_menu();
-            }
-            ui.separator();
-            ui.checkbox(&mut self.show_grid, "Show Grid");
-            if ui.button("Set Wallpaper...").clicked() {
-                self.pending_wallpaper_pick = true;
-                ui.close_menu();
-            }
-            if self.wallpaper.is_some() && ui.button("Clear Wallpaper").clicked() {
-                self.pending_wallpaper_clear = true;
-                ui.close_menu();
-            }
-            ui.separator();
-            if !self.selection.is_empty() {
-                let selected = self.selection.clone();
-                let any_live = selected.iter().any(|id| {
-                    preview_manager
-                        .get(*id)
-                        .is_some_and(|preview| !preview.manually_frozen)
-                });
-                let any_frozen = selected.iter().any(|id| {
-                    preview_manager
-                        .get(*id)
-                        .is_some_and(|preview| preview.manually_frozen)
-                });
-                if any_live && ui.button("Freeze Selected").clicked() {
-                    self.queue_activity_for_selection(&selected, TileActivityAction::Freeze);
+        let background_context_menu_active =
+            background_context_response.context_menu_opened() || background_secondary_target;
+        show_context_menu_if(
+            &background_context_response,
+            background_context_menu_active,
+            |ui| {
+                if ui.button("Add Window...").clicked() {
+                    if let Some(screen_pos) = self.last_secondary_click {
+                        let canvas_pos = self.screen_to_canvas(screen_pos, canvas_rect);
+                        self.pending_quick_add = Some((canvas_pos, screen_pos));
+                    }
                     ui.close_menu();
                 }
-                if any_frozen && ui.button("Resume Selected").clicked() {
-                    self.queue_activity_for_selection(&selected, TileActivityAction::Resume);
+                if ui.button("Add Browser...").clicked() {
+                    if let Some(screen_pos) = self.last_secondary_click {
+                        self.pending_browser_add =
+                            Some(self.screen_to_canvas(screen_pos, canvas_rect));
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("Add Image...").clicked() {
+                    if let Some(screen_pos) = self.last_secondary_click {
+                        self.pending_media_add =
+                            Some(self.screen_to_canvas(screen_pos, canvas_rect));
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("Add Video...").clicked() {
+                    if let Some(screen_pos) = self.last_secondary_click {
+                        self.pending_video_add =
+                            Some(self.screen_to_canvas(screen_pos, canvas_rect));
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("Add Stream...").clicked() {
+                    if let Some(screen_pos) = self.last_secondary_click {
+                        self.pending_stream_add =
+                            Some(self.screen_to_canvas(screen_pos, canvas_rect));
+                    }
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Remove Selected").clicked() {
-                    for id in self.selection.clone() {
-                        capture_coordinator.stop_capture(id);
-                        preview_manager.start_removal(id);
-                    }
-                    self.selection.clear();
+                if ui.button("Reset View").clicked() {
+                    self.reset();
                     ui.close_menu();
                 }
-            }
-        });
+                ui.separator();
+                ui.checkbox(&mut self.show_grid, "Show Grid");
+                if ui.button("Set Wallpaper...").clicked() {
+                    self.pending_wallpaper_pick = true;
+                    ui.close_menu();
+                }
+                if self.wallpaper.is_some() && ui.button("Clear Wallpaper").clicked() {
+                    self.pending_wallpaper_clear = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                if !self.selection.is_empty() {
+                    let selected = self.selection.clone();
+                    let any_live = selected.iter().any(|id| {
+                        preview_manager
+                            .get(*id)
+                            .is_some_and(|preview| !preview.manually_frozen)
+                    });
+                    let any_frozen = selected.iter().any(|id| {
+                        preview_manager
+                            .get(*id)
+                            .is_some_and(|preview| preview.manually_frozen)
+                    });
+                    if any_live && ui.button("Freeze Selected").clicked() {
+                        self.queue_activity_for_selection(&selected, TileActivityAction::Freeze);
+                        ui.close_menu();
+                    }
+                    if any_frozen && ui.button("Resume Selected").clicked() {
+                        self.queue_activity_for_selection(&selected, TileActivityAction::Resume);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Remove Selected").clicked() {
+                        for id in self.selection.clone() {
+                            capture_coordinator.stop_capture(id);
+                            preview_manager.start_removal(id);
+                        }
+                        self.selection.clear();
+                        ui.close_menu();
+                    }
+                }
+            },
+        );
 
         // Keyboard shortcuts are app-wide while Pluriview owns focus. They do
         // not depend on pointer position; the app suppresses them while a text
@@ -3584,7 +3862,11 @@ impl CanvasState {
         }
 
         if input.select_all {
-            self.selection = preview_manager.all_ids();
+            self.selection = preview_manager
+                .all()
+                .filter(|preview| !preview.left_click_disabled)
+                .map(|preview| preview.id)
+                .collect();
         }
     }
 
@@ -3625,6 +3907,8 @@ impl CanvasState {
         preview_info.sort_by_key(|info| (info.viewport_pin.is_some(), info.z_order));
 
         let mut any_spawn_or_remove_animating = false;
+        let mut window_capture_connecting = false;
+        let mut transparent_browser_waiting = false;
 
         for info in &preview_info {
             let id = info.id;
@@ -3646,6 +3930,7 @@ impl CanvasState {
             let window_exe = info.window_exe.as_deref();
             let is_spout_capture = info.is_spout_capture;
             let viewport_pin = info.viewport_pin;
+            let left_click_disabled = info.left_click_disabled;
             let muted = if is_video {
                 info.video_playback.muted
             } else {
@@ -3714,12 +3999,39 @@ impl CanvasState {
                 continue;
             }
 
-            // Create interactive area for this preview
+            let secondary_clicked_raw =
+                ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary));
+            let secondary_target = secondary_clicked_raw
+                && input
+                    .interact_pos
+                    .or(input.hover_pos)
+                    .is_some_and(|pointer| {
+                        self.preview_at_screen(pointer, canvas_rect, preview_manager) == Some(id)
+                    });
+
+            // Create interactive area for primary input. A disabled tile uses
+            // hover-only sense so tiles underneath can own clicks and drags.
             let preview_response = ui.interact(
                 screen_rect,
                 ui.id().with(("preview", id.0)),
-                Sense::click_and_drag(),
+                if left_click_disabled {
+                    Sense::hover()
+                } else {
+                    Sense::click_and_drag()
+                },
             );
+            // Context menus are button-agnostic in egui, so registering click
+            // sense on a disabled tile would also swallow primary input. Route
+            // the raw secondary click to the visually topmost tile and mark a
+            // cloned response as clicked without changing widget ownership.
+            let mut context_response = preview_response.clone();
+            if secondary_target {
+                context_response.sense = Sense::click();
+                context_response.contains_pointer = true;
+                context_response.hovered = true;
+                context_response.clicked = true;
+                context_response.interact_pointer_pos = input.interact_pos.or(input.hover_pos);
+            }
 
             let pinned_pointer_active = viewport_pin.is_some_and(|pin| {
                 self.handle_pinned_pointer_drag(id, pin, screen_rect, frame, preview_manager)
@@ -3764,7 +4076,7 @@ impl CanvasState {
                 is_browser && browser_waiting_for_content && !manually_frozen;
             if browser_loading_placeholder {
                 paint_browser_placeholder(&painter, anim_rect, browser_status, input.time as f32);
-                any_spawn_or_remove_animating |=
+                transparent_browser_waiting |=
                     !matches!(browser_status, BrowserTileStatus::Failed(_));
             }
 
@@ -3820,7 +4132,7 @@ impl CanvasState {
                 } else if is_inactive_window {
                     paint_inactive_window_placeholder(&painter, anim_rect, window_exe);
                 } else {
-                    any_spawn_or_remove_animating |= paint_window_capture_placeholder(
+                    window_capture_connecting |= paint_window_capture_placeholder(
                         &painter,
                         anim_rect,
                         capture_failed,
@@ -3840,9 +4152,11 @@ impl CanvasState {
             let pointer_over_tile = !input.pointer_blocked
                 && input.hover_pos.is_some_and(|pointer_pos| {
                     screen_rect.contains(pointer_pos)
-                        && preview_manager
-                            .get_preview_at(self.screen_to_canvas(pointer_pos, canvas_rect))
-                            == Some(id)
+                        && self.left_click_preview_at_screen(
+                            pointer_pos,
+                            canvas_rect,
+                            preview_manager,
+                        ) == Some(id)
                 });
             if show_overlays && pointer_over_tile {
                 // Playlist tiles already have a designed header; a second title
@@ -4491,6 +4805,8 @@ impl CanvasState {
                 }
             }
 
+            let secondary_clicked = context_response.secondary_clicked();
+
             // Handle click to select
             if preview_response.clicked() {
                 if input.ctrl {
@@ -4506,7 +4822,7 @@ impl CanvasState {
 
             // A context click on an unselected tile makes it the target;
             // clicking any selected tile keeps the whole group selected.
-            if preview_response.secondary_clicked() && !self.selection.contains(&id) {
+            if secondary_clicked && !self.selection.contains(&id) {
                 self.selection = vec![id];
             }
 
@@ -4662,7 +4978,9 @@ impl CanvasState {
             }
 
             // Context menu for preview
-            preview_response.context_menu(|ui| {
+            let context_menu_interaction_active =
+                context_response.context_menu_opened() || secondary_target;
+            show_context_menu_if(&context_response, context_menu_interaction_active, |ui| {
                 ui.set_max_width(280.0);
                 ui.label(egui::RichText::new(compact_title(title, 42)).strong());
                 ui.separator();
@@ -4756,12 +5074,19 @@ impl CanvasState {
 
                 if ui
                     .selectable_label(viewport_pin.is_some(), "Pin to Viewport")
-                    .on_hover_text(
-                        "Keep this tile fixed above the canvas while panning or zooming",
-                    )
+                    .on_hover_text("Keep this tile fixed above the canvas while panning or zooming")
                     .clicked()
                 {
                     self.toggle_viewport_pin(id, canvas_rect, preview_manager);
+                    ui.close_menu();
+                }
+
+                if ui
+                    .selectable_label(left_click_disabled, "Disable Left Click")
+                    .on_hover_text("Let primary clicks and drags pass through to tiles underneath")
+                    .clicked()
+                {
+                    self.toggle_left_click_disabled(id, preview_manager);
                     ui.close_menu();
                 }
                 ui.separator();
@@ -4825,7 +5150,10 @@ impl CanvasState {
                         ui.label(egui::RichText::new("Browser preview is starting…").weak());
                     }
                     if ui
-                        .add_enabled(browser_ready, egui::Button::new("Interact"))
+                        .add_enabled(
+                            browser_ready && !left_click_disabled,
+                            egui::Button::new("Interact"),
+                        )
                         .clicked()
                     {
                         self.last_double_clicked = Some(id);
@@ -5060,7 +5388,10 @@ impl CanvasState {
                 ui.separator();
 
                 if ui
-                    .add_enabled(viewport_pin.is_none(), egui::Button::new("Focus on This Tile"))
+                    .add_enabled(
+                        viewport_pin.is_none(),
+                        egui::Button::new("Focus on This Tile"),
+                    )
                     .clicked()
                 {
                     self.focus_on_tile(id, rect, canvas_rect);
@@ -5093,6 +5424,12 @@ impl CanvasState {
         // still waiting on its first frame so the animations stay smooth.
         if any_spawn_or_remove_animating {
             ctx.request_repaint();
+        }
+        if window_capture_connecting {
+            ctx.request_repaint_after(WINDOW_CONNECTING_REPAINT_INTERVAL);
+        }
+        if transparent_browser_waiting {
+            ctx.request_repaint_after(TRANSPARENT_BROWSER_REPAINT_INTERVAL);
         }
     }
 
@@ -5719,6 +6056,7 @@ impl CanvasState {
                     preview.set_fps_preset(info.fps_preset);
                     preview.crop_uv = info.crop_uv;
                     preview.viewport_pin = info.viewport_pin;
+                    preview.left_click_disabled = info.left_click_disabled;
                 }
                 capture_coordinator.start_spout_capture(id, sender, info.fps_preset.as_u32());
             } else if info.window_waiting_for_match {
@@ -5734,6 +6072,7 @@ impl CanvasState {
                     preview.crop_uv = info.crop_uv;
                     preview.stream_audio = info.stream_audio;
                     preview.viewport_pin = info.viewport_pin;
+                    preview.left_click_disabled = info.left_click_disabled;
                 }
             } else if let Some(handle) = info.window_handle {
                 let capture_title = info.title.clone();
@@ -5750,6 +6089,7 @@ impl CanvasState {
                     preview.crop_uv = info.crop_uv;
                     preview.stream_audio = info.stream_audio;
                     preview.viewport_pin = info.viewport_pin;
+                    preview.left_click_disabled = info.left_click_disabled;
                 }
                 capture_coordinator.start_capture(
                     id,
@@ -5780,8 +6120,11 @@ impl CanvasState {
             .selection
             .iter()
             .filter_map(|id| {
-                preview_manager.get(*id).map(|p| {
-                    (
+                preview_manager.get(*id).and_then(|p| {
+                    if p.left_click_disabled {
+                        return None;
+                    }
+                    Some((
                         *id,
                         p.rect(),
                         p.source_aspect_ratio,
@@ -5792,7 +6135,7 @@ impl CanvasState {
                         p.is_window_capture(),
                         p.is_video(),
                         p.is_playlist(),
-                    )
+                    ))
                 })
             })
             .collect();

@@ -32,6 +32,7 @@
 | **Ad & Tracker Blocking** | uBlock Origin Lite is built in for browser tiles and on by default |
 | **Infinite Canvas** | Pan and zoom freely to organize your workspace |
 | **Viewport Pinning** | Pin any tile so it stays fixed on screen while the canvas pans or zooms |
+| **Click Pass-Through** | Disable left click on an overlay tile to interact with tiles underneath it |
 | **Live Wallpaper** | Image, GIF, or looping muted video behind the canvas; it stays screen-sized |
 | **Tile Freeze** | Pause live work on selected tiles and keep the last frame until you resume |
 | **Stream Audio Monitor** | Copy tile audio into Pluriview so Discord/OBS window shares pick it up |

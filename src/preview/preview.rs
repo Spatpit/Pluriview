@@ -224,6 +224,11 @@ pub struct Preview {
     /// Screen-space placement when this tile is pinned above the canvas.
     pub viewport_pin: Option<ViewportPin>,
 
+    /// When true, primary pointer interaction passes through this tile to the
+    /// next eligible tile or the canvas. Secondary click remains available so
+    /// the user can reopen the context menu and disable this setting.
+    pub left_click_disabled: bool,
+
     /// Display title (cached from window)
     pub title: String,
 
@@ -367,6 +372,7 @@ impl Preview {
             window_waiting_for_match: false,
             spout_sender: None,
             viewport_pin: None,
+            left_click_disabled: false,
             title,
             capture_paused: false,
             capture_hibernated: false,
@@ -588,9 +594,9 @@ impl Preview {
         data: Vec<u8>,
     ) {
         self.clear_capture_error();
-        if self.browser_waiting_for_content
-            && data.iter().skip(3).step_by(4).any(|alpha| *alpha != 0)
-        {
+        let transparent_browser_startup = self.browser_waiting_for_content
+            && !data.iter().skip(3).step_by(4).any(|alpha| *alpha != 0);
+        if self.browser_waiting_for_content && !transparent_browser_startup {
             self.browser_waiting_for_content = false;
         }
         if source_width > 0 && source_height > 0 {
@@ -602,6 +608,13 @@ impl Preview {
         }
         if width > 0 && height > 0 {
             self.frame_size = Some((width, height));
+        }
+
+        // The loading card deliberately covers fully transparent startup
+        // frames. Avoid allocating/uploading textures that cannot be seen.
+        if transparent_browser_startup {
+            self.frame_buffer = None;
+            return;
         }
 
         self.frame_buffer = Some(FrameData {
@@ -778,6 +791,9 @@ pub struct PreviewLayout {
     /// Viewport placement for tiles pinned independently of the canvas.
     #[serde(default)]
     pub viewport_pin: Option<ViewportPin>,
+    /// Treat this tile as transparent to primary pointer interaction.
+    #[serde(default)]
+    pub left_click_disabled: bool,
 }
 
 impl From<&Preview> for PreviewLayout {
@@ -804,6 +820,7 @@ impl From<&Preview> for PreviewLayout {
             folder_playlist: preview.folder_playlist.as_ref().map(FolderPlaylist::layout),
             spout_sender: preview.spout_sender.clone(),
             viewport_pin: preview.viewport_pin,
+            left_click_disabled: preview.left_click_disabled,
         }
     }
 }
@@ -1146,6 +1163,35 @@ mod tests {
     }
 
     #[test]
+    fn older_saved_tiles_default_to_left_click_enabled() {
+        let preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        value.as_object_mut().unwrap().remove("left_click_disabled");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(!restored.left_click_disabled);
+    }
+
+    #[test]
+    fn disabled_left_click_round_trips_through_layout() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.left_click_disabled = true;
+
+        let restored = PreviewLayout::from(&preview);
+        assert!(restored.left_click_disabled);
+    }
+
+    #[test]
     fn frozen_state_round_trips_through_layout() {
         let mut preview = Preview::new(
             PreviewId(1),
@@ -1340,9 +1386,11 @@ mod tests {
 
         preview.update_frame(2, 1, vec![0, 0, 0, 0, 0, 0, 0, 0]);
         assert!(preview.browser_waiting_for_content);
+        assert!(preview.frame_buffer.is_none());
 
         preview.update_frame(2, 1, vec![0, 0, 0, 0, 255, 255, 255, 1]);
         assert!(!preview.browser_waiting_for_content);
+        assert!(preview.frame_buffer.is_some());
     }
 
     #[test]

@@ -55,6 +55,10 @@ const BROWSER_FOCUS_GRACE: Duration = Duration::from_millis(300);
 /// WebView startup out so several media sites cannot saturate the UI at once.
 #[cfg(windows)]
 const RESTORED_BROWSER_START_INTERVAL: Duration = Duration::from_secs(2);
+/// Transparent overlay pages can legitimately take a long time to show their
+/// first visible pixel. Probe them slowly until there is content to display.
+#[cfg(windows)]
+const TRANSPARENT_BROWSER_STARTUP_FPS: u32 = 5;
 #[cfg(windows)]
 const RESTORED_VIDEO_START_INTERVAL: Duration = Duration::from_secs(2);
 /// Polling cadence for saved Windows tiles whose applications are not open.
@@ -108,6 +112,16 @@ fn find_saved_window<'a>(
         .iter()
         .filter(available)
         .find(|window| window.title == saved_title)
+}
+
+#[cfg(windows)]
+fn browser_capture_fps(preview: &Preview) -> u32 {
+    let requested = preview.target_fps.max(1);
+    if preview.browser_waiting_for_content {
+        requested.min(TRANSPARENT_BROWSER_STARTUP_FPS)
+    } else {
+        requested
+    }
 }
 
 fn title_bar_ease(t: f32) -> f32 {
@@ -182,7 +196,8 @@ fn browser_capture_display_size(preview: &Preview) -> Vec2 {
     .size()
 }
 
-fn restore_manual_freeze(preview: &mut Preview, saved: &PreviewLayout) {
+fn restore_common_tile_state(preview: &mut Preview, saved: &PreviewLayout) {
+    preview.left_click_disabled = saved.left_click_disabled;
     preview.manually_frozen = saved.manually_frozen;
     preview.capture_paused = saved.manually_frozen;
     preview.capture_hibernated = false;
@@ -197,7 +212,7 @@ fn restore_browser_geometry(preview: &mut Preview, saved: &PreviewLayout) {
     preview.lock_aspect_ratio = saved.lock_aspect_ratio;
     preview.crop_uv = saved.crop_uv;
     preview.viewport_pin = saved.viewport_pin;
-    restore_manual_freeze(preview, saved);
+    restore_common_tile_state(preview, saved);
 }
 
 fn original_image_path(source: &std::path::Path) -> Result<std::path::PathBuf, String> {
@@ -406,6 +421,17 @@ struct PendingBrowserTile {
     /// Layout restores wait for a visible viewport and are rate-limited.
     /// Direct user additions and undo actions start immediately.
     restore_deferred: bool,
+}
+
+#[cfg(windows)]
+fn mark_pending_browser_placeholders_shown(
+    pending_tiles: &mut HashMap<PreviewId, PendingBrowserTile>,
+) -> bool {
+    let awaiting_first_paint = pending_tiles.values().any(|pending| !pending.shown_once);
+    for pending in pending_tiles.values_mut() {
+        pending.shown_once = true;
+    }
+    awaiting_first_paint
 }
 
 #[cfg(windows)]
@@ -3169,6 +3195,20 @@ impl PluriviewApp {
         }
     }
 
+    /// Fully transparent browser captures are hidden behind a loading card.
+    /// Keep probing for visible content without copying frames at full speed.
+    #[cfg(windows)]
+    fn browser_capture_frame_rate_upkeep(&mut self) {
+        for preview in self
+            .preview_manager
+            .all()
+            .filter(|preview| preview.is_browser() && preview.removing.is_none())
+        {
+            self.capture_coordinator
+                .set_target_fps(preview.id, browser_capture_fps(preview));
+        }
+    }
+
     /// Per-frame browser housekeeping. Runs after the canvas UI so tile
     /// rects and double-click state are fresh.
     #[cfg(windows)]
@@ -4765,7 +4805,7 @@ impl PluriviewApp {
                             preview.crop_uv = preview_layout.crop_uv;
                             preview.viewport_pin = preview_layout.viewport_pin;
                             preview.created_at = Instant::now() - Duration::from_secs(1);
-                            restore_manual_freeze(preview, preview_layout);
+                            restore_common_tile_state(preview, preview_layout);
                         }
                     }
                     Err(error) => {
@@ -4796,7 +4836,7 @@ impl PluriviewApp {
                         if let Some(preview) = self.preview_manager.get_mut(id) {
                             preview.viewport_pin = preview_layout.viewport_pin;
                             preview.created_at = Instant::now() - Duration::from_secs(1);
-                            restore_manual_freeze(preview, preview_layout);
+                            restore_common_tile_state(preview, preview_layout);
                         }
                     }
                     Err(error) => {
@@ -4824,7 +4864,7 @@ impl PluriviewApp {
                     preview.playlist_group = preview_layout.playlist_group;
                     preview.viewport_pin = preview_layout.viewport_pin;
                     preview.created_at = Instant::now() - Duration::from_secs(1);
-                    restore_manual_freeze(preview, preview_layout);
+                    restore_common_tile_state(preview, preview_layout);
                 }
                 continue;
             }
@@ -4842,7 +4882,7 @@ impl PluriviewApp {
                     preview.crop_uv = preview_layout.crop_uv;
                     preview.viewport_pin = preview_layout.viewport_pin;
                     preview.created_at = Instant::now() - Duration::from_secs(1);
-                    restore_manual_freeze(preview, preview_layout);
+                    restore_common_tile_state(preview, preview_layout);
                 }
                 if !preview_layout.manually_frozen {
                     self.capture_coordinator.start_spout_capture(
@@ -4886,7 +4926,7 @@ impl PluriviewApp {
                     preview.crop_uv = preview_layout.crop_uv;
                     preview.stream_audio = preview_layout.stream_audio;
                     preview.viewport_pin = preview_layout.viewport_pin;
-                    restore_manual_freeze(preview, preview_layout);
+                    restore_common_tile_state(preview, preview_layout);
                 }
 
                 if !preview_layout.manually_frozen {
@@ -4917,7 +4957,7 @@ impl PluriviewApp {
                     preview.crop_uv = preview_layout.crop_uv;
                     preview.stream_audio = preview_layout.stream_audio;
                     preview.viewport_pin = preview_layout.viewport_pin;
-                    restore_manual_freeze(preview, preview_layout);
+                    restore_common_tile_state(preview, preview_layout);
                 }
                 #[cfg(debug_assertions)]
                 println!(
@@ -4953,8 +4993,9 @@ impl PluriviewApp {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        browser_capture_display_size, browser_page_screen_rect, browser_tile_screen_rect,
-        find_saved_window, preview_playback_state, preview_video_status, restore_browser_geometry,
+        browser_capture_display_size, browser_capture_fps, browser_page_screen_rect,
+        browser_tile_screen_rect, find_saved_window, mark_pending_browser_placeholders_shown,
+        preview_playback_state, preview_video_status, restore_browser_geometry,
         restored_browser_ready, restored_video_ready, resumable_video_position,
         video_launch_for_source, video_session_is_stale, wallpaper_hibernation_due, FpsPreset,
         PendingBrowserTile, PendingVideoTile, VideoSource, VideoTileStatus,
@@ -4966,7 +5007,7 @@ mod tests {
     use crate::video::{LoopMode, TrackInfo, TrackSelection, VideoState};
     use crate::window_picker::WindowInfo;
     use eframe::egui::{Pos2, Rect, Vec2};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -4982,6 +5023,34 @@ mod tests {
             now - WALLPAPER_HIBERNATE_AFTER,
             now
         ));
+    }
+
+    #[test]
+    fn transparent_browser_uses_probe_fps_until_visible_content_arrives() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "browser".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        preview.browser_url = Some("https://example.com".to_owned());
+        preview.target_fps = 30;
+        preview.browser_waiting_for_content = true;
+
+        assert_eq!(browser_capture_fps(&preview), 5);
+        preview.browser_waiting_for_content = false;
+        assert_eq!(browser_capture_fps(&preview), 30);
+    }
+
+    #[test]
+    fn frozen_pending_browser_requests_only_its_initial_placeholder_paint() {
+        let id = PreviewId(1);
+        let mut pending = HashMap::from([(id, restored_pending(false))]);
+
+        assert!(mark_pending_browser_placeholders_shown(&mut pending));
+        assert!(pending.get(&id).unwrap().shown_once);
+        assert!(!mark_pending_browser_placeholders_shown(&mut pending));
+        assert!(pending.contains_key(&id));
     }
 
     #[test]
@@ -5071,6 +5140,7 @@ mod tests {
         saved.lock_aspect_ratio = false;
         saved.crop_uv = Some((0.25, 0.0, 1.0, 1.0));
         saved.manually_frozen = true;
+        saved.left_click_disabled = true;
         saved.viewport_pin = Some(ViewportPin::from_rect(
             Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(240.0, 180.0)),
             Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)),
@@ -5089,6 +5159,7 @@ mod tests {
         assert_eq!(restored.viewport_pin, saved.viewport_pin);
         assert_eq!(restored.lock_aspect_ratio, saved.lock_aspect_ratio);
         assert!(restored.manually_frozen);
+        assert!(restored.left_click_disabled);
         assert!(restored.capture_paused);
     }
 
@@ -5492,6 +5563,8 @@ impl eframe::App for PluriviewApp {
         // Process any pending captured frames
         self.capture_coordinator
             .process_frames(&mut self.preview_manager);
+        #[cfg(windows)]
+        self.browser_capture_frame_rate_upkeep();
 
         // Handle pending region selection request (from context menu in canvas)
         if let Some(preview_id) = self.canvas.pending_region_select.take() {
@@ -5586,12 +5659,11 @@ impl eframe::App for PluriviewApp {
         self.import_dropped_files(ctx);
 
         #[cfg(windows)]
-        if !self.pending_browser_tiles.is_empty() {
-            for pending in self.pending_browser_tiles.values_mut() {
-                pending.shown_once = true;
-            }
+        if mark_pending_browser_placeholders_shown(&mut self.pending_browser_tiles) {
             // Guarantee at least one painted placeholder frame before any
-            // WebView creation can occupy the UI thread.
+            // WebView creation can occupy the UI thread. Restored frozen
+            // browsers stay pending until resumed, so subsequent frames must
+            // not keep repainting just because the queue is non-empty.
             ctx.request_repaint();
         }
         #[cfg(windows)]
@@ -5622,11 +5694,13 @@ impl eframe::App for PluriviewApp {
                 // interaction off even if selection drifted while the page
                 // had focus.
                 self.browser.active_id().or_else(|| {
-                    self.canvas
-                        .selection
-                        .iter()
-                        .copied()
-                        .find(|id| self.browser.contains(*id))
+                    self.canvas.selection.iter().copied().find(|id| {
+                        self.browser.contains(*id)
+                            && self
+                                .preview_manager
+                                .get(*id)
+                                .is_some_and(|preview| !preview.left_click_disabled)
+                    })
                 })
             })
             .flatten();
@@ -5657,9 +5731,8 @@ impl eframe::App for PluriviewApp {
                         // Hold the last correct captured frame onscreen while
                         // WebView2 prepares its interactive viewport offscreen.
                         self.capture_coordinator.pause_capture(id);
-                        // Bring to front + select so the accent outline shows
-                        // around the live window's inset edge.
-                        self.preview_manager.bring_to_front(id);
+                        // Select for the accent outline without changing the
+                        // saved canvas stacking order.
                         self.canvas.selection = vec![id];
                         if let Some(host) = self.browser.get_mut(id) {
                             host.place(
@@ -5782,6 +5855,7 @@ impl eframe::App for PluriviewApp {
                         Ok(id) => {
                             if let Some(preview) = self.preview_manager.get_mut(id) {
                                 preview.viewport_pin = info.viewport_pin;
+                                preview.left_click_disabled = info.left_click_disabled;
                             }
                             self.apply_browser_mute(id, info.browser_muted);
                         }
@@ -5798,6 +5872,7 @@ impl eframe::App for PluriviewApp {
                         if let Some(preview) = self.preview_manager.get_mut(id) {
                             preview.crop_uv = info.crop_uv;
                             preview.viewport_pin = info.viewport_pin;
+                            preview.left_click_disabled = info.left_click_disabled;
                         }
                     }
                     Err(error) => {
@@ -5822,6 +5897,7 @@ impl eframe::App for PluriviewApp {
                 if let Some(preview) = self.preview_manager.get_mut(id) {
                     preview.crop_uv = info.crop_uv;
                     preview.viewport_pin = info.viewport_pin;
+                    preview.left_click_disabled = info.left_click_disabled;
                 }
             }
         }
@@ -5847,8 +5923,11 @@ impl eframe::App for PluriviewApp {
                     Ok(id) => {
                         if let Some(preview) = self.preview_manager.get_mut(id) {
                             preview.viewport_pin = info.viewport_pin;
+                            preview.left_click_disabled = info.left_click_disabled;
                         }
-                        self.canvas.selection = vec![id];
+                        if !info.left_click_disabled {
+                            self.canvas.selection = vec![id];
+                        }
                     }
                     Err(error) => self.media_error = Some(error),
                 }

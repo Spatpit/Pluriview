@@ -29,6 +29,8 @@ pub(crate) struct CaptureWorkerState {
     pub target_generation: Arc<AtomicU32>,
     pub active: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
+    /// Becomes true after the source has delivered its first usable frame.
+    pub has_produced_frame: Arc<AtomicBool>,
     pub latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
     pub failure: Arc<Mutex<Option<String>>>,
 }
@@ -67,6 +69,10 @@ struct CaptureSession {
 
     /// Is capture paused? (shared with capture thread)
     paused: Arc<AtomicBool>,
+
+    /// Whether this session has ever produced a usable frame. A session that
+    /// is merely waiting for its source must not drive the UI at capture FPS.
+    has_produced_frame: Arc<AtomicBool>,
 
     /// Per-session latest-frame slot. Replacing a capture gives the new worker
     /// a different slot, so an old worker can never publish a stale frame into it.
@@ -116,6 +122,7 @@ impl CaptureCoordinator {
 
         let active = Arc::new(AtomicBool::new(true));
         let paused = Arc::new(AtomicBool::new(false));
+        let has_produced_frame = Arc::new(AtomicBool::new(false));
         let fps = Arc::new(AtomicU32::new(target_fps.max(1)));
         let target_width = Arc::new(AtomicU32::new(0));
         let target_height = Arc::new(AtomicU32::new(0));
@@ -129,6 +136,7 @@ impl CaptureCoordinator {
             target_generation: target_generation.clone(),
             active: active.clone(),
             paused: paused.clone(),
+            has_produced_frame: has_produced_frame.clone(),
             latest_frame: latest_frame.clone(),
             failure: failure.clone(),
         };
@@ -147,6 +155,7 @@ impl CaptureCoordinator {
             window_hwnd: Some(hwnd),
             active,
             paused,
+            has_produced_frame,
             latest_frame,
             failure,
             stop_sender,
@@ -167,6 +176,7 @@ impl CaptureCoordinator {
 
         let active = Arc::new(AtomicBool::new(true));
         let paused = Arc::new(AtomicBool::new(false));
+        let has_produced_frame = Arc::new(AtomicBool::new(false));
         let fps = Arc::new(AtomicU32::new(target_fps.max(1)));
         let target_width = Arc::new(AtomicU32::new(0));
         let target_height = Arc::new(AtomicU32::new(0));
@@ -180,6 +190,7 @@ impl CaptureCoordinator {
             target_generation: target_generation.clone(),
             active: active.clone(),
             paused: paused.clone(),
+            has_produced_frame: has_produced_frame.clone(),
             latest_frame: latest_frame.clone(),
             failure: failure.clone(),
         };
@@ -199,6 +210,7 @@ impl CaptureCoordinator {
                 window_hwnd: None,
                 active,
                 paused,
+                has_produced_frame,
                 latest_frame,
                 failure,
                 stop_sender,
@@ -328,7 +340,9 @@ impl CaptureCoordinator {
         self.sessions
             .values()
             .filter(|session| {
-                session.active.load(Ordering::Relaxed) && !session.paused.load(Ordering::Relaxed)
+                session.active.load(Ordering::Relaxed)
+                    && !session.paused.load(Ordering::Relaxed)
+                    && session.has_produced_frame.load(Ordering::Relaxed)
             })
             .map(|session| session.target_fps.load(Ordering::Relaxed).max(1))
             .max()
@@ -430,6 +444,7 @@ fn capture_window_loop(
         target_generation,
         active,
         paused,
+        has_produced_frame,
         latest_frame,
         failure,
     } = worker_state;
@@ -441,6 +456,7 @@ fn capture_window_loop(
         latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
         active: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
+        has_produced_frame: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
         target_width: Arc<AtomicU32>,
         target_height: Arc<AtomicU32>,
@@ -452,6 +468,7 @@ fn capture_window_loop(
         latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
         active: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
+        has_produced_frame: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
         target_width: Arc<AtomicU32>,
         target_height: Arc<AtomicU32>,
@@ -471,6 +488,7 @@ fn capture_window_loop(
                 latest_frame: ctx.flags.latest_frame,
                 active: ctx.flags.active,
                 paused: ctx.flags.paused,
+                has_produced_frame: ctx.flags.has_produced_frame,
                 fps: ctx.flags.fps,
                 target_width: ctx.flags.target_width,
                 target_height: ctx.flags.target_height,
@@ -552,6 +570,7 @@ fn capture_window_loop(
                 }
             };
             *self.latest_frame.lock() = Some(captured_frame);
+            self.has_produced_frame.store(true, Ordering::Relaxed);
             self.handled_target_generation = requested_generation;
 
             Ok(())
@@ -580,6 +599,7 @@ fn capture_window_loop(
         latest_frame,
         active: active.clone(),
         paused,
+        has_produced_frame,
         fps: target_fps,
         target_width,
         target_height,
@@ -713,6 +733,7 @@ mod tests {
             window_hwnd: None,
             active: Arc::new(AtomicBool::new(active)),
             paused: Arc::new(AtomicBool::new(paused)),
+            has_produced_frame: Arc::new(AtomicBool::new(true)),
             latest_frame: Arc::new(Mutex::new(None)),
             failure: Arc::new(Mutex::new(None)),
             stop_sender,
@@ -796,6 +817,21 @@ mod tests {
     }
 
     #[test]
+    fn repaint_rate_ignores_a_session_waiting_for_its_first_frame() {
+        let waiting = session(60, true, false);
+        waiting
+            .has_produced_frame
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let produced = waiting.has_produced_frame.clone();
+        let mut coordinator = CaptureCoordinator::new();
+        coordinator.sessions.insert(PreviewId(1), waiting);
+
+        assert_eq!(coordinator.max_live_fps(), None);
+        produced.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(coordinator.max_live_fps(), Some(60));
+    }
+
+    #[test]
     fn replaced_session_cannot_publish_into_the_new_session_slot() {
         let mut previews = PreviewManager::new();
         let preview_id = previews.add("test".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
@@ -847,6 +883,7 @@ mod tests {
                 window_hwnd: None,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
+                has_produced_frame: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
                 failure: Arc::new(Mutex::new(None)),
                 stop_sender,
@@ -876,6 +913,7 @@ mod tests {
                 window_hwnd: None,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
+                has_produced_frame: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
                 failure: Arc::new(Mutex::new(None)),
                 stop_sender,
@@ -949,6 +987,7 @@ mod tests {
                 window_hwnd: None,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
+                has_produced_frame: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
                 failure: Arc::new(Mutex::new(None)),
                 stop_sender,

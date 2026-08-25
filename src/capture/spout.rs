@@ -35,6 +35,7 @@ pub fn capture_spout_loop(
         target_generation: _,
         active,
         paused,
+        has_produced_frame,
         latest_frame,
         failure,
     } = worker_state;
@@ -73,6 +74,7 @@ pub fn capture_spout_loop(
             Ok(Some(frame)) => {
                 last_error = None;
                 *latest_frame.lock() = Some(frame);
+                has_produced_frame.store(true, Ordering::Relaxed);
             }
             Ok(None) => {}
             Err(error) => {

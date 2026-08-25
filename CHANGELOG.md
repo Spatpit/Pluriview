@@ -10,12 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Image, animated GIF, browser, and libmpv video tiles can be cropped with Alt+drag; cropped browser pages keep capture and interaction coordinates aligned.
 - Saved window tiles remain visible as inactive when their application is closed and reconnect automatically after its window appears.
+- Tiles can disable left-click interaction from their context menu, passing primary clicks and drags through to content underneath while keeping right-click access available.
 
 ### Changed
 - Image/GIF tiles and image wallpapers use their original file paths instead of creating copies in `pluriview_data/media`; missing originals remain visible with a path-change message.
 - Libmpv video tiles show a vertical volume slider above the speaker icon on hover and use a larger time readout.
 
 ### Fixed
+- Entering browser interaction mode no longer moves that browser tile to the front of the saved canvas stacking order.
+- Fully transparent browser overlays waiting for their first visible content no longer capture and repaint at full speed.
+- Restored frozen browser tiles no longer keep repainting while their deferred WebView remains suspended.
+- Window capture tiles waiting for their first frame no longer keep the canvas repainting at an unrestricted rate.
 - Manually frozen tiles remain frozen after closing and reopening Pluriview without restarting their source resources.
 - Menus and popups block canvas pointer gestures beneath them, so scrolling a menu no longer zooms the canvas.
 - Browser crops persist when a workspace is saved and restored.

@@ -32,6 +32,8 @@ pub struct RemovedPreviewInfo {
     pub spout_sender: Option<String>,
     /// Restored when undo recreates a pinned tile.
     pub viewport_pin: Option<ViewportPin>,
+    /// Restored when undo recreates a tile that passes primary clicks through.
+    pub left_click_disabled: bool,
     /// Original local path for image and GIF tiles.
     pub media_path: Option<PathBuf>,
     /// Set for mpv-backed local video and Streamlink tiles.
@@ -268,6 +270,7 @@ impl PreviewManager {
                     stream_audio: preview.stream_audio,
                     spout_sender: preview.spout_sender,
                     viewport_pin: preview.viewport_pin,
+                    left_click_disabled: preview.left_click_disabled,
                     media_path: preview.media_path,
                     video_source: preview.video_source,
                     folder_playlist: preview.folder_playlist,
@@ -325,11 +328,6 @@ impl PreviewManager {
     /// Get a mutable preview by ID
     pub fn get_mut(&mut self, id: PreviewId) -> Option<&mut Preview> {
         self.previews.get_mut(&id)
-    }
-
-    /// Get all preview IDs
-    pub fn all_ids(&self) -> Vec<PreviewId> {
-        self.previews.keys().copied().collect()
     }
 
     /// Get the number of previews
