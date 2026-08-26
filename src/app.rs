@@ -907,7 +907,7 @@ impl PluriviewApp {
             Ok(())
         } else {
             Err(format!(
-                "{action} needs libmpv-2.dll next to pluriview.exe."
+                "{action} needs libmpv-2.dll in the lib folder next to pluriview.exe."
             ))
         }
     }

@@ -28,6 +28,9 @@ use eframe::egui;
 use persistence::{Storage, WindowLayout, DEFAULT_WINDOW_SIZE};
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    configure_runtime_library_directory();
+
     env_logger::init();
 
     // Create the window icon (leaf)
@@ -68,6 +71,61 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(PluriviewApp::new(cc)))),
     )
+}
+
+/// Make packaged runtimes available before eframe asks Windows to load EGL.
+/// Release builds keep every DLL under `lib/`; the development fallback keeps
+/// `cargo run` working with the prepared runtimes under `vendor/`.
+#[cfg(windows)]
+fn configure_runtime_library_directory() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{core::PCWSTR, Win32::System::LibraryLoader::SetDllDirectoryW};
+
+    let executable = std::env::current_exe().ok();
+    let Some(directory) = runtime_library_candidates(executable.as_deref())
+        .into_iter()
+        .find(|directory| {
+            directory.join("libEGL.dll").is_file() && directory.join("libGLESv2.dll").is_file()
+        })
+    else {
+        return;
+    };
+
+    let wide_path: Vec<u16> = directory
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if let Err(error) = unsafe { SetDllDirectoryW(PCWSTR(wide_path.as_ptr())) } {
+        eprintln!(
+            "Could not configure the runtime library folder {}: {error}",
+            directory.display()
+        );
+    }
+}
+
+#[cfg(windows)]
+fn runtime_library_candidates(executable: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(directory) = executable.and_then(std::path::Path::parent) {
+        candidates.push(directory.join("lib"));
+
+        let is_build_profile = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "debug" | "release"));
+        let target_directory = directory.parent();
+        let is_target_directory = target_directory
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("target");
+        if is_build_profile && is_target_directory {
+            if let Some(workspace) = target_directory.and_then(std::path::Path::parent) {
+                candidates.push(workspace.join("vendor"));
+            }
+        }
+    }
+    candidates
 }
 
 /// Geometry the main window was last closed at, if a layout has one.
@@ -113,5 +171,38 @@ fn create_window_icon() -> egui::IconData {
         rgba: crate::tray::create_leaf_rgba(size),
         width: size,
         height: size,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::runtime_library_candidates;
+    use std::path::Path;
+
+    #[test]
+    fn packaged_lib_folder_precedes_development_fallbacks() {
+        let candidates = runtime_library_candidates(Some(Path::new(
+            r"C:\Program Files\Pluriview\pluriview.exe",
+        )));
+
+        assert_eq!(
+            candidates,
+            vec![Path::new(r"C:\Program Files\Pluriview\lib").to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn source_build_uses_workspace_vendor_as_fallback() {
+        let candidates = runtime_library_candidates(Some(Path::new(
+            r"S:\src\pluriview\target\debug\pluriview.exe",
+        )));
+
+        assert_eq!(
+            candidates,
+            vec![
+                Path::new(r"S:\src\pluriview\target\debug\lib").to_path_buf(),
+                Path::new(r"S:\src\pluriview\vendor").to_path_buf(),
+            ]
+        );
     }
 }

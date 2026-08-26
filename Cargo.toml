@@ -1,6 +1,6 @@
 [package]
 name = "pluriview"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 description = "Live window preview application with infinite canvas"
 authors = ["Spatpit"]
@@ -92,3 +92,9 @@ incremental = false
 [profile.test]
 debug = 1
 incremental = false
+
+# eframe currently asks glutin-winit to prefer WGL on Windows. This focused
+# compatibility fork honors that preference elsewhere but selects EGL on
+# Windows so the bundled ANGLE runtime can use its Direct3D 11 backend.
+[patch.crates-io]
+glutin-winit = { path = "third_party/glutin-winit-egl" }

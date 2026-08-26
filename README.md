@@ -48,7 +48,7 @@
 
 ### Video tiles and playlists
 
-Keep `libmpv-2.dll` next to `pluriview.exe`. Then:
+Keep `libmpv-2.dll` inside the `lib` folder next to `pluriview.exe`. Then:
 
 - Drop a video file onto the canvas, or use **File → Add Video...**
 - Drop a folder of videos to create a linked player and playlist
@@ -112,9 +112,10 @@ own process so window shares pick it up. Off by default.
 
 - **OS:** Windows 10 (version 1903+) or Windows 11
 - **GPU:** DirectX 11 compatible graphics card
+- **Renderer:** `lib\libEGL.dll` and `lib\libGLESv2.dll` beside `pluriview.exe` (included in every download)
 - **Browser tiles:** [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (already on Windows 11 and current Windows 10)
 - **Ad blocking:** WebView2 Runtime 122 or newer
-- **Video tiles, playlists, video wallpaper:** `libmpv-2.dll` next to `pluriview.exe` (included in the Full download)
+- **Video tiles, playlists, video wallpaper:** `lib\libmpv-2.dll` beside `pluriview.exe` (included in the Full download)
 - **Stream URLs:** [Streamlink](https://streamlink.github.io/), configured in Settings if it is not already on PATH
 - **Building from source:** Rust 1.88 or newer
 
@@ -129,11 +130,12 @@ Get the latest release from [Releases](https://github.com/Spatpit/Pluriview/rele
 
 | Zip | Contains | Use when |
 |-----|----------|----------|
-| **Full** (recommended) | `pluriview.exe` + `libmpv-2.dll` + license/notices | You want video tiles, playlists, or video wallpaper |
-| **Lite** | `pluriview.exe` only | You only need windows, browsers, and images |
+| **Full** (recommended) | `pluriview.exe` + a `lib` folder containing ANGLE, `libmpv-2.dll`, and license/notices | You want video tiles, playlists, or video wallpaper |
+| **Lite** | `pluriview.exe` + a `lib` folder containing ANGLE and license/notices | You only need windows, browsers, and images |
 
-Keep `libmpv-2.dll` in the **same folder** as `pluriview.exe`. You can add the
-DLL to a Lite install later. Do not ship or run `pluriview.pdb`.
+Keep the included `lib` folder next to `pluriview.exe`. Full installs also
+include `libmpv-2.dll` inside that folder; you can add that DLL to a Lite
+install later. Do not ship or run `pluriview.pdb`.
 
 Streamlink is a separate optional install. Point Pluriview at it in Settings
 if Windows does not already find `streamlink.exe`.
@@ -143,14 +145,15 @@ if Windows does not already find `streamlink.exe`.
 ```powershell
 git clone https://github.com/Spatpit/Pluriview.git
 cd Pluriview
+.\scripts\prepare-angle.ps1
 .\scripts\prepare-libmpv.ps1
 .\scripts\build-release.ps1
 ```
 
-`dist` will contain the privacy-safe executable, `libmpv-2.dll`, versioned Full
-and Lite zip archives, and `SHA256SUMS.txt`. Keep the DLL beside the executable
-when using the Full build. Do not distribute `pluriview.pdb`; debug symbols can
-contain local paths.
+`dist` will contain the privacy-safe executable, a `lib` folder with the
+runtime DLLs and text notices, versioned Full and Lite zip archives, and
+`SHA256SUMS.txt`. Keep the `lib` folder beside the executable. Do not
+distribute `pluriview.pdb`; debug symbols can contain local paths.
 
 ## Usage
 
@@ -220,9 +223,12 @@ Pluriview/
 ├── assets/
 │   ├── icon.ico                  # Application icon
 │   ├── pluriview-preview.gif     # README preview
-│   └── third_party/ubol/         # Pinned official uBlock Origin Lite package
+│   └── third_party/
+│       ├── angle/                 # Pinned standalone ANGLE runtime and provenance
+│       └── ubol/                  # Pinned official uBlock Origin Lite package
 ├── scripts/
 │   ├── build-release.ps1   # Privacy-safe Windows release build
+│   ├── prepare-angle.ps1   # Verify and prepare the pinned standalone ANGLE runtime
 │   └── prepare-libmpv.ps1  # Download the pinned libmpv runtime
 ├── Cargo.toml
 ├── build.rs
@@ -238,7 +244,8 @@ Pluriview/
 This project is licensed under the MIT License — see [LICENSE](LICENSE).
 Bundled third-party components keep their own licenses; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Full releases include
-`libmpv-2.dll` (mpv/FFmpeg, GPLv2+).
+`libmpv-2.dll` (mpv/FFmpeg, GPLv2+); every release includes standalone ANGLE
+and the applicable permissive runtime notices.
 
 ## Acknowledgments
 
@@ -246,6 +253,7 @@ Bundled third-party components keep their own licenses; see
 - Window capture via [windows-rs](https://github.com/microsoft/windows-rs)
 - Spout2 sender capture via the public [Spout](https://spout.zeal.co/) shared-memory registry and DirectX 11
 - Browser tiles via [wry](https://github.com/tauri-apps/wry) (WebView2)
+- OpenGL ES translation via [ANGLE](https://github.com/google/angle) (Direct3D 11 on Windows)
 - Video playback via [libmpv](https://github.com/mpv-player/mpv) (shinchiro Windows builds)
 - Ad and tracker blocking via [uBlock Origin Lite](https://github.com/gorhill/uBlock) (GPL-3.0)
 

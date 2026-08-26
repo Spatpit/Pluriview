@@ -189,7 +189,7 @@ unsafe impl Sync for MpvApi {}
 impl MpvApi {
     fn load() -> Result<Arc<Self>, String> {
         let path = find_libmpv().ok_or_else(|| {
-            "libmpv-2.dll is missing. Reinstall Pluriview or place libmpv-2.dll beside pluriview.exe."
+            "libmpv-2.dll is missing. Reinstall the Full package or place libmpv-2.dll in the lib folder next to pluriview.exe."
                 .to_owned()
         })?;
         let library = unsafe { Library::new(&path) }
@@ -262,7 +262,8 @@ impl MpvApi {
     }
 }
 
-/// True when `libmpv-2.dll` is beside the exe, in `vendor/`, or in the cwd.
+/// True when `libmpv-2.dll` is in the packaged `lib/` folder or a supported
+/// development/legacy location.
 pub fn runtime_is_available() -> bool {
     find_libmpv().is_some()
 }
@@ -271,10 +272,12 @@ fn find_libmpv() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(executable) = std::env::current_exe() {
         if let Some(directory) = executable.parent() {
+            candidates.push(directory.join("lib").join("libmpv-2.dll"));
             candidates.push(directory.join("libmpv-2.dll"));
         }
     }
     if let Ok(directory) = std::env::current_dir() {
+        candidates.push(directory.join("lib").join("libmpv-2.dll"));
         candidates.push(directory.join("vendor").join("libmpv-2.dll"));
         candidates.push(directory.join("libmpv-2.dll"));
     }
@@ -597,9 +600,15 @@ impl MpvCore {
             ("input-default-bindings", "no"),
             ("keep-open", "yes"),
             ("vo", "libmpv"),
-            // The WGL render context cannot directly import D3D11 surfaces,
-            // but copy-mode hardware decoding is compatible and substantially
-            // lowers CPU use compared with forcing software decoding.
+            // ANGLE exposes the renderer as OpenGL ES. libmpv may otherwise
+            // enter its restricted GPU dumb mode, which disables high-quality
+            // scaling and makes enlarged video visibly blocky.
+            ("gpu-dumb-mode", "no"),
+            ("scale", "ewa_lanczossharp"),
+            ("scale-antiring", "0.6"),
+            // Copy-mode hardware decoding remains compatible with both WGL
+            // and ANGLE and substantially lowers CPU use compared with
+            // forcing software decoding.
             ("hwdec", "auto-copy-safe"),
         ] {
             if let Err(error) = core.set_option(name, value) {
@@ -2463,6 +2472,31 @@ unsafe extern "C" fn get_gl_proc_address(
     _context: *mut c_void,
     name: *const c_char,
 ) -> *mut c_void {
+    // An ANGLE-backed EGL context exposes core GLES functions from
+    // libGLESv2 and extensions through eglGetProcAddress. Prefer those when
+    // ANGLE is loaded, while retaining the native WGL path for installations
+    // that use Pluriview's existing desktop OpenGL renderer.
+    let egl_module = GetModuleHandleA(c"libEGL.dll".as_ptr());
+    if !egl_module.is_null() {
+        let gles_module = GetModuleHandleA(c"libGLESv2.dll".as_ptr());
+        if !gles_module.is_null() {
+            let address = GetProcAddress(gles_module, name);
+            if !address.is_null() {
+                return address;
+            }
+        }
+
+        let egl_get_proc_address = GetProcAddress(egl_module, c"eglGetProcAddress".as_ptr());
+        if !egl_get_proc_address.is_null() {
+            let egl_get_proc_address: unsafe extern "system" fn(*const c_char) -> *mut c_void =
+                std::mem::transmute(egl_get_proc_address);
+            let address = egl_get_proc_address(name);
+            if !address.is_null() {
+                return address;
+            }
+        }
+    }
+
     let address = wglGetProcAddress(name);
     let invalid = address.is_null() || matches!(address as usize, 1..=3) || address as isize == -1;
     if !invalid {

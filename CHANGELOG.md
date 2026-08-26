@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-08-26
+
+### Changed
+- The Windows compositor now uses ANGLE's Direct3D 11 backend; all release packages include the required `libEGL.dll` and `libGLESv2.dll` runtime files.
+- The bundled ANGLE runtime is built from pinned official standalone source, with reproducible provenance, privacy-safe paths, checksums, and complete runtime license notices.
+- Libmpv tiles retain high-quality scaling on the OpenGL ES renderer instead of falling back to visibly blocky restricted scaling.
+- Release DLLs and text notices now live in a single `lib` folder beside `pluriview.exe`.
+
+### Fixed
+- Capturing Pluriview at 60 FPS with OBS Game Capture or Discord's injected capture hook no longer multiplies GPU usage through per-frame WGL-to-Direct3D synchronization.
+
 ## [0.6.5] - 2026-08-24
 
 ### Added
