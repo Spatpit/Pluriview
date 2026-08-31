@@ -11,7 +11,7 @@ pub struct WorkspaceSummary {
 }
 
 /// Catalog of named workspaces and the workspace currently shown by the app.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceIndex {
     pub version: u32,
     pub active_workspace_id: String,
@@ -35,6 +35,27 @@ impl Default for WorkspaceIndex {
 }
 
 impl WorkspaceIndex {
+    pub fn from_recovered(mut ids: Vec<String>, active_workspace_id: String) -> Self {
+        ids.retain(|id| is_valid_workspace_id(id));
+        ids.sort_by_key(|id| workspace_number(id).unwrap_or(u64::MAX));
+        ids.dedup();
+        let workspaces = ids
+            .into_iter()
+            .map(|id| WorkspaceSummary {
+                name: recovered_workspace_name(&id),
+                id,
+            })
+            .collect();
+        let mut index = Self {
+            version: 1,
+            active_workspace_id,
+            workspaces,
+            next_workspace_id: default_next_workspace_id(),
+        };
+        index.repair();
+        index
+    }
+
     pub fn active(&self) -> Option<&WorkspaceSummary> {
         self.workspaces
             .iter()
@@ -54,6 +75,18 @@ impl WorkspaceIndex {
             name,
         });
         id
+    }
+
+    pub fn add_recovered(&mut self, id: String) -> bool {
+        if !is_valid_workspace_id(&id) || self.workspaces.iter().any(|workspace| workspace.id == id)
+        {
+            return false;
+        }
+        self.workspaces.push(WorkspaceSummary {
+            name: recovered_workspace_name(&id),
+            id,
+        });
+        true
     }
 
     pub fn rename(&mut self, id: &str, name: String) -> bool {
@@ -119,6 +152,23 @@ pub fn is_valid_workspace_id(id: &str) -> bool {
     })
 }
 
+fn workspace_number(id: &str) -> Option<u64> {
+    id.strip_prefix("workspace-")?.parse().ok()
+}
+
+fn recovered_workspace_name(id: &str) -> String {
+    if id == DEFAULT_WORKSPACE_ID {
+        DEFAULT_WORKSPACE_NAME.to_owned()
+    } else {
+        format!(
+            "Recovered workspace {}",
+            workspace_number(id)
+                .map(|number| number.to_string())
+                .unwrap_or_else(|| id.to_owned())
+        )
+    }
+}
+
 fn default_next_workspace_id() -> u64 {
     2
 }
@@ -149,5 +199,16 @@ mod tests {
         assert!(index.remove(&second));
         assert_eq!(index.active_workspace_id, "workspace-1");
         assert!(!index.remove("workspace-1"));
+    }
+
+    #[test]
+    fn recovered_workspace_ids_advance_the_next_generated_id() {
+        let mut index = WorkspaceIndex::from_recovered(
+            vec!["workspace-4".to_owned(), "workspace-7".to_owned()],
+            "workspace-7".to_owned(),
+        );
+
+        assert_eq!(index.active_workspace_id, "workspace-7");
+        assert_eq!(index.add("New".to_owned()), "workspace-8");
     }
 }

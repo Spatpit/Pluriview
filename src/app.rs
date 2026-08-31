@@ -38,7 +38,13 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows::core::HSTRING;
 #[cfg(windows)]
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HGLOBAL, HWND};
+#[cfg(windows)]
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+};
+#[cfg(windows)]
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 #[cfg(windows)]
 use windows::Win32::UI::Shell::ShellExecuteW;
 #[cfg(windows)]
@@ -71,6 +77,43 @@ const WALLPAPER_HIBERNATE_AFTER: Duration = Duration::from_secs(10);
 
 /// How many recent browser URLs to keep for the Add Browser dialog.
 const MAX_RECENT_URLS: usize = 8;
+/// Persist a changed workspace at most this long after the previous check.
+const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
+
+#[cfg(windows)]
+fn clipboard_text() -> Result<String, &'static str> {
+    // CF_UNICODETEXT is always UTF-16 and avoids lossy ANSI URL conversion.
+    const CF_UNICODETEXT: u32 = 13;
+
+    unsafe {
+        IsClipboardFormatAvailable(CF_UNICODETEXT)
+            .map_err(|_| "The clipboard does not contain text.")?;
+        OpenClipboard(None).map_err(|_| "The clipboard is temporarily unavailable.")?;
+
+        let result = (|| {
+            let handle = GetClipboardData(CF_UNICODETEXT)
+                .map_err(|_| "The clipboard text could not be read.")?;
+            let memory = HGLOBAL(handle.0);
+            let data = GlobalLock(memory);
+            if data.is_null() {
+                return Err("The clipboard text could not be read.");
+            }
+
+            let text = {
+                let len = GlobalSize(memory) / std::mem::size_of::<u16>();
+                let utf16 = std::slice::from_raw_parts(data.cast::<u16>(), len);
+                let nul = utf16.iter().position(|unit| *unit == 0).unwrap_or(len);
+                String::from_utf16(&utf16[..nul])
+                    .map_err(|_| "The clipboard contains invalid text.")
+            };
+            let _ = GlobalUnlock(memory);
+            text
+        })();
+
+        let _ = CloseClipboard();
+        result
+    }
+}
 
 /// Custom title bar height when fully visible (also the window-control hit size).
 const TITLE_BAR_HEIGHT: f32 = 34.0;
@@ -403,6 +446,7 @@ struct WorkspaceDialog {
 enum WorkspaceMenuAction {
     Switch(String),
     OpenDialog(WorkspaceDialogKind),
+    RestorePreviousSave,
     ConfirmDelete,
 }
 
@@ -496,6 +540,10 @@ fn video_session_is_stale(
 #[cfg(windows)]
 fn wallpaper_hibernation_due(since: Instant, now: Instant) -> bool {
     now.saturating_duration_since(since) >= WALLPAPER_HIBERNATE_AFTER
+}
+
+fn workspace_snapshot_changed(previous: Option<&[u8]>, current: &[u8]) -> bool {
+    previous != Some(current)
 }
 
 #[cfg(windows)]
@@ -609,6 +657,14 @@ pub struct PluriviewApp {
 
     /// Last workspace persistence error, shown as a dismissible dialog.
     workspace_error: Option<String>,
+
+    /// A corrupt catalog must never be replaced by a blank in-memory fallback.
+    workspace_persistence_ready: bool,
+
+    /// Periodic saves compare serialized persisted state instead of writing
+    /// unchanged JSON or requiring every canvas mutation to set a dirty flag.
+    last_saved_workspace_snapshot: Option<Vec<u8>>,
+    last_workspace_autosave_check: Instant,
 
     /// System tray manager
     tray_manager: Option<TrayManager>,
@@ -725,17 +781,19 @@ impl PluriviewApp {
             ),
         };
         let external_tools = ExternalTools::new(app_config.external_tools.streamlink_path.clone());
-        let (workspaces, workspace_error) = match &storage {
+        let (workspaces, workspace_error, workspace_persistence_ready) = match &storage {
             Some(storage) => match storage.load_or_initialize_workspaces() {
-                Ok(index) => (index, None),
+                Ok(index) => (index, None, true),
                 Err(error) => (
                     WorkspaceIndex::default(),
                     Some(format!("Could not load workspaces: {error}")),
+                    false,
                 ),
             },
             None => (
                 WorkspaceIndex::default(),
                 Some("Workspace storage is unavailable.".to_owned()),
+                false,
             ),
         };
         let tray_manager = TrayManager::new();
@@ -791,6 +849,9 @@ impl PluriviewApp {
             workspace_dialog: None,
             confirm_workspace_delete: false,
             workspace_error,
+            workspace_persistence_ready,
+            last_saved_workspace_snapshot: None,
+            last_workspace_autosave_check: Instant::now(),
             tray_manager,
             hwnd_set: false,
             show_about: false,
@@ -2715,11 +2776,18 @@ impl PluriviewApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label("Paste a website URL");
+                    let mut paste_requested = false;
                     let response = ui.add_sized(
                         [420.0, 24.0],
                         egui::TextEdit::singleline(&mut dialog.url)
                             .hint_text("twitch.tv/channel or https://kick.com/channel"),
                     );
+                    response.context_menu(|ui| {
+                        if ui.button("Paste").clicked() {
+                            paste_requested = true;
+                            ui.close_menu();
+                        }
+                    });
                     if !dialog.focused {
                         response.request_focus();
                         dialog.focused = true;
@@ -2738,10 +2806,25 @@ impl PluriviewApp {
                         if ui.button(label).clicked() || submitted {
                             submit = Some((dialog.url.clone(), dialog.position, dialog.target));
                         }
+                        if ui.button("Paste").clicked() {
+                            paste_requested = true;
+                        }
                         if ui.button("Cancel").clicked() {
                             cancel = true;
                         }
                     });
+
+                    if paste_requested {
+                        match clipboard_text() {
+                            Ok(text) if !text.trim().is_empty() => {
+                                dialog.url = text.trim().to_owned();
+                                dialog.error = None;
+                                response.request_focus();
+                            }
+                            Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
+                            Err(error) => dialog.error = Some(error.to_owned()),
+                        }
+                    }
 
                     if !recent_urls.is_empty() {
                         ui.add_space(6.0);
@@ -3526,6 +3609,10 @@ impl PluriviewApp {
             .active()
             .map(|workspace| workspace.name.clone())
             .unwrap_or_else(|| "Default".to_owned());
+        let previous_save_available = self
+            .storage
+            .as_ref()
+            .is_some_and(|storage| storage.workspace_backup_exists(&active_workspace_id));
         let mut workspace_action = None;
 
         ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
@@ -3612,6 +3699,19 @@ impl PluriviewApp {
                 if ui.button("Rename Workspace...").clicked() {
                     workspace_action =
                         Some(WorkspaceMenuAction::OpenDialog(WorkspaceDialogKind::Rename));
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(
+                        previous_save_available,
+                        egui::Button::new("Restore Previous Save as New Workspace"),
+                    )
+                    .on_hover_text(
+                        "Opens the previous valid save as a separate workspace and preserves the current one.",
+                    )
+                    .clicked()
+                {
+                    workspace_action = Some(WorkspaceMenuAction::RestorePreviousSave);
                     ui.close_menu();
                 }
                 if ui
@@ -3745,6 +3845,11 @@ impl PluriviewApp {
                         name,
                         focused: false,
                     });
+                }
+                WorkspaceMenuAction::RestorePreviousSave => {
+                    if let Err(error) = self.restore_previous_workspace_save() {
+                        self.workspace_error = Some(error);
+                    }
                 }
                 WorkspaceMenuAction::ConfirmDelete => self.confirm_workspace_delete = true,
             }
@@ -4417,6 +4522,7 @@ impl PluriviewApp {
         match storage.load_workspace(&id) {
             Ok(layout) => {
                 self.apply_layout(&layout);
+                self.remember_saved_workspace(&layout);
                 #[cfg(debug_assertions)]
                 println!(
                     "Loaded workspace {id} with {} previews",
@@ -4435,14 +4541,28 @@ impl PluriviewApp {
     }
 
     /// Save the current workspace and mirror it to legacy autosave.json.
-    fn save_active_workspace(&self) -> Result<(), String> {
+    fn save_active_workspace(&mut self) -> Result<(), String> {
+        if !self.workspace_persistence_ready {
+            return Err(
+                "Workspace saving is disabled because the catalog could not be loaded safely. Restart after repairing the workspace files."
+                    .to_owned(),
+            );
+        }
         let Some(storage) = &self.storage else {
             return Err("Workspace storage is unavailable.".to_owned());
         };
         let layout = self.create_layout();
+        let snapshot = serde_json::to_vec(&layout)
+            .map_err(|error| format!("Could not prepare workspace save: {error}"))?;
+        if !workspace_snapshot_changed(self.last_saved_workspace_snapshot.as_deref(), &snapshot) {
+            self.last_workspace_autosave_check = Instant::now();
+            return Ok(());
+        }
         storage
-            .save_active_workspace(&self.workspaces, &layout)
+            .save_active_layout(&self.workspaces, &layout)
             .map_err(|error| format!("Could not save workspace: {error}"))?;
+        self.last_saved_workspace_snapshot = Some(snapshot);
+        self.last_workspace_autosave_check = Instant::now();
         #[cfg(debug_assertions)]
         println!(
             "Saved workspace {} with {} previews",
@@ -4450,6 +4570,50 @@ impl PluriviewApp {
             layout.previews.len()
         );
         Ok(())
+    }
+
+    fn remember_saved_workspace(&mut self, layout: &SavedLayout) {
+        self.last_saved_workspace_snapshot = serde_json::to_vec(layout).ok();
+        self.last_workspace_autosave_check = Instant::now();
+    }
+
+    fn workspace_autosave_upkeep(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_workspace_autosave_check);
+        if elapsed < WORKSPACE_AUTOSAVE_INTERVAL {
+            ctx.request_repaint_after(WORKSPACE_AUTOSAVE_INTERVAL - elapsed);
+            return;
+        }
+        self.last_workspace_autosave_check = now;
+        if !self.workspace_persistence_ready {
+            return;
+        }
+
+        let layout = self.create_layout();
+        let snapshot = match serde_json::to_vec(&layout) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.workspace_error = Some(format!("Could not prepare automatic save: {error}"));
+                return;
+            }
+        };
+        if !workspace_snapshot_changed(self.last_saved_workspace_snapshot.as_deref(), &snapshot) {
+            return;
+        }
+
+        let result = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "Workspace storage is unavailable.".to_owned())
+            .and_then(|storage| {
+                storage
+                    .save_active_layout(&self.workspaces, &layout)
+                    .map_err(|error| format!("Could not automatically save workspace: {error}"))
+            });
+        match result {
+            Ok(()) => self.last_saved_workspace_snapshot = Some(snapshot),
+            Err(error) => self.workspace_error = Some(error),
+        }
     }
 
     fn blank_workspace_layout(&self) -> SavedLayout {
@@ -4495,6 +4659,7 @@ impl PluriviewApp {
             }
         }
         self.apply_layout(&layout);
+        self.remember_saved_workspace(&layout);
         Ok(())
     }
 
@@ -4519,6 +4684,7 @@ impl PluriviewApp {
             return Err(format!("Could not create workspace: {error}"));
         }
         self.apply_layout(&layout);
+        self.remember_saved_workspace(&layout);
         Ok(())
     }
 
@@ -4579,7 +4745,73 @@ impl PluriviewApp {
             ));
         }
         self.apply_layout(&layout);
+        self.remember_saved_workspace(&layout);
         Ok(())
+    }
+
+    fn restore_previous_workspace_save(&mut self) -> Result<(), String> {
+        if !self.workspace_persistence_ready {
+            return Err(
+                "Workspace saving is unavailable until the catalog is repaired.".to_owned(),
+            );
+        }
+        let active_id = self.workspaces.active_workspace_id.clone();
+        let active_name = self
+            .workspaces
+            .active()
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| "Workspace".to_owned());
+        let recovered_layout = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "Workspace storage is unavailable.".to_owned())?
+            .load_workspace_backup(&active_id)
+            .map_err(|error| format!("Could not load the previous workspace save: {error}"))?;
+
+        // Preserve the current state first. The old backup is already in memory,
+        // so rotating the current primary cannot destroy the recovery candidate.
+        self.save_active_workspace()?;
+        let previous_index = self.workspaces.clone();
+        let recovered_name = self.unique_recovered_workspace_name(&active_name);
+        let recovered_id = self.workspaces.add(recovered_name);
+        self.workspaces.active_workspace_id = recovered_id;
+        let save_result = self
+            .storage
+            .as_ref()
+            .expect("workspace storage checked above")
+            .save_active_workspace(&self.workspaces, &recovered_layout);
+        if let Err(error) = save_result {
+            self.workspaces = previous_index;
+            return Err(format!("Could not create the recovered workspace: {error}"));
+        }
+        self.apply_layout(&recovered_layout);
+        self.remember_saved_workspace(&recovered_layout);
+        Ok(())
+    }
+
+    fn unique_recovered_workspace_name(&self, active_name: &str) -> String {
+        let shortened = active_name.chars().take(38).collect::<String>();
+        let base = format!("{shortened} Recovered");
+        if self
+            .workspaces
+            .workspaces
+            .iter()
+            .all(|workspace| !workspace.name.eq_ignore_ascii_case(&base))
+        {
+            return base;
+        }
+        for suffix in 2.. {
+            let candidate = format!("{shortened} Recovered {suffix}");
+            if self
+                .workspaces
+                .workspaces
+                .iter()
+                .all(|workspace| !workspace.name.eq_ignore_ascii_case(&candidate))
+            {
+                return candidate;
+            }
+        }
+        unreachable!("an unused recovered workspace name always exists")
     }
 
     fn valid_workspace_name(&self, name: &str, except_id: Option<&str>) -> Result<String, String> {
@@ -4997,9 +5229,10 @@ mod tests {
         browser_tile_screen_rect, find_saved_window, mark_pending_browser_placeholders_shown,
         preview_playback_state, preview_video_status, restore_browser_geometry,
         restored_browser_ready, restored_video_ready, resumable_video_position,
-        video_launch_for_source, video_session_is_stale, wallpaper_hibernation_due, FpsPreset,
-        PendingBrowserTile, PendingVideoTile, VideoSource, VideoTileStatus,
-        WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID,
+        video_launch_for_source, video_session_is_stale, wallpaper_hibernation_due,
+        workspace_snapshot_changed, FpsPreset, PendingBrowserTile, PendingVideoTile, VideoSource,
+        VideoTileStatus, WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID,
+        WORKSPACE_AUTOSAVE_INTERVAL,
     };
     use crate::canvas::CanvasState;
     use crate::external_tools::{DiscoverySource, ToolStatus};
@@ -5023,6 +5256,15 @@ mod tests {
             now - WALLPAPER_HIBERNATE_AFTER,
             now
         ));
+    }
+
+    #[test]
+    fn workspace_autosave_checks_once_per_minute_and_skips_unchanged_state() {
+        assert_eq!(WORKSPACE_AUTOSAVE_INTERVAL, Duration::from_secs(60));
+        let saved = br#"{"version":1}"#;
+        assert!(!workspace_snapshot_changed(Some(saved), saved));
+        assert!(workspace_snapshot_changed(Some(saved), br#"{"version":2}"#));
+        assert!(workspace_snapshot_changed(None, saved));
     }
 
     #[test]
@@ -5933,6 +6175,8 @@ impl eframe::App for PluriviewApp {
                 }
             }
         }
+
+        self.workspace_autosave_upkeep(ctx);
 
         self.quick_add_ui(ctx);
         #[cfg(windows)]

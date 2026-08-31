@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Browser URL dialogs now provide a Paste button and a right-click Paste action for the URL field.
+- Changed workspaces now save automatically once per minute, while unchanged workspaces produce no disk writes.
+- The Workspace menu can restore the previous valid save as a separate recovered workspace.
+
+### Fixed
+- Workspace, catalog, autosave, and settings JSON now use crash-safe temporary files with a previous-save backup instead of truncating the live file in place.
+- Missing or corrupt workspace catalogs are rebuilt from valid workspace files, including layouts orphaned by an interrupted save.
+
 ## [0.6.6] - 2026-08-26
 
 ### Changed

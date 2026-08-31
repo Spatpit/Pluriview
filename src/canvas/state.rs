@@ -348,10 +348,15 @@ mod tests {
     }
 
     #[test]
-    fn foreground_menu_blocks_canvas_scroll_zoom() {
+    fn foreground_menu_blocks_canvas_scroll_and_secondary_click() {
         let context = Context::default();
         let mut canvas = CanvasState::default();
         let mut previews = PreviewManager::new();
+        previews.add(
+            "covered tile".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::splat(100.0),
+        );
         let mut captures = CaptureCoordinator::new();
         let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
         let menu_pos = Pos2::new(150.0, 150.0);
@@ -385,6 +390,19 @@ mod tests {
             Some(Order::Foreground)
         );
 
+        render(vec![Event::PointerButton {
+            pos: menu_pos,
+            button: PointerButton::Secondary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        render(vec![Event::PointerButton {
+            pos: menu_pos,
+            button: PointerButton::Secondary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+
         render(vec![
             Event::PointerMoved(menu_pos),
             Event::MouseWheel {
@@ -405,6 +423,8 @@ mod tests {
 
         // Only the wheel event outside the foreground area may affect zoom.
         assert!((canvas.zoom - 1.1).abs() < f32::EPSILON);
+        assert!(canvas.selection.is_empty());
+        assert!(canvas.last_secondary_click.is_none());
     }
 
     #[test]
@@ -3786,6 +3806,7 @@ impl CanvasState {
         // report their secondary click; exclude every visible tile explicitly.
         let background_secondary_target = ui
             .input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary))
+            && !input.pointer_blocked
             && input.interact_pos.is_some_and(|pointer| {
                 self.preview_at_screen(pointer, canvas_rect, preview_manager)
                     .is_none()
@@ -4042,7 +4063,8 @@ impl CanvasState {
 
             let secondary_clicked_raw =
                 ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary));
-            let secondary_target = secondary_clicked_raw
+            let secondary_target = !input.pointer_blocked
+                && secondary_clicked_raw
                 && input
                     .interact_pos
                     .or(input.hover_pos)

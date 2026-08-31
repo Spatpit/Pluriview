@@ -1,7 +1,12 @@
 use super::workspace::is_valid_workspace_id;
 use super::{AppConfig, SavedLayout, WorkspaceIndex};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::fs;
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 /// File storage for layouts and config
 pub struct Storage {
@@ -59,21 +64,18 @@ impl Storage {
 
     /// Save app-global settings.
     pub fn save_config(&self, config: &AppConfig) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(config)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        fs::write(self.config_path(), json)
+        write_json_safely(&self.config_path(), config)
     }
 
     /// Load app-global settings. A first run without config.json uses defaults.
     pub fn load_config(&self) -> Result<AppConfig, Box<dyn std::error::Error>> {
         let path = self.config_path();
-        if !path.exists() {
+        if !path.exists() && !backup_path(&path).exists() {
             let config = AppConfig::default();
             self.save_config(&config)?;
             return Ok(config);
         }
-        let json = fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&json)?)
+        load_json_with_backup(&path)
     }
 
     fn workspace_index_path(&self) -> PathBuf {
@@ -108,16 +110,12 @@ impl Storage {
 
     /// Save autosave
     pub fn save_autosave(&self, layout: &SavedLayout) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(layout)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        fs::write(self.autosave_path(), json)
+        write_json_safely(&self.autosave_path(), layout)
     }
 
     /// Load autosave
     pub fn load_autosave(&self) -> Result<SavedLayout, Box<dyn std::error::Error>> {
-        let json = fs::read_to_string(self.autosave_path())?;
-        let layout: SavedLayout = serde_json::from_str(&json)?;
-        Ok(layout)
+        load_json_with_backup(&self.autosave_path())
     }
 
     /// Load the workspace catalog. The first v0.5 launch copies the legacy
@@ -126,11 +124,31 @@ impl Storage {
         &self,
     ) -> Result<WorkspaceIndex, Box<dyn std::error::Error>> {
         let index_path = self.workspace_index_path();
-        if index_path.exists() {
-            let json = fs::read_to_string(index_path)?;
-            let mut index: WorkspaceIndex = serde_json::from_str(&json)?;
+        if index_path.exists() || backup_path(&index_path).exists() {
+            let mut index: WorkspaceIndex = match load_json_with_backup(&index_path) {
+                Ok(index) => index,
+                Err(index_error) => {
+                    if let Some(index) = self.rebuild_workspace_index()? {
+                        self.save_workspace_index(&index)?;
+                        self.save_autosave_for_active_workspace(&index)?;
+                        return Ok(index);
+                    }
+                    return Err(index_error);
+                }
+            };
+            let before_repair = index.clone();
             index.repair();
+            let recovered = self.recover_orphaned_workspaces(&mut index)?;
+            if index != before_repair || recovered {
+                self.save_workspace_index(&index)?;
+                self.save_autosave_for_active_workspace(&index)?;
+            }
+            return Ok(index);
+        }
+
+        if let Some(index) = self.rebuild_workspace_index()? {
             self.save_workspace_index(&index)?;
+            self.save_autosave_for_active_workspace(&index)?;
             return Ok(index);
         }
 
@@ -144,20 +162,40 @@ impl Storage {
     }
 
     pub fn save_workspace_index(&self, index: &WorkspaceIndex) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(index)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        fs::write(self.workspace_index_path(), json)
+        write_json_safely(&self.workspace_index_path(), index)
     }
 
     pub fn save_workspace(&self, id: &str, layout: &SavedLayout) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(layout)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        fs::write(self.workspace_path(id)?, json)
+        write_json_safely(&self.workspace_path(id)?, layout)
     }
 
     pub fn load_workspace(&self, id: &str) -> Result<SavedLayout, Box<dyn std::error::Error>> {
-        let json = fs::read_to_string(self.workspace_path(id)?)?;
-        Ok(serde_json::from_str(&json)?)
+        load_json_with_backup(&self.workspace_path(id)?)
+    }
+
+    /// Load the immediately preceding valid save without replacing the current one.
+    pub fn load_workspace_backup(
+        &self,
+        id: &str,
+    ) -> Result<SavedLayout, Box<dyn std::error::Error>> {
+        load_json(&backup_path(&self.workspace_path(id)?))
+    }
+
+    pub fn workspace_backup_exists(&self, id: &str) -> bool {
+        self.workspace_path(id)
+            .ok()
+            .map(|path| backup_path(&path).is_file())
+            .unwrap_or(false)
+    }
+
+    /// Save layout content without rewriting the workspace catalog.
+    pub fn save_active_layout(
+        &self,
+        index: &WorkspaceIndex,
+        layout: &SavedLayout,
+    ) -> Result<(), std::io::Error> {
+        self.save_workspace(&index.active_workspace_id, layout)?;
+        self.save_autosave(layout)
     }
 
     /// Save the active workspace and keep autosave.json as a downgrade-safe
@@ -168,17 +206,223 @@ impl Storage {
         layout: &SavedLayout,
     ) -> Result<(), std::io::Error> {
         self.save_workspace(&index.active_workspace_id, layout)?;
-        self.save_workspace_index(index)?;
-        self.save_autosave(layout)
+        self.save_autosave(layout)?;
+        // Write the catalog last: every workspace it references is already durable.
+        self.save_workspace_index(index)
     }
 
     pub fn delete_workspace(&self, id: &str) -> Result<(), std::io::Error> {
         let path = self.workspace_path(id)?;
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+        for candidate in [&path, &backup_path(&path), &temporary_path(&path)] {
+            match fs::remove_file(candidate) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
+        Ok(())
+    }
+
+    fn save_autosave_for_active_workspace(
+        &self,
+        index: &WorkspaceIndex,
+    ) -> Result<(), std::io::Error> {
+        match self.load_workspace(&index.active_workspace_id) {
+            Ok(layout) => self.save_autosave(&layout),
+            Err(error) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Could not load recovered active workspace: {error}"),
+            )),
+        }
+    }
+
+    fn rebuild_workspace_index(&self) -> Result<Option<WorkspaceIndex>, std::io::Error> {
+        let recovered = self.valid_workspace_files()?;
+        if recovered.is_empty() {
+            return Ok(None);
+        }
+        let active = recovered
+            .iter()
+            .filter(|workspace| workspace.preview_count > 0)
+            .max_by_key(|workspace| workspace.modified)
+            .or_else(|| recovered.iter().max_by_key(|workspace| workspace.modified))
+            .map(|workspace| workspace.id.clone())
+            .expect("non-empty recovered workspace list");
+        Ok(Some(WorkspaceIndex::from_recovered(
+            recovered
+                .into_iter()
+                .map(|workspace| workspace.id)
+                .collect(),
+            active,
+        )))
+    }
+
+    fn recover_orphaned_workspaces(
+        &self,
+        index: &mut WorkspaceIndex,
+    ) -> Result<bool, std::io::Error> {
+        let recovered = self.valid_workspace_files()?;
+        let mut newest_added = None;
+        let mut added_any = false;
+        for workspace in recovered {
+            if index.add_recovered(workspace.id.clone()) {
+                added_any = true;
+                if workspace.preview_count > 0
+                    && newest_added
+                        .as_ref()
+                        .is_none_or(|current: &RecoveredWorkspace| {
+                            workspace.modified > current.modified
+                        })
+                {
+                    newest_added = Some(workspace);
+                }
+            }
+        }
+
+        if added_any {
+            let active_is_blank = self
+                .load_workspace(&index.active_workspace_id)
+                .map(|layout| layout.previews.is_empty())
+                .unwrap_or(true);
+            if active_is_blank {
+                if let Some(workspace) = newest_added {
+                    index.active_workspace_id = workspace.id;
+                }
+            }
+            index.repair();
+        }
+        Ok(added_any)
+    }
+
+    fn valid_workspace_files(&self) -> Result<Vec<RecoveredWorkspace>, std::io::Error> {
+        let mut recovered = Vec::new();
+        for entry in fs::read_dir(self.workspaces_dir()?)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if !is_valid_workspace_id(id) {
+                continue;
+            }
+            let Ok(layout) = self.load_workspace(id) else {
+                continue;
+            };
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            recovered.push(RecoveredWorkspace {
+                id: id.to_owned(),
+                modified,
+                preview_count: layout.previews.len(),
+            });
+        }
+        recovered.sort_by_key(|workspace| workspace.id.clone());
+        Ok(recovered)
+    }
+}
+
+struct RecoveredWorkspace {
+    id: String,
+    modified: SystemTime,
+    preview_count: usize,
+}
+
+fn load_json_with_backup<T: DeserializeOwned>(
+    path: &Path,
+) -> Result<T, Box<dyn std::error::Error>> {
+    match load_json(path) {
+        Ok(value) => Ok(value),
+        Err(primary_error) => match load_json(&backup_path(path)) {
+            Ok(value) => Ok(value),
+            Err(backup_error)
+                if primary_error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    && backup_error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Err(primary_error)
+            }
+            Err(backup_error) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} could not be loaded ({primary_error}); its backup also failed ({backup_error})",
+                    path.display()
+                ),
+            )
+            .into()),
+        },
+    }
+}
+
+fn load_json<T: DeserializeOwned>(path: &Path) -> Result<T, Box<dyn std::error::Error>> {
+    let json = fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+/// Write a complete sibling file first, then rotate the previous valid file to
+/// `.bak`. A power loss at any point leaves either the primary or backup intact.
+fn write_json_safely<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io::Error> {
+    let json = serde_json::to_vec_pretty(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let temporary = temporary_path(path);
+    let backup = backup_path(path);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&json)?;
+    file.sync_all()?;
+    drop(file);
+
+    if path.exists() {
+        let primary_is_valid_json = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some();
+        if primary_is_valid_json {
+            remove_file_if_exists(&backup)?;
+            fs::rename(path, &backup)?;
+        } else {
+            // Never replace a known-good backup with a truncated primary.
+            remove_file_if_exists(path)?;
+        }
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        if !path.exists() && backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    path_with_suffix(path, ".bak")
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    path_with_suffix(path, ".tmp")
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), std::io::Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -268,6 +512,121 @@ mod tests {
         assert!(storage
             .save_workspace("../outside", &SavedLayout::new())
             .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn safe_workspace_writes_keep_the_previous_valid_save() {
+        let root = temp_root("workspace-backup");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let mut first = SavedLayout::new();
+        first.canvas.zoom = 1.25;
+        let mut second = SavedLayout::new();
+        second.canvas.zoom = 2.5;
+
+        storage.save_workspace("workspace-1", &first).unwrap();
+        storage.save_workspace("workspace-1", &second).unwrap();
+
+        assert_eq!(
+            storage
+                .load_workspace_backup("workspace-1")
+                .unwrap()
+                .canvas
+                .zoom,
+            1.25
+        );
+        assert_eq!(
+            storage.load_workspace("workspace-1").unwrap().canvas.zoom,
+            2.5
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn truncated_primary_uses_and_preserves_the_valid_backup() {
+        let root = temp_root("workspace-truncated-primary");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let mut first = SavedLayout::new();
+        first.canvas.zoom = 1.25;
+        let mut second = SavedLayout::new();
+        second.canvas.zoom = 2.5;
+        let mut third = SavedLayout::new();
+        third.canvas.zoom = 3.75;
+        storage.save_workspace("workspace-1", &first).unwrap();
+        storage.save_workspace("workspace-1", &second).unwrap();
+        let primary = root.join("workspaces").join("workspace-1.json");
+        fs::write(&primary, "{ truncated").unwrap();
+
+        assert_eq!(
+            storage.load_workspace("workspace-1").unwrap().canvas.zoom,
+            1.25
+        );
+        storage.save_workspace("workspace-1", &third).unwrap();
+        assert_eq!(
+            storage
+                .load_workspace_backup("workspace-1")
+                .unwrap()
+                .canvas
+                .zoom,
+            1.25
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_catalog_is_rebuilt_from_valid_workspace_files() {
+        let root = temp_root("workspace-catalog-rebuild");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        storage
+            .save_workspace("workspace-4", &SavedLayout::new())
+            .unwrap();
+        storage
+            .save_workspace("workspace-7", &SavedLayout::new())
+            .unwrap();
+        fs::write(root.join("workspaces.json"), "{ truncated").unwrap();
+
+        let index = storage.load_or_initialize_workspaces().unwrap();
+        let ids = index
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["workspace-4", "workspace-7"]);
+        assert!(
+            index.active_workspace_id == "workspace-4"
+                || index.active_workspace_id == "workspace-7"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn orphaned_workspace_files_are_returned_to_the_catalog() {
+        let root = temp_root("workspace-orphan-recovery");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let index = WorkspaceIndex::default();
+        storage
+            .save_workspace("workspace-1", &SavedLayout::new())
+            .unwrap();
+        storage.save_workspace_index(&index).unwrap();
+        storage
+            .save_workspace("workspace-4", &SavedLayout::new())
+            .unwrap();
+
+        let recovered = storage.load_or_initialize_workspaces().unwrap();
+
+        assert!(recovered
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == "workspace-4"));
         fs::remove_dir_all(root).unwrap();
     }
 

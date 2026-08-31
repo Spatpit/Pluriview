@@ -38,7 +38,7 @@
 | **Stream Audio Monitor** | Copy tile audio into Pluriview so Discord/OBS window shares pick it up |
 | **Crop Regions** | Focus on part of a window, browser page, image, GIF, or video with Alt+drag |
 | **Adjustable FPS** | 15, 30, or 60 FPS per preview |
-| **Auto-Save** | Layouts persist automatically, including browser URLs, video tiles, and inactive window tiles that reconnect when their app opens |
+| **Auto-Save** | Changed layouts save once per minute with crash-safe previous-save backups; unchanged layouts do not write to disk |
 | **Named Workspaces** | Create, duplicate, rename, and switch between reusable canvas setups |
 | **System Tray** | Minimize to tray for background operation |
 | **Quick Focus** | Double-click a preview to bring its source window to the front |
@@ -170,7 +170,12 @@ distribute `pluriview.pdb`; debug symbols can contain local paths.
 11. **Focus** a tile with right-click → **Focus on This Tile**; `Esc` restores the canvas
 
 The **Workspace** menu holds separate setups. Existing installs are migrated
-into a workspace named **Default** the first time workspaces run.
+into a workspace named **Default** the first time workspaces run. Pluriview
+checks once per minute and saves only when persisted workspace state changed.
+Use **Workspace → Restore Previous Save as New Workspace** to inspect the prior
+valid save without overwriting the current workspace. If the workspace catalog
+is interrupted or damaged, valid unlisted workspace files are returned to the
+catalog automatically.
 
 ## Keyboard Shortcuts
 
