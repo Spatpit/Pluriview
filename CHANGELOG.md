@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Named canvas views save camera positions within each workspace and glide between them with interruptible, smoothly eased pan and proportional zoom transitions. Configurable next, previous, and direct 1–9 shortcuts provide quick access; the menu indicates active and modified views, and deleted views can be undone.
 - Browser URL dialogs now provide a Paste button and a right-click Paste action for the URL field.
 - Changed workspaces now save automatically once per minute, while unchanged workspaces produce no disk writes.
 - The Workspace menu can restore the previous valid save as a separate recovered workspace.

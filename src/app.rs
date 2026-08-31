@@ -14,7 +14,8 @@ use crate::libmpv::{SeekPreviewManager, VideoManager, VideoSnapshot};
 use crate::media;
 use crate::overlay::RegionSelector;
 use crate::persistence::{
-    AppConfig, CanvasLayout, SavedLayout, Storage, WallpaperLayout, WindowLayout, WorkspaceIndex,
+    AppConfig, CanvasLayout, CanvasView, SavedLayout, Storage, WallpaperLayout, WindowLayout,
+    WorkspaceIndex,
 };
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout, ThumbnailState};
 #[cfg(windows)]
@@ -79,6 +80,8 @@ const WALLPAPER_HIBERNATE_AFTER: Duration = Duration::from_secs(10);
 const MAX_RECENT_URLS: usize = 8;
 /// Persist a changed workspace at most this long after the previous check.
 const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
+/// Recoverable deletion window for a named canvas view.
+const CANVAS_VIEW_UNDO_SECS: f32 = 4.0;
 
 #[cfg(windows)]
 fn clipboard_text() -> Result<String, &'static str> {
@@ -450,6 +453,36 @@ enum WorkspaceMenuAction {
     ConfirmDelete,
 }
 
+#[derive(Clone, Copy)]
+enum CanvasViewDialogKind {
+    Create,
+    Rename(usize),
+}
+
+struct CanvasViewDialog {
+    kind: CanvasViewDialogKind,
+    name: String,
+    focused: bool,
+    error: Option<String>,
+}
+
+struct DeletedCanvasView {
+    removed_at: Instant,
+    index: usize,
+    view: CanvasView,
+    was_active: bool,
+}
+
+enum CanvasViewMenuAction {
+    Jump(usize),
+    Previous,
+    Next,
+    OpenCreateDialog,
+    OpenRenameDialog(usize),
+    Update(usize),
+    Delete(usize),
+}
+
 enum SettingsAction {
     Browse(ToolKind),
     UseAutoDetected(ToolKind),
@@ -544,6 +577,50 @@ fn wallpaper_hibernation_due(since: Instant, now: Instant) -> bool {
 
 fn workspace_snapshot_changed(previous: Option<&[u8]>, current: &[u8]) -> bool {
     previous != Some(current)
+}
+
+fn adjacent_canvas_view_index(
+    active: Option<usize>,
+    view_count: usize,
+    forward: bool,
+) -> Option<usize> {
+    if view_count == 0 {
+        return None;
+    }
+    match (active.filter(|index| *index < view_count), forward) {
+        (Some(index), true) => Some((index + 1) % view_count),
+        (Some(index), false) => Some((index + view_count - 1) % view_count),
+        (None, true) => Some(0),
+        (None, false) => Some(view_count - 1),
+    }
+}
+
+fn active_canvas_view_after_deletion(active: Option<usize>, deleted_index: usize) -> Option<usize> {
+    match active {
+        Some(index) if index == deleted_index => None,
+        Some(index) if index > deleted_index => Some(index - 1),
+        other => other,
+    }
+}
+
+fn active_canvas_view_after_insertion(
+    active: Option<usize>,
+    inserted_index: usize,
+) -> Option<usize> {
+    active.map(|index| {
+        if index >= inserted_index {
+            index + 1
+        } else {
+            index
+        }
+    })
+}
+
+fn camera_matches_canvas_view(center: Pos2, zoom: f32, view: &CanvasView) -> bool {
+    let target = Pos2::new(view.center.0, view.center.1);
+    let screen_distance = center.distance(target) * zoom.max(0.01);
+    let zoom_distance = (zoom.max(0.01) / view.zoom.max(0.01)).ln().abs();
+    screen_distance <= 1.0 && zoom_distance <= 0.001
 }
 
 #[cfg(windows)]
@@ -651,6 +728,19 @@ pub struct PluriviewApp {
 
     /// Create, duplicate, or rename dialog.
     workspace_dialog: Option<WorkspaceDialog>,
+
+    /// Named camera positions belonging to the active workspace.
+    canvas_views: Vec<CanvasView>,
+
+    /// Last selected view remains active while its camera is moving; manual
+    /// navigation leaves it selected but marks it modified in the menu.
+    active_canvas_view: Option<usize>,
+
+    /// Create or rename a workspace-local canvas view.
+    canvas_view_dialog: Option<CanvasViewDialog>,
+
+    /// Most recently deleted view, retained briefly for a recoverable Undo.
+    deleted_canvas_view: Option<DeletedCanvasView>,
 
     /// Confirmation guard for deleting the active workspace.
     confirm_workspace_delete: bool,
@@ -847,6 +937,10 @@ impl PluriviewApp {
             config_error,
             workspaces,
             workspace_dialog: None,
+            canvas_views: Vec::new(),
+            active_canvas_view: None,
+            canvas_view_dialog: None,
+            deleted_canvas_view: None,
             confirm_workspace_delete: false,
             workspace_error,
             workspace_persistence_ready,
@@ -3603,6 +3697,10 @@ impl PluriviewApp {
     /// menu-bar row).
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let workspace_entries = self.workspaces.workspaces.clone();
+        let canvas_views = self.canvas_views.clone();
+        let active_canvas_view = self.active_canvas_view;
+        let active_canvas_view_modified =
+            active_canvas_view.is_some_and(|index| self.canvas_view_is_modified(index));
         let active_workspace_id = self.workspaces.active_workspace_id.clone();
         let active_workspace_name = self
             .workspaces
@@ -3614,6 +3712,7 @@ impl PluriviewApp {
             .as_ref()
             .is_some_and(|storage| storage.workspace_backup_exists(&active_workspace_id));
         let mut workspace_action = None;
+        let mut canvas_view_action = None;
 
         ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
         ui.visuals_mut().widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(30, 30, 35);
@@ -3775,6 +3874,98 @@ impl PluriviewApp {
                     ui.close_menu();
                 }
                 ui.separator();
+                ui.menu_button("Canvas Views", |ui| {
+                    if canvas_views.is_empty() {
+                        ui.label(egui::RichText::new("No saved views").weak());
+                    } else {
+                        let previous_label = format!(
+                            "Previous View ({})",
+                            self.app_config
+                                .keyboard_shortcuts
+                                .get(HotkeySlot::PreviousCanvasView)
+                                .display()
+                        );
+                        if ui.button(previous_label).clicked() {
+                            canvas_view_action = Some(CanvasViewMenuAction::Previous);
+                            ui.close_menu();
+                        }
+                        let next_label = format!(
+                            "Next View ({})",
+                            self.app_config
+                                .keyboard_shortcuts
+                                .get(HotkeySlot::NextCanvasView)
+                                .display()
+                        );
+                        if ui.button(next_label).clicked() {
+                            canvas_view_action = Some(CanvasViewMenuAction::Next);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        for (index, view) in canvas_views.iter().enumerate() {
+                            ui.push_id(index, |ui| {
+                                ui.horizontal(|ui| {
+                                    let is_active = active_canvas_view == Some(index);
+                                    let mut label = if is_active {
+                                        format!("● {}", view.name)
+                                    } else {
+                                        view.name.clone()
+                                    };
+                                    if is_active && active_canvas_view_modified {
+                                        label.push_str(" (modified)");
+                                    }
+                                    if let Some(slot) = HotkeySlot::CANVAS_VIEWS.get(index) {
+                                        label.push_str(&format!(
+                                            "  {}",
+                                            self.app_config.keyboard_shortcuts.get(*slot).display()
+                                        ));
+                                    }
+                                    let text = if is_active {
+                                        egui::RichText::new(label).color(if active_canvas_view_modified {
+                                            egui::Color32::from_rgb(220, 180, 95)
+                                        } else {
+                                            egui::Color32::from_rgb(125, 185, 255)
+                                        })
+                                    } else {
+                                        egui::RichText::new(label)
+                                    };
+                                    if ui
+                                        .button(text)
+                                        .on_hover_text("Move smoothly to this canvas view")
+                                        .clicked()
+                                    {
+                                        canvas_view_action =
+                                            Some(CanvasViewMenuAction::Jump(index));
+                                        ui.close_menu();
+                                    }
+                                    ui.menu_button(egui_phosphor::regular::DOTS_THREE, |ui| {
+                                        if ui.button("Update from Current View").clicked() {
+                                            canvas_view_action =
+                                                Some(CanvasViewMenuAction::Update(index));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Rename...").clicked() {
+                                            canvas_view_action = Some(
+                                                CanvasViewMenuAction::OpenRenameDialog(index),
+                                            );
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Delete").clicked() {
+                                            canvas_view_action =
+                                                Some(CanvasViewMenuAction::Delete(index));
+                                            ui.close_menu();
+                                        }
+                                    });
+                                });
+                            });
+                        }
+                        ui.separator();
+                    }
+                    if ui.button("Save Current View...").clicked() {
+                        canvas_view_action = Some(CanvasViewMenuAction::OpenCreateDialog);
+                        ui.close_menu();
+                    }
+                });
+                ui.separator();
                 if ui.button("Reset View").clicked() {
                     self.canvas.reset();
                     ui.close_menu();
@@ -3826,6 +4017,10 @@ impl PluriviewApp {
                 }
             });
         });
+
+        if let Some(action) = canvas_view_action {
+            self.handle_canvas_view_menu_action(action, ctx);
+        }
 
         if let Some(action) = workspace_action {
             match action {
@@ -4208,6 +4403,310 @@ impl PluriviewApp {
                 .map(|error| format!("Could not save settings: {error}")),
             None => Some("Settings storage is unavailable.".to_owned()),
         };
+    }
+
+    fn validate_canvas_view_name(
+        &self,
+        name: &str,
+        renamed_index: Option<usize>,
+    ) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Canvas view name cannot be empty.".to_owned());
+        }
+        if name.chars().count() > 60 {
+            return Err("Canvas view names can contain at most 60 characters.".to_owned());
+        }
+        if self.canvas_views.iter().enumerate().any(|(index, view)| {
+            Some(index) != renamed_index && view.name.eq_ignore_ascii_case(name)
+        }) {
+            return Err("A canvas view with that name already exists.".to_owned());
+        }
+        Ok(name.to_owned())
+    }
+
+    fn current_canvas_view(&self, name: String) -> Result<CanvasView, String> {
+        let canvas_rect = self
+            .canvas
+            .last_screen_rect
+            .ok_or_else(|| "The canvas is not ready yet.".to_owned())?;
+        let center = self.canvas.camera_center(canvas_rect);
+        Ok(CanvasView {
+            name,
+            center: (center.x, center.y),
+            zoom: self.canvas.zoom,
+        })
+    }
+
+    fn canvas_view_is_modified(&self, index: usize) -> bool {
+        if self.active_canvas_view != Some(index) || self.canvas.is_camera_transitioning() {
+            return false;
+        }
+        let Some(view) = self.canvas_views.get(index) else {
+            return false;
+        };
+        let Some(canvas_rect) = self.canvas.last_screen_rect else {
+            return false;
+        };
+        !camera_matches_canvas_view(
+            self.canvas.camera_center(canvas_rect),
+            self.canvas.zoom,
+            view,
+        )
+    }
+
+    fn jump_to_canvas_view(&mut self, index: usize, ctx: &egui::Context) {
+        let Some(view) = self.canvas_views.get(index).cloned() else {
+            return;
+        };
+        let Some(canvas_rect) = self.canvas.last_screen_rect else {
+            return;
+        };
+        let now = ctx.input(|input| input.time);
+        self.canvas.start_camera_transition(
+            Pos2::new(view.center.0, view.center.1),
+            view.zoom,
+            canvas_rect,
+            now,
+        );
+        self.active_canvas_view = Some(index);
+        ctx.request_repaint();
+    }
+
+    fn jump_to_adjacent_canvas_view(&mut self, forward: bool, ctx: &egui::Context) {
+        if let Some(index) =
+            adjacent_canvas_view_index(self.active_canvas_view, self.canvas_views.len(), forward)
+        {
+            self.jump_to_canvas_view(index, ctx);
+        }
+    }
+
+    fn persist_canvas_view_change(&mut self) {
+        if let Err(error) = self.save_active_workspace() {
+            self.workspace_error = Some(error);
+        }
+    }
+
+    fn handle_canvas_view_menu_action(
+        &mut self,
+        action: CanvasViewMenuAction,
+        ctx: &egui::Context,
+    ) {
+        match action {
+            CanvasViewMenuAction::Jump(index) => self.jump_to_canvas_view(index, ctx),
+            CanvasViewMenuAction::Previous => self.jump_to_adjacent_canvas_view(false, ctx),
+            CanvasViewMenuAction::Next => self.jump_to_adjacent_canvas_view(true, ctx),
+            CanvasViewMenuAction::OpenCreateDialog => {
+                self.canvas_view_dialog = Some(CanvasViewDialog {
+                    kind: CanvasViewDialogKind::Create,
+                    name: format!("View {}", self.canvas_views.len() + 1),
+                    focused: false,
+                    error: None,
+                });
+            }
+            CanvasViewMenuAction::OpenRenameDialog(index) => {
+                if let Some(view) = self.canvas_views.get(index) {
+                    self.canvas_view_dialog = Some(CanvasViewDialog {
+                        kind: CanvasViewDialogKind::Rename(index),
+                        name: view.name.clone(),
+                        focused: false,
+                        error: None,
+                    });
+                }
+            }
+            CanvasViewMenuAction::Update(index) => {
+                let Some(name) = self.canvas_views.get(index).map(|view| view.name.clone()) else {
+                    return;
+                };
+                match self.current_canvas_view(name) {
+                    Ok(view) => {
+                        self.canvas_views[index] = view;
+                        self.active_canvas_view = Some(index);
+                        self.persist_canvas_view_change();
+                    }
+                    Err(error) => self.workspace_error = Some(error),
+                }
+            }
+            CanvasViewMenuAction::Delete(index) => {
+                if index < self.canvas_views.len() {
+                    let was_active = self.active_canvas_view == Some(index);
+                    let view = self.canvas_views.remove(index);
+                    if was_active {
+                        self.canvas.cancel_camera_transition();
+                    }
+                    self.active_canvas_view =
+                        active_canvas_view_after_deletion(self.active_canvas_view, index);
+                    self.deleted_canvas_view = Some(DeletedCanvasView {
+                        removed_at: Instant::now(),
+                        index,
+                        view,
+                        was_active,
+                    });
+                    self.persist_canvas_view_change();
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
+    fn canvas_view_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.canvas_view_dialog else {
+            return;
+        };
+        let (title, submit_label) = match dialog.kind {
+            CanvasViewDialogKind::Create => ("Save Canvas View", "Save"),
+            CanvasViewDialogKind::Rename(_) => ("Rename Canvas View", "Rename"),
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("View name");
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut dialog.name).desired_width(300.0));
+                if !dialog.focused {
+                    response.request_focus();
+                    dialog.focused = true;
+                }
+                let enter =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if let Some(error) = &dialog.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(submit_label).clicked() || enter {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            self.canvas_view_dialog = None;
+        } else if submit {
+            let mut dialog = self
+                .canvas_view_dialog
+                .take()
+                .expect("canvas view dialog exists");
+            let renamed_index = match dialog.kind {
+                CanvasViewDialogKind::Create => None,
+                CanvasViewDialogKind::Rename(index) => Some(index),
+            };
+            match self.validate_canvas_view_name(&dialog.name, renamed_index) {
+                Ok(name) => match dialog.kind {
+                    CanvasViewDialogKind::Create => match self.current_canvas_view(name) {
+                        Ok(view) => {
+                            self.canvas_views.push(view);
+                            self.active_canvas_view = self.canvas_views.len().checked_sub(1);
+                            self.persist_canvas_view_change();
+                        }
+                        Err(error) => {
+                            dialog.error = Some(error);
+                            self.canvas_view_dialog = Some(dialog);
+                        }
+                    },
+                    CanvasViewDialogKind::Rename(index) => {
+                        if let Some(view) = self.canvas_views.get_mut(index) {
+                            view.name = name;
+                            self.persist_canvas_view_change();
+                        }
+                    }
+                },
+                Err(error) => {
+                    dialog.error = Some(error);
+                    self.canvas_view_dialog = Some(dialog);
+                }
+            }
+        }
+    }
+
+    fn canvas_view_undo_toast_ui(&mut self, ctx: &egui::Context) {
+        if self.canvas_only {
+            return;
+        }
+        let Some(deleted) = self.deleted_canvas_view.as_ref() else {
+            return;
+        };
+        let age = deleted.removed_at.elapsed().as_secs_f32();
+        if age >= CANVAS_VIEW_UNDO_SECS {
+            self.deleted_canvas_view = None;
+            return;
+        }
+        let Some(canvas_rect) = self.canvas.last_screen_rect else {
+            return;
+        };
+
+        let fade_in = (age / 0.15).clamp(0.0, 1.0);
+        let fade_out = ((CANVAS_VIEW_UNDO_SECS - age) / 0.5).clamp(0.0, 1.0);
+        let fade = fade_in.min(fade_out);
+        let name = if deleted.view.name.chars().count() > 32 {
+            format!(
+                "{}...",
+                deleted.view.name.chars().take(29).collect::<String>()
+            )
+        } else {
+            deleted.view.name.clone()
+        };
+        let position = Pos2::new(canvas_rect.center().x - 130.0, canvas_rect.top() + 16.0);
+        let mut undo = false;
+        egui::Area::new(egui::Id::new("canvas_view_undo_toast"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .show(ctx, |ui| {
+                ui.multiply_opacity(fade);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(24, 24, 28))
+                    .rounding(10.0)
+                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Deleted “{name}”"));
+                            if ui
+                                .button(
+                                    egui::RichText::new("Undo")
+                                        .color(egui::Color32::from_rgb(125, 185, 255)),
+                                )
+                                .clicked()
+                            {
+                                undo = true;
+                            }
+                        });
+                    });
+            });
+        ctx.request_repaint();
+
+        if undo {
+            let deleted = self
+                .deleted_canvas_view
+                .take()
+                .expect("deleted canvas view exists");
+            if self
+                .canvas_views
+                .iter()
+                .any(|view| view.name.eq_ignore_ascii_case(&deleted.view.name))
+            {
+                self.workspace_error = Some(format!(
+                    "Could not restore “{}” because a canvas view now uses that name.",
+                    deleted.view.name
+                ));
+                return;
+            }
+            let index = deleted.index.min(self.canvas_views.len());
+            self.active_canvas_view =
+                active_canvas_view_after_insertion(self.active_canvas_view, index);
+            self.canvas_views.insert(index, deleted.view);
+            if deleted.was_active && self.active_canvas_view.is_none() {
+                self.active_canvas_view = Some(index);
+            }
+            self.persist_canvas_view_change();
+        }
     }
 
     fn workspace_dialog_ui(&mut self, ctx: &egui::Context) {
@@ -4875,6 +5374,8 @@ impl PluriviewApp {
                 .wallpaper
                 .as_ref()
                 .map(CanvasWallpaper::to_layout),
+            views: self.canvas_views.clone(),
+            active_view: self.active_canvas_view,
         };
 
         // Save all previews
@@ -4915,6 +5416,9 @@ impl PluriviewApp {
 
     /// Apply a SavedLayout to restore state
     fn apply_layout(&mut self, layout: &SavedLayout) {
+        self.canvas_view_dialog = None;
+        self.active_canvas_view = None;
+        self.deleted_canvas_view = None;
         self.clear_wallpaper();
         // Clear existing state
         self.capture_coordinator.stop_all();
@@ -4955,6 +5459,12 @@ impl PluriviewApp {
         self.canvas.pan = Vec2::new(layout.canvas.pan.0, layout.canvas.pan.1);
         self.canvas.zoom = layout.canvas.zoom;
         self.canvas.show_grid = layout.canvas.show_grid;
+        self.canvas.cancel_camera_transition();
+        self.canvas_views = layout.canvas.views.clone();
+        self.active_canvas_view = layout
+            .canvas
+            .active_view
+            .filter(|index| *index < self.canvas_views.len());
         if let Some(wallpaper) = layout.canvas.wallpaper.clone() {
             if let Err(error) = self.restore_wallpaper(wallpaper) {
                 log::error!("Failed to restore wallpaper: {error}");
@@ -5225,14 +5735,15 @@ impl PluriviewApp {
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        browser_capture_display_size, browser_capture_fps, browser_page_screen_rect,
-        browser_tile_screen_rect, find_saved_window, mark_pending_browser_placeholders_shown,
-        preview_playback_state, preview_video_status, restore_browser_geometry,
-        restored_browser_ready, restored_video_ready, resumable_video_position,
-        video_launch_for_source, video_session_is_stale, wallpaper_hibernation_due,
-        workspace_snapshot_changed, FpsPreset, PendingBrowserTile, PendingVideoTile, VideoSource,
-        VideoTileStatus, WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID,
-        WORKSPACE_AUTOSAVE_INTERVAL,
+        active_canvas_view_after_deletion, active_canvas_view_after_insertion,
+        adjacent_canvas_view_index, browser_capture_display_size, browser_capture_fps,
+        browser_page_screen_rect, browser_tile_screen_rect, camera_matches_canvas_view,
+        find_saved_window, mark_pending_browser_placeholders_shown, preview_playback_state,
+        preview_video_status, restore_browser_geometry, restored_browser_ready,
+        restored_video_ready, resumable_video_position, video_launch_for_source,
+        video_session_is_stale, wallpaper_hibernation_due, workspace_snapshot_changed, CanvasView,
+        FpsPreset, PendingBrowserTile, PendingVideoTile, VideoSource, VideoTileStatus,
+        WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID, WORKSPACE_AUTOSAVE_INTERVAL,
     };
     use crate::canvas::CanvasState;
     use crate::external_tools::{DiscoverySource, ToolStatus};
@@ -5265,6 +5776,49 @@ mod tests {
         assert!(!workspace_snapshot_changed(Some(saved), saved));
         assert!(workspace_snapshot_changed(Some(saved), br#"{"version":2}"#));
         assert!(workspace_snapshot_changed(None, saved));
+    }
+
+    #[test]
+    fn adjacent_canvas_views_wrap_and_start_at_the_nearest_end() {
+        assert_eq!(adjacent_canvas_view_index(None, 3, true), Some(0));
+        assert_eq!(adjacent_canvas_view_index(None, 3, false), Some(2));
+        assert_eq!(adjacent_canvas_view_index(Some(2), 3, true), Some(0));
+        assert_eq!(adjacent_canvas_view_index(Some(0), 3, false), Some(2));
+        assert_eq!(adjacent_canvas_view_index(Some(8), 3, true), Some(0));
+        assert_eq!(adjacent_canvas_view_index(None, 0, true), None);
+    }
+
+    #[test]
+    fn active_canvas_view_index_survives_delete_and_undo_reordering() {
+        assert_eq!(active_canvas_view_after_deletion(Some(3), 1), Some(2));
+        assert_eq!(active_canvas_view_after_deletion(Some(1), 1), None);
+        assert_eq!(active_canvas_view_after_deletion(Some(0), 1), Some(0));
+        assert_eq!(active_canvas_view_after_insertion(Some(2), 1), Some(3));
+        assert_eq!(active_canvas_view_after_insertion(Some(0), 1), Some(0));
+    }
+
+    #[test]
+    fn active_canvas_view_uses_screen_and_proportional_zoom_tolerances() {
+        let view = CanvasView {
+            name: "Overview".to_owned(),
+            center: (100.0, 200.0),
+            zoom: 1.0,
+        };
+        assert!(camera_matches_canvas_view(
+            Pos2::new(100.5, 200.0),
+            1.0,
+            &view
+        ));
+        assert!(!camera_matches_canvas_view(
+            Pos2::new(102.0, 200.0),
+            1.0,
+            &view
+        ));
+        assert!(!camera_matches_canvas_view(
+            Pos2::new(100.0, 200.0),
+            1.01,
+            &view
+        ));
     }
 
     #[test]
@@ -5706,6 +6260,9 @@ impl eframe::App for PluriviewApp {
             && !self.show_settings
             && !self.show_shortcuts
             && !self.show_about
+            && self.canvas_view_dialog.is_none()
+            && self.workspace_dialog.is_none()
+            && !self.confirm_workspace_delete
             && self.hotkey_recording.is_none();
         let shortcut_presses = self
             .hotkey_tracker
@@ -5733,6 +6290,16 @@ impl eframe::App for PluriviewApp {
         }
         if shortcut_presses.pressed(HotkeySlot::ShowShortcutHelp) {
             self.show_shortcuts = true;
+        }
+        let numbered_canvas_view = HotkeySlot::CANVAS_VIEWS
+            .iter()
+            .position(|slot| shortcut_presses.pressed(*slot));
+        if let Some(index) = numbered_canvas_view {
+            self.jump_to_canvas_view(index, ctx);
+        } else if shortcut_presses.pressed(HotkeySlot::PreviousCanvasView) {
+            self.jump_to_adjacent_canvas_view(false, ctx);
+        } else if shortcut_presses.pressed(HotkeySlot::NextCanvasView) {
+            self.jump_to_adjacent_canvas_view(true, ctx);
         }
         self.canvas.set_keyboard_input(CanvasKeyboardInput {
             delete_selected: shortcut_presses.pressed(HotkeySlot::DeleteSelected),
@@ -6186,8 +6753,10 @@ impl eframe::App for PluriviewApp {
         self.external_tool_error_ui(ctx);
         self.video_action_error_ui(ctx);
         self.settings_ui(ctx);
+        self.canvas_view_dialog_ui(ctx);
         self.workspace_dialog_ui(ctx);
         self.workspace_delete_confirmation_ui(ctx);
+        self.canvas_view_undo_toast_ui(ctx);
 
         if self.media_error.is_some() {
             let mut dismiss = false;
@@ -6348,6 +6917,47 @@ impl eframe::App for PluriviewApp {
                                     self.app_config
                                         .keyboard_shortcuts
                                         .get(HotkeySlot::ExitTileOrBrowser)
+                                        .display()
+                                ))
+                                .weak(),
+                            );
+                            ui.end_row();
+
+                            ui.label("Previous canvas view");
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::PreviousCanvasView)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
+                            ui.end_row();
+
+                            ui.label("Next canvas view");
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::NextCanvasView)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
+                            ui.end_row();
+
+                            ui.label("Canvas views 1–9");
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} … {}",
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::CanvasView1)
+                                        .display(),
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::CanvasView9)
                                         .display()
                                 ))
                                 .weak(),

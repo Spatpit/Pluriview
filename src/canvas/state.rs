@@ -1,4 +1,4 @@
-use super::animation::{AnimationState, DragTracker};
+use super::animation::{AnimationState, CameraTransition, DragTracker};
 use super::wallpaper::CanvasWallpaper;
 use crate::capture::{capture_lod_factor, window_capture_target, CaptureCoordinator};
 use crate::preview::{
@@ -93,6 +93,40 @@ mod tests {
     #[test]
     fn canvas_screen_rect_starts_empty() {
         assert!(CanvasState::default().last_screen_rect.is_none());
+    }
+
+    #[test]
+    fn saved_view_transition_finishes_with_target_center_and_zoom() {
+        let mut canvas = CanvasState {
+            pan: Vec2::new(-120.0, 40.0),
+            zoom: 0.75,
+            ..Default::default()
+        };
+        let viewport = Rect::from_min_size(Pos2::new(50.0, 80.0), Vec2::new(1200.0, 700.0));
+        let target_center = Pos2::new(1600.0, -420.0);
+
+        canvas.start_camera_transition(target_center, 2.25, viewport, 10.0);
+        canvas.update_camera_transition(viewport, 11.0);
+
+        assert!(canvas.camera_center(viewport).distance(target_center) < 0.001);
+        assert!((canvas.zoom - 2.25).abs() < 0.0001);
+        assert!(canvas.animation.camera_transition.is_none());
+    }
+
+    #[test]
+    fn retargeting_a_saved_view_transition_is_continuous() {
+        let mut canvas = CanvasState::default();
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 600.0));
+        canvas.start_camera_transition(Pos2::new(2000.0, 500.0), 2.0, viewport, 3.0);
+        canvas.update_camera_transition(viewport, 3.2);
+        let center_before = canvas.camera_center(viewport);
+        let zoom_before = canvas.zoom;
+
+        canvas.start_camera_transition(Pos2::new(-800.0, 900.0), 0.4, viewport, 3.2);
+        canvas.update_camera_transition(viewport, 3.2);
+
+        assert!(canvas.camera_center(viewport).distance(center_before) < 0.001);
+        assert!((canvas.zoom - zoom_before).abs() < 0.0001);
     }
 
     #[test]
@@ -2752,6 +2786,7 @@ impl CanvasState {
         self.pinned_pointer_drag = None;
         self.video_volume_hover = None;
         self.animation.preview_springs.clear();
+        self.cancel_camera_transition();
     }
 
     /// Drop animation state belonging to previews from a previous layout.
@@ -2776,6 +2811,7 @@ impl CanvasState {
 
     /// Fit one tile in the current canvas without changing its saved geometry.
     pub fn focus_on_tile(&mut self, id: PreviewId, tile_rect: Rect, canvas_rect: Rect) {
+        self.cancel_camera_transition();
         if let Some(focus) = &mut self.focus {
             focus.id = id;
         } else {
@@ -2801,6 +2837,71 @@ impl CanvasState {
 
     pub fn is_focusing_tile(&self) -> bool {
         self.focus.is_some()
+    }
+
+    /// Canvas-space point currently shown at the center of the viewport.
+    pub fn camera_center(&self, canvas_rect: Rect) -> Pos2 {
+        self.screen_to_canvas(canvas_rect.center(), canvas_rect)
+    }
+
+    /// Glide to a named view. A new request samples the camera's current
+    /// position, so selecting another view mid-transition remains continuous.
+    pub fn start_camera_transition(
+        &mut self,
+        target_center: Pos2,
+        target_zoom: f32,
+        canvas_rect: Rect,
+        now: f64,
+    ) {
+        let start_center = self.camera_center(canvas_rect);
+        let target_zoom = target_zoom.clamp(self.zoom_min, self.zoom_max);
+        self.focus = None;
+        self.animation.momentum_active = false;
+        self.animation.momentum_velocity = Vec2::ZERO;
+
+        if start_center.distance(target_center) < 0.01 && (self.zoom - target_zoom).abs() < 0.0001 {
+            self.zoom = target_zoom;
+            self.pan =
+                (canvas_rect.center() - canvas_rect.min) / self.zoom - target_center.to_vec2();
+            self.animation.camera_transition = None;
+            return;
+        }
+
+        self.animation.camera_transition = Some(CameraTransition::new(
+            start_center,
+            target_center,
+            self.zoom,
+            target_zoom,
+            canvas_rect.size(),
+            now,
+        ));
+    }
+
+    /// Stop a saved-view glide at its current position. Direct navigation
+    /// input calls this before applying its own movement.
+    pub fn cancel_camera_transition(&mut self) {
+        self.animation.camera_transition = None;
+    }
+
+    pub fn is_camera_transitioning(&self) -> bool {
+        self.animation.camera_transition.is_some()
+    }
+
+    fn update_camera_transition(&mut self, canvas_rect: Rect, now: f64) {
+        let Some(sample) = self
+            .animation
+            .camera_transition
+            .as_ref()
+            .map(|transition| transition.sample(now))
+        else {
+            return;
+        };
+
+        self.zoom = sample.zoom.clamp(self.zoom_min, self.zoom_max);
+        self.pan = (canvas_rect.center() - canvas_rect.min) / self.zoom - sample.center.to_vec2();
+        if sample.finished {
+            self.animation.camera_transition = None;
+        }
     }
 
     /// Restore the canvas view saved before tile focus.
@@ -3244,8 +3345,8 @@ impl CanvasState {
                 .is_some_and(|layer| layer != ui.layer_id())
         });
 
-        if input.escape_pressed {
-            self.exit_focus();
+        if input.escape_pressed && !self.exit_focus() {
+            self.cancel_camera_transition();
         }
         if !show_overlays {
             self.drag_state = None;
@@ -3267,13 +3368,15 @@ impl CanvasState {
 
         // Update all animations
         self.animation.update(dt);
+        self.update_camera_transition(canvas_rect, current_time);
 
         // Apply momentum to pan (smooth inertia scrolling)
         let handle_drag_active = matches!(
             self.drag_state,
             Some(DragState::Resizing { .. } | DragState::Cropping { .. })
         );
-        if self.animation.momentum_active
+        if self.animation.camera_transition.is_none()
+            && self.animation.momentum_active
             && !handle_drag_active
             && !input.middle_down
             && !(input.alt && input.primary_down)
@@ -3737,6 +3840,7 @@ impl CanvasState {
                                 .max(0.0);
                             }
                         } else {
+                            self.cancel_camera_transition();
                             let zoom_factor = if scroll_delta > 0.0 { 1.1 } else { 0.9 };
                             let new_zoom =
                                 (self.zoom * zoom_factor).clamp(self.zoom_min, self.zoom_max);
@@ -3766,6 +3870,7 @@ impl CanvasState {
             if !self.canvas_panning {
                 self.canvas_panning = true;
                 self.pan_drag_tracker.clear();
+                self.cancel_camera_transition();
                 // Stop any existing momentum
                 self.animation.momentum_active = false;
                 self.animation.momentum_velocity = Vec2::ZERO;

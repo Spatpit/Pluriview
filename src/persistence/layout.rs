@@ -84,6 +84,22 @@ pub struct CanvasLayout {
     /// Optional live wallpaper drawn behind tiles in screen space.
     #[serde(default)]
     pub wallpaper: Option<WallpaperLayout>,
+    /// Named camera positions within this workspace. Centers are canvas-space
+    /// coordinates, independent of window and sidebar dimensions.
+    #[serde(default)]
+    pub views: Vec<CanvasView>,
+    /// Last selected view. It remains selected when the camera moves away so
+    /// the UI can indicate that the view is modified.
+    #[serde(default)]
+    pub active_view: Option<usize>,
+}
+
+/// A named, workspace-local camera position on the infinite canvas.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CanvasView {
+    pub name: String,
+    pub center: (f32, f32),
+    pub zoom: f32,
 }
 
 impl Default for CanvasLayout {
@@ -93,6 +109,8 @@ impl Default for CanvasLayout {
             zoom: 1.0,
             show_grid: true,
             wallpaper: None,
+            views: Vec::new(),
+            active_view: None,
         }
     }
 }
@@ -107,6 +125,8 @@ impl SavedLayout {
                 zoom: 1.0,
                 show_grid: true,
                 wallpaper: None,
+                views: Vec::new(),
+                active_view: None,
             },
             previews: Vec::new(),
             recent_browser_urls: Vec::new(),
@@ -124,7 +144,7 @@ fn default_true() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SavedLayout, WindowLayout};
+    use super::{CanvasView, SavedLayout, WindowLayout};
     use std::path::PathBuf;
 
     #[test]
@@ -215,5 +235,50 @@ mod tests {
 
         let restored: SavedLayout = serde_json::from_value(value).unwrap();
         assert!(restored.canvas.wallpaper.is_none());
+    }
+
+    #[test]
+    fn canvas_views_survive_a_round_trip() {
+        let mut layout = SavedLayout::new();
+        layout.canvas.views.push(CanvasView {
+            name: "Streams".to_owned(),
+            center: (1250.0, -320.0),
+            zoom: 0.75,
+        });
+        layout.canvas.active_view = Some(0);
+
+        let json = serde_json::to_string(&layout).unwrap();
+        let restored: SavedLayout = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.canvas.views, layout.canvas.views);
+        assert_eq!(restored.canvas.active_view, Some(0));
+    }
+
+    #[test]
+    fn older_layouts_have_no_canvas_views() {
+        let layout = SavedLayout::new();
+        let mut value = serde_json::to_value(layout).unwrap();
+        value
+            .get_mut("canvas")
+            .and_then(|canvas| canvas.as_object_mut())
+            .unwrap()
+            .remove("views");
+
+        let restored: SavedLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.canvas.views.is_empty());
+    }
+
+    #[test]
+    fn older_layouts_have_no_active_canvas_view() {
+        let layout = SavedLayout::new();
+        let mut value = serde_json::to_value(layout).unwrap();
+        value
+            .get_mut("canvas")
+            .and_then(|canvas| canvas.as_object_mut())
+            .unwrap()
+            .remove("active_view");
+
+        let restored: SavedLayout = serde_json::from_value(value).unwrap();
+        assert!(restored.canvas.active_view.is_none());
     }
 }

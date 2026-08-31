@@ -44,6 +44,17 @@ pub enum HotkeySlot {
     ToggleWindowPicker,
     ToggleGrid,
     ToggleCanvasOnly,
+    PreviousCanvasView,
+    NextCanvasView,
+    CanvasView1,
+    CanvasView2,
+    CanvasView3,
+    CanvasView4,
+    CanvasView5,
+    CanvasView6,
+    CanvasView7,
+    CanvasView8,
+    CanvasView9,
     SelectAll,
     DeleteSelected,
     FocusCurrentTile,
@@ -54,10 +65,33 @@ pub enum HotkeySlot {
 }
 
 impl HotkeySlot {
-    pub const ALL: [Self; 10] = [
+    pub const CANVAS_VIEWS: [Self; 9] = [
+        Self::CanvasView1,
+        Self::CanvasView2,
+        Self::CanvasView3,
+        Self::CanvasView4,
+        Self::CanvasView5,
+        Self::CanvasView6,
+        Self::CanvasView7,
+        Self::CanvasView8,
+        Self::CanvasView9,
+    ];
+
+    pub const ALL: [Self; 21] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
+        Self::PreviousCanvasView,
+        Self::NextCanvasView,
+        Self::CanvasView1,
+        Self::CanvasView2,
+        Self::CanvasView3,
+        Self::CanvasView4,
+        Self::CanvasView5,
+        Self::CanvasView6,
+        Self::CanvasView7,
+        Self::CanvasView8,
+        Self::CanvasView9,
         Self::SelectAll,
         Self::DeleteSelected,
         Self::FocusCurrentTile,
@@ -72,6 +106,17 @@ impl HotkeySlot {
             Self::ToggleWindowPicker => "Toggle Window Picker",
             Self::ToggleGrid => "Toggle grid",
             Self::ToggleCanvasOnly => "Canvas-only mode",
+            Self::PreviousCanvasView => "Previous canvas view",
+            Self::NextCanvasView => "Next canvas view",
+            Self::CanvasView1 => "Canvas view 1",
+            Self::CanvasView2 => "Canvas view 2",
+            Self::CanvasView3 => "Canvas view 3",
+            Self::CanvasView4 => "Canvas view 4",
+            Self::CanvasView5 => "Canvas view 5",
+            Self::CanvasView6 => "Canvas view 6",
+            Self::CanvasView7 => "Canvas view 7",
+            Self::CanvasView8 => "Canvas view 8",
+            Self::CanvasView9 => "Canvas view 9",
             Self::SelectAll => "Select all tiles",
             Self::DeleteSelected => "Delete selected tiles",
             Self::FocusCurrentTile => "Focus current tile",
@@ -89,6 +134,17 @@ pub struct HotkeyBindings {
     pub toggle_window_picker: Hotkey,
     pub toggle_grid: Hotkey,
     pub toggle_canvas_only: Hotkey,
+    pub previous_canvas_view: Hotkey,
+    pub next_canvas_view: Hotkey,
+    pub canvas_view_1: Hotkey,
+    pub canvas_view_2: Hotkey,
+    pub canvas_view_3: Hotkey,
+    pub canvas_view_4: Hotkey,
+    pub canvas_view_5: Hotkey,
+    pub canvas_view_6: Hotkey,
+    pub canvas_view_7: Hotkey,
+    pub canvas_view_8: Hotkey,
+    pub canvas_view_9: Hotkey,
     pub select_all: Hotkey,
     pub delete_selected: Hotkey,
     pub focus_current_tile: Hotkey,
@@ -101,16 +157,27 @@ pub struct HotkeyBindings {
 impl Default for HotkeyBindings {
     fn default() -> Self {
         Self {
-            toggle_window_picker: Hotkey::key(0x57),       // W
-            toggle_grid: Hotkey::key(0x47),                // G
-            toggle_canvas_only: Hotkey::key(0x48),         // H
-            select_all: Hotkey::pair(0x11, 0x41),          // Ctrl+A
-            delete_selected: Hotkey::key(0x2E),            // Delete
-            focus_current_tile: Hotkey::key(0x62),         // Numpad 2
-            exit_tile_or_browser: Hotkey::key(0x1B),       // Escape
-            interact_browser: Hotkey::pair(0x11, 0x42),    // Ctrl+B
-            interact_browser_alternate: Hotkey::key(0x61), // Numpad 1
-            show_shortcut_help: Hotkey::key(0x70),         // F1
+            toggle_window_picker: Hotkey::key(0x57),        // W
+            toggle_grid: Hotkey::key(0x47),                 // G
+            toggle_canvas_only: Hotkey::key(0x48),          // H
+            previous_canvas_view: Hotkey::pair(0x11, 0x21), // Ctrl+Page Up
+            next_canvas_view: Hotkey::pair(0x11, 0x22),     // Ctrl+Page Down
+            canvas_view_1: Hotkey::pair(0x11, 0x31),        // Ctrl+1
+            canvas_view_2: Hotkey::pair(0x11, 0x32),        // Ctrl+2
+            canvas_view_3: Hotkey::pair(0x11, 0x33),        // Ctrl+3
+            canvas_view_4: Hotkey::pair(0x11, 0x34),        // Ctrl+4
+            canvas_view_5: Hotkey::pair(0x11, 0x35),        // Ctrl+5
+            canvas_view_6: Hotkey::pair(0x11, 0x36),        // Ctrl+6
+            canvas_view_7: Hotkey::pair(0x11, 0x37),        // Ctrl+7
+            canvas_view_8: Hotkey::pair(0x11, 0x38),        // Ctrl+8
+            canvas_view_9: Hotkey::pair(0x11, 0x39),        // Ctrl+9
+            select_all: Hotkey::pair(0x11, 0x41),           // Ctrl+A
+            delete_selected: Hotkey::key(0x2E),             // Delete
+            focus_current_tile: Hotkey::key(0x62),          // Numpad 2
+            exit_tile_or_browser: Hotkey::key(0x1B),        // Escape
+            interact_browser: Hotkey::pair(0x11, 0x42),     // Ctrl+B
+            interact_browser_alternate: Hotkey::key(0x61),  // Numpad 1
+            show_shortcut_help: Hotkey::key(0x70),          // F1
         }
     }
 }
@@ -121,6 +188,17 @@ impl HotkeyBindings {
             HotkeySlot::ToggleWindowPicker => self.toggle_window_picker,
             HotkeySlot::ToggleGrid => self.toggle_grid,
             HotkeySlot::ToggleCanvasOnly => self.toggle_canvas_only,
+            HotkeySlot::PreviousCanvasView => self.previous_canvas_view,
+            HotkeySlot::NextCanvasView => self.next_canvas_view,
+            HotkeySlot::CanvasView1 => self.canvas_view_1,
+            HotkeySlot::CanvasView2 => self.canvas_view_2,
+            HotkeySlot::CanvasView3 => self.canvas_view_3,
+            HotkeySlot::CanvasView4 => self.canvas_view_4,
+            HotkeySlot::CanvasView5 => self.canvas_view_5,
+            HotkeySlot::CanvasView6 => self.canvas_view_6,
+            HotkeySlot::CanvasView7 => self.canvas_view_7,
+            HotkeySlot::CanvasView8 => self.canvas_view_8,
+            HotkeySlot::CanvasView9 => self.canvas_view_9,
             HotkeySlot::SelectAll => self.select_all,
             HotkeySlot::DeleteSelected => self.delete_selected,
             HotkeySlot::FocusCurrentTile => self.focus_current_tile,
@@ -136,6 +214,17 @@ impl HotkeyBindings {
             HotkeySlot::ToggleWindowPicker => self.toggle_window_picker = hotkey,
             HotkeySlot::ToggleGrid => self.toggle_grid = hotkey,
             HotkeySlot::ToggleCanvasOnly => self.toggle_canvas_only = hotkey,
+            HotkeySlot::PreviousCanvasView => self.previous_canvas_view = hotkey,
+            HotkeySlot::NextCanvasView => self.next_canvas_view = hotkey,
+            HotkeySlot::CanvasView1 => self.canvas_view_1 = hotkey,
+            HotkeySlot::CanvasView2 => self.canvas_view_2 = hotkey,
+            HotkeySlot::CanvasView3 => self.canvas_view_3 = hotkey,
+            HotkeySlot::CanvasView4 => self.canvas_view_4 = hotkey,
+            HotkeySlot::CanvasView5 => self.canvas_view_5 = hotkey,
+            HotkeySlot::CanvasView6 => self.canvas_view_6 = hotkey,
+            HotkeySlot::CanvasView7 => self.canvas_view_7 = hotkey,
+            HotkeySlot::CanvasView8 => self.canvas_view_8 = hotkey,
+            HotkeySlot::CanvasView9 => self.canvas_view_9 = hotkey,
             HotkeySlot::SelectAll => self.select_all = hotkey,
             HotkeySlot::DeleteSelected => self.delete_selected = hotkey,
             HotkeySlot::FocusCurrentTile => self.focus_current_tile = hotkey,
@@ -419,6 +508,10 @@ mod tests {
         assert_eq!(shortcuts.select_all.display(), "Ctrl+A");
         assert_eq!(shortcuts.focus_current_tile.display(), "Numpad 2");
         assert_eq!(shortcuts.interact_browser_alternate.display(), "Numpad 1");
+        assert_eq!(shortcuts.previous_canvas_view.display(), "Ctrl+Page Up");
+        assert_eq!(shortcuts.next_canvas_view.display(), "Ctrl+Page Down");
+        assert_eq!(shortcuts.canvas_view_1.display(), "Ctrl+1");
+        assert_eq!(shortcuts.canvas_view_9.display(), "Ctrl+9");
     }
 
     #[test]
@@ -449,9 +542,11 @@ mod tests {
         let configured = shortcuts.configured_keys();
         assert_eq!(
             configured.into_iter().filter(|enabled| *enabled).count(),
-            11
+            22
         );
         assert!(configured[0x11]); // Ctrl
+        assert!(configured[0x31]); // 1
+        assert!(configured[0x39]); // 9
         assert!(configured[0x47]); // G
         assert!(configured[0x57]); // W
         assert!(!configured[0x51]); // Q

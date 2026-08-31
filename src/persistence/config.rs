@@ -82,6 +82,11 @@ mod tests {
             config.keyboard_shortcuts.toggle_window_picker.display(),
             "W"
         );
+        assert_eq!(
+            config.keyboard_shortcuts.previous_canvas_view.display(),
+            "Ctrl+Page Up"
+        );
+        assert_eq!(config.keyboard_shortcuts.canvas_view_1.display(), "Ctrl+1");
     }
 
     #[test]
