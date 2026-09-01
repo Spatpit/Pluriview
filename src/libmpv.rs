@@ -25,11 +25,8 @@ use libloading::Library;
 use parking_lot::Mutex;
 
 use crate::{
-    preview::PreviewId,
-    video::{
-        self, LoopMode, TrackInfo, TrackSelection, VideoLaunch, VideoProperty, VideoState,
-        VideoUpdate,
-    },
+    preview::{PreviewId, VideoPlaybackState, VideoSource, VideoTrack},
+    video::{self, VideoLaunch, VideoUpdate},
 };
 
 type MpvHandle = c_void;
@@ -290,7 +287,10 @@ struct EventChanges {
     pause: bool,
 }
 
-unsafe fn apply_property_event(state: &mut VideoState, property: &MpvEventProperty) -> bool {
+unsafe fn apply_property_event(
+    state: &mut VideoPlaybackState,
+    property: &MpvEventProperty,
+) -> bool {
     if property.name.is_null() {
         return false;
     }
@@ -300,34 +300,27 @@ unsafe fn apply_property_event(state: &mut VideoState, property: &MpvEventProper
             "time-pos" => state.time_pos = None,
             "duration" => state.duration = None,
             "media-title" => state.media_title = None,
-            "track-list" => state.track_list.clear(),
-            "aid" => state.audio_track = TrackSelection::Disabled,
-            "sid" => state.subtitle_track = TrackSelection::Disabled,
+            "track-list" => state.tracks.clear(),
+            "aid" => state.audio_track = None,
+            "sid" => state.subtitle_track = None,
             _ => return false,
         }
         return true;
     }
 
     match name.as_ref() {
-        "pause" => event_flag(property).map(|value| state.pause = value),
+        "pause" => event_flag(property).map(|value| state.paused = value),
         "time-pos" => event_double(property).map(|value| state.time_pos = Some(value)),
         "duration" => event_double(property).map(|value| state.duration = Some(value)),
         "volume" => event_double(property).map(|value| state.volume = value),
-        "mute" => event_flag(property).map(|value| state.mute = value),
+        "mute" => event_flag(property).map(|value| state.muted = value),
         "speed" => event_double(property).map(|value| state.speed = value),
         "loop-file" => event_string(property).map(|value| {
-            state.loop_file = match value.as_str() {
-                "inf" | "yes" => LoopMode::Infinite,
-                _ => value
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|count| *count > 0)
-                    .map(LoopMode::Count)
-                    .unwrap_or(LoopMode::Off),
-            }
+            state.looping = matches!(value.as_str(), "inf" | "yes")
+                || value.parse::<u64>().is_ok_and(|count| count > 0)
         }),
         "track-list" => event_node(property).map(|node| {
-            state.track_list = parse_track_list_node(node);
+            state.tracks = parse_track_list_node(node);
         }),
         "aid" => event_string(property)
             .map(|value| state.audio_track = parse_track_selection(Some(value))),
@@ -363,7 +356,7 @@ unsafe fn event_node(property: &MpvEventProperty) -> Option<&MpvNode> {
     (property.format == MPV_FORMAT_NODE).then(|| &*property.data.cast::<MpvNode>())
 }
 
-unsafe fn parse_track_list_node(node: &MpvNode) -> Vec<TrackInfo> {
+unsafe fn parse_track_list_node(node: &MpvNode) -> Vec<VideoTrack> {
     if node.format != MPV_FORMAT_NODE_ARRAY || node.value.list.is_null() {
         return Vec::new();
     }
@@ -375,20 +368,16 @@ unsafe fn parse_track_list_node(node: &MpvNode) -> Vec<TrackInfo> {
         .filter_map(|index| {
             let track = &*list.values.add(index);
             let id = node_map_value(track, "id").and_then(|node| node_i64(node))?;
-            Some(TrackInfo {
+            Some(VideoTrack {
                 id,
                 kind: node_map_value(track, "type")
                     .and_then(|node| node_string(node))
                     .unwrap_or_default(),
                 title: node_map_value(track, "title").and_then(|node| node_string(node)),
-                lang: node_map_value(track, "lang").and_then(|node| node_string(node)),
+                language: node_map_value(track, "lang").and_then(|node| node_string(node)),
                 selected: node_map_value(track, "selected")
                     .and_then(|node| node_flag(node))
                     .unwrap_or(false),
-                external: node_map_value(track, "external")
-                    .and_then(|node| node_flag(node))
-                    .unwrap_or(false),
-                codec: node_map_value(track, "codec").and_then(|node| node_string(node)),
             })
         })
         .collect()
@@ -765,7 +754,7 @@ impl MpvCore {
         Some(result)
     }
 
-    fn drain_events(&mut self, state: &mut VideoState) -> EventChanges {
+    fn drain_events(&mut self, state: &mut VideoPlaybackState) -> EventChanges {
         let mut changes = EventChanges::default();
         for _ in 0..256 {
             let event = unsafe { (self.api.wait_event)(self.handle, 0.0) };
@@ -1202,7 +1191,7 @@ pub struct VideoSnapshot {
 
 pub struct VideoSession {
     renderer: Arc<VideoRenderer>,
-    state: VideoState,
+    state: VideoPlaybackState,
     first_poll: bool,
     stream_receiver: Option<mpsc::Receiver<Result<OsString, String>>>,
 }
@@ -1210,19 +1199,17 @@ pub struct VideoSession {
 impl VideoSession {
     fn new(renderer: Arc<VideoRenderer>, launch: &VideoLaunch) -> Result<Self, String> {
         let stream_receiver = match &launch.source {
-            video::VideoSource::LocalFile(path) => {
+            VideoSource::LocalFile { path } => {
                 renderer.load_source(path.as_os_str().to_owned())?;
                 None
             }
-            video::VideoSource::Stream {
-                url,
-                quality,
-                streamlink_path,
-            } => {
+            VideoSource::Stream { url, quality } => {
                 let (sender, receiver) = mpsc::channel();
                 let url = url.clone();
                 let quality = quality.clone();
-                let streamlink_path = streamlink_path.clone();
+                let streamlink_path = launch.streamlink_path.clone().ok_or_else(|| {
+                    "Streamlink is required to start this video stream".to_owned()
+                })?;
                 thread::spawn(move || {
                     let result = video::resolve_stream_url(&streamlink_path, &url, &quality);
                     let _ = sender.send(result);
@@ -1232,11 +1219,9 @@ impl VideoSession {
         };
         Ok(Self {
             renderer,
-            state: VideoState {
+            state: VideoPlaybackState {
                 connected: true,
-                pause: launch.start_paused,
-                volume: 100.0,
-                speed: 1.0,
+                paused: launch.start_paused,
                 core_idle: true,
                 ..Default::default()
             },
@@ -1245,7 +1230,7 @@ impl VideoSession {
         })
     }
 
-    pub fn state(&self) -> &VideoState {
+    pub fn state(&self) -> &VideoPlaybackState {
         &self.state
     }
 
@@ -1295,7 +1280,7 @@ impl VideoSession {
             updates.push(VideoUpdate::Error(error));
         }
         if changes.pause {
-            updates.push(VideoUpdate::Property(VideoProperty::Pause));
+            updates.push(VideoUpdate::PauseChanged);
         }
         if changes.any {
             updates.push(VideoUpdate::Event);
@@ -1308,7 +1293,7 @@ impl VideoSession {
             .core
             .lock()
             .set_property("pause", if paused { "yes" } else { "no" })?;
-        self.state.pause = paused;
+        self.state.paused = paused;
         Ok(())
     }
 
@@ -1370,7 +1355,7 @@ impl VideoSession {
             .core
             .lock()
             .set_property("mute", if muted { "yes" } else { "no" })?;
-        self.state.mute = muted;
+        self.state.muted = muted;
         Ok(())
     }
 
@@ -1391,11 +1376,7 @@ impl VideoSession {
             .core
             .lock()
             .set_property("loop-file", if enabled { "inf" } else { "no" })?;
-        self.state.loop_file = if enabled {
-            LoopMode::Infinite
-        } else {
-            LoopMode::Off
-        };
+        self.state.looping = enabled;
         Ok(())
     }
 
@@ -1413,7 +1394,7 @@ impl VideoSession {
             .core
             .lock()
             .set_property("aid", &id.to_string())?;
-        self.state.audio_track = TrackSelection::Id(id);
+        self.state.audio_track = Some(id);
         Ok(())
     }
 
@@ -1422,13 +1403,13 @@ impl VideoSession {
             .core
             .lock()
             .set_property("sid", &id.to_string())?;
-        self.state.subtitle_track = TrackSelection::Id(id);
+        self.state.subtitle_track = Some(id);
         Ok(())
     }
 
     pub fn disable_subtitles(&mut self) -> Result<(), String> {
         self.renderer.core.lock().set_property("sid", "no")?;
-        self.state.subtitle_track = TrackSelection::Disabled;
+        self.state.subtitle_track = None;
         Ok(())
     }
 }
@@ -1465,7 +1446,7 @@ impl VideoManager {
         let renderer = VideoRenderer::new(
             self.api.as_ref().expect("libmpv was loaded").clone(),
             launch.start_paused,
-            matches!(&launch.source, video::VideoSource::Stream { .. }),
+            matches!(&launch.source, VideoSource::Stream { .. }),
             launch.wallpaper,
         )?;
         let session = VideoSession::new(renderer.clone(), &launch)?;
@@ -1487,7 +1468,7 @@ impl VideoManager {
         let Some(tile) = self.tiles.get_mut(&id) else {
             return Ok(());
         };
-        if tile.session.state.pause == paused {
+        if tile.session.state.paused == paused {
             return Ok(());
         }
         tile.session.set_paused(paused)
@@ -1496,7 +1477,7 @@ impl VideoManager {
     pub fn repaint_fps(&self) -> Option<u32> {
         self.tiles
             .values()
-            .filter(|tile| tile.session.state.connected && !tile.session.state.pause)
+            .filter(|tile| tile.session.state.connected && !tile.session.state.paused)
             .map(|tile| tile.target_fps)
             .max()
     }
@@ -2443,13 +2424,10 @@ impl SeekPreviewManager {
     }
 }
 
-fn parse_track_selection(value: Option<String>) -> TrackSelection {
+fn parse_track_selection(value: Option<String>) -> Option<i64> {
     match value.as_deref() {
-        None | Some("no") => TrackSelection::Disabled,
-        Some(value) => value
-            .parse::<i64>()
-            .map(TrackSelection::Id)
-            .unwrap_or_else(|_| TrackSelection::Other(value.to_owned())),
+        None | Some("no" | "auto") => None,
+        Some(value) => value.parse().ok(),
     }
 }
 
@@ -2789,8 +2767,10 @@ mod tests {
         let wallpaper = std::env::var_os("PLURIVIEW_TEST_WALLPAPER").is_some();
         let renderer = VideoRenderer::new(api, false, false, wallpaper).expect("create renderer");
         let launch = VideoLaunch {
-            mpv_path: PathBuf::from("mpv.exe"),
-            source: video::VideoSource::LocalFile(media.clone()),
+            source: VideoSource::LocalFile {
+                path: media.clone(),
+            },
+            streamlink_path: None,
             start_paused: false,
             wallpaper,
         };
@@ -2879,13 +2859,13 @@ mod tests {
             assert!(
                 session
                     .state
-                    .track_list
+                    .tracks
                     .iter()
                     .any(|track| track.kind == "audio"),
                 "the diagnostic media has no audio track"
             );
             assert!(
-                !matches!(session.state.audio_track, TrackSelection::Disabled),
+                session.state.audio_track.is_some(),
                 "libmpv did not select the audio track"
             );
         }

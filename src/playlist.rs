@@ -99,7 +99,7 @@ impl FolderPlaylist {
         })
     }
 
-    pub fn from_layout(layout: &FolderPlaylistLayout) -> Result<Self, String> {
+    pub fn from_layout(layout: &FolderPlaylistLayout) -> Self {
         let mut playlist = match Self::scan(layout.folder.clone(), layout.selected.clone()) {
             Ok(playlist) => playlist,
             Err(error) => Self {
@@ -116,7 +116,7 @@ impl FolderPlaylist {
         playlist.autoplay = layout.autoplay;
         playlist.shuffle = layout.shuffle;
         playlist.repeat = layout.repeat;
-        Ok(playlist)
+        playlist
     }
 
     pub fn layout(&self) -> FolderPlaylistLayout {
@@ -271,8 +271,7 @@ mod tests {
             autoplay: true,
             shuffle: false,
             repeat: false,
-        })
-        .unwrap();
+        });
 
         assert!(restored.entries.is_empty());
         assert!(restored.error.is_some());

@@ -57,7 +57,7 @@ pub struct VideoTrack {
     pub selected: bool,
 }
 
-/// Playback properties mirrored from mpv JSON IPC for canvas controls.
+/// Playback properties mirrored from libmpv for canvas controls.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoPlaybackState {
     pub connected: bool,
@@ -72,6 +72,10 @@ pub struct VideoPlaybackState {
     pub audio_track: Option<i64>,
     pub subtitle_track: Option<i64>,
     pub seekable: bool,
+    pub media_title: Option<String>,
+    pub paused_for_cache: bool,
+    pub core_idle: bool,
+    pub eof_reached: bool,
 }
 
 impl Default for VideoPlaybackState {
@@ -89,6 +93,10 @@ impl Default for VideoPlaybackState {
             audio_track: None,
             subtitle_track: None,
             seekable: false,
+            media_title: None,
+            paused_for_cache: false,
+            core_idle: false,
+            eof_reached: false,
         }
     }
 }

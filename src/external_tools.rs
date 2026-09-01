@@ -820,43 +820,17 @@ fn registry_install_locations(kind: ToolKind) -> Vec<PathBuf> {
 /// Show a native Windows picker restricted to executable files.
 #[cfg(windows)]
 pub fn pick_executable(owner: Option<isize>, kind: ToolKind) -> Option<PathBuf> {
-    use windows::core::{PCWSTR, PWSTR};
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::Controls::Dialogs::{
-        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
-    };
-
-    let mut path = vec![0u16; 32_768];
     let filter_text = format!(
         "{} ({} executable)\0{}\0Executables (*.exe)\0*.exe\0All files (*.*)\0*.*\0\0",
         kind.display_name(),
         kind.display_name(),
         kind.executable_name()
     );
-    let filter: Vec<u16> = filter_text.encode_utf16().collect();
-    let title: Vec<u16> = format!("Select {} executable\0", kind.display_name())
-        .encode_utf16()
-        .collect();
-    let mut dialog = OPENFILENAMEW {
-        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: owner.map_or_else(HWND::default, |hwnd| HWND(hwnd as *mut _)),
-        lpstrFilter: PCWSTR(filter.as_ptr()),
-        lpstrFile: PWSTR(path.as_mut_ptr()),
-        nMaxFile: path.len() as u32,
-        lpstrTitle: PCWSTR(title.as_ptr()),
-        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
-        ..Default::default()
-    };
-
-    if unsafe { GetOpenFileNameW(&mut dialog) }.as_bool() {
-        let length = path
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(path.len());
-        Some(PathBuf::from(String::from_utf16_lossy(&path[..length])))
-    } else {
-        None
-    }
+    crate::media::pick_file_with_filter(
+        owner,
+        &filter_text,
+        &format!("Select {} executable", kind.display_name()),
+    )
 }
 
 #[cfg(not(windows))]

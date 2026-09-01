@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use eframe::egui;
 use parking_lot::Mutex;
 use webview2_com::{
     take_pwstr, BrowserExtensionEnableCompletedHandler,
@@ -1656,6 +1657,7 @@ mod tests {
         write_ubol_verification_marker, NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE,
         UBOL_VERSION,
     };
+    use eframe::egui;
     use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicU32, Ordering};
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};

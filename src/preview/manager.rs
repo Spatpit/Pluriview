@@ -354,13 +354,6 @@ impl PreviewManager {
         self.previews.values_mut()
     }
 
-    /// Translate a preview
-    pub fn translate(&mut self, id: PreviewId, delta: Vec2) {
-        if let Some(preview) = self.previews.get_mut(&id) {
-            preview.translate(delta);
-        }
-    }
-
     /// Set a preview's z-order directly (used by layout restore), keeping
     /// the max-z counter in sync so bring-to-front keeps working.
     pub fn set_z_order(&mut self, id: PreviewId, z_order: u32) {

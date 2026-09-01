@@ -84,7 +84,7 @@ mod tests {
     use crate::playlist::FolderPlaylist;
     use crate::preview::{FpsPreset, PreviewId, PreviewManager, VideoSource, VideoTileStatus};
     use eframe::egui::{
-        CentralPanel, Context, CursorIcon, Event, Id, Modifiers, MouseWheelUnit, Order,
+        self, CentralPanel, Context, CursorIcon, Event, Id, Modifiers, MouseWheelUnit, Order,
         PointerButton, Pos2, RawInput, Rect, Sense, Shape, Vec2,
     };
     use std::path::PathBuf;
@@ -2683,18 +2683,9 @@ pub struct CanvasState {
     /// Folder playlist actions queued by its rows and header controls.
     pub pending_playlist_actions: Vec<(PreviewId, PlaylistAction)>,
 
-    /// A removed browser tile whose "Undo" was clicked; the app recreates
-    /// the WebView from its saved URL (the original host is already gone).
-    pub pending_browser_restore: Option<RemovedPreviewInfo>,
-
-    /// A removed image/GIF tile whose managed asset should be decoded again.
-    pub pending_media_restore: Option<RemovedPreviewInfo>,
-
-    /// A removed video tile whose mpv host should be recreated by the app.
-    pub pending_video_restore: Option<RemovedPreviewInfo>,
-
-    /// A removed folder playlist whose directory should be rescanned.
-    pub pending_playlist_restore: Option<RemovedPreviewInfo>,
+    /// Removed tile whose "Undo" was clicked. The app owns source recreation
+    /// so every tile type follows one restore path.
+    pub pending_removed_restore: Option<RemovedPreviewInfo>,
 
     /// The browser tile currently in interaction mode, set by the app each
     /// frame so the canvas can outline it in the accent color.
@@ -2755,10 +2746,7 @@ impl Default for CanvasState {
             video_volume_hover: None,
             pending_tile_activity_actions: Vec::new(),
             pending_playlist_actions: Vec::new(),
-            pending_browser_restore: None,
-            pending_media_restore: None,
-            pending_video_restore: None,
-            pending_playlist_restore: None,
+            pending_removed_restore: None,
             interactive_browser: None,
             stream_monitor_ready: false,
             last_screen_rect: None,
@@ -3290,6 +3278,7 @@ impl CanvasState {
     }
 
     /// Main UI rendering for the canvas
+    #[cfg(test)]
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -3297,6 +3286,25 @@ impl CanvasState {
         capture_coordinator: &mut CaptureCoordinator,
         ctx: &egui::Context,
         show_overlays: bool,
+    ) {
+        self.ui_with_canvas_views_menu(
+            ui,
+            preview_manager,
+            capture_coordinator,
+            ctx,
+            show_overlays,
+            |_| {},
+        );
+    }
+
+    pub fn ui_with_canvas_views_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        preview_manager: &mut PreviewManager,
+        capture_coordinator: &mut CaptureCoordinator,
+        ctx: &egui::Context,
+        show_overlays: bool,
+        mut canvas_views_menu: impl FnMut(&mut egui::Ui),
     ) {
         let canvas_rect = ui.available_rect_before_wrap();
         self.last_screen_rect = Some(canvas_rect);
@@ -3459,12 +3467,7 @@ impl CanvasState {
             self.draw_floating_status(&painter, canvas_rect, preview_manager.count());
         }
         if show_overlays {
-            self.draw_and_interact_undo_toast(
-                ui,
-                canvas_rect,
-                preview_manager,
-                capture_coordinator,
-            );
+            self.draw_and_interact_undo_toast(ui, canvas_rect);
         }
 
         // Handle canvas-level input using the pre-allocated bg_response
@@ -3474,6 +3477,7 @@ impl CanvasState {
             preview_manager,
             capture_coordinator,
             bg_response,
+            &mut canvas_views_menu,
         );
 
         // Apply pending FPS changes
@@ -3792,6 +3796,7 @@ impl CanvasState {
         preview_manager: &mut PreviewManager,
         capture_coordinator: &mut CaptureCoordinator,
         bg_response: egui::Response,
+        canvas_views_menu: &mut impl FnMut(&mut egui::Ui),
     ) {
         let CanvasFrameScope {
             canvas_rect,
@@ -3968,6 +3973,7 @@ impl CanvasState {
                     ui.close_menu();
                 }
                 ui.separator();
+                ui.menu_button("Canvas Views", |ui| canvas_views_menu(ui));
                 if ui.button("Reset View").clicked() {
                     self.reset();
                     ui.close_menu();
@@ -5088,7 +5094,9 @@ impl CanvasState {
                                 ));
                             }
                         } else {
-                            preview_manager.translate(sel_id, canvas_delta);
+                            if let Some(preview) = preview_manager.get_mut(sel_id) {
+                                preview.translate(canvas_delta);
+                            }
                             // Keep spring in sync during drag
                             if let Some(preview) = preview_manager.get(sel_id) {
                                 if let Some(spring) =
@@ -5549,11 +5557,9 @@ impl CanvasState {
                             ui.close_menu();
                         }
 
-                        if has_crop {
-                            if ui.button("Clear Crop").clicked() {
-                                self.set_preview_crop(id, None, canvas_rect, preview_manager);
-                                ui.close_menu();
-                            }
+                        if has_crop && ui.button("Clear Crop").clicked() {
+                            self.set_preview_crop(id, None, canvas_rect, preview_manager);
+                            ui.close_menu();
                         }
 
                         ui.separator();
@@ -6131,13 +6137,7 @@ impl CanvasState {
     }
 
     /// Floating "Removed '...' · Undo" toast for the most recently removed preview.
-    fn draw_and_interact_undo_toast(
-        &mut self,
-        ui: &mut egui::Ui,
-        canvas_rect: Rect,
-        preview_manager: &mut PreviewManager,
-        capture_coordinator: &mut CaptureCoordinator,
-    ) {
+    fn draw_and_interact_undo_toast(&mut self, ui: &mut egui::Ui, canvas_rect: Rect) {
         let Some((removed_at, _)) = self.last_removed.as_ref() else {
             return;
         };
@@ -6215,69 +6215,7 @@ impl CanvasState {
                 .last_removed
                 .take()
                 .expect("removed preview is present");
-            if info.folder_playlist.is_some() {
-                self.pending_playlist_restore = Some(info);
-            } else if info.browser_url.is_some() {
-                // The browser's host window was destroyed with the tile, so
-                // the app must recreate the WebView from the saved URL.
-                self.pending_browser_restore = Some(info);
-            } else if info.media_path.is_some() {
-                self.pending_media_restore = Some(info);
-            } else if info.video_source.is_some() {
-                self.pending_video_restore = Some(info);
-            } else if let Some(sender) = info.spout_sender {
-                let id = preview_manager.add_for_spout(
-                    sender.clone(),
-                    info.position,
-                    info.size,
-                    info.fps_preset,
-                );
-                if let Some(preview) = preview_manager.get_mut(id) {
-                    preview.set_fps_preset(info.fps_preset);
-                    preview.crop_uv = info.crop_uv;
-                    preview.viewport_pin = info.viewport_pin;
-                    preview.left_click_disabled = info.left_click_disabled;
-                }
-                capture_coordinator.start_spout_capture(id, sender, info.fps_preset.as_u32());
-            } else if info.window_waiting_for_match {
-                let id = preview_manager.add_inactive_window(
-                    info.title,
-                    info.window_exe,
-                    info.position,
-                    info.size,
-                    info.fps_preset,
-                    0,
-                );
-                if let Some(preview) = preview_manager.get_mut(id) {
-                    preview.crop_uv = info.crop_uv;
-                    preview.stream_audio = info.stream_audio;
-                    preview.viewport_pin = info.viewport_pin;
-                    preview.left_click_disabled = info.left_click_disabled;
-                }
-            } else if let Some(handle) = info.window_handle {
-                let capture_title = info.title.clone();
-                let id = preview_manager.add_for_window(
-                    handle.hwnd,
-                    handle.process_id,
-                    info.title,
-                    info.position,
-                    info.size,
-                );
-                if let Some(preview) = preview_manager.get_mut(id) {
-                    preview.window_exe = info.window_exe;
-                    preview.set_fps_preset(info.fps_preset);
-                    preview.crop_uv = info.crop_uv;
-                    preview.stream_audio = info.stream_audio;
-                    preview.viewport_pin = info.viewport_pin;
-                    preview.left_click_disabled = info.left_click_disabled;
-                }
-                capture_coordinator.start_capture(
-                    id,
-                    handle.hwnd,
-                    capture_title,
-                    info.fps_preset.as_u32(),
-                );
-            }
+            self.pending_removed_restore = Some(info);
         }
 
         // Keep repainting while the toast is visible so it can fade out.

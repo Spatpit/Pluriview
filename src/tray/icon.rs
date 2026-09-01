@@ -19,8 +19,7 @@ static MAIN_WINDOW_HWND: OnceLock<isize> = OnceLock::new();
 /// Manages the system tray icon and menu
 pub struct TrayManager {
     /// The tray icon (must be kept alive)
-    #[allow(dead_code)]
-    tray_icon: TrayIcon,
+    _tray_icon: TrayIcon,
 }
 
 impl TrayManager {
@@ -83,8 +82,8 @@ impl TrayManager {
         ])
         .ok()?;
 
-        // Create a simple icon (blue square with P)
-        let icon = create_default_icon()?;
+        let size = 32;
+        let icon = Icon::from_rgba(create_leaf_rgba(size), size, size).ok()?;
 
         // Build the tray icon
         let tray_icon = TrayIconBuilder::new()
@@ -94,19 +93,10 @@ impl TrayManager {
             .build()
             .ok()?;
 
-        Some(Self { tray_icon })
+        Some(Self {
+            _tray_icon: tray_icon,
+        })
     }
-}
-
-/// Create the leaf icon (32x32 green leaf)
-fn create_default_icon() -> Option<Icon> {
-    Some(create_leaf_icon(32))
-}
-
-/// Create leaf icon at specified size - used for both tray and window icon
-fn create_leaf_icon(size: u32) -> Icon {
-    let rgba = create_leaf_rgba(size);
-    Icon::from_rgba(rgba, size, size).unwrap()
 }
 
 /// Generate the shared leaf pixels used by both the window and tray icons.

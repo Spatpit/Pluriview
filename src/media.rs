@@ -127,7 +127,7 @@ fn validate_frame_size(width: u32, height: u32, decoded_bytes: usize) -> Result<
 }
 
 #[cfg(windows)]
-fn pick_file_with_filter(
+pub(crate) fn pick_file_with_filter(
     owner: Option<isize>,
     filter_text: &str,
     title_text: &str,
