@@ -18,7 +18,7 @@ egui-phosphor = "0.7"
 windows-capture = "1.4"
 
 # System Tray
-tray-icon = "0.19"
+tray-icon = "0.24"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
