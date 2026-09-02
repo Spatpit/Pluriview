@@ -151,6 +151,16 @@ Keep the included `lib` folder next to `pluriview.exe`. Full installs also
 include `libmpv-2.dll` inside that folder; you can add that DLL to a Lite
 install later. Do not ship or run `pluriview.pdb`.
 
+Official archives are built from their version tag on a public GitHub-hosted
+Windows runner. The workflow runs formatting, tests, dependency auditing, the
+privacy-safe release build, and publishes build-provenance attestations. To
+verify a downloaded archive against the repository and workflow with the
+GitHub CLI:
+
+```powershell
+gh attestation verify .\Pluriview-vX.Y.Z-windows-x64-full.zip --repo Spatpit/Pluriview
+```
+
 Streamlink is a separate optional install. Point Pluriview at it in Settings
 if Windows does not already find `streamlink.exe`.
 
@@ -168,6 +178,11 @@ cd Pluriview
 runtime DLLs and text notices, versioned Full and Lite zip archives, and
 `SHA256SUMS.txt`. Keep the `lib` folder beside the executable. Do not
 distribute `pluriview.pdb`; debug symbols can contain local paths.
+
+Maintainers can test the same public release build without publishing through
+the workflow's manual dispatch action. Pushing an existing version tag such as
+`v0.6.7` runs the verified build and publishes the matching approved file from
+`release-notes/` only after every build and attestation step succeeds.
 
 ## Usage
 
