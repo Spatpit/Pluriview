@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-09-02
+
 ### Added
 - Saved Viewpoints store camera positions within each workspace and glide between them with interruptible, smoothly eased pan and proportional zoom transitions. Configurable next, previous, and direct 1–9 shortcuts provide quick access; the menu indicates active and modified viewpoints, and deleted viewpoints can be undone.
 - Browser and stream URL dialogs now provide a Paste button and a right-click Paste action for the URL field.
