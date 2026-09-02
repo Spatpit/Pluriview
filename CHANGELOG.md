@@ -8,16 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Named canvas views save camera positions within each workspace and glide between them with interruptible, smoothly eased pan and proportional zoom transitions. Configurable next, previous, and direct 1–9 shortcuts provide quick access; the menu indicates active and modified views, and deleted views can be undone.
+- Saved Viewpoints store camera positions within each workspace and glide between them with interruptible, smoothly eased pan and proportional zoom transitions. Configurable next, previous, and direct 1–9 shortcuts provide quick access; the menu indicates active and modified viewpoints, and deleted viewpoints can be undone.
 - Browser URL dialogs now provide a Paste button and a right-click Paste action for the URL field.
 - Changed workspaces now save automatically once per minute, while unchanged workspaces produce no disk writes.
 - The Workspace menu can restore the previous valid save as a separate recovered workspace.
-- Canvas Views are available from the empty-canvas right-click menu as well as the top View menu.
+- Saved Viewpoints are available from the empty-canvas right-click menu as well as the top View menu.
 
 ### Changed
 - Removed the retired external-player implementation and consolidated video playback state around the active in-process libmpv backend.
 
 ### Fixed
+- The Saved Viewpoints submenu now opens to the left near the right edge, keeping the main canvas context menu anchored to the click position without overlap.
+- Updated vulnerable transitive dependencies and added automated RustSec and Dependabot checks for newly disclosed dependency issues.
 - Workspace, catalog, autosave, and settings JSON now use crash-safe temporary files with a previous-save backup instead of truncating the live file in place.
 - Missing or corrupt workspace catalogs are rebuilt from valid workspace files, including layouts orphaned by an interrupted save.
 

@@ -40,7 +40,7 @@
 | **Adjustable FPS** | 15, 30, or 60 FPS per preview |
 | **Auto-Save** | Changed layouts save once per minute with crash-safe previous-save backups; unchanged layouts do not write to disk |
 | **Named Workspaces** | Create, duplicate, rename, and switch between reusable canvas setups |
-| **Canvas Views** | Save named positions inside a workspace and glide smoothly between them |
+| **Saved Viewpoints** | Save named positions inside a workspace and glide smoothly between them |
 | **System Tray** | Minimize to tray for background operation |
 | **Quick Focus** | Double-click a preview to bring its source window to the front |
 | **Canvas-Only Mode** | Press `H` to hide chrome; right-click menus still work |
@@ -109,17 +109,18 @@ Stream Audio Monitor** and pick an output you do not listen to (a virtual
 cable such as VB-Cable, or an unused output). Pluriview plays a copy from its
 own process so window shares pick it up. Off by default.
 
-### Canvas views
+### Saved viewpoints
 
-Use **View → Canvas Views → Save Current View...** to bookmark the current
-canvas center and zoom inside the active workspace. Selecting a saved view
-glides to it with a smooth pan and proportional zoom. Each view can be updated
-from the current camera position, renamed, or deleted. The active view is
-highlighted; it is marked modified after the camera moves away. Deleting a view
-shows a short Undo action. Panning, zooming, or pressing `Esc` interrupts a
-transition immediately, and choosing another view while moving redirects the
-camera without a jump. Use `Ctrl+1` through `Ctrl+9` for direct access or
-`Ctrl+Page Up` / `Ctrl+Page Down` to cycle; all view shortcuts are configurable.
+Use **View → Saved Viewpoints → Save Current Viewpoint...** to bookmark the
+current canvas center and zoom inside the active workspace. Selecting a saved
+viewpoint glides to it with a smooth pan and proportional zoom. Each viewpoint
+can be updated from the current camera position, renamed, or deleted. The active
+viewpoint is highlighted; it is marked modified after the camera moves away.
+Deleting a viewpoint shows a short Undo action. Panning, zooming, or pressing
+`Esc` interrupts a transition immediately, and choosing another viewpoint while
+moving redirects the camera without a jump. Use `Ctrl+1` through `Ctrl+9` for
+direct access or `Ctrl+Page Up` / `Ctrl+Page Down` to cycle; all viewpoint
+shortcuts are configurable.
 
 ## Requirements
 
@@ -180,7 +181,7 @@ distribute `pluriview.pdb`; debug symbols can contain local paths.
 8. **Arrange** by dragging tiles; **resize** from corners or edges
 9. **Crop** window, browser, image, GIF, or video tiles with Alt+drag on edges or corners
 10. **Pin** any tile with right-click → **Pin to Viewport** to keep it fixed while navigating the canvas
-11. **Save canvas views** under View → Canvas Views to jump between regions of a workspace
+11. **Save viewpoints** under View → Saved Viewpoints to jump between regions of a workspace
 12. **Focus** a tile with right-click → **Focus on This Tile**; `Esc` restores the canvas
 
 The **Workspace** menu holds separate setups. Existing installs are migrated
@@ -205,8 +206,8 @@ to those shown below.
 | Toggle Window Picker | `W` |
 | Toggle grid | `G` |
 | Toggle canvas-only mode | `H` |
-| Previous / next canvas view | `Ctrl + Page Up` / `Ctrl + Page Down` |
-| Open canvas views 1–9 | `Ctrl + 1` through `Ctrl + 9` |
+| Previous / next saved viewpoint | `Ctrl + Page Up` / `Ctrl + Page Down` |
+| Open saved viewpoints 1–9 | `Ctrl + 1` through `Ctrl + 9` |
 | Select all | `Ctrl + A` |
 | Multi-select | `Ctrl + Click` |
 | Box-select tiles | `Left-drag empty canvas` |

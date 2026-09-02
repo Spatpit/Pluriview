@@ -463,10 +463,10 @@ fn canvas_views_menu_contents(
 ) -> Option<CanvasViewMenuAction> {
     let mut action = None;
     if canvas_views.is_empty() {
-        ui.label(egui::RichText::new("No saved views").weak());
+        ui.label(egui::RichText::new("No saved viewpoints").weak());
     } else {
         let previous_label = format!(
-            "Previous View ({})",
+            "Previous Viewpoint ({})",
             keyboard_shortcuts
                 .get(HotkeySlot::PreviousCanvasView)
                 .display()
@@ -476,7 +476,7 @@ fn canvas_views_menu_contents(
             ui.close_menu();
         }
         let next_label = format!(
-            "Next View ({})",
+            "Next Viewpoint ({})",
             keyboard_shortcuts.get(HotkeySlot::NextCanvasView).display()
         );
         if ui.button(next_label).clicked() {
@@ -510,14 +510,14 @@ fn canvas_views_menu_contents(
                     };
                     if ui
                         .button(text)
-                        .on_hover_text("Move smoothly to this canvas view")
+                        .on_hover_text("Move smoothly to this saved viewpoint")
                         .clicked()
                     {
                         action = Some(CanvasViewMenuAction::Jump(index));
                         ui.close_menu();
                     }
                     ui.menu_button(egui_phosphor::regular::DOTS_THREE, |ui| {
-                        if ui.button("Update from Current View").clicked() {
+                        if ui.button("Update from Current Viewpoint").clicked() {
                             action = Some(CanvasViewMenuAction::Update(index));
                             ui.close_menu();
                         }
@@ -535,7 +535,7 @@ fn canvas_views_menu_contents(
         }
         ui.separator();
     }
-    if ui.button("Save Current View...").clicked() {
+    if ui.button("Save Current Viewpoint...").clicked() {
         action = Some(CanvasViewMenuAction::OpenCreateDialog);
         ui.close_menu();
     }
@@ -3994,7 +3994,7 @@ impl PluriviewApp {
                     ui.close_menu();
                 }
                 ui.separator();
-                ui.menu_button("Canvas Views", |ui| {
+                ui.menu_button("Saved Viewpoints", |ui| {
                     canvas_view_action = canvas_views_menu_contents(
                         ui,
                         &canvas_views,
@@ -4450,15 +4450,15 @@ impl PluriviewApp {
     ) -> Result<String, String> {
         let name = name.trim();
         if name.is_empty() {
-            return Err("Canvas view name cannot be empty.".to_owned());
+            return Err("Viewpoint name cannot be empty.".to_owned());
         }
         if name.chars().count() > 60 {
-            return Err("Canvas view names can contain at most 60 characters.".to_owned());
+            return Err("Viewpoint names can contain at most 60 characters.".to_owned());
         }
         if self.canvas_views.iter().enumerate().any(|(index, view)| {
             Some(index) != renamed_index && view.name.eq_ignore_ascii_case(name)
         }) {
-            return Err("A canvas view with that name already exists.".to_owned());
+            return Err("A saved viewpoint with that name already exists.".to_owned());
         }
         Ok(name.to_owned())
     }
@@ -4537,7 +4537,7 @@ impl PluriviewApp {
             CanvasViewMenuAction::OpenCreateDialog => {
                 self.canvas_view_dialog = Some(CanvasViewDialog {
                     kind: CanvasViewDialogKind::Create,
-                    name: format!("View {}", self.canvas_views.len() + 1),
+                    name: format!("Viewpoint {}", self.canvas_views.len() + 1),
                     focused: false,
                     error: None,
                 });
@@ -4592,8 +4592,8 @@ impl PluriviewApp {
             return;
         };
         let (title, submit_label) = match dialog.kind {
-            CanvasViewDialogKind::Create => ("Save Canvas View", "Save"),
-            CanvasViewDialogKind::Rename(_) => ("Rename Canvas View", "Rename"),
+            CanvasViewDialogKind::Create => ("Save Viewpoint", "Save"),
+            CanvasViewDialogKind::Rename(_) => ("Rename Viewpoint", "Rename"),
         };
         let mut submit = false;
         let mut cancel = false;
@@ -4602,7 +4602,7 @@ impl PluriviewApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("View name");
+                ui.label("Viewpoint name");
                 let response =
                     ui.add(egui::TextEdit::singleline(&mut dialog.name).desired_width(300.0));
                 if !dialog.focused {
@@ -4731,7 +4731,7 @@ impl PluriviewApp {
                 .any(|view| view.name.eq_ignore_ascii_case(&deleted.view.name))
             {
                 self.workspace_error = Some(format!(
-                    "Could not restore “{}” because a canvas view now uses that name.",
+                    "Could not restore “{}” because a saved viewpoint now uses that name.",
                     deleted.view.name
                 ));
                 return;
@@ -6478,6 +6478,7 @@ impl eframe::App for PluriviewApp {
                             active_canvas_view_modified,
                             keyboard_shortcuts,
                         );
+                        canvas_view_action.is_some()
                     },
                 );
             });
@@ -6864,7 +6865,7 @@ impl eframe::App for PluriviewApp {
                             );
                             ui.end_row();
 
-                            ui.label("Previous canvas view");
+                            ui.label("Previous saved viewpoint");
                             ui.label(
                                 egui::RichText::new(
                                     self.app_config
@@ -6876,7 +6877,7 @@ impl eframe::App for PluriviewApp {
                             );
                             ui.end_row();
 
-                            ui.label("Next canvas view");
+                            ui.label("Next saved viewpoint");
                             ui.label(
                                 egui::RichText::new(
                                     self.app_config
@@ -6888,7 +6889,7 @@ impl eframe::App for PluriviewApp {
                             );
                             ui.end_row();
 
-                            ui.label("Canvas views 1–9");
+                            ui.label("Saved viewpoints 1–9");
                             ui.label(
                                 egui::RichText::new(format!(
                                     "{} … {}",

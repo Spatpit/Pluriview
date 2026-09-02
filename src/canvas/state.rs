@@ -75,10 +75,11 @@ mod tests {
         apply_crop, apply_resize, browser_control_colors, capture_resolution_badge_rect,
         format_time, live_capture_display_size, media_placeholder_content,
         native_capture_canvas_size, pixel_aligned_rect, playlist_first_row_center,
-        rect_for_crop_change, stream_audio_badge_rect, video_placeholder_content, video_time_style,
-        video_volume_popover_rect, video_volume_slider_rect, window_capture_placeholder_content,
-        window_capture_target, BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle,
-        TileActivityAction, VideoAction,
+        rect_for_crop_change, stream_audio_badge_rect, submenu_should_open_left,
+        video_placeholder_content, video_time_style, video_volume_popover_rect,
+        video_volume_slider_rect, window_capture_placeholder_content, window_capture_target,
+        BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle, TileActivityAction,
+        VideoAction,
     };
     use crate::capture::CaptureCoordinator;
     use crate::playlist::FolderPlaylist;
@@ -93,6 +94,12 @@ mod tests {
     #[test]
     fn canvas_screen_rect_starts_empty() {
         assert!(CanvasState::default().last_screen_rect.is_none());
+    }
+
+    #[test]
+    fn submenu_opens_left_only_when_the_right_side_is_too_narrow() {
+        assert!(submenu_should_open_left(1850.0, 1920.0, 280.0));
+        assert!(!submenu_should_open_left(800.0, 1920.0, 280.0));
     }
 
     #[test]
@@ -1805,6 +1812,157 @@ fn show_context_menu_if(
     }
 }
 
+const EGUI_CONTEXT_MENU_ID: &str = "__egui::context_menu";
+const SAVED_VIEWPOINTS_SUBMENU_ID: &str = "canvas_saved_viewpoints_submenu";
+const SAVED_VIEWPOINTS_SUBMENU_WIDTH: f32 = 280.0;
+
+#[derive(Clone, Copy, Default)]
+struct LeftSubmenuState {
+    open: bool,
+    rect: Option<Rect>,
+    parent_rect: Option<Rect>,
+    close_parent: bool,
+}
+
+fn submenu_should_open_left(parent_right: f32, screen_right: f32, submenu_width: f32) -> bool {
+    screen_right - parent_right < submenu_width
+}
+
+fn saved_viewpoints_submenu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> bool) {
+    let state_id = egui::Id::new(SAVED_VIEWPOINTS_SUBMENU_ID);
+    let open_left = submenu_should_open_left(
+        ui.min_rect().right(),
+        ui.ctx().screen_rect().right(),
+        SAVED_VIEWPOINTS_SUBMENU_WIDTH,
+    );
+    if !open_left {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(state_id, LeftSubmenuState::default()));
+        ui.menu_button("Saved Viewpoints", add_contents);
+        return;
+    }
+
+    let mut state = ui.ctx().data_mut(|data| {
+        data.get_temp::<LeftSubmenuState>(state_id)
+            .unwrap_or_default()
+    });
+    let button = ui.button("◀  Saved Viewpoints");
+    let pointer = ui.ctx().pointer_hover_pos();
+    let hovering_submenu = pointer
+        .zip(state.rect)
+        .is_some_and(|(pointer, rect)| rect.contains(pointer));
+    let crossing_gap = pointer.zip(state.rect).is_some_and(|(pointer, rect)| {
+        Rect::from_min_max(
+            Pos2::new(rect.right(), button.rect.top()),
+            Pos2::new(button.rect.left(), button.rect.bottom()),
+        )
+        .contains(pointer)
+    });
+
+    if button.hovered() {
+        state.open = true;
+    } else if state.open && !hovering_submenu && !crossing_gap {
+        state.open = false;
+    }
+
+    state.close_parent = false;
+    if state.open {
+        let frame_margin = egui::Frame::menu(ui.style()).total_margin();
+        let position = Pos2::new(
+            button.rect.left() - ui.spacing().menu_spacing,
+            button.rect.top() - frame_margin.top,
+        );
+        let area = egui::Area::new(state_id.with("area"))
+            .kind(egui::UiKind::Menu)
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(position)
+            .default_width(ui.spacing().menu_width)
+            .sense(Sense::hover())
+            .show(ui.ctx(), |ui| {
+                let style = ui.style_mut();
+                style.spacing.button_padding = egui::vec2(2.0, 0.0);
+                style.visuals.widgets.active.bg_stroke = Stroke::NONE;
+                style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+                style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+
+                egui::Frame::menu(ui.style())
+                    .show(ui, |ui| {
+                        ui.with_layout(
+                            egui::Layout::top_down_justified(egui::Align::LEFT),
+                            add_contents,
+                        )
+                        .inner
+                    })
+                    .inner
+            });
+        state.rect = Some(area.response.rect);
+        state.close_parent = area.inner;
+    } else {
+        state.rect = None;
+    }
+
+    ui.ctx().data_mut(|data| data.insert_temp(state_id, state));
+}
+
+fn show_canvas_context_menu_if(
+    response: &egui::Response,
+    active: bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    if !active {
+        return;
+    }
+
+    let state_id = egui::Id::new(SAVED_VIEWPOINTS_SUBMENU_ID);
+    let mut state = response.ctx.data_mut(|data| {
+        data.get_temp::<LeftSubmenuState>(state_id)
+            .unwrap_or_default()
+    });
+    let menu_id = egui::Id::new(EGUI_CONTEXT_MENU_ID);
+    let mut bar_state = egui::menu::BarState::load(&response.ctx, menu_id);
+    let menu_response = egui::menu::MenuRoot::context_interaction(response, &mut bar_state);
+
+    if matches!(menu_response, egui::menu::MenuResponse::Create(_, _)) {
+        state = LeftSubmenuState::default();
+    }
+    egui::menu::MenuRoot::handle_menu_response(&mut bar_state, menu_response);
+
+    // The expanded rectangle keeps clicks in the custom left submenu from
+    // dismissing the root. Restore the root's real rectangle before drawing,
+    // because egui also uses its minimum corner as the popup anchor.
+    if let (Some(root), Some(parent_rect)) = (bar_state.as_mut(), state.parent_rect) {
+        root.menu_state.write().rect = parent_rect;
+    }
+
+    let _ = bar_state.show(response, add_contents);
+    state = response.ctx.data_mut(|data| {
+        data.get_temp::<LeftSubmenuState>(state_id)
+            .unwrap_or_default()
+    });
+
+    if state.close_parent {
+        egui::menu::MenuRoot::handle_menu_response(&mut bar_state, egui::menu::MenuResponse::Close);
+        state = LeftSubmenuState::default();
+    } else if let Some(root) = bar_state.as_mut() {
+        let parent_rect = root.menu_state.read().rect;
+        state.parent_rect = Some(parent_rect);
+        if state.open {
+            if let Some(submenu_rect) = state.rect {
+                root.menu_state.write().rect = parent_rect.union(submenu_rect);
+            }
+        }
+    } else {
+        state = LeftSubmenuState::default();
+    }
+
+    bar_state.store(&response.ctx, menu_id);
+    response
+        .ctx
+        .data_mut(|data| data.insert_temp(state_id, state));
+}
+
 fn browser_control_colors(
     action: BrowserAction,
     hovered: bool,
@@ -3293,7 +3451,7 @@ impl CanvasState {
             capture_coordinator,
             ctx,
             show_overlays,
-            |_| {},
+            |_| false,
         );
     }
 
@@ -3304,7 +3462,7 @@ impl CanvasState {
         capture_coordinator: &mut CaptureCoordinator,
         ctx: &egui::Context,
         show_overlays: bool,
-        mut canvas_views_menu: impl FnMut(&mut egui::Ui),
+        mut canvas_views_menu: impl FnMut(&mut egui::Ui) -> bool,
     ) {
         let canvas_rect = ui.available_rect_before_wrap();
         self.last_screen_rect = Some(canvas_rect);
@@ -3796,7 +3954,7 @@ impl CanvasState {
         preview_manager: &mut PreviewManager,
         capture_coordinator: &mut CaptureCoordinator,
         bg_response: egui::Response,
-        canvas_views_menu: &mut impl FnMut(&mut egui::Ui),
+        canvas_views_menu: &mut impl FnMut(&mut egui::Ui) -> bool,
     ) {
         let CanvasFrameScope {
             canvas_rect,
@@ -3933,7 +4091,7 @@ impl CanvasState {
 
         let background_context_menu_active =
             background_context_response.context_menu_opened() || background_secondary_target;
-        show_context_menu_if(
+        show_canvas_context_menu_if(
             &background_context_response,
             background_context_menu_active,
             |ui| {
@@ -3973,7 +4131,7 @@ impl CanvasState {
                     ui.close_menu();
                 }
                 ui.separator();
-                ui.menu_button("Canvas Views", |ui| canvas_views_menu(ui));
+                saved_viewpoints_submenu(ui, |ui| canvas_views_menu(ui));
                 if ui.button("Reset View").clicked() {
                     self.reset();
                     ui.close_menu();
