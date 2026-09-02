@@ -9,12 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Saved Viewpoints store camera positions within each workspace and glide between them with interruptible, smoothly eased pan and proportional zoom transitions. Configurable next, previous, and direct 1–9 shortcuts provide quick access; the menu indicates active and modified viewpoints, and deleted viewpoints can be undone.
-- Browser URL dialogs now provide a Paste button and a right-click Paste action for the URL field.
+- Browser and stream URL dialogs now provide a Paste button and a right-click Paste action for the URL field.
 - Changed workspaces now save automatically once per minute, while unchanged workspaces produce no disk writes.
 - The Workspace menu can restore the previous valid save as a separate recovered workspace.
 - Saved Viewpoints are available from the empty-canvas right-click menu as well as the top View menu.
 
 ### Changed
+- Tiles now stop exactly where they are released instead of continuing with momentum and a spring bounce.
 - Removed the retired external-player implementation and consolidated video playback state around the active in-process libmpv backend.
 
 ### Fixed

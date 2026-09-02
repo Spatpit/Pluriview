@@ -3153,11 +3153,18 @@ impl PluriviewApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label("Stream URL");
+                    let mut paste_requested = false;
                     let response = ui.add_sized(
                         [460.0, 24.0],
                         egui::TextEdit::singleline(&mut dialog.url)
                             .hint_text("https://example.com/channel"),
                     );
+                    response.context_menu(|ui| {
+                        if ui.button("Paste").clicked() {
+                            paste_requested = true;
+                            ui.close_menu();
+                        }
+                    });
                     if !dialog.focused {
                         response.request_focus();
                         dialog.focused = true;
@@ -3206,10 +3213,31 @@ impl PluriviewApp {
                         if ui.button("Add").clicked() {
                             submit = true;
                         }
+                        if ui.button("Paste").clicked() {
+                            paste_requested = true;
+                        }
                         if ui.button("Cancel").clicked() {
                             cancel = true;
                         }
                     });
+
+                    if paste_requested {
+                        match clipboard_text() {
+                            Ok(text) if !text.trim().is_empty() => {
+                                dialog.url = text.trim().to_owned();
+                                dialog.error = None;
+                                dialog.probe_error = None;
+                                dialog.probe_receiver = None;
+                                dialog.probing_url.clear();
+                                dialog.qualities.clear();
+                                dialog.probe_due =
+                                    Some(Instant::now() + Duration::from_millis(400));
+                                response.request_focus();
+                            }
+                            Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
+                            Err(error) => dialog.error = Some(error.to_owned()),
+                        }
+                    }
                 });
         }
 
@@ -5481,7 +5509,7 @@ impl PluriviewApp {
                 .saturating_add(1);
         }
         self.preview_manager.clear();
-        self.canvas.clear_preview_animations();
+        self.canvas.clear_preview_interactions();
         #[cfg(windows)]
         {
             self.browser.clear();

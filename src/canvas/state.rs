@@ -876,18 +876,125 @@ mod tests {
     }
 
     #[test]
-    fn stale_preview_springs_are_pruned() {
+    fn fast_tile_drag_stops_exactly_at_release_position() {
+        fn run_frame(
+            context: &Context,
+            canvas: &mut CanvasState,
+            previews: &mut PreviewManager,
+            captures: &mut CaptureCoordinator,
+            screen_rect: Rect,
+            time: f64,
+            events: Vec<Event>,
+        ) {
+            let _ = context.run(
+                RawInput {
+                    screen_rect: Some(screen_rect),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            canvas.ui(ui, previews, captures, context, true);
+                        });
+                },
+            );
+        }
+
+        let context = Context::default();
         let mut canvas = CanvasState::default();
         let mut previews = PreviewManager::new();
-        let live_id = previews.add("live".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
-        let stale_id = PreviewId(999);
-        canvas.animation.get_or_create_spring(live_id, Pos2::ZERO);
-        canvas.animation.get_or_create_spring(stale_id, Pos2::ZERO);
+        let id = previews.add(
+            "tile".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(200.0, 120.0),
+        );
+        let mut captures = CaptureCoordinator::new();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let start = Pos2::new(180.0, 150.0);
+        let midway = Pos2::new(260.0, 150.0);
+        let end = Pos2::new(380.0, 150.0);
 
-        canvas.prune_preview_animations(&previews);
+        run_frame(
+            &context,
+            &mut canvas,
+            &mut previews,
+            &mut captures,
+            screen_rect,
+            0.00,
+            vec![Event::PointerMoved(start)],
+        );
+        run_frame(
+            &context,
+            &mut canvas,
+            &mut previews,
+            &mut captures,
+            screen_rect,
+            0.01,
+            vec![Event::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        run_frame(
+            &context,
+            &mut canvas,
+            &mut previews,
+            &mut captures,
+            screen_rect,
+            0.02,
+            vec![Event::PointerMoved(midway)],
+        );
+        run_frame(
+            &context,
+            &mut canvas,
+            &mut previews,
+            &mut captures,
+            screen_rect,
+            0.03,
+            vec![Event::PointerMoved(end)],
+        );
+        run_frame(
+            &context,
+            &mut canvas,
+            &mut previews,
+            &mut captures,
+            screen_rect,
+            0.04,
+            vec![Event::PointerButton {
+                pos: end,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
 
-        assert!(canvas.animation.preview_springs.contains_key(&live_id));
-        assert!(!canvas.animation.preview_springs.contains_key(&stale_id));
+        let released_position = previews.get(id).unwrap().position;
+        run_frame(
+            &context,
+            &mut canvas,
+            &mut previews,
+            &mut captures,
+            screen_rect,
+            0.10,
+            Vec::new(),
+        );
+        run_frame(
+            &context,
+            &mut canvas,
+            &mut previews,
+            &mut captures,
+            screen_rect,
+            0.20,
+            Vec::new(),
+        );
+
+        assert_ne!(released_position, Pos2::new(100.0, 100.0));
+        assert_eq!(previews.get(id).unwrap().position, released_position);
     }
 
     #[test]
@@ -2931,22 +3038,17 @@ impl CanvasState {
         self.pinned_drag_origins.clear();
         self.pinned_pointer_drag = None;
         self.video_volume_hover = None;
-        self.animation.preview_springs.clear();
         self.cancel_camera_transition();
     }
 
-    /// Drop animation state belonging to previews from a previous layout.
-    pub fn clear_preview_animations(&mut self) {
-        self.animation.preview_springs.clear();
+    /// Drop transient tile interaction state from a previous layout.
+    pub fn clear_preview_interactions(&mut self) {
         self.pinned_drag_origins.clear();
         self.pinned_pointer_drag = None;
         self.video_volume_hover = None;
     }
 
-    fn prune_preview_animations(&mut self, preview_manager: &PreviewManager) {
-        self.animation
-            .preview_springs
-            .retain(|id, _| preview_manager.get(*id).is_some());
+    fn prune_preview_interactions(&mut self, preview_manager: &PreviewManager) {
         if self
             .pinned_pointer_drag
             .is_some_and(|drag| preview_manager.get(drag.id).is_none())
@@ -3137,7 +3239,6 @@ impl CanvasState {
         };
         let target_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
         let new_rect = rect_for_crop_change(current_crop, target_crop, current_rect);
-        self.animation.preview_springs.remove(&id);
         if let Some(preview) = preview_manager.get_mut(id) {
             preview.crop_uv = crop_uv;
             if screen_space {
@@ -3172,7 +3273,6 @@ impl CanvasState {
         };
 
         self.exit_focus();
-        self.animation.preview_springs.remove(&id);
         self.pinned_drag_origins
             .retain(|(drag_id, _)| *drag_id != id);
         if self.pinned_pointer_drag.is_some_and(|drag| drag.id == id) {
@@ -3209,7 +3309,6 @@ impl CanvasState {
                 self.exit_focus();
             }
             self.selection.retain(|selected| *selected != id);
-            self.animation.preview_springs.remove(&id);
             self.pinned_drag_origins
                 .retain(|(drag_id, _)| *drag_id != id);
             if self.pinned_pointer_drag.is_some_and(|drag| drag.id == id) {
@@ -3282,9 +3381,6 @@ impl CanvasState {
                 let position = self.screen_to_canvas(aligned_min, canvas_rect);
                 preview.position = position;
                 preview.size = size;
-                if let Some(spring) = self.animation.preview_springs.get_mut(&id) {
-                    spring.set_immediate_pos(position);
-                }
             }
         }
     }
@@ -3426,7 +3522,6 @@ impl CanvasState {
         }
 
         self.selection = vec![id];
-        self.animation.preview_springs.remove(&id);
         self.pinned_pointer_drag = Some(PinnedPointerDrag {
             id,
             start_pointer: pointer,
@@ -3527,13 +3622,10 @@ impl CanvasState {
             self.drag_state = None;
         }
 
-        // Calculate delta time for animations
         let current_time = input.time;
-        let dt = (current_time - self.animation.last_frame_time) as f32;
-        self.animation.last_frame_time = current_time;
 
         // Update all animations
-        self.animation.update(dt);
+        self.animation.update();
         self.update_camera_transition(canvas_rect, current_time);
 
         // Apply momentum to pan (smooth inertia scrolling)
@@ -3551,17 +3643,14 @@ impl CanvasState {
             self.pan += momentum_delta / self.zoom;
         }
 
-        // Update preview positions from their spring animations
-        self.update_preview_animations(preview_manager);
-
-        // Keep the focused tile fitted after camera and tile animations move.
+        // Keep the focused tile fitted after camera movement.
         self.refit_focus(preview_manager, canvas_rect);
 
         // Reap any previews whose fade/shrink-out animation has finished,
         // keeping the most recent one around briefly for the undo toast.
         let finished_removals = preview_manager.finalize_removals();
         if !finished_removals.is_empty() {
-            self.prune_preview_animations(preview_manager);
+            self.prune_preview_interactions(preview_manager);
         }
         if let Some(info) = finished_removals.into_iter().last() {
             self.last_removed = Some((Instant::now(), info));
@@ -3650,19 +3739,6 @@ impl CanvasState {
         // Request repaint if animations are active
         if self.animation.is_animating() {
             ctx.request_repaint();
-        }
-    }
-
-    /// Update preview positions from their spring animations
-    fn update_preview_animations(&mut self, preview_manager: &mut PreviewManager) {
-        for (id, spring) in &self.animation.preview_springs {
-            if spring.is_animating() {
-                if let Some(preview) = preview_manager.get_mut(*id) {
-                    if preview.viewport_pin.is_none() {
-                        preview.position = spring.current_pos();
-                    }
-                }
-            }
         }
     }
 
@@ -5182,32 +5258,25 @@ impl CanvasState {
                 }
             }
 
-            // Handle drag start - initialize spring and tracker
+            // Handle drag start and remember screen-space origins for pinned tiles.
             if preview_response.drag_started()
                 && !input.alt
                 && !input.middle_down
                 && !pinned_pointer_active
             {
                 self.preview_dragging = true;
-                self.animation.drag_tracker.clear();
                 self.pinned_drag_origins.clear();
 
-                // Initialize springs for dragged previews at their current position
-                let ids_to_init: Vec<PreviewId> = if self.selection.contains(&id) {
+                let dragged_ids: Vec<PreviewId> = if self.selection.contains(&id) {
                     self.selection.clone()
                 } else {
                     vec![id]
                 };
 
-                for sel_id in ids_to_init {
+                for sel_id in dragged_ids {
                     if let Some(preview) = preview_manager.get(sel_id) {
                         if let Some(pin) = preview.viewport_pin {
                             self.pinned_drag_origins.push((sel_id, pin));
-                        } else {
-                            let spring = self
-                                .animation
-                                .get_or_create_spring(sel_id, preview.position);
-                            spring.set_immediate_pos(preview.position);
                         }
                     }
                 }
@@ -5224,11 +5293,6 @@ impl CanvasState {
                 if self.drag_state.is_none() {
                     let screen_delta = preview_response.drag_delta();
                     let canvas_delta = screen_delta / self.zoom;
-
-                    // Track velocity for momentum
-                    if let Some(mouse_pos) = input.hover_pos {
-                        self.animation.drag_tracker.record(mouse_pos, input.time);
-                    }
 
                     let dragged_ids = if self.selection.contains(&id) {
                         self.selection.clone()
@@ -5255,59 +5319,14 @@ impl CanvasState {
                             if let Some(preview) = preview_manager.get_mut(sel_id) {
                                 preview.translate(canvas_delta);
                             }
-                            // Keep spring in sync during drag
-                            if let Some(preview) = preview_manager.get(sel_id) {
-                                if let Some(spring) =
-                                    self.animation.preview_springs.get_mut(&sel_id)
-                                {
-                                    spring.set_immediate_pos(preview.position);
-                                }
-                            }
                         }
                     }
                 }
             }
 
-            // Handle drag end - apply momentum and snap-to-grid
+            // Tiles stop exactly where the pointer is released.
             if preview_response.drag_stopped() && self.preview_dragging {
                 self.preview_dragging = false;
-
-                // Get velocity from tracker
-                let velocity = self.animation.drag_tracker.get_velocity() / self.zoom;
-
-                // Apply to all dragged previews
-                let ids_to_animate: Vec<PreviewId> = if self.selection.contains(&id) {
-                    self.selection.clone()
-                } else {
-                    vec![id]
-                };
-
-                for sel_id in ids_to_animate {
-                    if let Some(preview) = preview_manager.get(sel_id) {
-                        if preview.viewport_pin.is_some() {
-                            continue;
-                        }
-                        // Calculate target with subtle momentum
-                        let momentum_offset = velocity * 0.05; // Very subtle momentum
-                        let target_pos = preview.position + momentum_offset;
-
-                        // Optionally snap to grid
-                        let final_target = if self.animation.snap_config.enabled {
-                            self.animation.snap_config.snap_position(target_pos)
-                        } else {
-                            target_pos
-                        };
-
-                        // Set spring target for smooth animation to final position
-                        let spring = self
-                            .animation
-                            .get_or_create_spring(sel_id, preview.position);
-                        spring.set_target_pos(final_target);
-
-                        // Add minimal velocity for subtle ease-out
-                        spring.add_velocity(velocity * 0.1);
-                    }
-                }
                 self.pinned_drag_origins.clear();
             }
 
@@ -6495,7 +6514,6 @@ impl CanvasState {
                 if handle_response.drag_started() {
                     if alt_held && (frame_size.is_some() || is_video) && !is_playlist {
                         // Start crop mode
-                        self.animation.preview_springs.remove(&id);
                         let current_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
                         self.drag_state = Some(DragState::Cropping {
                             id,
