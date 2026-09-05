@@ -471,6 +471,21 @@ impl Preview {
         self.is_window_capture() || self.is_spout_capture()
     }
 
+    /// Keep the saved source and geometry while discarding the closed HWND.
+    pub fn mark_window_inactive(&mut self) {
+        if !self.is_window_capture() {
+            return;
+        }
+        self.window_handle = None;
+        self.window_waiting_for_match = true;
+        self.capture_paused = self.manually_frozen;
+        self.capture_hibernated = false;
+        self.capture_offscreen_since = None;
+        self.frame_buffer = None;
+        self.texture = None;
+        self.clear_capture_error();
+    }
+
     /// Record that Windows Graphics Capture could not start for this tile.
     pub fn set_capture_error(&mut self, error: String) {
         self.capture_error = Some(error.clone());
@@ -539,6 +554,9 @@ impl Preview {
 
     /// Attach decoded image data to this preview.
     pub fn set_media(&mut self, path: PathBuf, frames: Vec<MediaFrame>) {
+        self.texture = None;
+        self.frame_buffer = None;
+        self.clear_capture_error();
         self.media_path = Some(path);
         self.media_frames = frames;
         self.media_frame_index = 0;

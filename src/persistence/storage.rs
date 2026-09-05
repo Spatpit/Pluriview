@@ -128,6 +128,9 @@ impl Storage {
             let mut index: WorkspaceIndex = match load_json_with_backup(&index_path) {
                 Ok(index) => index,
                 Err(index_error) => {
+                    if is_unsupported_document(index_error.as_ref()) {
+                        return Err(index_error);
+                    }
                     if let Some(index) = self.rebuild_workspace_index()? {
                         self.save_workspace_index(&index)?;
                         self.save_autosave_for_active_workspace(&index)?;
@@ -153,10 +156,13 @@ impl Storage {
         }
 
         let index = WorkspaceIndex::default();
-        if self.autosave_path().exists() {
-            let legacy_layout = self.load_autosave()?;
-            self.save_workspace(&index.active_workspace_id, &legacy_layout)?;
-        }
+        let layout = if self.autosave_path().exists() || backup_path(&self.autosave_path()).exists()
+        {
+            self.load_autosave()?
+        } else {
+            SavedLayout::new()
+        };
+        self.save_workspace(&index.active_workspace_id, &layout)?;
         self.save_workspace_index(&index)?;
         Ok(index)
     }
@@ -239,6 +245,12 @@ impl Storage {
     fn rebuild_workspace_index(&self) -> Result<Option<WorkspaceIndex>, std::io::Error> {
         let recovered = self.valid_workspace_files()?;
         if recovered.is_empty() {
+            for entry in fs::read_dir(self.workspaces_dir()?)? {
+                if workspace_file_id(&entry?.path()).is_some() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                        "Workspace files exist, but none could be recovered. They have been preserved."));
+                }
+            }
             return Ok(None);
         }
         let active = recovered
@@ -296,16 +308,14 @@ impl Storage {
 
     fn valid_workspace_files(&self) -> Result<Vec<RecoveredWorkspace>, std::io::Error> {
         let mut recovered = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for entry in fs::read_dir(self.workspaces_dir()?)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            let Some(id) = workspace_file_id(&path) else {
                 continue;
             };
-            if !is_valid_workspace_id(id) {
+            if !seen.insert(id.to_owned()) {
                 continue;
             }
             let Ok(layout) = self.load_workspace(id) else {
@@ -326,17 +336,67 @@ impl Storage {
     }
 }
 
+fn workspace_file_id(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let id = name
+        .strip_suffix(".json")
+        .or_else(|| name.strip_suffix(".json.bak"))?;
+    is_valid_workspace_id(id).then_some(id)
+}
+
 struct RecoveredWorkspace {
     id: String,
     modified: SystemTime,
     preview_count: usize,
 }
 
-fn load_json_with_backup<T: DeserializeOwned>(
-    path: &Path,
-) -> Result<T, Box<dyn std::error::Error>> {
+trait StoredDocument: Serialize + DeserializeOwned {
+    fn version(&self) -> u32;
+
+    fn validate_version(&self) -> Result<(), std::io::Error> {
+        if self.version() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "Document version {} is not supported by this Pluriview version",
+                    self.version()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl StoredDocument for SavedLayout {
+    fn version(&self) -> u32 {
+        self.version
+    }
+}
+
+impl StoredDocument for WorkspaceIndex {
+    fn version(&self) -> u32 {
+        self.version
+    }
+}
+
+impl StoredDocument for AppConfig {
+    fn version(&self) -> u32 {
+        self.version
+    }
+}
+
+fn is_unsupported_document(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::Unsupported)
+}
+
+fn load_json_with_backup<T: StoredDocument>(path: &Path) -> Result<T, Box<dyn std::error::Error>> {
     match load_json(path) {
         Ok(value) => Ok(value),
+        // Opening an older backup of a newer document would allow a downgrade
+        // to silently overwrite fields that this executable does not understand.
+        Err(error) if is_unsupported_document(error.as_ref()) => Err(error),
         Err(primary_error) => match load_json(&backup_path(path)) {
             Ok(value) => Ok(value),
             Err(backup_error)
@@ -361,14 +421,47 @@ fn load_json_with_backup<T: DeserializeOwned>(
     }
 }
 
-fn load_json<T: DeserializeOwned>(path: &Path) -> Result<T, Box<dyn std::error::Error>> {
-    let json = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&json)?)
+fn load_json<T: StoredDocument>(path: &Path) -> Result<T, Box<dyn std::error::Error>> {
+    decode_document(&fs::read(path)?)
+}
+
+fn decode_document<T: StoredDocument>(bytes: &[u8]) -> Result<T, Box<dyn std::error::Error>> {
+    let json: serde_json::Value = serde_json::from_slice(bytes)?;
+    // Detect a newer schema even when its fields no longer deserialize into T.
+    if let Some(version) = json.get("version").and_then(serde_json::Value::as_u64) {
+        if version != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("Document version {version} is not supported by this Pluriview version"),
+            )
+            .into());
+        }
+    }
+    let document: T = serde_json::from_value(json)?;
+    document.validate_version()?;
+    Ok(document)
 }
 
 /// Write a complete sibling file first, then rotate the previous valid file to
 /// `.bak`. A power loss at any point leaves either the primary or backup intact.
-fn write_json_safely<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io::Error> {
+fn write_json_safely<T: StoredDocument>(path: &Path, value: &T) -> Result<(), std::io::Error> {
+    value.validate_version()?;
+    // Read before touching any file. A read failure must not authorize removal
+    // of an unreadable primary, and only a usable document may replace .bak.
+    let primary_is_valid = match fs::read(path) {
+        Ok(bytes) => match decode_document::<T>(&bytes) {
+            Ok(_) => true,
+            Err(error) if is_unsupported_document(error.as_ref()) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    error.to_string(),
+                ))
+            }
+            Err(_) => false,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
     let json = serde_json::to_vec_pretty(value)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let temporary = temporary_path(path);
@@ -383,15 +476,11 @@ fn write_json_safely<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io
     drop(file);
 
     if path.exists() {
-        let primary_is_valid_json = fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .is_some();
-        if primary_is_valid_json {
+        if primary_is_valid {
             remove_file_if_exists(&backup)?;
             fs::rename(path, &backup)?;
         } else {
-            // Never replace a known-good backup with a truncated primary.
+            // Never replace a known-good backup with an unusable primary.
             remove_file_if_exists(path)?;
         }
     }
@@ -435,7 +524,7 @@ impl Default for Storage {
 #[cfg(test)]
 mod tests {
     use super::Storage;
-    use crate::persistence::{AppConfig, SavedLayout, WorkspaceIndex};
+    use crate::persistence::{AppConfig, SavedLayout, WorkspaceIndex, WorkspaceSaveState};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -639,5 +728,216 @@ mod tests {
             std::env::temp_dir().join(format!("pluriview-{label}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn first_run_creates_a_durable_empty_workspace() {
+        let root = temp_root("first-workspace");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let index = storage.load_or_initialize_workspaces().unwrap();
+        assert!(storage
+            .load_workspace(&index.active_workspace_id)
+            .unwrap()
+            .previews
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_workspace_schema_never_replaces_a_usable_backup() {
+        let root = temp_root("workspace-schema-backup");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let mut first = SavedLayout::new();
+        first.canvas.zoom = 1.25;
+        storage.save_workspace("workspace-1", &first).unwrap();
+        storage
+            .save_workspace("workspace-1", &SavedLayout::new())
+            .unwrap();
+        let primary = storage.workspace_path("workspace-1").unwrap();
+        let backup_before = fs::read(super::backup_path(&primary)).unwrap();
+        for broken in ["{}", "[]", "null", r#"{"version":1,"canvas":{}}"#] {
+            fs::write(&primary, broken).unwrap();
+            assert_eq!(
+                storage.load_workspace("workspace-1").unwrap().canvas.zoom,
+                1.25
+            );
+            storage
+                .save_workspace("workspace-1", &SavedLayout::new())
+                .unwrap();
+            assert_eq!(
+                fs::read(super::backup_path(&primary)).unwrap(),
+                backup_before
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_load_blocks_autosave_and_exit_save_until_a_successful_retry() {
+        let root = temp_root("failed-workspace-load");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let index = storage.load_or_initialize_workspaces().unwrap();
+        let mut state = WorkspaceSaveState::default();
+        let mut layout = state.load(&storage, &index.active_workspace_id).unwrap();
+        layout.canvas.zoom = 1.5;
+        state.save(&storage, &index, &layout).unwrap();
+        let primary = storage.workspace_path(&index.active_workspace_id).unwrap();
+        let backup = super::backup_path(&primary);
+        let good_bytes = fs::read(&primary).unwrap();
+        let autosave = fs::read(storage.autosave_path()).unwrap();
+        fs::write(&primary, "{ incomplete").unwrap();
+        fs::write(&backup, "{}").unwrap();
+
+        assert!(state.load(&storage, &index.active_workspace_id).is_err());
+        assert!(!state.is_ready());
+        // The same save entry point is used by periodic, explicit, and exit saves.
+        for _ in 0..3 {
+            assert!(state.save(&storage, &index, &SavedLayout::new()).is_err());
+            assert_eq!(fs::read(&primary).unwrap(), b"{ incomplete");
+            assert_eq!(fs::read(&backup).unwrap(), b"{}");
+            assert_eq!(fs::read(storage.autosave_path()).unwrap(), autosave);
+        }
+        fs::write(&primary, good_bytes).unwrap();
+        let mut recovered = state.load(&storage, &index.active_workspace_id).unwrap();
+        assert!(state.is_ready());
+        recovered.canvas.zoom = 2.0;
+        state.save(&storage, &index, &recovered).unwrap();
+        assert_eq!(
+            storage
+                .load_workspace(&index.active_workspace_id)
+                .unwrap()
+                .canvas
+                .zoom,
+            2.0
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_workspace_does_not_rotate_backup_or_rewrite_catalog() {
+        let root = temp_root("unchanged-workspace");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let index = storage.load_or_initialize_workspaces().unwrap();
+        let catalog = fs::read(storage.workspace_index_path()).unwrap();
+        let mut state = WorkspaceSaveState::default();
+        let mut layout = state.load(&storage, &index.active_workspace_id).unwrap();
+        layout.canvas.zoom = 2.0;
+        state.save(&storage, &index, &layout).unwrap();
+        let backup =
+            super::backup_path(&storage.workspace_path(&index.active_workspace_id).unwrap());
+        let backup_before = fs::read(&backup).unwrap();
+        state.save(&storage, &index, &layout).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), backup_before);
+        assert_eq!(fs::read(storage.workspace_index_path()).unwrap(), catalog);
+        assert!(!super::backup_path(&storage.workspace_index_path()).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn newer_workspace_and_catalog_versions_are_preserved() {
+        let root = temp_root("newer-workspace");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let index = storage.load_or_initialize_workspaces().unwrap();
+        let primary = storage.workspace_path(&index.active_workspace_id).unwrap();
+        storage
+            .save_workspace(&index.active_workspace_id, &SavedLayout::new())
+            .unwrap();
+        let backup_before = fs::read(super::backup_path(&primary)).unwrap();
+        let mut newer = SavedLayout::new();
+        newer.version = 2;
+        let bytes = serde_json::to_vec(&newer).unwrap();
+        fs::write(&primary, &bytes).unwrap();
+        assert!(storage.load_workspace(&index.active_workspace_id).is_err());
+        assert!(storage
+            .save_workspace(&index.active_workspace_id, &SavedLayout::new())
+            .is_err());
+        assert_eq!(fs::read(&primary).unwrap(), bytes);
+        assert_eq!(
+            fs::read(super::backup_path(&primary)).unwrap(),
+            backup_before
+        );
+        let mut newer_index = index.clone();
+        newer_index.version = 2;
+        let bytes = serde_json::to_vec(&newer_index).unwrap();
+        fs::write(storage.workspace_index_path(), &bytes).unwrap();
+        assert!(storage.load_or_initialize_workspaces().is_err());
+        assert_eq!(fs::read(storage.workspace_index_path()).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incompatible_future_schema_never_falls_back_or_gets_overwritten() {
+        let root = temp_root("future-schema");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let index = storage.load_or_initialize_workspaces().unwrap();
+        let primary = storage.workspace_path(&index.active_workspace_id).unwrap();
+        storage
+            .save_workspace(&index.active_workspace_id, &SavedLayout::new())
+            .unwrap();
+        let backup_before = fs::read(super::backup_path(&primary)).unwrap();
+        let future = br#"{"version":2,"canvas":"a new format"}"#;
+        fs::write(&primary, future).unwrap();
+        assert!(storage.load_workspace(&index.active_workspace_id).is_err());
+        assert!(storage
+            .save_workspace(&index.active_workspace_id, &SavedLayout::new())
+            .is_err());
+        assert_eq!(fs::read(&primary).unwrap(), future);
+        assert_eq!(
+            fs::read(super::backup_path(&primary)).unwrap(),
+            backup_before
+        );
+        fs::write(storage.workspace_index_path(), future).unwrap();
+        assert!(storage.load_or_initialize_workspaces().is_err());
+        assert_eq!(fs::read(storage.workspace_index_path()).unwrap(), future);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_catalog_recovers_a_backup_only_workspace() {
+        let root = temp_root("backup-only-workspace");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let mut layout = SavedLayout::new();
+        layout.canvas.zoom = 1.75;
+        storage.save_workspace("workspace-7", &layout).unwrap();
+        let primary = storage.workspace_path("workspace-7").unwrap();
+        fs::rename(&primary, super::backup_path(&primary)).unwrap();
+        let index = storage.load_or_initialize_workspaces().unwrap();
+        assert_eq!(index.active_workspace_id, "workspace-7");
+        assert_eq!(index.workspaces.len(), 1);
+        assert_eq!(
+            storage.load_workspace("workspace-7").unwrap().canvas.zoom,
+            1.75
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_catalog_does_not_replace_unrecoverable_workspace_files() {
+        let root = temp_root("unrecoverable-workspaces");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let primary = storage.workspace_path("workspace-1").unwrap();
+        fs::write(&primary, b"{ broken").unwrap();
+        fs::write(super::backup_path(&primary), b"{}").unwrap();
+        assert!(storage.load_or_initialize_workspaces().is_err());
+        assert_eq!(fs::read(&primary).unwrap(), b"{ broken");
+        assert_eq!(fs::read(super::backup_path(&primary)).unwrap(), b"{}");
+        assert!(!storage.workspace_index_path().exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

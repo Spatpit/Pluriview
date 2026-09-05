@@ -116,6 +116,14 @@ fn load_gif(path: &Path) -> Result<MediaAsset, String> {
     })
 }
 
+/// Preserve a saved source when it cannot currently be decoded.
+pub fn load_or_placeholder(path: &Path) -> (Vec<MediaFrame>, Option<String>) {
+    match load(path) {
+        Ok(asset) => (asset.frames, None),
+        Err(error) => (Vec::new(), Some(error)),
+    }
+}
+
 fn validate_frame_size(width: u32, height: u32, decoded_bytes: usize) -> Result<(), String> {
     if width == 0 || height == 0 {
         return Err("Image has invalid dimensions".to_owned());
@@ -235,6 +243,52 @@ mod tests {
         assert!(!is_supported_video_path(std::path::Path::new(
             "extensionless"
         )));
+    }
+
+    #[test]
+    fn corrupt_image_restores_as_a_persistable_tile_and_can_be_repaired() {
+        use crate::preview::{Preview, PreviewId, PreviewLayout};
+        use eframe::egui::{Context, Pos2, Vec2};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "pluriview-corrupt-image-{}-{nonce}.png",
+            std::process::id()
+        ));
+        fs::write(&path, b"incomplete PNG").unwrap();
+        let (frames, error) = super::load_or_placeholder(&path);
+        assert!(frames.is_empty());
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "image".to_owned(),
+            Pos2::new(12.0, 34.0),
+            Vec2::new(200.0, 150.0),
+        );
+        preview.set_media(path.clone(), frames);
+        preview.set_capture_error(error.unwrap());
+        preview.crop_uv = Some((0.1, 0.2, 0.9, 0.8));
+        preview.manually_frozen = true;
+        let before = PreviewLayout::from(&preview);
+        let saved = serde_json::to_string(&before).unwrap();
+        let restored: PreviewLayout = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.media_path, Some(path.clone()));
+        assert!(preview.get_texture(&Context::default()).is_none());
+
+        RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let (frames, error) = super::load_or_placeholder(&path);
+        assert!(error.is_none());
+        preview.set_media(path.clone(), frames);
+        assert!(preview.get_texture(&Context::default()).is_some());
+        assert!(preview.capture_error.is_none());
+        assert_eq!(
+            serde_json::to_value(PreviewLayout::from(&preview)).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

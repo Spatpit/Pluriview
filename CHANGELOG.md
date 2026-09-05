@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- A workspace recovery screen pauses editing and saving after a failed load, with retry, previous-save recovery, and options to open another workspace.
+- Unavailable image/GIF tiles offer Retry Image and Locate Image actions while retaining their layout settings.
+- Stream Audio Monitor displays starting, active, retrying, and failure status for its sources.
+
+### Fixed
+- Settings now places Streamlink first and groups Saved Viewpoints shortcuts in a separate collapsible section below the general shortcuts.
+- Failed workspace loads cannot be overwritten by autosave or exit saves. Backup rotation validates the document schema, unsupported versions are preserved, and catalog recovery recognizes backup-only workspaces without replacing unrecoverable files with a blank workspace.
+- Closed window captures become inactive and reconnect through privacy-approved window matching. Waking or undoing window tiles revalidates window identity instead of reusing stale handles.
+- Corrupt images remain recoverable tiles when reopening a workspace instead of disappearing from later saves.
+- Undo restores a complete tile deletion batch with its stacking order, aspect-ratio lock, freeze state, and playlist links; switching workspaces clears the old deletion undo.
+- Repeated Send to Back actions maintain a strict tile stacking order.
+- Stopping audio monitoring no longer blocks the UI waiting for a worker; audio activation waits can be cancelled.
+
 ## [0.6.7] - 2026-09-02
 
 ### Added

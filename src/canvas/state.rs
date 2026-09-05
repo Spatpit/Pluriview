@@ -257,6 +257,72 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_selection_keeps_the_whole_batch_for_undo() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let first = previews.add("first".to_owned(), Pos2::ZERO, Vec2::splat(50.0));
+        let second = previews.add(
+            "second".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::splat(50.0),
+        );
+        canvas.selection = vec![first, second];
+        canvas.set_keyboard_input(super::CanvasKeyboardInput {
+            delete_selected: true,
+            ..Default::default()
+        });
+        let mut captures = CaptureCoordinator::new();
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+            ..Default::default()
+        };
+        let _ = context.run(input(), |context| {
+            CentralPanel::default().show(context, |ui| {
+                canvas.ui(ui, &mut previews, &mut captures, context, true);
+            });
+        });
+        for id in [first, second] {
+            assert!(previews.get(id).unwrap().removing.is_some());
+            previews.get_mut(id).unwrap().removing = Some(Instant::now() - Duration::from_secs(1));
+        }
+        let _ = context.run(input(), |context| {
+            CentralPanel::default().show(context, |ui| {
+                canvas.ui(ui, &mut previews, &mut captures, context, true);
+            });
+        });
+        assert_eq!(canvas.last_removed.as_ref().unwrap().1.len(), 2);
+        assert_eq!(previews.all().count(), 0);
+        // Switching workspaces must discard the old workspace's Undo state.
+        canvas.clear_preview_interactions();
+        assert!(canvas.last_removed.is_none());
+        assert!(canvas.pending_removed_restore.is_none());
+    }
+
+    #[test]
+    fn waking_a_hibernated_window_requires_fresh_identity_matching() {
+        let canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id =
+            previews.add_for_window(123, 42, "editor".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let preview = previews.get_mut(id).unwrap();
+        preview.capture_hibernated = true;
+        preview.capture_paused = true;
+        preview.stream_audio = true;
+        let mut captures = CaptureCoordinator::new();
+        canvas.update_viewport_culling(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0)),
+            &mut previews,
+            &mut captures,
+        );
+        let preview = previews.get(id).unwrap();
+        assert!(preview.is_inactive_window());
+        assert!(preview.window_handle.is_none());
+        assert!(preview.stream_audio);
+        assert!(!captures.is_live(id));
+    }
+
+    #[test]
     fn disabled_tile_passes_primary_drag_to_the_tile_underneath() {
         let context = Context::default();
         let mut canvas = CanvasState::default();
@@ -868,11 +934,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_image_placeholder_explains_that_the_original_path_changed() {
+    fn unavailable_image_placeholder_offers_recovery() {
         let (title, detail) = media_placeholder_content();
-        assert_eq!(title, "Can't find image");
-        assert!(detail.contains("moved"));
-        assert!(detail.contains("path"));
+        assert_eq!(title, "Image unavailable");
+        assert!(detail.contains("retry"));
+        assert!(detail.contains("locate"));
     }
 
     #[test]
@@ -2125,6 +2191,12 @@ pub enum PlaylistAction {
     RequestThumbnail(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaAction {
+    Retry,
+    Locate,
+}
+
 /// User-requested runtime activity changes. The canvas queues these and the
 /// app applies them because it owns browser hosts, video sessions, and capture
 /// workers.
@@ -2551,8 +2623,8 @@ fn window_capture_placeholder_content(failed: bool) -> (&'static str, &'static s
 
 fn media_placeholder_content() -> (&'static str, &'static str) {
     (
-        "Can't find image",
-        "The original file may have moved or its path changed",
+        "Image unavailable",
+        "Right-click to retry or locate the original file",
     )
 }
 
@@ -2909,7 +2981,7 @@ pub struct CanvasState {
     pub pending_region_select: Option<PreviewId>,
 
     /// Most recently removed preview, kept briefly to power the "Undo" toast.
-    last_removed: Option<(Instant, RemovedPreviewInfo)>,
+    last_removed: Option<(Instant, Vec<RemovedPreviewInfo>)>,
 
     /// Screen position of the last right-click on the canvas background,
     /// used to anchor the "Add Window..." quick-add popup.
@@ -2950,7 +3022,8 @@ pub struct CanvasState {
 
     /// Removed tile whose "Undo" was clicked. The app owns source recreation
     /// so every tile type follows one restore path.
-    pub pending_removed_restore: Option<RemovedPreviewInfo>,
+    pub pending_removed_restore: Option<Vec<RemovedPreviewInfo>>,
+    pub pending_media_actions: Vec<(PreviewId, MediaAction)>,
 
     /// The browser tile currently in interaction mode, set by the app each
     /// frame so the canvas can outline it in the accent color.
@@ -3012,6 +3085,7 @@ impl Default for CanvasState {
             pending_tile_activity_actions: Vec::new(),
             pending_playlist_actions: Vec::new(),
             pending_removed_restore: None,
+            pending_media_actions: Vec::new(),
             interactive_browser: None,
             stream_monitor_ready: false,
             last_screen_rect: None,
@@ -3043,6 +3117,9 @@ impl CanvasState {
 
     /// Drop transient tile interaction state from a previous layout.
     pub fn clear_preview_interactions(&mut self) {
+        self.last_removed = None;
+        self.pending_removed_restore = None;
+        self.pending_media_actions.clear();
         self.pinned_drag_origins.clear();
         self.pinned_pointer_drag = None;
         self.video_volume_hover = None;
@@ -3795,21 +3872,9 @@ impl CanvasState {
             if is_visible {
                 preview.capture_offscreen_since = None;
                 if preview.capture_hibernated {
-                    if let Some(window) = preview.window_handle.as_ref() {
-                        capture_coordinator.start_capture(
-                            id,
-                            window.hwnd,
-                            preview.title.clone(),
-                            preview.target_fps,
-                        );
-                    }
-                    preview.capture_hibernated = false;
-                    preview.capture_paused = false;
-                    #[cfg(debug_assertions)]
-                    println!(
-                        "Viewport hibernation: Restarted capture for '{}'",
-                        privacy::redact_title(&preview.title)
-                    );
+                    // The app/window may have closed while capture was asleep.
+                    // Let the app revalidate identity through the approved list.
+                    preview.mark_window_inactive();
                 } else if preview.capture_paused {
                     capture_coordinator.resume_capture(id);
                     preview.capture_paused = false;
@@ -4245,10 +4310,10 @@ impl CanvasState {
                     }
                     ui.separator();
                     if ui.button("Remove Selected").clicked() {
-                        for id in self.selection.clone() {
-                            capture_coordinator.stop_capture(id);
-                            preview_manager.start_removal(id);
+                        for id in &self.selection {
+                            capture_coordinator.stop_capture(*id);
                         }
+                        preview_manager.start_removal_batch(&self.selection);
                         self.selection.clear();
                         ui.close_menu();
                     }
@@ -4260,10 +4325,10 @@ impl CanvasState {
         // not depend on pointer position; the app suppresses them while a text
         // field or shortcut recorder owns keyboard input.
         if input.delete_pressed {
-            for id in self.selection.clone() {
-                capture_coordinator.stop_capture(id);
-                preview_manager.start_removal(id);
+            for id in &self.selection {
+                capture_coordinator.stop_capture(*id);
             }
+            preview_manager.start_removal_batch(&self.selection);
             self.selection.clear();
         }
 
@@ -5425,6 +5490,24 @@ impl CanvasState {
                     ui.separator();
                 }
 
+                if is_media {
+                    if let Some(error) = preview_manager
+                        .get(id)
+                        .and_then(|preview| preview.capture_error.as_deref())
+                    {
+                        ui.label(egui::RichText::new(error).small().weak());
+                    }
+                    if ui.button("Retry Image").clicked() {
+                        self.pending_media_actions.push((id, MediaAction::Retry));
+                        ui.close_menu();
+                    }
+                    if ui.button("Locate Image…").clicked() {
+                        self.pending_media_actions.push((id, MediaAction::Locate));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                }
+
                 if ui
                     .selectable_label(viewport_pin.is_some(), "Pin to Viewport")
                     .on_hover_text("Keep this tile fixed above the canvas while panning or zooming")
@@ -6324,7 +6407,7 @@ impl CanvasState {
             self.last_removed = None;
             return;
         }
-        let info = &self
+        let removed = &self
             .last_removed
             .as_ref()
             .expect("removed preview is present")
@@ -6337,7 +6420,10 @@ impl CanvasState {
         let bg_alpha = (fade * 220.0) as u8;
         let text_alpha = (fade * 255.0) as u8;
 
-        let label = if info.title.chars().count() > 28 {
+        let info = &removed[0];
+        let label = if removed.len() > 1 {
+            format!("Removed {} tiles", removed.len())
+        } else if info.title.chars().count() > 28 {
             let truncated: String = info.title.chars().take(25).collect();
             format!("Removed \"{}...\"", truncated)
         } else {

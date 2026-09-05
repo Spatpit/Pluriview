@@ -66,9 +66,11 @@ You do **not** need a separate mpv install for playback. Stream URLs need
 Choose **File → Add Image...** or right-click the canvas → **Add Image...**.
 Pluriview supports PNG, JPEG, GIF, WebP, and BMP. Animated GIFs keep their
 original timing. Tiles use the image's original path and do not create a copy
-inside `pluriview_data`. If the original is moved or removed, the tile remains
-on the canvas and explains that its saved path can no longer be found. You can
-also drag files from Explorer onto the canvas.
+inside `pluriview_data`. If the original is missing or cannot be decoded, the
+tile remains on the canvas with an error. Right-click it and choose **Retry
+Image** after repairing the file, or **Locate Image…** to choose a replacement.
+Its position, crop, pin, and freeze settings are retained. You can also drag
+files from Explorer onto the canvas.
 
 Development builds keep `pluriview_data` at the repo root. Release builds keep
 it beside the executable.
@@ -108,6 +110,23 @@ WebView2, so sharing the Pluriview window has no tile audio. Enable **View →
 Stream Audio Monitor** and pick an output you do not listen to (a virtual
 cable such as VB-Cable, or an unused output). Pluriview plays a copy from its
 own process so window shares pick it up. Off by default.
+The monitor menu shows whether each audio source is starting, active, retrying,
+or has failed. Disabling a monitor does not wait for audio activation to finish.
+
+### Workspace recovery and source reconnection
+
+If a workspace cannot be loaded, Pluriview pauses editing and saving so an empty
+canvas cannot overwrite the saved layout. The recovery screen lets you retry,
+restore the previous save into a separate workspace, or open another workspace.
+Files written in an unsupported format are preserved for a compatible version
+of Pluriview. Catalog recovery also recognizes workspaces whose backup is their
+only remaining file.
+
+Closing a captured application leaves its tile marked **Not active**. Pluriview
+reconnects when a matching window appears, including after a tile wakes from
+off-screen resource saving. Its geometry, crop, and Stream Audio setting remain
+intact. Undoing a tile deletion restores the entire deleted selection, including
+stacking order, aspect-ratio locks, and freeze settings.
 
 ### Saved viewpoints
 
@@ -121,6 +140,8 @@ Deleting a viewpoint shows a short Undo action. Panning, zooming, or pressing
 moving redirects the camera without a jump. Use `Ctrl+1` through `Ctrl+9` for
 direct access or `Ctrl+Page Up` / `Ctrl+Page Down` to cycle; all viewpoint
 shortcuts are configurable.
+In **Settings**, Streamlink appears first, followed by the general keyboard
+shortcuts. Expand **Saved Viewpoints** below them to configure viewpoint keys.
 
 ## Requirements
 
