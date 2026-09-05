@@ -1,4 +1,5 @@
 <p align="center">
+  <img src="assets/icon.png" width="128" height="128" alt="Pluriview gold Canvas P logo">
   <h1 align="center">Pluriview</h1>
   <p align="center">
     Live window previews on an infinite canvas for Windows
@@ -259,6 +260,11 @@ to those shown below.
 
 ## Project Structure
 
+The Canvas P logo uses honey gold, champagne, and olive on chocolate brown.
+Edit `assets/logo.svg`, then run `./scripts/generate-icons.ps1` on Windows to
+regenerate the shared PNG and multi-resolution ICO. These checked-in assets are
+used by the title bar, About dialog, taskbar, tray, and executable resource.
+
 ```
 Pluriview/
 ├── src/
@@ -279,7 +285,9 @@ Pluriview/
 │   ├── window_picker/      # Window enumeration and picker UI
 │   └── spout.rs            # Spout2 sender detection
 ├── assets/
-│   ├── icon.ico                  # Application icon
+│   ├── icon.ico                  # Multi-resolution Windows application icon
+│   ├── icon.png                  # Shared window/tray icon and README branding
+│   ├── logo.svg                  # Editable Canvas P logo master
 │   ├── pluriview-preview.gif     # README preview
 │   └── third_party/
 │       ├── angle/                 # Pinned standalone ANGLE runtime and provenance

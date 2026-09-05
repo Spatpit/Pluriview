@@ -2796,7 +2796,7 @@ fn paint_browser_placeholder(
     status: &BrowserTileStatus,
     time: f32,
 ) {
-    let accent = Color32::from_rgb(107, 170, 75);
+    let accent = Color32::from_rgb(207, 161, 57);
     painter.rect_filled(rect, 8.0, Color32::from_rgb(14, 17, 15));
 
     // A restrained moving glow keeps the tile feeling alive without making
@@ -2807,7 +2807,7 @@ fn paint_browser_placeholder(
         Vec2::new((rect.width() * 0.24).max(36.0), rect.height()),
     )
     .intersect(rect);
-    painter.rect_filled(glow, 8.0, Color32::from_rgba_unmultiplied(107, 170, 75, 10));
+    painter.rect_filled(glow, 8.0, Color32::from_rgba_unmultiplied(207, 161, 57, 10));
 
     let (title, detail, progress, determinate, icon, color) = match status {
         BrowserTileStatus::PreparingAdblock { progress } => (
@@ -4765,7 +4765,7 @@ impl CanvasState {
                                 egui_phosphor::regular::IMAGE
                             },
                             egui::FontId::proportional(12.0),
-                            Color32::from_rgb(107, 170, 75),
+                            Color32::from_rgb(207, 161, 57),
                         );
                         screen_rect.left_top() + Vec2::new(28.0, 20.0)
                     } else {
@@ -5267,7 +5267,7 @@ impl CanvasState {
                     painter.rect_stroke(
                         screen_rect,
                         8.0,
-                        Stroke::new(2.0, Color32::from_rgb(107, 170, 75)),
+                        Stroke::new(2.0, Color32::from_rgb(207, 161, 57)),
                     );
                 } else if self.selection.contains(&id) {
                     painter.rect_stroke(
@@ -5934,7 +5934,7 @@ impl CanvasState {
         clipped.rect_filled(
             icon_rect,
             s(8.0),
-            Color32::from_rgba_unmultiplied(107, 170, 75, 38),
+            Color32::from_rgba_unmultiplied(207, 161, 57, 38),
         );
         clipped.text(
             icon_rect.center(),
@@ -6163,7 +6163,7 @@ impl CanvasState {
                         Vec2::new(s(3.0), card.height() - s(16.0)),
                     ),
                     s(1.5),
-                    Color32::from_rgb(107, 170, 75),
+                    Color32::from_rgb(207, 161, 57),
                 );
             }
 
@@ -6545,7 +6545,7 @@ impl CanvasState {
 
             // Minimal Void: Selection border with accent color.
             let border_color = if self.interactive_browser == Some(id) {
-                Color32::from_rgb(107, 170, 75) // Green: live interaction mode
+                Color32::from_rgb(207, 161, 57) // Gold: live interaction mode
             } else if alt_held && !is_playlist {
                 Color32::from_rgb(255, 150, 100) // Orange for crop mode
             } else {

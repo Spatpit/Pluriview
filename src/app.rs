@@ -700,6 +700,7 @@ fn restored_browser_ready(
 
 /// Main application state
 pub struct PluriviewApp {
+    brand_icon: egui::TextureHandle,
     /// Canvas state (pan, zoom, selection)
     pub canvas: CanvasState,
 
@@ -956,6 +957,14 @@ impl PluriviewApp {
         }
 
         let mut app = Self {
+            brand_icon: _cc.egui_ctx.load_texture(
+                "pluriview-brand-icon",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [256, 256],
+                    &crate::tray::create_app_icon_rgba(256),
+                ),
+                egui::TextureOptions::LINEAR,
+            ),
             canvas: CanvasState::default(),
             preview_manager: PreviewManager::new(),
             window_picker: WindowPicker::new(),
@@ -3795,13 +3804,7 @@ impl PluriviewApp {
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_bar_rect), |ui| {
                     ui.horizontal_centered(|ui| {
                         ui.add_space(10.0);
-                        let (dot_rect, _) =
-                            ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
-                        ui.painter().circle_filled(
-                            dot_rect.center(),
-                            4.0,
-                            egui::Color32::from_rgb(107, 170, 75),
-                        );
+                        ui.image((self.brand_icon.id(), Vec2::splat(20.0)));
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("Pluriview")
@@ -6983,6 +6986,7 @@ impl eframe::App for PluriviewApp {
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(10.0);
+                        ui.image((self.brand_icon.id(), Vec2::splat(80.0)));
                         ui.heading("Pluriview");
                         ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
                         ui.add_space(10.0);

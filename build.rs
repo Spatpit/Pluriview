@@ -15,11 +15,12 @@ fn expose_ubol_fingerprint() {
 #[cfg(windows)]
 fn main() {
     expose_ubol_fingerprint();
+    println!("cargo:rerun-if-changed=assets/icon.ico");
     let mut res = winres::WindowsResource::new();
     res.set_icon("assets/icon.ico");
     // Set additional metadata
     res.set("ProductName", "Pluriview");
-    res.set("FileDescription", "Live window preview application");
+    res.set("FileDescription", "Pluriview");
     res.compile().unwrap();
 }
 

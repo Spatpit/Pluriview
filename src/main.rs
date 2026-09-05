@@ -33,7 +33,7 @@ fn main() -> eframe::Result<()> {
 
     env_logger::init();
 
-    // Create the window icon (leaf)
+    // Share the Canvas P branding with the tray and executable resource.
     let icon = create_window_icon();
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -164,11 +164,11 @@ fn is_on_screen(_position: &(f32, f32)) -> bool {
     true
 }
 
-/// Create the window icon (green leaf) for title bar and taskbar
+/// Create a high-resolution window icon for the taskbar and Alt+Tab.
 fn create_window_icon() -> egui::IconData {
-    let size = 32;
+    let size = 256;
     egui::IconData {
-        rgba: crate::tray::create_leaf_rgba(size),
+        rgba: crate::tray::create_app_icon_rgba(size),
         width: size,
         height: size,
     }
