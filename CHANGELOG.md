@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-09-06
+
+### Added
+- An optional Support on Ko-fi link in the About dialog opens the creator's page in your browser.
+
 ### Changed
+- Focus current tile now defaults to F, making it available on keyboards without a number pad. Existing saved bindings are preserved; change the action in Settings to adopt the new default.
 - Reorganized the README around setup and everyday use, clarified browser profiles, shared logins, ad blocking, and audio sharing, and moved technical details into expandable sections.
+- Updated the About description to reflect windows, web pages, and media on the canvas.
+
+### Fixed
+- Canvas shortcuts no longer trigger while interacting with a browser page, so typing F or using a site's player shortcuts does not change the canvas. Browser interaction and exit shortcuts remain available.
 
 ## [0.6.8] - 2026-09-05
 

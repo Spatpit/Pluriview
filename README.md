@@ -93,6 +93,9 @@ To interact with the website, **double-click the tile** or press **`Ctrl+B`**.
 You can then click links, type, sign in, and use the page's controls.
 Press **`Esc`** or click outside to return to arranging your canvas.
 
+Canvas shortcuts, including `F` for tile focus, stay inactive while you interact
+with a page. The browser interaction and exit shortcuts remain available.
+
 Hover over the tile for **back, forward, reload, and mute**. Each tile has its
 own page and mute control. One browser tile can receive direct interaction at
 a time.
@@ -245,6 +248,10 @@ This feature is off by default.
 Keyboard shortcuts can be changed under **View → Settings → Keyboard
 shortcuts**. Mouse controls are fixed.
 
+Starting with v0.6.9, **Focus current tile** defaults to `F`. Existing saved
+shortcuts are preserved when updating; set this action to `F` in Settings if
+your installation still uses `Numpad 2`.
+
 | Action | Default control |
 |---|---|
 | Pan canvas | Middle mouse drag or `Alt` + drag on empty canvas |
@@ -259,7 +266,7 @@ shortcuts**. Mouse controls are fixed.
 | Crop a supported tile | `Alt` + drag an edge or corner |
 | Delete selected tiles | `Delete` |
 | Undo the latest tile deletion | `Ctrl+Z` |
-| Focus current tile | `Numpad 2` |
+| Focus current tile | `F` |
 | Interact with browser tile | Double-click, `Ctrl+B`, or `Numpad 1` |
 | Exit focus or browser interaction | `Esc` |
 | Open saved viewpoints 1–9 | `Ctrl+1` through `Ctrl+9` |
@@ -354,6 +361,12 @@ The editable logo is `assets/logo.svg`. Run `scripts/generate-icons.ps1` on
 Windows to regenerate the application's PNG and ICO assets.
 
 </details>
+
+## Support
+
+If you would like to support Pluriview's development, you can visit
+[Spatpit on Ko-fi](https://ko-fi.com/spatpit). The same link is available in the
+app's **About** dialog. Support is always optional.
 
 ## License
 
