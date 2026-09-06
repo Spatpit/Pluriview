@@ -81,6 +81,9 @@ struct CaptureSession {
     /// Set when the worker cannot start Windows Graphics Capture.
     failure: Arc<Mutex<Option<String>>>,
 
+    /// Source closure is distinct from a requested stop or a capture failure.
+    closed: Arc<AtomicBool>,
+
     /// Stops Windows Graphics Capture directly, even when a static window is
     /// no longer producing frame callbacks.
     stop_sender: Sender<()>,
@@ -143,8 +146,17 @@ impl CaptureCoordinator {
         let (stop_sender, stop_receiver) = mpsc::channel();
 
         // Start capture in a new thread
+        let closed = Arc::new(AtomicBool::new(false));
+        let worker_closed = closed.clone();
         let worker = std::thread::spawn(move || {
-            capture_window_loop(preview_id, hwnd, window_title, worker_state, stop_receiver);
+            capture_window_loop(
+                preview_id,
+                hwnd,
+                window_title,
+                worker_state,
+                stop_receiver,
+                worker_closed,
+            );
         });
 
         let session = CaptureSession {
@@ -158,6 +170,7 @@ impl CaptureCoordinator {
             has_produced_frame,
             latest_frame,
             failure,
+            closed,
             stop_sender,
             worker: Some(worker),
         };
@@ -213,6 +226,7 @@ impl CaptureCoordinator {
                 has_produced_frame,
                 latest_frame,
                 failure,
+                closed: Arc::new(AtomicBool::new(false)),
                 stop_sender,
                 worker: Some(worker),
             },
@@ -289,7 +303,15 @@ impl CaptureCoordinator {
             let frame = session.latest_frame.lock().take();
             let failure = session.failure.lock().take();
             if let Some(preview) = preview_manager.get_mut(*preview_id) {
-                if let Some(frame) = frame {
+                if session.closed.swap(false, Ordering::AcqRel) {
+                    // The slot belongs to this session, so a retired worker
+                    // cannot disconnect a replacement with the same tile ID.
+                    if preview.is_window_capture() {
+                        preview.mark_window_inactive();
+                    } else if preview.is_browser() {
+                        preview.set_capture_error("Browser capture closed".to_owned());
+                    }
+                } else if let Some(frame) = frame {
                     preview.update_capture_frame(
                         frame.width,
                         frame.height,
@@ -426,6 +448,7 @@ fn capture_window_loop(
     window_title: String,
     worker_state: CaptureWorkerState,
     stop_receiver: Receiver<()>,
+    closed: Arc<AtomicBool>,
 ) {
     use windows_capture::{
         capture::{Context, GraphicsCaptureApiHandler},
@@ -455,6 +478,7 @@ fn capture_window_loop(
         preview_id: PreviewId,
         latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
         active: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         has_produced_frame: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
@@ -467,6 +491,7 @@ fn capture_window_loop(
         preview_id: PreviewId,
         latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
         active: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
         has_produced_frame: Arc<AtomicBool>,
         fps: Arc<AtomicU32>,
@@ -487,6 +512,7 @@ fn capture_window_loop(
                 preview_id: ctx.flags.preview_id,
                 latest_frame: ctx.flags.latest_frame,
                 active: ctx.flags.active,
+                closed: ctx.flags.closed,
                 paused: ctx.flags.paused,
                 has_produced_frame: ctx.flags.has_produced_frame,
                 fps: ctx.flags.fps,
@@ -577,6 +603,7 @@ fn capture_window_loop(
         }
 
         fn on_closed(&mut self) -> Result<(), Self::Error> {
+            self.closed.store(true, Ordering::Release);
             self.active.store(false, Ordering::Relaxed);
             log::info!("Capture closed for preview {:?}", self.preview_id);
             Ok(())
@@ -598,6 +625,7 @@ fn capture_window_loop(
         preview_id,
         latest_frame,
         active: active.clone(),
+        closed,
         paused,
         has_produced_frame,
         fps: target_fps,
@@ -736,6 +764,7 @@ mod tests {
             has_produced_frame: Arc::new(AtomicBool::new(true)),
             latest_frame: Arc::new(Mutex::new(None)),
             failure: Arc::new(Mutex::new(None)),
+            closed: Arc::new(AtomicBool::new(false)),
             stop_sender,
             worker: None,
         }
@@ -754,6 +783,100 @@ mod tests {
         assert!(capture_frame_due(too_soon, 30, 0, u32::MAX));
         assert!(!capture_frame_due(too_soon, 30, 4, 4));
         assert!(capture_frame_due(too_soon, 30, 5, 4));
+    }
+
+    #[test]
+    fn closed_window_becomes_reconnectable_without_losing_saved_settings() {
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_window(
+            123,
+            42,
+            "Editor".to_owned(),
+            Pos2::new(10.0, 20.0),
+            Vec2::splat(200.0),
+        );
+        let preview = previews.get_mut(id).unwrap();
+        preview.window_exe = Some("editor.exe".to_owned());
+        preview.stream_audio = true;
+        preview.crop_uv = Some((0.1, 0.2, 0.9, 0.8));
+        preview.update_frame(1, 1, vec![255; 4]);
+        let saved = crate::preview::PreviewLayout::from(&*preview);
+        let mut coordinator = CaptureCoordinator::new();
+        let closed = session(30, false, false);
+        closed
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        *closed.latest_frame.lock() = Some(CapturedFrame {
+            width: 1,
+            height: 1,
+            source_width: 1,
+            source_height: 1,
+            data: vec![255; 4],
+        });
+        coordinator.sessions.insert(id, closed);
+        coordinator.process_frames(&mut previews);
+        let preview = previews.get_mut(id).unwrap();
+        assert!(preview.is_inactive_window());
+        assert!(preview.window_handle.is_none());
+        assert!(preview
+            .get_texture(&eframe::egui::Context::default())
+            .is_none());
+        assert_eq!(
+            serde_json::to_value(crate::preview::PreviewLayout::from(&*preview)).unwrap(),
+            serde_json::to_value(saved).unwrap()
+        );
+    }
+
+    #[test]
+    fn browser_capture_closure_never_enters_external_window_matching() {
+        let mut previews = PreviewManager::new();
+        let id = previews.add_browser_placeholder(
+            "https://example.com".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+            crate::preview::FpsPreset::Medium,
+        );
+        previews.get_mut(id).unwrap().window_handle = Some(crate::preview::WindowHandle {
+            hwnd: 123,
+            process_id: 42,
+        });
+        let mut coordinator = CaptureCoordinator::new();
+        let closed = session(30, false, false);
+        closed
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        coordinator.sessions.insert(id, closed);
+        coordinator.process_frames(&mut previews);
+        let preview = previews.get(id).unwrap();
+        assert!(preview.is_browser());
+        assert!(!preview.is_inactive_window());
+        assert!(preview.capture_error.is_some());
+    }
+
+    #[test]
+    fn a_retired_source_closure_cannot_disconnect_its_replacement() {
+        let mut previews = PreviewManager::new();
+        let id =
+            previews.add_for_window(456, 42, "Editor".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let mut coordinator = CaptureCoordinator::new();
+        let old = session(30, false, false);
+        let old_closed = old.closed.clone();
+        coordinator.sessions.insert(id, old);
+        coordinator.stop_capture(id);
+        coordinator.sessions.insert(id, session(30, true, false));
+        old_closed.store(true, std::sync::atomic::Ordering::Release);
+        coordinator.process_frames(&mut previews);
+        assert!(!previews.get(id).unwrap().is_inactive_window());
+        assert_eq!(
+            previews
+                .get(id)
+                .unwrap()
+                .window_handle
+                .as_ref()
+                .unwrap()
+                .hwnd,
+            456
+        );
     }
 
     #[test]
@@ -886,6 +1009,7 @@ mod tests {
                 has_produced_frame: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
                 failure: Arc::new(Mutex::new(None)),
+                closed: Arc::new(AtomicBool::new(false)),
                 stop_sender,
                 worker: Some(worker),
             },
@@ -916,6 +1040,7 @@ mod tests {
                 has_produced_frame: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
                 failure: Arc::new(Mutex::new(None)),
+                closed: Arc::new(AtomicBool::new(false)),
                 stop_sender,
                 worker: None,
             },
@@ -990,6 +1115,7 @@ mod tests {
                 has_produced_frame: Arc::new(AtomicBool::new(false)),
                 latest_frame: Arc::new(Mutex::new(None)),
                 failure: Arc::new(Mutex::new(None)),
+                closed: Arc::new(AtomicBool::new(false)),
                 stop_sender,
                 worker: Some(worker),
             },

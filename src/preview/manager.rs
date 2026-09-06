@@ -1,6 +1,6 @@
 use super::{
-    BrowserTileStatus, FpsPreset, Preview, PreviewId, VideoSource, VideoTileStatus, ViewportPin,
-    WindowHandle,
+    BrowserTileStatus, FpsPreset, Preview, PreviewId, VideoPlaybackState, VideoSource,
+    VideoTileStatus, ViewportPin, WindowHandle,
 };
 use crate::media::MediaFrame;
 use crate::playlist::FolderPlaylist;
@@ -19,6 +19,10 @@ pub struct RemovedPreviewInfo {
     pub window_waiting_for_match: bool,
     pub position: Pos2,
     pub size: Vec2,
+    pub z_order: u32,
+    pub lock_aspect_ratio: bool,
+    pub manually_frozen: bool,
+    pub video_playback: VideoPlaybackState,
     pub fps_preset: FpsPreset,
     pub crop_uv: Option<(f32, f32, f32, f32)>,
     /// Set for browser tiles; undo recreates the WebView from this URL
@@ -52,6 +56,7 @@ pub struct PreviewManager {
 
     /// Highest z-order
     max_z_order: u32,
+    removal_batches: Vec<Vec<PreviewId>>,
 }
 
 impl PreviewManager {
@@ -60,6 +65,7 @@ impl PreviewManager {
             previews: HashMap::new(),
             next_id: 1,
             max_z_order: 0,
+            removal_batches: Vec::new(),
         }
     }
 
@@ -238,52 +244,79 @@ impl PreviewManager {
     /// in the manager (still rendered, but non-interactive) until its
     /// removal animation finishes and `finalize_removals` reaps it.
     pub fn start_removal(&mut self, id: PreviewId) {
-        if let Some(preview) = self.previews.get_mut(&id) {
-            preview.start_removal();
+        self.start_removal_batch(&[id]);
+    }
+
+    pub fn start_removal_batch(&mut self, ids: &[PreviewId]) {
+        let mut batch = Vec::new();
+        for id in ids {
+            if let Some(preview) = self.previews.get_mut(id) {
+                if preview.removing.is_none() {
+                    preview.start_removal();
+                    batch.push(*id);
+                }
+            }
+        }
+        if !batch.is_empty() {
+            self.removal_batches.push(batch);
         }
     }
 
     /// Drop any previews whose removal animation has finished, returning a
     /// snapshot of each one so the caller can offer an "Undo".
-    pub fn finalize_removals(&mut self) -> Vec<RemovedPreviewInfo> {
-        let done: Vec<PreviewId> = self
-            .previews
-            .values()
-            .filter(|p| p.is_removal_complete())
-            .map(|p| p.id)
-            .collect();
-
-        let mut removed = Vec::with_capacity(done.len());
-        for id in done {
-            if let Some(preview) = self.previews.remove(&id) {
-                removed.push(RemovedPreviewInfo {
-                    title: preview.title,
-                    window_handle: preview.window_handle,
-                    window_exe: preview.window_exe,
-                    window_waiting_for_match: preview.window_waiting_for_match,
-                    position: preview.position,
-                    size: preview.size,
-                    fps_preset: preview.fps_preset,
-                    crop_uv: preview.crop_uv,
-                    browser_url: preview.browser_url,
-                    browser_muted: preview.browser_muted,
-                    stream_audio: preview.stream_audio,
-                    spout_sender: preview.spout_sender,
-                    viewport_pin: preview.viewport_pin,
-                    left_click_disabled: preview.left_click_disabled,
-                    media_path: preview.media_path,
-                    video_source: preview.video_source,
-                    folder_playlist: preview.folder_playlist,
-                    playlist_group: preview.playlist_group,
-                });
+    pub fn finalize_removals(&mut self) -> Vec<Vec<RemovedPreviewInfo>> {
+        let mut completed = Vec::new();
+        let mut index = 0;
+        while index < self.removal_batches.len() {
+            if !self.removal_batches[index].iter().all(|id| {
+                self.previews
+                    .get(id)
+                    .is_none_or(Preview::is_removal_complete)
+            }) {
+                index += 1;
+                continue;
+            }
+            let done = self.removal_batches.remove(index);
+            let mut removed = Vec::with_capacity(done.len());
+            for id in done {
+                if let Some(preview) = self.previews.remove(&id) {
+                    removed.push(RemovedPreviewInfo {
+                        title: preview.title,
+                        window_handle: preview.window_handle,
+                        window_exe: preview.window_exe,
+                        window_waiting_for_match: preview.window_waiting_for_match,
+                        position: preview.position,
+                        size: preview.size,
+                        z_order: preview.z_order,
+                        lock_aspect_ratio: preview.lock_aspect_ratio,
+                        manually_frozen: preview.manually_frozen,
+                        video_playback: preview.video_playback,
+                        fps_preset: preview.fps_preset,
+                        crop_uv: preview.crop_uv,
+                        browser_url: preview.browser_url,
+                        browser_muted: preview.browser_muted,
+                        stream_audio: preview.stream_audio,
+                        spout_sender: preview.spout_sender,
+                        viewport_pin: preview.viewport_pin,
+                        left_click_disabled: preview.left_click_disabled,
+                        media_path: preview.media_path,
+                        video_source: preview.video_source,
+                        folder_playlist: preview.folder_playlist,
+                        playlist_group: preview.playlist_group,
+                    });
+                }
+            }
+            if !removed.is_empty() {
+                completed.push(removed);
             }
         }
-        removed
+        completed
     }
 
     /// Clear all previews
     pub fn clear(&mut self) {
         self.previews.clear();
+        self.removal_batches.clear();
         self.next_id = 1;
         self.max_z_order = 0;
     }
@@ -377,16 +410,18 @@ impl PreviewManager {
 
     /// Send a preview to back
     pub fn send_to_back(&mut self, id: PreviewId) {
-        if let Some(preview) = self.previews.get_mut(&id) {
-            preview.z_order = 0;
+        if !self.previews.contains_key(&id) {
+            return;
         }
 
         // Renumber all z-orders
         let mut sorted: Vec<_> = self.previews.values().map(|p| p.id).collect();
-        sorted.sort_by(|a, b| {
-            let za = self.previews.get(a).map(|p| p.z_order).unwrap_or(0);
-            let zb = self.previews.get(b).map(|p| p.z_order).unwrap_or(0);
-            za.cmp(&zb)
+        sorted.sort_by_key(|preview_id| {
+            (
+                *preview_id != id,
+                self.previews[preview_id].z_order,
+                preview_id.0,
+            )
         });
 
         for (i, preview_id) in sorted.iter().enumerate() {
@@ -443,5 +478,60 @@ mod tests {
         assert_eq!(preview.video_source.as_ref(), Some(&source));
         assert_eq!(preview.video_status, VideoTileStatus::PausedOnRestore);
         assert_eq!(preview.fps_preset, FpsPreset::High);
+    }
+
+    #[test]
+    fn deletion_batches_wait_for_all_tiles_and_preserve_settings() {
+        let mut previews = PreviewManager::new();
+        let first = previews.add("first".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let second = previews.add("second".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let original = previews.get_mut(first).unwrap();
+        original.manually_frozen = true;
+        original.lock_aspect_ratio = false;
+        original.playlist_group = Some(7);
+        original.video_playback.volume = 37.0;
+        previews.start_removal_batch(&[first, second]);
+        let finished = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        previews.get_mut(first).unwrap().removing = Some(finished);
+        assert!(previews.finalize_removals().is_empty());
+        assert!(previews.get(first).is_some());
+        previews.get_mut(second).unwrap().removing = Some(finished);
+        let batches = previews.finalize_removals();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2);
+        let first = &batches[0][0];
+        assert!(first.manually_frozen);
+        assert!(!first.lock_aspect_ratio);
+        assert_eq!(first.z_order, 1);
+        assert_eq!(first.playlist_group, Some(7));
+        assert_eq!(first.video_playback.volume, 37.0);
+        assert_eq!(previews.all().count(), 0);
+    }
+
+    #[test]
+    fn repeated_send_to_back_preserves_a_strict_stack_order() {
+        let mut previews = PreviewManager::new();
+        let ids = (0..3)
+            .map(|n| previews.add(n.to_string(), Pos2::ZERO, Vec2::splat(100.0)))
+            .collect::<Vec<_>>();
+        let mut expected = ids.clone();
+        for id in [ids[2], ids[1], ids[0], ids[2], ids[2], ids[1]] {
+            previews.send_to_back(id);
+            expected.retain(|candidate| *candidate != id);
+            expected.insert(0, id);
+            let mut actual = previews.all().collect::<Vec<_>>();
+            actual.sort_by_key(|preview| preview.z_order);
+            assert_eq!(
+                actual.iter().map(|preview| preview.id).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|preview| preview.z_order)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+        }
     }
 }

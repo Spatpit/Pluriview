@@ -27,7 +27,7 @@ use std::{
         mpsc, Arc,
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use windows::{
@@ -118,6 +118,35 @@ pub struct AudioMonitor {
     device_id: String,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    status: Arc<parking_lot::Mutex<AudioMonitorStatus>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum AudioMonitorStatus {
+    Starting,
+    Active,
+    Retrying(String),
+    Failed(String),
+    Stopped,
+}
+
+impl AudioMonitorStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::Active => "Active",
+            Self::Retrying(_) => "Retrying",
+            Self::Failed(_) => "Failed",
+            Self::Stopped => "Stopped",
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Retrying(error) | Self::Failed(error) => error,
+            _ => self.label(),
+        }
+    }
 }
 
 impl AudioMonitor {
@@ -125,15 +154,24 @@ impl AudioMonitor {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let thread_device = device_id.clone();
+        let status = Arc::new(parking_lot::Mutex::new(AudioMonitorStatus::Starting));
+        let thread_status = status.clone();
         let thread = std::thread::Builder::new()
             .name("audio-monitor".into())
-            .spawn(move || monitor_thread(pid, &thread_device, &thread_stop))
-            .ok();
+            .spawn(move || monitor_thread(pid, &thread_device, &thread_stop, &thread_status));
+        let thread = match thread {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                *status.lock() = AudioMonitorStatus::Failed(error.to_string());
+                None
+            }
+        };
         Self {
             pid,
             device_id,
             stop,
             thread,
+            status,
         }
     }
 
@@ -144,18 +182,57 @@ impl AudioMonitor {
     pub fn device_id(&self) -> &str {
         &self.device_id
     }
+
+    pub fn status(&self) -> AudioMonitorStatus {
+        if self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+            && !matches!(*self.status.lock(), AudioMonitorStatus::Stopped)
+        {
+            return AudioMonitorStatus::Failed("Audio worker stopped unexpectedly".to_owned());
+        }
+        self.status.lock().clone()
+    }
 }
 
 impl Drop for AudioMonitor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // The worker owns its COM objects and a clone of the stop flag.
+            // Dropping a running handle lets it finish on its own thread;
+            // joining here would block canvas/workspace changes on WASAPI.
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
         }
     }
 }
 
-fn monitor_thread(browser_pid: u32, device_id: &str, stop: &AtomicBool) {
+fn wait_for_activation(receiver: &mpsc::Receiver<()>, stop: &AtomicBool) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err("Audio monitoring stopped".to_owned());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("Audio activation timed out".to_owned());
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Audio activation stopped".to_owned())
+            }
+        }
+    }
+}
+
+fn monitor_thread(
+    browser_pid: u32,
+    device_id: &str,
+    stop: &AtomicBool,
+    status: &parking_lot::Mutex<AudioMonitorStatus>,
+) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
@@ -169,13 +246,17 @@ fn monitor_thread(browser_pid: u32, device_id: &str, stop: &AtomicBool) {
     // the device back in resumes the monitor.
     'monitor: while !stop.load(Ordering::Relaxed) {
         let streams = MixFormat::for_default_device().and_then(|format| {
-            let capture = Capture::start(browser_pid, &format)?;
+            let capture = Capture::start_cancellable(browser_pid, &format, stop)?;
+            if stop.load(Ordering::Relaxed) {
+                return Err("Audio monitoring stopped".to_owned());
+            }
             let render = Render::start(device_id, format.sample_rate)?;
             Ok((capture, render, format))
         });
         let (capture, render, format) = match streams {
             Ok(streams) => streams,
             Err(error) => {
+                *status.lock() = AudioMonitorStatus::Retrying(error.clone());
                 if !logged {
                     log::warn!("audio monitor unavailable: {error}");
                     logged = true;
@@ -189,6 +270,7 @@ fn monitor_thread(browser_pid: u32, device_id: &str, stop: &AtomicBool) {
                 continue;
             }
         };
+        *status.lock() = AudioMonitorStatus::Active;
         if !logged {
             log::info!(
                 "audio monitor started: process {browser_pid} ({} ch, {} Hz) -> device {device_id}",
@@ -201,22 +283,28 @@ fn monitor_thread(browser_pid: u32, device_id: &str, stop: &AtomicBool) {
         while !stop.load(Ordering::Relaxed) {
             unsafe { WaitForSingleObject(capture.event, 100) };
             loop {
+                if stop.load(Ordering::Relaxed) {
+                    break 'monitor;
+                }
                 match capture.read(&mut samples, format.channels) {
                     Ok(0) => break,
                     Ok(_) => {}
                     Err(error) => {
+                        *status.lock() = AudioMonitorStatus::Retrying(error.clone());
                         log::warn!("audio monitor capture error, rebuilding: {error}");
                         continue 'monitor;
                     }
                 }
                 fold_to_stereo(&samples, format.channels as usize, &mut stereo);
                 if let Err(error) = render.write(&stereo) {
+                    *status.lock() = AudioMonitorStatus::Retrying(error.clone());
                     log::warn!("audio monitor render error, rebuilding: {error}");
                     continue 'monitor;
                 }
             }
         }
     }
+    *status.lock() = AudioMonitorStatus::Stopped;
 }
 
 /// Fold interleaved `channels`-channel audio to stereo with unity front
@@ -352,7 +440,12 @@ struct Capture {
 }
 
 impl Capture {
+    #[cfg(test)]
     fn start(pid: u32, format: &MixFormat) -> Result<Self, String> {
+        Self::start_cancellable(pid, format, &AtomicBool::new(false))
+    }
+
+    fn start_cancellable(pid: u32, format: &MixFormat, stop: &AtomicBool) -> Result<Self, String> {
         let params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -383,9 +476,7 @@ impl Capture {
             )
         }
         .map_err(|e| e.to_string())?;
-        receiver
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "activation timed out".to_owned())?;
+        wait_for_activation(&receiver, stop)?;
 
         let mut result = HRESULT(0);
         let mut unknown: Option<windows::core::IUnknown> = None;
@@ -563,6 +654,59 @@ mod tests {
         let mut out = Vec::new();
         fold_to_stereo(&[0.1, -0.2, 0.3, -0.4], 2, &mut out);
         assert_eq!(out, vec![0.1, -0.2, 0.3, -0.4]);
+    }
+
+    #[test]
+    fn dropping_a_monitor_does_not_wait_for_its_worker() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (dropped, observed) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (finished, worker_finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            blocked.recv().unwrap();
+            finished
+                .send(worker_stop.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap();
+        });
+        let monitor = AudioMonitor {
+            pid: 42,
+            device_id: "test".to_owned(),
+            stop,
+            thread: Some(worker),
+            status: std::sync::Arc::new(parking_lot::Mutex::new(
+                super::AudioMonitorStatus::Starting,
+            )),
+        };
+        let dropper = std::thread::spawn(move || {
+            drop(monitor);
+            dropped.send(()).unwrap();
+        });
+        let result = observed.recv_timeout(Duration::from_secs(2));
+        // Always release the worker, even if a blocking-drop regression occurs.
+        release.send(()).unwrap();
+        dropper.join().unwrap();
+        assert!(worker_finished
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap());
+        assert!(result.is_ok(), "monitor destruction waited for activation");
+    }
+
+    #[test]
+    fn audio_activation_wait_is_cancellable() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (sender, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(super::wait_for_activation(&receiver, &worker_stop))
+                .unwrap();
+        });
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stopped = result.recv_timeout(Duration::from_secs(2));
+        worker.join().unwrap();
+        assert!(stopped.unwrap().unwrap_err().contains("stopped"));
     }
 
     #[test]

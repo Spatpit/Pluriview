@@ -77,7 +77,7 @@ impl WindowPicker {
         // Colors for the modern theme
         let card_bg = egui::Color32::from_rgb(28, 28, 32);
         let card_hover = egui::Color32::from_rgb(38, 38, 45);
-        let accent_color = egui::Color32::from_rgb(107, 170, 75); // Leaf green
+        let accent_color = egui::Color32::from_rgb(207, 161, 57); // Canvas P honey gold
         let text_secondary = egui::Color32::from_rgb(140, 140, 150);
         let search_bg = egui::Color32::from_rgb(22, 22, 26);
 
@@ -344,7 +344,7 @@ impl WindowPicker {
         palette: PickerPalette,
     ) {
         let text_secondary = palette.text_secondary;
-        let accent = egui::Color32::from_rgb(107, 170, 75);
+        let accent = egui::Color32::from_rgb(207, 161, 57);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(egui_phosphor::regular::BROADCAST)
@@ -484,7 +484,7 @@ fn draw_spout_sender_row(
         card_bg,
         card_hover,
     } = palette;
-    let accent_color = egui::Color32::from_rgb(107, 170, 75);
+    let accent_color = egui::Color32::from_rgb(207, 161, 57);
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(available_width, row_height), egui::Sense::hover());
     let is_hovered = response.hovered();

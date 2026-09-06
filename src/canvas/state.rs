@@ -257,6 +257,117 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_selection_keeps_the_whole_batch_for_undo() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let first = previews.add("first".to_owned(), Pos2::ZERO, Vec2::splat(50.0));
+        let second = previews.add(
+            "second".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::splat(50.0),
+        );
+        canvas.selection = vec![first, second];
+        canvas.set_keyboard_input(super::CanvasKeyboardInput {
+            delete_selected: true,
+            ..Default::default()
+        });
+        let mut captures = CaptureCoordinator::new();
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+            ..Default::default()
+        };
+        let _ = context.run(input(), |context| {
+            CentralPanel::default().show(context, |ui| {
+                canvas.ui(ui, &mut previews, &mut captures, context, true);
+            });
+        });
+        for id in [first, second] {
+            assert!(previews.get(id).unwrap().removing.is_some());
+            previews.get_mut(id).unwrap().removing = Some(Instant::now() - Duration::from_secs(1));
+        }
+        let _ = context.run(input(), |context| {
+            CentralPanel::default().show(context, |ui| {
+                canvas.ui(ui, &mut previews, &mut captures, context, true);
+            });
+        });
+        assert_eq!(canvas.last_removed.as_ref().unwrap().1.len(), 2);
+        assert_eq!(previews.all().count(), 0);
+        canvas.last_removed.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(60);
+        let _ = context.run(input(), |context| {
+            CentralPanel::default().show(context, |ui| {
+                canvas.ui(ui, &mut previews, &mut captures, context, true);
+            });
+        });
+        assert!(
+            canvas.last_removed.is_some(),
+            "toast expiry must not discard undo"
+        );
+        canvas.request_removed_undo();
+        let _ = context.run(input(), |context| {
+            CentralPanel::default().show(context, |ui| {
+                canvas.ui(ui, &mut previews, &mut captures, context, false);
+            });
+        });
+        assert_eq!(canvas.pending_removed_restore.as_ref().unwrap().len(), 2);
+        assert!(canvas.last_removed.is_none());
+        // Switching workspaces must discard the old workspace's Undo state.
+        canvas.clear_preview_interactions();
+        assert!(canvas.last_removed.is_none());
+        assert!(canvas.pending_removed_restore.is_none());
+    }
+
+    #[test]
+    fn undo_during_removal_waits_for_the_current_batch() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add("tile".to_owned(), Pos2::ZERO, Vec2::splat(50.0));
+        previews.start_removal(id);
+        previews.get_mut(id).unwrap().removing = Some(Instant::now() + Duration::from_secs(60));
+        canvas.request_removed_undo();
+        let mut captures = CaptureCoordinator::new();
+        let mut render = |canvas: &mut CanvasState, previews: &mut PreviewManager| {
+            let _ = context.run(RawInput::default(), |context| {
+                CentralPanel::default().show(context, |ui| {
+                    canvas.ui(ui, previews, &mut captures, context, true);
+                });
+            });
+        };
+        render(&mut canvas, &mut previews);
+        assert!(canvas.removed_undo_requested);
+        assert!(canvas.pending_removed_restore.is_none());
+        previews.get_mut(id).unwrap().removing = Some(Instant::now() - Duration::from_secs(1));
+        render(&mut canvas, &mut previews);
+        assert!(!canvas.removed_undo_requested);
+        assert_eq!(canvas.pending_removed_restore.as_ref().unwrap().len(), 1);
+        assert!(canvas.last_removed.is_none());
+    }
+
+    #[test]
+    fn waking_a_hibernated_window_requires_fresh_identity_matching() {
+        let canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id =
+            previews.add_for_window(123, 42, "editor".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let preview = previews.get_mut(id).unwrap();
+        preview.capture_hibernated = true;
+        preview.capture_paused = true;
+        preview.stream_audio = true;
+        let mut captures = CaptureCoordinator::new();
+        canvas.update_viewport_culling(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0)),
+            &mut previews,
+            &mut captures,
+        );
+        let preview = previews.get(id).unwrap();
+        assert!(preview.is_inactive_window());
+        assert!(preview.window_handle.is_none());
+        assert!(preview.stream_audio);
+        assert!(!captures.is_live(id));
+    }
+
+    #[test]
     fn disabled_tile_passes_primary_drag_to_the_tile_underneath() {
         let context = Context::default();
         let mut canvas = CanvasState::default();
@@ -868,11 +979,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_image_placeholder_explains_that_the_original_path_changed() {
+    fn unavailable_image_placeholder_offers_recovery() {
         let (title, detail) = media_placeholder_content();
-        assert_eq!(title, "Can't find image");
-        assert!(detail.contains("moved"));
-        assert!(detail.contains("path"));
+        assert_eq!(title, "Image unavailable");
+        assert!(detail.contains("retry"));
+        assert!(detail.contains("locate"));
     }
 
     #[test]
@@ -2125,6 +2236,12 @@ pub enum PlaylistAction {
     RequestThumbnail(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaAction {
+    Retry,
+    Locate,
+}
+
 /// User-requested runtime activity changes. The canvas queues these and the
 /// app applies them because it owns browser hosts, video sessions, and capture
 /// workers.
@@ -2551,8 +2668,8 @@ fn window_capture_placeholder_content(failed: bool) -> (&'static str, &'static s
 
 fn media_placeholder_content() -> (&'static str, &'static str) {
     (
-        "Can't find image",
-        "The original file may have moved or its path changed",
+        "Image unavailable",
+        "Right-click to retry or locate the original file",
     )
 }
 
@@ -2724,7 +2841,7 @@ fn paint_browser_placeholder(
     status: &BrowserTileStatus,
     time: f32,
 ) {
-    let accent = Color32::from_rgb(107, 170, 75);
+    let accent = Color32::from_rgb(207, 161, 57);
     painter.rect_filled(rect, 8.0, Color32::from_rgb(14, 17, 15));
 
     // A restrained moving glow keeps the tile feeling alive without making
@@ -2735,7 +2852,7 @@ fn paint_browser_placeholder(
         Vec2::new((rect.width() * 0.24).max(36.0), rect.height()),
     )
     .intersect(rect);
-    painter.rect_filled(glow, 8.0, Color32::from_rgba_unmultiplied(107, 170, 75, 10));
+    painter.rect_filled(glow, 8.0, Color32::from_rgba_unmultiplied(207, 161, 57, 10));
 
     let (title, detail, progress, determinate, icon, color) = match status {
         BrowserTileStatus::PreparingAdblock { progress } => (
@@ -2908,8 +3025,9 @@ pub struct CanvasState {
     /// Preview ID pending region selection (set from context menu, consumed by app)
     pub pending_region_select: Option<PreviewId>,
 
-    /// Most recently removed preview, kept briefly to power the "Undo" toast.
-    last_removed: Option<(Instant, RemovedPreviewInfo)>,
+    /// Latest deletion batch, retained until undo, another deletion, or workspace change.
+    last_removed: Option<(Instant, Vec<RemovedPreviewInfo>)>,
+    removed_undo_requested: bool,
 
     /// Screen position of the last right-click on the canvas background,
     /// used to anchor the "Add Window..." quick-add popup.
@@ -2948,9 +3066,10 @@ pub struct CanvasState {
     /// Folder playlist actions queued by its rows and header controls.
     pub pending_playlist_actions: Vec<(PreviewId, PlaylistAction)>,
 
-    /// Removed tile whose "Undo" was clicked. The app owns source recreation
+    /// Removed batch requested by button or shortcut. The app owns source recreation
     /// so every tile type follows one restore path.
-    pub pending_removed_restore: Option<RemovedPreviewInfo>,
+    pub pending_removed_restore: Option<Vec<RemovedPreviewInfo>>,
+    pub pending_media_actions: Vec<(PreviewId, MediaAction)>,
 
     /// The browser tile currently in interaction mode, set by the app each
     /// frame so the canvas can outline it in the accent color.
@@ -3000,6 +3119,7 @@ impl Default for CanvasState {
             pan_drag_tracker: DragTracker::new(),
             pending_region_select: None,
             last_removed: None,
+            removed_undo_requested: false,
             last_secondary_click: None,
             pending_quick_add: None,
             pending_browser_add: None,
@@ -3012,6 +3132,7 @@ impl Default for CanvasState {
             pending_tile_activity_actions: Vec::new(),
             pending_playlist_actions: Vec::new(),
             pending_removed_restore: None,
+            pending_media_actions: Vec::new(),
             interactive_browser: None,
             stream_monitor_ready: false,
             last_screen_rect: None,
@@ -3043,6 +3164,10 @@ impl CanvasState {
 
     /// Drop transient tile interaction state from a previous layout.
     pub fn clear_preview_interactions(&mut self) {
+        self.last_removed = None;
+        self.removed_undo_requested = false;
+        self.pending_removed_restore = None;
+        self.pending_media_actions.clear();
         self.pinned_drag_origins.clear();
         self.pinned_pointer_drag = None;
         self.video_volume_hover = None;
@@ -3647,13 +3772,23 @@ impl CanvasState {
         self.refit_focus(preview_manager, canvas_rect);
 
         // Reap any previews whose fade/shrink-out animation has finished,
-        // keeping the most recent one around briefly for the undo toast.
+        // retaining the latest batch independently of the toast's visibility.
         let finished_removals = preview_manager.finalize_removals();
         if !finished_removals.is_empty() {
             self.prune_preview_interactions(preview_manager);
         }
         if let Some(info) = finished_removals.into_iter().last() {
             self.last_removed = Some((Instant::now(), info));
+        }
+        // A shortcut pressed during the removal animation must restore that
+        // batch once source cleanup completes, rather than an older deletion.
+        if self.removed_undo_requested
+            && !preview_manager
+                .all()
+                .any(|preview| preview.removing.is_some())
+        {
+            self.removed_undo_requested = false;
+            self.queue_removed_undo();
         }
 
         // CRITICAL: Allocate background interaction FIRST
@@ -3795,21 +3930,9 @@ impl CanvasState {
             if is_visible {
                 preview.capture_offscreen_since = None;
                 if preview.capture_hibernated {
-                    if let Some(window) = preview.window_handle.as_ref() {
-                        capture_coordinator.start_capture(
-                            id,
-                            window.hwnd,
-                            preview.title.clone(),
-                            preview.target_fps,
-                        );
-                    }
-                    preview.capture_hibernated = false;
-                    preview.capture_paused = false;
-                    #[cfg(debug_assertions)]
-                    println!(
-                        "Viewport hibernation: Restarted capture for '{}'",
-                        privacy::redact_title(&preview.title)
-                    );
+                    // The app/window may have closed while capture was asleep.
+                    // Let the app revalidate identity through the approved list.
+                    preview.mark_window_inactive();
                 } else if preview.capture_paused {
                     capture_coordinator.resume_capture(id);
                     preview.capture_paused = false;
@@ -4245,10 +4368,10 @@ impl CanvasState {
                     }
                     ui.separator();
                     if ui.button("Remove Selected").clicked() {
-                        for id in self.selection.clone() {
-                            capture_coordinator.stop_capture(id);
-                            preview_manager.start_removal(id);
+                        for id in &self.selection {
+                            capture_coordinator.stop_capture(*id);
                         }
+                        preview_manager.start_removal_batch(&self.selection);
                         self.selection.clear();
                         ui.close_menu();
                     }
@@ -4260,10 +4383,10 @@ impl CanvasState {
         // not depend on pointer position; the app suppresses them while a text
         // field or shortcut recorder owns keyboard input.
         if input.delete_pressed {
-            for id in self.selection.clone() {
-                capture_coordinator.stop_capture(id);
-                preview_manager.start_removal(id);
+            for id in &self.selection {
+                capture_coordinator.stop_capture(*id);
             }
+            preview_manager.start_removal_batch(&self.selection);
             self.selection.clear();
         }
 
@@ -4700,7 +4823,7 @@ impl CanvasState {
                                 egui_phosphor::regular::IMAGE
                             },
                             egui::FontId::proportional(12.0),
-                            Color32::from_rgb(107, 170, 75),
+                            Color32::from_rgb(207, 161, 57),
                         );
                         screen_rect.left_top() + Vec2::new(28.0, 20.0)
                     } else {
@@ -5202,7 +5325,7 @@ impl CanvasState {
                     painter.rect_stroke(
                         screen_rect,
                         8.0,
-                        Stroke::new(2.0, Color32::from_rgb(107, 170, 75)),
+                        Stroke::new(2.0, Color32::from_rgb(207, 161, 57)),
                     );
                 } else if self.selection.contains(&id) {
                     painter.rect_stroke(
@@ -5420,6 +5543,24 @@ impl CanvasState {
                                 preview_manager,
                             );
                         }
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                }
+
+                if is_media {
+                    if let Some(error) = preview_manager
+                        .get(id)
+                        .and_then(|preview| preview.capture_error.as_deref())
+                    {
+                        ui.label(egui::RichText::new(error).small().weak());
+                    }
+                    if ui.button("Retry Image").clicked() {
+                        self.pending_media_actions.push((id, MediaAction::Retry));
+                        ui.close_menu();
+                    }
+                    if ui.button("Locate Image…").clicked() {
+                        self.pending_media_actions.push((id, MediaAction::Locate));
                         ui.close_menu();
                     }
                     ui.separator();
@@ -5851,7 +5992,7 @@ impl CanvasState {
         clipped.rect_filled(
             icon_rect,
             s(8.0),
-            Color32::from_rgba_unmultiplied(107, 170, 75, 38),
+            Color32::from_rgba_unmultiplied(207, 161, 57, 38),
         );
         clipped.text(
             icon_rect.center(),
@@ -6080,7 +6221,7 @@ impl CanvasState {
                         Vec2::new(s(3.0), card.height() - s(16.0)),
                     ),
                     s(1.5),
-                    Color32::from_rgb(107, 170, 75),
+                    Color32::from_rgb(207, 161, 57),
                 );
             }
 
@@ -6313,6 +6454,16 @@ impl CanvasState {
         );
     }
 
+    pub fn request_removed_undo(&mut self) {
+        self.removed_undo_requested = true;
+    }
+
+    fn queue_removed_undo(&mut self) {
+        if let Some((_, removed)) = self.last_removed.take() {
+            self.pending_removed_restore = Some(removed);
+        }
+    }
+
     /// Floating "Removed '...' · Undo" toast for the most recently removed preview.
     fn draw_and_interact_undo_toast(&mut self, ui: &mut egui::Ui, canvas_rect: Rect) {
         let Some((removed_at, _)) = self.last_removed.as_ref() else {
@@ -6321,10 +6472,9 @@ impl CanvasState {
 
         let age = removed_at.elapsed().as_secs_f32();
         if age >= UNDO_TOAST_SECS {
-            self.last_removed = None;
             return;
         }
-        let info = &self
+        let removed = &self
             .last_removed
             .as_ref()
             .expect("removed preview is present")
@@ -6337,7 +6487,10 @@ impl CanvasState {
         let bg_alpha = (fade * 220.0) as u8;
         let text_alpha = (fade * 255.0) as u8;
 
-        let label = if info.title.chars().count() > 28 {
+        let info = &removed[0];
+        let label = if removed.len() > 1 {
+            format!("Removed {} tiles", removed.len())
+        } else if info.title.chars().count() > 28 {
             let truncated: String = info.title.chars().take(25).collect();
             format!("Removed \"{}...\"", truncated)
         } else {
@@ -6388,11 +6541,8 @@ impl CanvasState {
         );
 
         if undo_response.clicked() {
-            let (_, info) = self
-                .last_removed
-                .take()
-                .expect("removed preview is present");
-            self.pending_removed_restore = Some(info);
+            self.request_removed_undo();
+            ui.ctx().request_repaint();
         }
 
         // Keep repainting while the toast is visible so it can fade out.
@@ -6459,7 +6609,7 @@ impl CanvasState {
 
             // Minimal Void: Selection border with accent color.
             let border_color = if self.interactive_browser == Some(id) {
-                Color32::from_rgb(107, 170, 75) // Green: live interaction mode
+                Color32::from_rgb(207, 161, 57) // Gold: live interaction mode
             } else if alt_held && !is_playlist {
                 Color32::from_rgb(255, 150, 100) // Orange for crop mode
             } else {

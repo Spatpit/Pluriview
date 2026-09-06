@@ -57,6 +57,7 @@ pub enum HotkeySlot {
     CanvasView9,
     SelectAll,
     DeleteSelected,
+    UndoRemovedTiles,
     FocusCurrentTile,
     ExitTileOrBrowser,
     InteractBrowser,
@@ -77,7 +78,7 @@ impl HotkeySlot {
         Self::CanvasView9,
     ];
 
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
@@ -94,6 +95,7 @@ impl HotkeySlot {
         Self::CanvasView9,
         Self::SelectAll,
         Self::DeleteSelected,
+        Self::UndoRemovedTiles,
         Self::FocusCurrentTile,
         Self::ExitTileOrBrowser,
         Self::InteractBrowser,
@@ -119,6 +121,7 @@ impl HotkeySlot {
             Self::CanvasView9 => "Saved viewpoint 9",
             Self::SelectAll => "Select all tiles",
             Self::DeleteSelected => "Delete selected tiles",
+            Self::UndoRemovedTiles => "Undo removed tiles",
             Self::FocusCurrentTile => "Focus current tile",
             Self::ExitTileOrBrowser => "Exit tile/browser mode",
             Self::InteractBrowser => "Interact with browser",
@@ -147,6 +150,7 @@ pub struct HotkeyBindings {
     pub canvas_view_9: Hotkey,
     pub select_all: Hotkey,
     pub delete_selected: Hotkey,
+    pub undo_removed_tiles: Hotkey,
     pub focus_current_tile: Hotkey,
     pub exit_tile_or_browser: Hotkey,
     pub interact_browser: Hotkey,
@@ -173,6 +177,7 @@ impl Default for HotkeyBindings {
             canvas_view_9: Hotkey::pair(0x11, 0x39),        // Ctrl+9
             select_all: Hotkey::pair(0x11, 0x41),           // Ctrl+A
             delete_selected: Hotkey::key(0x2E),             // Delete
+            undo_removed_tiles: Hotkey::pair(0x11, 0x5A),   // Ctrl+Z
             focus_current_tile: Hotkey::key(0x62),          // Numpad 2
             exit_tile_or_browser: Hotkey::key(0x1B),        // Escape
             interact_browser: Hotkey::pair(0x11, 0x42),     // Ctrl+B
@@ -201,6 +206,7 @@ impl HotkeyBindings {
             HotkeySlot::CanvasView9 => self.canvas_view_9,
             HotkeySlot::SelectAll => self.select_all,
             HotkeySlot::DeleteSelected => self.delete_selected,
+            HotkeySlot::UndoRemovedTiles => self.undo_removed_tiles,
             HotkeySlot::FocusCurrentTile => self.focus_current_tile,
             HotkeySlot::ExitTileOrBrowser => self.exit_tile_or_browser,
             HotkeySlot::InteractBrowser => self.interact_browser,
@@ -227,6 +233,7 @@ impl HotkeyBindings {
             HotkeySlot::CanvasView9 => self.canvas_view_9 = hotkey,
             HotkeySlot::SelectAll => self.select_all = hotkey,
             HotkeySlot::DeleteSelected => self.delete_selected = hotkey,
+            HotkeySlot::UndoRemovedTiles => self.undo_removed_tiles = hotkey,
             HotkeySlot::FocusCurrentTile => self.focus_current_tile = hotkey,
             HotkeySlot::ExitTileOrBrowser => self.exit_tile_or_browser = hotkey,
             HotkeySlot::InteractBrowser => self.interact_browser = hotkey,
@@ -498,6 +505,28 @@ const SUPPORTED_KEYS: &[(u16, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn undo_defaults_for_legacy_settings_and_respects_keyboard_focus() {
+        let mut value = serde_json::to_value(super::HotkeyBindings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("undo_removed_tiles");
+        let bindings: super::HotkeyBindings = serde_json::from_value(value).unwrap();
+        assert_eq!(bindings.undo_removed_tiles, super::Hotkey::pair(0x11, 0x5A));
+        let mut tracker = super::HotkeyTracker::default();
+        tracker.held[0x11] = true;
+        tracker.held[0x5A] = true;
+        tracker.newly_pressed.push(0x5A);
+        assert!(tracker
+            .presses(&bindings, true)
+            .pressed(super::HotkeySlot::UndoRemovedTiles));
+        assert!(!tracker
+            .presses(&bindings, false)
+            .pressed(super::HotkeySlot::UndoRemovedTiles));
+        tracker.newly_pressed.clear();
+        assert!(!tracker
+            .presses(&bindings, true)
+            .pressed(super::HotkeySlot::UndoRemovedTiles));
+    }
+
     use super::{Hotkey, HotkeyBindings, HotkeySlot, HotkeyTracker};
 
     #[test]
@@ -542,7 +571,7 @@ mod tests {
         let configured = shortcuts.configured_keys();
         assert_eq!(
             configured.into_iter().filter(|enabled| *enabled).count(),
-            22
+            23
         );
         assert!(configured[0x11]); // Ctrl
         assert!(configured[0x31]); // 1
