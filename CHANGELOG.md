@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Reorganized the README around setup and everyday use, clarified browser profiles, shared logins, ad blocking, and audio sharing, and moved technical details into expandable sections.
+
 ## [0.6.8] - 2026-09-05
 
 ### Changed

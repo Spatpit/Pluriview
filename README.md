@@ -1,196 +1,315 @@
 <p align="center">
-  <img src="assets/icon.png" width="128" height="128" alt="Pluriview gold Canvas P logo">
-  <h1 align="center">Pluriview</h1>
-  <p align="center">
-    Live window previews on an infinite canvas for Windows
-  </p>
+  <img src="assets/icon.png" width="128" height="128" alt="Pluriview logo">
+</p>
+
+<h1 align="center">Pluriview</h1>
+
+<p align="center">
+  Your windows, web pages, and media together on an infinite canvas for Windows.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-blue" alt="Platform">
-  <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="Rust">
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-blue" alt="Windows 10 and 11">
   <img src="https://img.shields.io/github/license/Spatpit/Pluriview" alt="License">
-  <img src="https://img.shields.io/github/v/release/Spatpit/Pluriview?include_prereleases" alt="Release">
+  <img src="https://img.shields.io/github/v/release/Spatpit/Pluriview?include_prereleases" alt="Latest release">
 </p>
+
+Pluriview gives you a flexible space to arrange live app windows, browser pages,
+videos, images, and overlays. Move and resize tiles, crop out distractions, and
+save different layouts for different activities.
+
+Watch streams alongside chat, keep reference material nearby, or build a canvas
+with transparent widgets and a moving wallpaper.
 
 <p align="center">
-  <img src="assets/pluriview-preview.gif" alt="Pluriview arranging live windows, browser pages, and image tiles on the infinite canvas">
+  <img src="assets/pluriview-preview.gif" alt="Live windows, browser pages, and images arranged on the Pluriview canvas">
 </p>
 
----
+## Download and start
 
-## Features
+Get the latest version from **[Releases](https://github.com/Spatpit/Pluriview/releases)**.
 
-| Feature | Description |
-|---------|-------------|
-| **Live Capture** | Real-time window previews using Windows Graphics Capture |
-| **Spout2 Capture** | Receive senders from apps such as VTube Studio as live canvas tiles |
-| **Browser Tiles** | Live web pages (YouTube, Twitch, anything) on the canvas with their own audio |
-| **Video Tiles** | Drop local videos onto the canvas; play, seek, volume, tracks, loop, reload |
-| **Folder Playlists** | Drop a folder to get a player plus a playlist tile (next/prev, shuffle, repeat) |
-| **Image & GIF Tiles** | Static images or animated GIFs loaded directly from their original local paths |
-| **Live Streams** | Optional Streamlink helper for Twitch and other stream URLs |
-| **Ad & Tracker Blocking** | uBlock Origin Lite is built in for browser tiles and on by default |
-| **Infinite Canvas** | Pan and zoom freely to organize your workspace |
-| **Viewport Pinning** | Pin any tile so it stays fixed on screen while the canvas pans or zooms |
-| **Click Pass-Through** | Disable left click on an overlay tile to interact with tiles underneath it |
-| **Live Wallpaper** | Image, GIF, or looping muted video behind the canvas; it stays screen-sized |
-| **Tile Freeze** | Pause live work on selected tiles and keep the last frame until you resume |
-| **Stream Audio Monitor** | Copy tile audio into Pluriview so Discord/OBS window shares pick it up |
-| **Crop Regions** | Focus on part of a window, browser page, image, GIF, or video with Alt+drag |
-| **Adjustable FPS** | 15, 30, or 60 FPS per preview |
-| **Auto-Save** | Changed layouts save once per minute with crash-safe previous-save backups; unchanged layouts do not write to disk |
-| **Named Workspaces** | Create, duplicate, rename, and switch between reusable canvas setups |
-| **Saved Viewpoints** | Save named positions inside a workspace and glide smoothly between them |
-| **System Tray** | Minimize to tray for background operation |
-| **Quick Focus** | Double-click a preview to bring its source window to the front |
-| **Canvas-Only Mode** | Press `H` to hide chrome; right-click menus still work |
-| **Tile Focus** | Fit a tile to the canvas, then restore with `Esc` |
-| **Auto-hiding Title Bar** | Optional: hide the title bar until the pointer is at the top of the window |
+| Version | Choose this if… |
+|---|---|
+| **Full — recommended** | You want all features, including local videos, folder playlists, and video wallpapers. |
+| **Lite** | You need live windows, browser tiles, Spout2 sources, images, and GIFs. |
 
-### Video tiles and playlists
+1. Download and extract the ZIP.
+2. Keep the included `lib` folder beside `pluriview.exe`.
+3. Launch `pluriview.exe` and start adding content.
 
-Keep `libmpv-2.dll` inside the `lib` folder next to `pluriview.exe`. Then:
+**Requirements:** Windows 10 version 1903 or newer, or Windows 11, with a
+DirectX 11-compatible GPU.
 
-- Drop a video file onto the canvas, or use **File → Add Video...**
-- Drop a folder of videos to create a linked player and playlist
-- Use play/pause, seek, mute, speed, loop, audio/subtitle tracks, and reload; hover the speaker icon for a vertical volume slider
-- Crop the visible video region with Alt+drag on tile edges or corners
-- Hover the seek bar to preview a frame without moving the playing video
-- Live streams do not get timeline thumbnails
+Browser tiles require the [Microsoft WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/).
+If browser tiles cannot start because the runtime is missing, install it and
+reopen Pluriview. Built-in ad blocking requires WebView2 Runtime 122 or newer.
 
-You do **not** need a separate mpv install for playback. Stream URLs need
-[Streamlink](https://streamlink.github.io/) (Settings → Streamlink).
+## Your first canvas
 
-### Image and GIF tiles
+- **Add an app window:** choose it from the Window Picker on the left.
+- **Add a web page:** right-click the canvas → **Add Browser...**
+- **Add images, GIFs, or videos:** drag files from Explorer onto the canvas.
+- **Add a video playlist:** drag a folder of videos onto the canvas.
+- **Arrange your tiles:** drag to move them and use their edges or corners to resize.
+- **Explore the canvas:** use the middle mouse button to pan and the scroll wheel to zoom.
 
-Choose **File → Add Image...** or right-click the canvas → **Add Image...**.
-Pluriview supports PNG, JPEG, GIF, WebP, and BMP. Animated GIFs keep their
-original timing. Tiles use the image's original path and do not create a copy
-inside `pluriview_data`. If the original is missing or cannot be decoded, the
-tile remains on the canvas with an error. Right-click it and choose **Retry
-Image** after repairing the file, or **Locate Image…** to choose a replacement.
-Its position, crop, pin, and freeze settings are retained. You can also drag
-files from Explorer onto the canvas.
+Hover over tiles for controls, or right-click a tile for more options.
+Press `F1` to see shortcuts.
 
-Development builds keep `pluriview_data` at the repo root. Release builds keep
-it beside the executable.
+## What you can add
 
-### Live wallpaper
+| Source | What it does |
+|---|---|
+| **App windows** | Displays a live preview of an open application window. |
+| **Browser tiles** | Opens a web page inside Pluriview, with navigation, interaction, and audio. |
+| **Images and GIFs** | Displays local images and plays animated GIFs. |
+| **Videos** | Plays local video files with playback, seeking, volume, and track controls. |
+| **Folder playlists** | Creates a video player linked to a playlist of files from a folder. |
+| **Stream URLs** | Uses optional Streamlink support to play supported streams in a video tile. |
+| **Spout2 sources** | Receives live output from compatible applications such as VTube Studio. |
 
-**View → Set Wallpaper...** or right-click the canvas. Images, GIFs, and local
-videos fill the window and do not pan or zoom with the canvas. Video wallpaper
-needs `libmpv-2.dll` and loops muted. Image, GIF, and video wallpapers keep
-their original paths instead of creating managed copies. A missing image
-wallpaper shows a path-change message. The wallpaper is saved per workspace.
-While a tile is in focus mode, video wallpaper pauses.
+### App windows and Spout2
+
+Use the **Window Picker** to add an open application as a live tile. You can
+resize, crop, freeze, or pin its preview.
+
+Live Spout2 senders appear in the same picker. Select one to display its shared
+output on the canvas.
 
 ### Browser tiles
 
-Right-click the canvas → **Add Browser...** and paste a URL. The page is a
-normal tile (move, resize, overlap) while audio keeps playing. Double-click
-(or `Ctrl+B`) to use the real page, then `Esc` or click outside to return to
-the canvas. Hover for back/forward/reload/mute. Logins live in a Pluriview
-WebView2 profile, not your main browser.
+Browser tiles let you place live web pages on the canvas, including streams,
+chats, dashboards, and overlay widgets.
 
-Browser tiles use **uBlock Origin Lite**, on by default. Toggle it under
-**View → Block Ads & Trackers (uBOL)**. WebView2 has no extension toolbar, so
-uBOL's popup is not shown.
+Right-click the canvas → **Add Browser...**, then paste a web address.
 
-Turn off **Lock Aspect Ratio** from a browser tile's right-click menu to resize
-its WebView into portrait, square, ultrawide, or another custom viewport shape.
+#### Arrange the tile or use the website
 
-Pages with transparent backgrounds stay transparent in browser tiles, which
-makes overlay widgets such as heart-rate monitors blend into the canvas.
-Browser tiles can also be cropped with Alt+drag while in canvas mode; entering
-interaction mode keeps the visible page region and pointer coordinates aligned,
-and the crop is restored with the workspace.
+While working on the canvas, you can move, resize, layer, crop, and pin a
+browser tile.
 
-**Streaming with audio (Discord/OBS):** browser-tile sound normally belongs to
-WebView2, so sharing the Pluriview window has no tile audio. Enable **View →
-Stream Audio Monitor** and pick an output you do not listen to (a virtual
-cable such as VB-Cable, or an unused output). Pluriview plays a copy from its
-own process so window shares pick it up. Off by default.
-The monitor menu shows whether each audio source is starting, active, retrying,
-or has failed. Disabling a monitor does not wait for audio activation to finish.
+To interact with the website, **double-click the tile** or press **`Ctrl+B`**.
+You can then click links, type, sign in, and use the page's controls.
+Press **`Esc`** or click outside to return to arranging your canvas.
 
-### Workspace recovery and source reconnection
+Hover over the tile for **back, forward, reload, and mute**. Each tile has its
+own page and mute control. One browser tile can receive direct interaction at
+a time.
 
-If a workspace cannot be loaded, Pluriview pauses editing and saving so an empty
-canvas cannot overwrite the saved layout. The recovery screen lets you retry,
-restore the previous save into a separate workspace, or open another workspace.
-Files written in an unsupported format are preserved for a compatible version
-of Pluriview. Catalog recovery also recognizes workspaces whose backup is their
-only remaining file.
+#### How browser tiles work
 
-Closing a captured application leaves its tile marked **Not active**. Pluriview
-reconnects when a matching window appears, including after a tile wakes from
-off-screen resource saving. Its geometry, crop, and Stream Audio setting remain
-intact. Undoing a tile deletion restores the entire deleted selection, including
-stacking order, aspect-ratio locks, and freeze settings. Press **Ctrl+Z** to undo
-the latest tile deletion, even after the notification disappears. This keeps
-one deletion batch until it is restored, replaced by another deletion, or you
-switch workspaces. The shortcut is configurable in Settings; text fields and
-interactive browser pages keep their own undo behavior.
+Pluriview uses **Microsoft WebView2** to run web pages inside browser instances
+managed by the app. You do not need to keep a separate browser window open for
+each tile.
 
-### Saved viewpoints
+Browser data is stored locally in a **dedicated Pluriview profile**, separate
+from your regular browser profile:
 
-Use **View → Saved Viewpoints → Save Current Viewpoint...** to bookmark the
-current canvas center and zoom inside the active workspace. Selecting a saved
-viewpoint glides to it with a smooth pan and proportional zoom. Each viewpoint
-can be updated from the current camera position, renamed, or deleted. The active
-viewpoint is highlighted; it is marked modified after the camera moves away.
-Deleting a viewpoint shows a short Undo action. Panning, zooming, or pressing
-`Esc` interrupts a transition immediately, and choosing another viewpoint while
-moving redirects the camera without a jump. Use `Ctrl+1` through `Ctrl+9` for
-direct access or `Ctrl+Page Up` / `Ctrl+Page Down` to cycle; all viewpoint
-shortcuts are configurable.
-In **Settings**, Streamlink appears first, followed by the general keyboard
-shortcuts. Expand **Saved Viewpoints** below them to configure viewpoint keys.
+- Your regular browser's tabs and sign-ins are not automatically imported.
+- All Pluriview browser tiles share cookies and login sessions, including across workspaces.
+- Signing into a website in one tile can also sign you into that website in other tiles.
+- Login sessions can remain available when you close and reopen Pluriview.
 
-## Requirements
+Websites connect to their own services and handle account information as they
+normally would when you visit them.
 
-- **OS:** Windows 10 (version 1903+) or Windows 11
-- **GPU:** DirectX 11 compatible graphics card
-- **Renderer:** `lib\libEGL.dll` and `lib\libGLESv2.dll` beside `pluriview.exe` (included in every download)
-- **Browser tiles:** [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (already on Windows 11 and current Windows 10)
-- **Ad blocking:** WebView2 Runtime 122 or newer
-- **Video tiles, playlists, video wallpaper:** `lib\libmpv-2.dll` beside `pluriview.exe` (included in the Full download)
-- **Stream URLs:** [Streamlink](https://streamlink.github.io/), configured in Settings if it is not already on PATH
-- **Building from source:** Rust 1.88 or newer
+#### Ad and tracker blocking
 
-Window capture, browsers, images, GIF wallpaper, and workspaces work without
+**uBlock Origin Lite** is included and enabled by default for browser tiles.
+
+Toggle it under **View → Block Ads & Trackers (uBOL)**. The setting applies to
+all browser tiles. If blocking interferes with a page, you can turn it off from
+this menu.
+
+WebView2 does not provide an extension toolbar, so the usual uBlock popup is
+unavailable.
+
+#### Transparent overlays and custom sizes
+
+Pages designed with transparent backgrounds stay transparent. This allows
+widgets such as heart-rate monitors to blend into your canvas.
+
+- **Change the page shape:** right-click the tile and turn off **Lock Aspect Ratio** to resize it into a portrait, square, or wide layout.
+- **Show part of a page:** hold `Alt` and drag a tile edge or corner to crop.
+- **Keep a widget in place:** right-click → **Pin to Viewport**.
+- **Click content underneath an overlay:** use the tile's **Disable Left Click** option.
+
+Cropping keeps the page's proportions, and you can still interact with the
+visible region.
+
+### Images and GIFs
+
+Drag an image onto the canvas, or choose **File → Add Image...**.
+
+Supported formats include **PNG, JPEG, GIF, WebP, and BMP**. Animated GIFs
+retain their original timing and pause when the tile is frozen.
+
+Pluriview uses the original file without creating a separate copy. Keep the
+file in its saved location, or use **Locate Image…** from the tile's right-click
+menu if you move it.
+
+### Videos and folder playlists
+
+The **Full** download includes the video runtime. No separate mpv installation
+is required for playback.
+
+Drag a video onto the canvas, or choose **File → Add Video...**. Controls
+include:
+
+- Play/pause, seek, mute, and volume.
+- Playback speed and looping.
+- Audio and subtitle track selection.
+- A seek-bar preview so you can inspect another moment without moving playback.
+
+Hold `Alt` and drag an edge or corner to crop the video.
+
+Drag a **folder of videos** onto the canvas to create a linked player and
+playlist. Playlists include previous/next, shuffle, and repeat controls, and
+use files directly inside the selected folder.
+
+### Live streams
+
+You can watch a stream in a **browser tile** by opening its website.
+
+To open a supported stream URL in a **video tile**, install
+[Streamlink](https://streamlink.github.io/) and add the stream from the canvas
+menu. Configure Streamlink in **Settings** if Pluriview does not find it
+automatically.
+
+Video-tile streams require the video runtime included in the Full download.
+Live streams do not provide seek-bar thumbnails.
+
+## Make the canvas yours
+
+| Option | What it does |
+|---|---|
+| **Crop** | Shows only the part of a tile you need. Hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
+| **Pin to Viewport** | Keeps any tile fixed on screen while you pan or zoom the canvas. |
+| **Freeze** | Holds the current frame of selected tiles until you resume them. |
+| **Focus on This Tile** | Fits a tile to the canvas. Press `Esc` to return. |
+| **Canvas-only mode** | Hides the interface with `H`; right-click menus remain available. |
+| **Capture FPS** | Chooses 15, 30, or 60 FPS for live previews. |
+| **System tray** | Keeps Pluriview available while minimized to the tray. |
+
+### Wallpapers
+
+Choose **View → Set Wallpaper...**, or use the canvas right-click menu.
+
+Images, GIFs, and local videos can fill the background. The wallpaper stays
+fixed to the window while you pan and zoom, and each workspace can have its
+own wallpaper.
+
+Video wallpapers require the Full download's video runtime. They loop without
+audio and pause while a tile is in focus mode.
+
+Wallpaper files stay in their original locations, so keep them available after
+adding them.
+
+### Workspaces and saved viewpoints
+
+Use the **Workspace** menu to create, duplicate, rename, and switch between
+canvas setups. Changes save automatically once per minute.
+
+**Saved viewpoints** bookmark places within a workspace. Arrange your camera,
+then choose **View → Saved Viewpoints → Save Current Viewpoint...**.
+
+Select a viewpoint to move smoothly back to it. You can rename, update, or
+delete viewpoints from the same menu. Pan, zoom, or press `Esc` to interrupt
+a transition.
+
+Use `Ctrl+1` through `Ctrl+9` to open a viewpoint directly, or
+`Ctrl+Page Up` / `Ctrl+Page Down` to cycle between them.
+
+## Sharing audio with Discord or OBS
+
+Browser audio plays normally while you use Pluriview. However, that sound
+belongs to WebView2, so sharing only the Pluriview window may leave browser
+audio out.
+
+**Stream Audio Monitor** lets Pluriview replay a copy of the audio through its
+own process so window sharing can capture it.
+
+1. Open **View → Stream Audio Monitor**.
+2. Choose an output you do not listen to, such as a virtual audio cable or an unused audio output.
+3. Share the Pluriview window in your streaming or calling application.
+
+Using a separate output avoids hearing the replayed audio twice. Browser tiles
+are monitored automatically when the feature is enabled; captured app windows
+use their individual **Stream Audio** toggle.
+
+This feature is off by default.
+
+## Controls and shortcuts
+
+Keyboard shortcuts can be changed under **View → Settings → Keyboard
+shortcuts**. Mouse controls are fixed.
+
+| Action | Default control |
+|---|---|
+| Pan canvas | Middle mouse drag or `Alt` + drag on empty canvas |
+| Zoom | Scroll wheel |
+| Show/hide Window Picker | `W` |
+| Show/hide grid | `G` |
+| Toggle canvas-only mode | `H` |
+| Select all tiles | `Ctrl+A` |
+| Select multiple tiles | `Ctrl` + click |
+| Box-select tiles | Left-drag on empty canvas |
+| Add to box selection | `Ctrl` + left-drag on empty canvas |
+| Crop a supported tile | `Alt` + drag an edge or corner |
+| Delete selected tiles | `Delete` |
+| Undo the latest tile deletion | `Ctrl+Z` |
+| Focus current tile | `Numpad 2` |
+| Interact with browser tile | Double-click, `Ctrl+B`, or `Numpad 1` |
+| Exit focus or browser interaction | `Esc` |
+| Open saved viewpoints 1–9 | `Ctrl+1` through `Ctrl+9` |
+| Previous/next viewpoint | `Ctrl+Page Up` / `Ctrl+Page Down` |
+| Show shortcuts | `F1` |
+
+## Technical information
+
+<details>
+<summary><strong>Included components and optional tools</strong></summary>
+
+Both downloads include the ANGLE rendering runtime in the `lib` folder:
+
+- `libEGL.dll`
+- `libGLESv2.dll`
+
+The **Full** download also includes `libmpv-2.dll` for video tiles, folder
+playlists, and video wallpapers.
+
+**WebView2** is required for browser tiles. **Streamlink** is an optional
+separate installation for supported stream URLs opened in video tiles.
+
+Window capture, browser tiles, images, GIFs, and workspaces do not require
 libmpv or Streamlink.
 
-## Installation
+</details>
 
-### Download
+<details>
+<summary><strong>Verify a release download</strong></summary>
 
-Get the latest release from [Releases](https://github.com/Spatpit/Pluriview/releases).
+Release downloads include a `SHA256SUMS.txt` file for checking archive integrity.
 
-| Zip | Contains | Use when |
-|-----|----------|----------|
-| **Full** (recommended) | `pluriview.exe` + a `lib` folder containing ANGLE, `libmpv-2.dll`, and license/notices | You want video tiles, playlists, or video wallpaper |
-| **Lite** | `pluriview.exe` + a `lib` folder containing ANGLE and license/notices | You only need windows, browsers, and images |
+Official tagged releases are built through the repository's public GitHub
+Actions workflow, which runs formatting checks, tests, dependency auditing,
+and the release build. Published archives include build-provenance attestations.
 
-Keep the included `lib` folder next to `pluriview.exe`. Full installs also
-include `libmpv-2.dll` inside that folder; you can add that DLL to a Lite
-install later. Do not ship or run `pluriview.pdb`.
-
-Official archives are built from their version tag on a public GitHub-hosted
-Windows runner. The workflow runs formatting, tests, dependency auditing, the
-privacy-safe release build, and publishes build-provenance attestations. To
-verify a downloaded archive against the repository and workflow with the
-GitHub CLI:
+With the GitHub CLI installed, verify an archive using:
 
 ```powershell
 gh attestation verify .\Pluriview-vX.Y.Z-windows-x64-full.zip --repo Spatpit/Pluriview
 ```
 
-Streamlink is a separate optional install. Point Pluriview at it in Settings
-if Windows does not already find `streamlink.exe`.
+Replace the example filename with the archive you downloaded.
 
-### Build from Source
+</details>
+
+<details>
+<summary><strong>Build from source</strong></summary>
+
+Building requires **Rust 1.88 or newer** and a Windows development environment.
 
 ```powershell
 git clone https://github.com/Spatpit/Pluriview.git
@@ -200,136 +319,56 @@ cd Pluriview
 .\scripts\build-release.ps1
 ```
 
-`dist` will contain the privacy-safe executable, a `lib` folder with the
-runtime DLLs and text notices, versioned Full and Lite zip archives, and
-`SHA256SUMS.txt`. Keep the `lib` folder beside the executable. Do not
-distribute `pluriview.pdb`; debug symbols can contain local paths.
+The release script builds with local path remapping, checks the executable for
+local-path and credential-like strings, and creates the packaged output in
+`dist`.
 
-Maintainers can test the same public release build without publishing through
-the workflow's manual dispatch action. Pushing an existing version tag such as
-`v0.6.8` runs the verified build and publishes the matching approved file from
-`release-notes/` only after every build and attestation step succeeds.
+Output includes Full and Lite ZIP archives, runtime libraries, third-party
+notices, and `SHA256SUMS.txt`.
 
-## Usage
+Keep the `lib` folder beside the executable. Do not distribute `pluriview.pdb`,
+which can contain local paths.
 
-1. **Launch** `pluriview.exe`
-2. **Add windows** from the Window Picker (left side). Live Spout2 senders such as VTube Studio appear in the same list; add them to capture the shared texture.
-3. **Add browsers** by right-clicking the canvas → Add Browser...
-4. **Add images or GIFs** with File → Add Image... or the canvas context menu
-5. **Add videos** by dropping a file or folder, or File → Add Video...
-6. **Add a stream** from the canvas menu (needs Streamlink)
-7. **Set a wallpaper** with View → Set Wallpaper...
-8. **Arrange** by dragging tiles; **resize** from corners or edges
-9. **Crop** window, browser, image, GIF, or video tiles with Alt+drag on edges or corners
-10. **Pin** any tile with right-click → **Pin to Viewport** to keep it fixed while navigating the canvas
-11. **Save viewpoints** under View → Saved Viewpoints to jump between regions of a workspace
-12. **Focus** a tile with right-click → **Focus on This Tile**; `Esc` restores the canvas
+</details>
 
-The **Workspace** menu holds separate setups. Existing installs are migrated
-into a workspace named **Default** the first time workspaces run. Pluriview
-checks once per minute and saves only when persisted workspace state changed.
-Use **Workspace → Restore Previous Save as New Workspace** to inspect the prior
-valid save without overwriting the current workspace. If the workspace catalog
-is interrupted or damaged, valid unlisted workspace files are returned to the
-catalog automatically.
+<details>
+<summary><strong>Project structure</strong></summary>
 
-## Keyboard Shortcuts
+| Location | Purpose |
+|---|---|
+| `src/app.rs` | Application state, menus, and source orchestration |
+| `src/canvas/` | Canvas rendering, interaction, and wallpaper |
+| `src/preview/` | Tile models and lifecycle |
+| `src/capture/` | Window and Spout2 capture |
+| `src/browser.rs` | WebView2 browser tiles |
+| `src/libmpv.rs` | In-process video rendering |
+| `src/media.rs` | Images and animated GIFs |
+| `src/playlist.rs` | Folder playlists |
+| `src/audio.rs` | Stream Audio Monitor |
+| `src/persistence/` | Workspaces, layouts, and settings |
+| `src/window_picker/` | Source enumeration and picker |
+| `assets/` | Branding and bundled third-party assets |
+| `scripts/` | Runtime preparation and release packaging |
 
-Keyboard shortcuts can be changed under **View → Settings → Keyboard
-shortcuts**. A binding can be one key or any two keys held together. Mouse
-controls remain fixed. **Restore Default Keys** returns the keyboard bindings
-to those shown below.
+The editable logo is `assets/logo.svg`. Run `scripts/generate-icons.ps1` on
+Windows to regenerate the application's PNG and ICO assets.
 
-| Action | Shortcut |
-|--------|----------|
-| Pan canvas | `Middle Mouse` or `Alt + Drag` |
-| Zoom | `Scroll Wheel` |
-| Toggle Window Picker | `W` |
-| Toggle grid | `G` |
-| Toggle canvas-only mode | `H` |
-| Previous / next saved viewpoint | `Ctrl + Page Up` / `Ctrl + Page Down` |
-| Open saved viewpoints 1–9 | `Ctrl + 1` through `Ctrl + 9` |
-| Select all | `Ctrl + A` |
-| Multi-select | `Ctrl + Click` |
-| Box-select tiles | `Left-drag empty canvas` |
-| Add with box selection | `Ctrl + Left-drag empty canvas` |
-| Freeze or resume selection | `Right-click selected tile or canvas` |
-| Delete selected | `Delete` |
-| Undo last tile deletion | `Ctrl+Z` |
-| Crop tile | `Alt + Drag edges or corners` |
-| Focus current tile | `Numpad 2` or `Double-click preview` |
-| Exit tile focus | `Esc` |
-| Interact with browser tile | `Ctrl + B`, `Numpad 1`, or `Double-click` |
-| Exit browser interaction | `Esc` or click outside |
-| Show shortcuts | `F1` |
-
-## Project Structure
-
-The Canvas P logo uses honey gold, champagne, and olive on chocolate brown.
-Edit `assets/logo.svg`, then run `./scripts/generate-icons.ps1` on Windows to
-regenerate the shared PNG and multi-resolution ICO. These checked-in assets are
-used by the title bar, About dialog, taskbar, tray, and executable resource.
-
-```
-Pluriview/
-├── src/
-│   ├── app.rs              # Main application state and UI
-│   ├── main.rs             # Entry point
-│   ├── audio.rs            # Stream audio monitor
-│   ├── browser.rs          # WebView2 browser tiles
-│   ├── libmpv.rs           # In-process video playback
-│   ├── media.rs            # Static image and animated GIF decoding
-│   ├── playlist.rs         # Folder playlist tiles
-│   ├── video.rs            # Video sources and playlist thumbnails
-│   ├── canvas/             # Infinite canvas, wallpaper, selection
-│   ├── capture/            # Window capture and downscale
-│   ├── overlay/            # Region selector overlay (crop)
-│   ├── persistence/        # Layout, workspaces, settings
-│   ├── preview/            # Preview window management
-│   ├── tray/               # System tray integration
-│   ├── window_picker/      # Window enumeration and picker UI
-│   └── spout.rs            # Spout2 sender detection
-├── assets/
-│   ├── icon.ico                  # Multi-resolution Windows application icon
-│   ├── icon.png                  # Shared window/tray icon and README branding
-│   ├── logo.svg                  # Editable Canvas P logo master
-│   ├── pluriview-preview.gif     # README preview
-│   └── third_party/
-│       ├── angle/                 # Pinned standalone ANGLE runtime and provenance
-│       └── ubol/                  # Pinned official uBlock Origin Lite package
-├── scripts/
-│   ├── build-release.ps1   # Privacy-safe Windows release build
-│   ├── prepare-angle.ps1   # Verify and prepare the pinned standalone ANGLE runtime
-│   └── prepare-libmpv.ps1  # Download the pinned libmpv runtime
-├── Cargo.toml
-├── build.rs
-├── LICENSE                 # MIT License
-├── THIRD_PARTY_NOTICES.md
-└── README.md
-```
-
-`vendor/` and `dist/` are local build outputs. They are not committed.
+</details>
 
 ## License
 
-This project is licensed under the MIT License — see [LICENSE](LICENSE).
-Bundled third-party components keep their own licenses; see
+Pluriview is licensed under the **MIT License**. See [LICENSE](LICENSE).
+
+Bundled components retain their own licenses. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Full releases include
-`libmpv-2.dll` (mpv/FFmpeg, GPLv2+); every release includes standalone ANGLE
-and the applicable permissive runtime notices.
+libmpv/FFmpeg under GPLv2+; all releases include ANGLE and its applicable notices.
 
 ## Acknowledgments
 
-- Built with [egui](https://github.com/emilk/egui)
-- Window capture via [windows-rs](https://github.com/microsoft/windows-rs)
-- Spout2 sender capture via the public [Spout](https://spout.zeal.co/) shared-memory registry and DirectX 11
-- Browser tiles via [wry](https://github.com/tauri-apps/wry) (WebView2)
-- OpenGL ES translation via [ANGLE](https://github.com/google/angle) (Direct3D 11 on Windows)
-- Video playback via [libmpv](https://github.com/mpv-player/mpv) (shinchiro Windows builds)
-- Ad and tracker blocking via [uBlock Origin Lite](https://github.com/gorhill/uBlock) (GPL-3.0)
-
----
-
-<p align="center">
-  Made with Rust
-</p>
+- [egui](https://github.com/emilk/egui) — application interface.
+- [windows-rs](https://github.com/microsoft/windows-rs) — Windows integration and capture.
+- [Spout](https://spout.zeal.co/) — shared GPU texture sources.
+- [wry](https://github.com/tauri-apps/wry) and Microsoft WebView2 — browser tiles.
+- [ANGLE](https://github.com/google/angle) — graphics rendering.
+- [libmpv](https://github.com/mpv-player/mpv) — video playback.
+- [uBlock Origin Lite](https://github.com/gorhill/uBlock) — ad and tracker blocking.
