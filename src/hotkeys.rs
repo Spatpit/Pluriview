@@ -178,7 +178,7 @@ impl Default for HotkeyBindings {
             select_all: Hotkey::pair(0x11, 0x41),           // Ctrl+A
             delete_selected: Hotkey::key(0x2E),             // Delete
             undo_removed_tiles: Hotkey::pair(0x11, 0x5A),   // Ctrl+Z
-            focus_current_tile: Hotkey::key(0x62),          // Numpad 2
+            focus_current_tile: Hotkey::key(0x46),          // F
             exit_tile_or_browser: Hotkey::key(0x1B),        // Escape
             interact_browser: Hotkey::pair(0x11, 0x42),     // Ctrl+B
             interact_browser_alternate: Hotkey::key(0x61),  // Numpad 1
@@ -271,6 +271,25 @@ pub struct HotkeyPresses([bool; HotkeySlot::ALL.len()]);
 impl HotkeyPresses {
     pub fn pressed(self, slot: HotkeySlot) -> bool {
         self.0[slot as usize]
+    }
+
+    pub fn for_browser_interaction(mut self, active: bool) -> Self {
+        if active {
+            // Native WebView text fields do not report keyboard ownership to
+            // egui. Leave page keys alone except for explicitly exiting or
+            // toggling browser interaction.
+            for slot in HotkeySlot::ALL {
+                if !matches!(
+                    slot,
+                    HotkeySlot::ExitTileOrBrowser
+                        | HotkeySlot::InteractBrowser
+                        | HotkeySlot::InteractBrowserAlternate
+                ) {
+                    self.0[slot as usize] = false;
+                }
+            }
+        }
+        self
     }
 }
 
@@ -530,17 +549,90 @@ mod tests {
     use super::{Hotkey, HotkeyBindings, HotkeySlot, HotkeyTracker};
 
     #[test]
-    fn defaults_preserve_existing_keyboard_shortcuts() {
+    fn default_keyboard_shortcuts() {
         let shortcuts = HotkeyBindings::default();
         assert_eq!(shortcuts.toggle_window_picker.display(), "W");
         assert_eq!(shortcuts.toggle_grid.display(), "G");
         assert_eq!(shortcuts.select_all.display(), "Ctrl+A");
-        assert_eq!(shortcuts.focus_current_tile.display(), "Numpad 2");
+        assert_eq!(shortcuts.focus_current_tile.display(), "F");
         assert_eq!(shortcuts.interact_browser_alternate.display(), "Numpad 1");
         assert_eq!(shortcuts.previous_canvas_view.display(), "Ctrl+Page Up");
         assert_eq!(shortcuts.next_canvas_view.display(), "Ctrl+Page Down");
         assert_eq!(shortcuts.canvas_view_1.display(), "Ctrl+1");
         assert_eq!(shortcuts.canvas_view_9.display(), "Ctrl+9");
+    }
+
+    #[test]
+    fn focus_defaults_to_f_when_missing_from_saved_settings() {
+        let mut value = serde_json::to_value(HotkeyBindings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("focus_current_tile");
+        let bindings: HotkeyBindings = serde_json::from_value(value).unwrap();
+        assert_eq!(bindings.focus_current_tile, Hotkey::key(0x46));
+    }
+
+    #[test]
+    fn saved_focus_bindings_are_preserved() {
+        for hotkey in [Hotkey::key(0x62), Hotkey::pair(0x11, 0x46)] {
+            let bindings = HotkeyBindings {
+                focus_current_tile: hotkey,
+                ..Default::default()
+            };
+            let value = serde_json::to_value(bindings).unwrap();
+            let restored: HotkeyBindings = serde_json::from_value(value).unwrap();
+            assert_eq!(restored.focus_current_tile, hotkey);
+        }
+    }
+
+    #[test]
+    fn focus_shortcut_respects_keyboard_ownership() {
+        let bindings = HotkeyBindings::default();
+        assert_eq!(
+            bindings.conflict(HotkeySlot::FocusCurrentTile, bindings.focus_current_tile),
+            None
+        );
+        let mut tracker = HotkeyTracker::default();
+        tracker.held[0x46] = true;
+        tracker.newly_pressed.push(0x46);
+        assert!(tracker
+            .presses(&bindings, true)
+            .pressed(HotkeySlot::FocusCurrentTile));
+        assert!(!tracker
+            .presses(&bindings, false)
+            .pressed(HotkeySlot::FocusCurrentTile));
+    }
+
+    #[test]
+    fn interactive_browser_keeps_page_keys_and_preserves_exit_controls() {
+        let mut bindings = HotkeyBindings::default();
+        for focus in [
+            Hotkey::key(0x46),
+            Hotkey::key(0x62),
+            Hotkey::pair(0x11, 0x46),
+        ] {
+            bindings.focus_current_tile = focus;
+            for slot in HotkeySlot::ALL {
+                let binding = bindings.get(slot);
+                let mut tracker = HotkeyTracker::default();
+                tracker.held[usize::from(binding.second_key)] = true;
+                tracker.newly_pressed.push(binding.second_key);
+                if let Some(first_key) = binding.first_key {
+                    tracker.held[usize::from(first_key)] = true;
+                }
+                let presses = tracker.presses(&bindings, true);
+                assert!(presses.for_browser_interaction(false).pressed(slot));
+                let browser_control = matches!(
+                    slot,
+                    HotkeySlot::ExitTileOrBrowser
+                        | HotkeySlot::InteractBrowser
+                        | HotkeySlot::InteractBrowserAlternate
+                );
+                assert_eq!(
+                    presses.for_browser_interaction(true).pressed(slot),
+                    browser_control,
+                    "{slot:?}"
+                );
+            }
+        }
     }
 
     #[test]

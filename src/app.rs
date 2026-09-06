@@ -6490,14 +6490,14 @@ impl eframe::App for PluriviewApp {
             && self.workspace_dialog.is_none()
             && !self.confirm_workspace_delete
             && self.hotkey_recording.is_none();
-        let shortcut_presses = self
-            .hotkey_tracker
-            .presses(&self.app_config.keyboard_shortcuts, shortcut_listening);
-
         #[cfg(windows)]
         let webview_active = self.browser.active_id().is_some();
         #[cfg(not(windows))]
         let webview_active = false;
+        let shortcut_presses = self
+            .hotkey_tracker
+            .presses(&self.app_config.keyboard_shortcuts, shortcut_listening)
+            .for_browser_interaction(webview_active);
         if owns_foreground && (self.hotkey_recording.is_some() || webview_active) {
             // Native WebViews do not wake egui for keyboard events. A short
             // poll interval keeps remapped shortcuts responsive there and in
@@ -6993,10 +6993,18 @@ impl eframe::App for PluriviewApp {
                         ui.heading("Pluriview");
                         ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
                         ui.add_space(10.0);
-                        ui.label("Live window preview application");
-                        ui.label("with infinite canvas");
+                        ui.label("Your windows, web pages, and media");
+                        ui.label("together on an infinite canvas.");
                         ui.add_space(15.0);
                         ui.label(egui::RichText::new("Created by Spatpit").weak());
+                        ui.add_space(10.0);
+                        ui.hyperlink_to("Support on Ko-fi", "https://ko-fi.com/spatpit")
+                            .on_hover_text("Open ko-fi.com/spatpit in your browser");
+                        ui.label(
+                            egui::RichText::new("Support is always optional.")
+                                .small()
+                                .weak(),
+                        );
                         ui.add_space(15.0);
                         if ui.button("Close").clicked() {
                             self.show_about = false;
