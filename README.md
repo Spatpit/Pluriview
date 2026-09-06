@@ -127,7 +127,11 @@ Closing a captured application leaves its tile marked **Not active**. Pluriview
 reconnects when a matching window appears, including after a tile wakes from
 off-screen resource saving. Its geometry, crop, and Stream Audio setting remain
 intact. Undoing a tile deletion restores the entire deleted selection, including
-stacking order, aspect-ratio locks, and freeze settings.
+stacking order, aspect-ratio locks, and freeze settings. Press **Ctrl+Z** to undo
+the latest tile deletion, even after the notification disappears. This keeps
+one deletion batch until it is restored, replaced by another deletion, or you
+switch workspaces. The shortcut is configurable in Settings; text fields and
+interactive browser pages keep their own undo behavior.
 
 ### Saved viewpoints
 
@@ -203,7 +207,7 @@ distribute `pluriview.pdb`; debug symbols can contain local paths.
 
 Maintainers can test the same public release build without publishing through
 the workflow's manual dispatch action. Pushing an existing version tag such as
-`v0.6.7` runs the verified build and publishes the matching approved file from
+`v0.6.8` runs the verified build and publishes the matching approved file from
 `release-notes/` only after every build and attestation step succeeds.
 
 ## Usage
@@ -251,6 +255,7 @@ to those shown below.
 | Add with box selection | `Ctrl + Left-drag empty canvas` |
 | Freeze or resume selection | `Right-click selected tile or canvas` |
 | Delete selected | `Delete` |
+| Undo last tile deletion | `Ctrl+Z` |
 | Crop tile | `Alt + Drag edges or corners` |
 | Focus current tile | `Numpad 2` or `Double-click preview` |
 | Exit tile focus | `Esc` |

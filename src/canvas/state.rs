@@ -293,10 +293,55 @@ mod tests {
         });
         assert_eq!(canvas.last_removed.as_ref().unwrap().1.len(), 2);
         assert_eq!(previews.all().count(), 0);
+        canvas.last_removed.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(60);
+        let _ = context.run(input(), |context| {
+            CentralPanel::default().show(context, |ui| {
+                canvas.ui(ui, &mut previews, &mut captures, context, true);
+            });
+        });
+        assert!(
+            canvas.last_removed.is_some(),
+            "toast expiry must not discard undo"
+        );
+        canvas.request_removed_undo();
+        let _ = context.run(input(), |context| {
+            CentralPanel::default().show(context, |ui| {
+                canvas.ui(ui, &mut previews, &mut captures, context, false);
+            });
+        });
+        assert_eq!(canvas.pending_removed_restore.as_ref().unwrap().len(), 2);
+        assert!(canvas.last_removed.is_none());
         // Switching workspaces must discard the old workspace's Undo state.
         canvas.clear_preview_interactions();
         assert!(canvas.last_removed.is_none());
         assert!(canvas.pending_removed_restore.is_none());
+    }
+
+    #[test]
+    fn undo_during_removal_waits_for_the_current_batch() {
+        let context = Context::default();
+        let mut canvas = CanvasState::default();
+        let mut previews = PreviewManager::new();
+        let id = previews.add("tile".to_owned(), Pos2::ZERO, Vec2::splat(50.0));
+        previews.start_removal(id);
+        previews.get_mut(id).unwrap().removing = Some(Instant::now() + Duration::from_secs(60));
+        canvas.request_removed_undo();
+        let mut captures = CaptureCoordinator::new();
+        let mut render = |canvas: &mut CanvasState, previews: &mut PreviewManager| {
+            let _ = context.run(RawInput::default(), |context| {
+                CentralPanel::default().show(context, |ui| {
+                    canvas.ui(ui, previews, &mut captures, context, true);
+                });
+            });
+        };
+        render(&mut canvas, &mut previews);
+        assert!(canvas.removed_undo_requested);
+        assert!(canvas.pending_removed_restore.is_none());
+        previews.get_mut(id).unwrap().removing = Some(Instant::now() - Duration::from_secs(1));
+        render(&mut canvas, &mut previews);
+        assert!(!canvas.removed_undo_requested);
+        assert_eq!(canvas.pending_removed_restore.as_ref().unwrap().len(), 1);
+        assert!(canvas.last_removed.is_none());
     }
 
     #[test]
@@ -2980,8 +3025,9 @@ pub struct CanvasState {
     /// Preview ID pending region selection (set from context menu, consumed by app)
     pub pending_region_select: Option<PreviewId>,
 
-    /// Most recently removed preview, kept briefly to power the "Undo" toast.
+    /// Latest deletion batch, retained until undo, another deletion, or workspace change.
     last_removed: Option<(Instant, Vec<RemovedPreviewInfo>)>,
+    removed_undo_requested: bool,
 
     /// Screen position of the last right-click on the canvas background,
     /// used to anchor the "Add Window..." quick-add popup.
@@ -3020,7 +3066,7 @@ pub struct CanvasState {
     /// Folder playlist actions queued by its rows and header controls.
     pub pending_playlist_actions: Vec<(PreviewId, PlaylistAction)>,
 
-    /// Removed tile whose "Undo" was clicked. The app owns source recreation
+    /// Removed batch requested by button or shortcut. The app owns source recreation
     /// so every tile type follows one restore path.
     pub pending_removed_restore: Option<Vec<RemovedPreviewInfo>>,
     pub pending_media_actions: Vec<(PreviewId, MediaAction)>,
@@ -3073,6 +3119,7 @@ impl Default for CanvasState {
             pan_drag_tracker: DragTracker::new(),
             pending_region_select: None,
             last_removed: None,
+            removed_undo_requested: false,
             last_secondary_click: None,
             pending_quick_add: None,
             pending_browser_add: None,
@@ -3118,6 +3165,7 @@ impl CanvasState {
     /// Drop transient tile interaction state from a previous layout.
     pub fn clear_preview_interactions(&mut self) {
         self.last_removed = None;
+        self.removed_undo_requested = false;
         self.pending_removed_restore = None;
         self.pending_media_actions.clear();
         self.pinned_drag_origins.clear();
@@ -3724,13 +3772,23 @@ impl CanvasState {
         self.refit_focus(preview_manager, canvas_rect);
 
         // Reap any previews whose fade/shrink-out animation has finished,
-        // keeping the most recent one around briefly for the undo toast.
+        // retaining the latest batch independently of the toast's visibility.
         let finished_removals = preview_manager.finalize_removals();
         if !finished_removals.is_empty() {
             self.prune_preview_interactions(preview_manager);
         }
         if let Some(info) = finished_removals.into_iter().last() {
             self.last_removed = Some((Instant::now(), info));
+        }
+        // A shortcut pressed during the removal animation must restore that
+        // batch once source cleanup completes, rather than an older deletion.
+        if self.removed_undo_requested
+            && !preview_manager
+                .all()
+                .any(|preview| preview.removing.is_some())
+        {
+            self.removed_undo_requested = false;
+            self.queue_removed_undo();
         }
 
         // CRITICAL: Allocate background interaction FIRST
@@ -6396,6 +6454,16 @@ impl CanvasState {
         );
     }
 
+    pub fn request_removed_undo(&mut self) {
+        self.removed_undo_requested = true;
+    }
+
+    fn queue_removed_undo(&mut self) {
+        if let Some((_, removed)) = self.last_removed.take() {
+            self.pending_removed_restore = Some(removed);
+        }
+    }
+
     /// Floating "Removed '...' · Undo" toast for the most recently removed preview.
     fn draw_and_interact_undo_toast(&mut self, ui: &mut egui::Ui, canvas_rect: Rect) {
         let Some((removed_at, _)) = self.last_removed.as_ref() else {
@@ -6404,7 +6472,6 @@ impl CanvasState {
 
         let age = removed_at.elapsed().as_secs_f32();
         if age >= UNDO_TOAST_SECS {
-            self.last_removed = None;
             return;
         }
         let removed = &self
@@ -6474,11 +6541,8 @@ impl CanvasState {
         );
 
         if undo_response.clicked() {
-            let (_, info) = self
-                .last_removed
-                .take()
-                .expect("removed preview is present");
-            self.pending_removed_restore = Some(info);
+            self.request_removed_undo();
+            ui.ctx().request_repaint();
         }
 
         // Keep repainting while the toast is visible so it can fade out.

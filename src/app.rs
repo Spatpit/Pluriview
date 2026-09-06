@@ -6508,6 +6508,9 @@ impl eframe::App for PluriviewApp {
         if shortcut_presses.pressed(HotkeySlot::ToggleGrid) {
             self.canvas.show_grid = !self.canvas.show_grid;
         }
+        if shortcut_presses.pressed(HotkeySlot::UndoRemovedTiles) && !webview_active {
+            self.canvas.request_removed_undo();
+        }
         if shortcut_presses.pressed(HotkeySlot::ToggleWindowPicker) {
             self.picker_open = !self.picker_open;
         }
@@ -7148,6 +7151,18 @@ impl eframe::App for PluriviewApp {
                                     self.app_config
                                         .keyboard_shortcuts
                                         .get(HotkeySlot::SelectAll)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
+                            ui.end_row();
+
+                            ui.label("Undo removed tiles");
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::UndoRemovedTiles)
                                         .display(),
                                 )
                                 .weak(),

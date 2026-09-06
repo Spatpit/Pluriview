@@ -7,12 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-09-05
+
 ### Changed
+- Updated image decoding, logging, and JSON dependencies, plus the pinned checkout, artifact-download, and attestation actions used by the release workflows.
 - Windows Task Manager identifies the application as "Pluriview" instead of "Live window preview application".
 - Replaced the green leaf branding with the gold, champagne, and olive Canvas P logo on a chocolate background across the title bar, About dialog, taskbar, tray, executable, and README.
 - Updated source-picker and canvas accents to the logo's honey gold.
 
 ### Added
+- Ctrl+Z restores the latest deleted tile batch even after its Undo toast disappears. The shortcut is configurable in Settings and leaves text-field and interactive-browser undo to their editors.
 - A workspace recovery screen pauses editing and saving after a failed load, with retry, previous-save recovery, and options to open another workspace.
 - Unavailable image/GIF tiles offer Retry Image and Locate Image actions while retaining their layout settings.
 - Stream Audio Monitor displays starting, active, retrying, and failure status for its sources.
