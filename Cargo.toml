@@ -15,7 +15,7 @@ eframe = { version = "0.29", default-features = false, features = [
 egui-phosphor = "0.7"
 
 # Window Capture
-windows-capture = "1.4"
+windows-capture = "2.0"
 
 # System Tray
 tray-icon = "0.19"
