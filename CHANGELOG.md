@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Prevented shortcut rows from expanding popups to their provisional width, aligned toggle labels, and kept saved-viewpoint names, shortcut hints, and overflow controls within compact menu bounds.
+
+### Changed
+- Menu shortcut hints now use a separate right-aligned column and reflect configured bindings, including saved viewpoints and matching canvas/tile actions.
+- Replaced the playlist header's brown folder badge with a pale-blue filmstrip on a subtle blue background.
+- Refreshed the top bar, window picker, quick-add popup, and context menus with coordinated charcoal surfaces, warm gold accents, clearer headings, and roomier controls.
+- Window picker search now has a clear button and visible empty states; long window and Spout names are ellipsized with full-name tooltips. The Spout section stays out of the way when Spout is absent.
+- Tile menus put frame-rate choices in a submenu and scroll when needed to keep every action reachable on smaller windows.
+
 ## [0.6.9] - 2026-09-06
 
 ### Added

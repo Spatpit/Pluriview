@@ -74,6 +74,11 @@ Press `F1` to see shortcuts.
 Use the **Window Picker** to add an open application as a live tile. You can
 resize, crop, freeze, or pin its preview.
 
+Search by window title or application name, then use **+** to add the source.
+Clear the search with **×**; hover a shortened name to read it in full.
+Right-click a tile for its settings, including the **Frame Rate** submenu.
+Menu shortcuts appear on the right and follow your bindings in **Settings**.
+
 Live Spout2 senders appear in the same picker. Select one to display its shared
 output on the canvas.
 

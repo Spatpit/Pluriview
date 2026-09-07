@@ -1,6 +1,7 @@
 use super::animation::{AnimationState, CameraTransition, DragTracker};
 use super::wallpaper::CanvasWallpaper;
 use crate::capture::{capture_lod_factor, window_capture_target, CaptureCoordinator};
+use crate::hotkeys::{HotkeyBindings, HotkeySlot};
 use crate::preview::{
     compact_title, BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager,
     RemovedPreviewInfo, VideoPlaybackState, VideoTileStatus, ViewportPin,
@@ -496,6 +497,68 @@ mod tests {
         assert_eq!(
             context.layer_id_at(pointer).map(|layer| layer.order),
             Some(Order::Foreground)
+        );
+    }
+
+    #[test]
+    fn long_tile_menu_scrolls_to_its_final_action_in_a_short_viewport() {
+        let ctx = Context::default();
+        crate::ui_theme::install(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let pointer = Pos2::new(300.0, 100.0);
+        let mut frame = 0;
+        let mut render = |events| {
+            frame += 1;
+            ctx.run(
+                RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(frame as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    CentralPanel::default().show(ctx, |ui| {
+                        let response = ui.allocate_rect(ui.max_rect(), Sense::click());
+                        super::show_context_menu_if(&response, true, |ui| {
+                            for index in 0..40 {
+                                let _ = ui.button(format!("Action {index}"));
+                            }
+                        });
+                    });
+                },
+            )
+        };
+        render(vec![Event::PointerMoved(pointer)]);
+        for pressed in [true, false] {
+            render(vec![Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }]);
+        }
+        let last_visible = |output: &egui::FullOutput| {
+            output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, Shape::Text(text) if text.galley.text() == "Action 39"
+                && shape.clip_rect.intersect(screen).contains_rect(Rect::from_min_size(text.pos, text.galley.size())))
+        })
+        };
+        assert!(!last_visible(&render(vec![])));
+        let mut reached_last = false;
+        for _ in 0..20 {
+            let output = render(vec![
+                Event::PointerMoved(pointer + Vec2::new(20.0, 10.0)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -150.0),
+                    modifiers: Modifiers::NONE,
+                },
+            ]);
+            reached_last |= last_visible(&output);
+        }
+        assert!(
+            reached_last,
+            "Scrolling should expose the last action inside the viewport"
         );
     }
 
@@ -2026,7 +2089,14 @@ fn show_context_menu_if(
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
     if active {
-        let _ = response.context_menu(add_contents);
+        let _ = response.context_menu(|ui| {
+            crate::ui_theme::menu(ui);
+            // Source-specific controls can exceed a short viewport. Keep the
+            // entire menu reachable instead of clipping its final actions.
+            egui::ScrollArea::vertical()
+                .max_height((ui.ctx().screen_rect().height() - 32.0).max(100.0))
+                .show(ui, add_contents);
+        });
     }
 }
 
@@ -2056,7 +2126,10 @@ fn saved_viewpoints_submenu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut eg
     if !open_left {
         ui.ctx()
             .data_mut(|data| data.insert_temp(state_id, LeftSubmenuState::default()));
-        ui.menu_button("Saved Viewpoints", add_contents);
+        ui.menu_button("Saved Viewpoints", |ui| {
+            crate::ui_theme::menu(ui);
+            add_contents(ui)
+        });
         return;
     }
 
@@ -2099,7 +2172,7 @@ fn saved_viewpoints_submenu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut eg
             .sense(Sense::hover())
             .show(ui.ctx(), |ui| {
                 let style = ui.style_mut();
-                style.spacing.button_padding = egui::vec2(2.0, 0.0);
+                style.spacing.button_padding = egui::vec2(9.0, 4.0);
                 style.visuals.widgets.active.bg_stroke = Stroke::NONE;
                 style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
                 style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
@@ -2107,6 +2180,7 @@ fn saved_viewpoints_submenu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut eg
 
                 egui::Frame::menu(ui.style())
                     .show(ui, |ui| {
+                        crate::ui_theme::menu(ui);
                         ui.with_layout(
                             egui::Layout::top_down_justified(egui::Align::LEFT),
                             add_contents,
@@ -2154,7 +2228,10 @@ fn show_canvas_context_menu_if(
         root.menu_state.write().rect = parent_rect;
     }
 
-    let _ = bar_state.show(response, add_contents);
+    let _ = bar_state.show(response, |ui| {
+        crate::ui_theme::menu(ui);
+        add_contents(ui);
+    });
     state = response.ctx.data_mut(|data| {
         data.get_temp::<LeftSubmenuState>(state_id)
             .unwrap_or_default()
@@ -2277,6 +2354,7 @@ struct CanvasFrameScope<'a> {
     canvas_rect: Rect,
     input: &'a FrameInput,
     show_overlays: bool,
+    keyboard_shortcuts: &'a HotkeyBindings,
 }
 
 /// Keyboard actions resolved by the app's configurable hotkey layer. `None`
@@ -3603,6 +3681,7 @@ impl CanvasState {
             canvas_rect,
             input,
             show_overlays,
+            keyboard_shortcuts: _,
         } = frame;
         if input.pointer_blocked
             || preview_manager
@@ -3671,6 +3750,7 @@ impl CanvasState {
             capture_coordinator,
             ctx,
             show_overlays,
+            &HotkeyBindings::default(),
             |_| false,
         );
     }
@@ -3682,6 +3762,7 @@ impl CanvasState {
         capture_coordinator: &mut CaptureCoordinator,
         ctx: &egui::Context,
         show_overlays: bool,
+        keyboard_shortcuts: &HotkeyBindings,
         mut canvas_views_menu: impl FnMut(&mut egui::Ui) -> bool,
     ) {
         let canvas_rect = ui.available_rect_before_wrap();
@@ -3829,6 +3910,7 @@ impl CanvasState {
             canvas_rect,
             input: &input,
             show_overlays,
+            keyboard_shortcuts,
         };
 
         // Draw previews and handle their interactions (AFTER bg allocation)
@@ -4159,6 +4241,7 @@ impl CanvasState {
             canvas_rect,
             input,
             show_overlays,
+            keyboard_shortcuts,
         } = frame;
         // Use the pre-allocated background response
 
@@ -4294,35 +4377,46 @@ impl CanvasState {
             &background_context_response,
             background_context_menu_active,
             |ui| {
-                if ui.button("Add Window...").clicked() {
+                crate::ui_theme::section(ui, "ADD TO CANVAS");
+                if crate::ui_theme::action(ui, egui_phosphor::regular::APP_WINDOW, "Add Window...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         let canvas_pos = self.screen_to_canvas(screen_pos, canvas_rect);
                         self.pending_quick_add = Some((canvas_pos, screen_pos));
                     }
                     ui.close_menu();
                 }
-                if ui.button("Add Browser...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::GLOBE, "Add Browser...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         self.pending_browser_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
                     ui.close_menu();
                 }
-                if ui.button("Add Image...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::IMAGE, "Add Image...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         self.pending_media_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
                     ui.close_menu();
                 }
-                if ui.button("Add Video...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::FILM_STRIP, "Add Video...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         self.pending_video_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
                     ui.close_menu();
                 }
-                if ui.button("Add Stream...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::BROADCAST, "Add Stream...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         self.pending_stream_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
@@ -4336,7 +4430,12 @@ impl CanvasState {
                     ui.close_menu();
                 }
                 ui.separator();
-                ui.checkbox(&mut self.show_grid, "Show Grid");
+                crate::ui_theme::shortcut_toggle(
+                    ui,
+                    &mut self.show_grid,
+                    "Show Grid",
+                    keyboard_shortcuts.get(HotkeySlot::ToggleGrid),
+                );
                 if ui.button("Set Wallpaper...").clicked() {
                     self.pending_wallpaper_pick = true;
                     ui.close_menu();
@@ -4367,7 +4466,13 @@ impl CanvasState {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Remove Selected").clicked() {
+                    if ui
+                        .add(crate::ui_theme::shortcut_button(
+                            egui::RichText::new("Remove Selected").color(crate::ui_theme::DANGER),
+                            keyboard_shortcuts.get(HotkeySlot::DeleteSelected),
+                        ))
+                        .clicked()
+                    {
                         for id in &self.selection {
                             capture_coordinator.stop_capture(*id);
                         }
@@ -4412,6 +4517,7 @@ impl CanvasState {
             canvas_rect,
             input,
             show_overlays,
+            keyboard_shortcuts,
         } = frame;
         let viewport = self.get_viewport(canvas_rect);
 
@@ -5457,6 +5563,7 @@ impl CanvasState {
             let context_menu_interaction_active =
                 context_response.context_menu_opened() || secondary_target;
             show_context_menu_if(&context_response, context_menu_interaction_active, |ui| {
+                crate::ui_theme::menu(ui);
                 ui.set_max_width(280.0);
                 ui.label(egui::RichText::new(compact_title(title, 42)).strong());
                 ui.separator();
@@ -5504,23 +5611,19 @@ impl CanvasState {
                 ui.separator();
 
                 if !is_media && !is_playlist {
-                    ui.label("Frame Rate:");
-                    for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
-                        let is_current = current_preset == preset;
-                        let label = if is_current {
-                            format!("  {} ✓", preset.label())
-                        } else {
-                            format!("  {}", preset.label())
-                        };
-
-                        if ui.selectable_label(is_current, label).clicked() {
-                            self.pending_fps_changes.push(PendingFpsChange {
-                                preview_id: id,
-                                new_fps: preset,
-                            });
-                            ui.close_menu();
+                    ui.menu_button(format!("Frame Rate: {}", current_preset.label()), |ui| {
+                        crate::ui_theme::menu(ui);
+                        for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
+                            let is_current = current_preset == preset;
+                            if ui.selectable_label(is_current, preset.label()).clicked() {
+                                self.pending_fps_changes.push(PendingFpsChange {
+                                    preview_id: id,
+                                    new_fps: preset,
+                                });
+                                ui.close_menu();
+                            }
                         }
-                    }
+                    });
                     ui.separator();
                 }
 
@@ -5638,6 +5741,7 @@ impl CanvasState {
                     ui.label(egui::RichText::new("Image / animated GIF tile").weak());
                     ui.separator();
                     ui.menu_button("Crop", |ui| {
+                        crate::ui_theme::menu(ui);
                         if has_crop && ui.button("Clear Crop").clicked() {
                             self.set_preview_crop(id, None, canvas_rect, preview_manager);
                             ui.close_menu();
@@ -5658,7 +5762,10 @@ impl CanvasState {
                     if ui
                         .add_enabled(
                             browser_ready && !left_click_disabled,
-                            egui::Button::new("Interact"),
+                            crate::ui_theme::shortcut_button(
+                                "Interact",
+                                keyboard_shortcuts.get(HotkeySlot::InteractBrowser),
+                            ),
                         )
                         .clicked()
                     {
@@ -5710,6 +5817,7 @@ impl CanvasState {
                     }
                     ui.separator();
                     ui.menu_button("Crop", |ui| {
+                        crate::ui_theme::menu(ui);
                         if has_crop && ui.button("Clear Crop").clicked() {
                             self.set_preview_crop(id, None, canvas_rect, preview_manager);
                             ui.close_menu();
@@ -5773,6 +5881,7 @@ impl CanvasState {
                         }
 
                         ui.menu_button(format!("Speed: {}×", video_playback.speed), |ui| {
+                            crate::ui_theme::menu(ui);
                             for speed in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
                                 let selected = (video_playback.speed - speed).abs() < 0.001;
                                 if ui.selectable_label(selected, format!("{speed}×")).clicked() {
@@ -5784,6 +5893,7 @@ impl CanvasState {
                         });
 
                         ui.menu_button("Audio Track", |ui| {
+                            crate::ui_theme::menu(ui);
                             let audio_tracks: Vec<_> = video_playback
                                 .tracks
                                 .iter()
@@ -5813,6 +5923,7 @@ impl CanvasState {
                         });
 
                         ui.menu_button("Subtitles", |ui| {
+                            crate::ui_theme::menu(ui);
                             if ui
                                 .selectable_label(video_playback.subtitle_track.is_none(), "Off")
                                 .clicked()
@@ -5858,6 +5969,7 @@ impl CanvasState {
 
                     ui.separator();
                     ui.menu_button("Crop", |ui| {
+                        crate::ui_theme::menu(ui);
                         if !is_spout_capture && ui.button("Select Region...").clicked() {
                             self.pending_region_select = Some(id);
                             ui.close_menu();
@@ -5870,6 +5982,7 @@ impl CanvasState {
                 } else {
                     // Crop section
                     ui.menu_button("Crop", |ui| {
+                        crate::ui_theme::menu(ui);
                         if !is_spout_capture && ui.button("Select Region...").clicked() {
                             self.pending_region_select = Some(id);
                             ui.close_menu();
@@ -5894,7 +6007,10 @@ impl CanvasState {
                 if ui
                     .add_enabled(
                         viewport_pin.is_none(),
-                        egui::Button::new("Focus on This Tile"),
+                        crate::ui_theme::shortcut_button(
+                            "Focus on This Tile",
+                            keyboard_shortcuts.get(HotkeySlot::FocusCurrentTile),
+                        ),
                     )
                     .clicked()
                 {
@@ -5914,7 +6030,7 @@ impl CanvasState {
 
                 ui.separator();
 
-                if ui.button("Remove").clicked() {
+                if crate::ui_theme::destructive(ui, "Remove").clicked() {
                     capture_coordinator.stop_capture(id);
                     preview_manager.start_removal(id);
                     self.selection.retain(|&x| x != id);
@@ -5992,14 +6108,14 @@ impl CanvasState {
         clipped.rect_filled(
             icon_rect,
             s(8.0),
-            Color32::from_rgba_unmultiplied(207, 161, 57, 38),
+            Color32::from_rgba_unmultiplied(94, 157, 235, (f32::from(alpha) * 0.14) as u8),
         );
         clipped.text(
             icon_rect.center(),
             egui::Align2::CENTER_CENTER,
-            egui_phosphor::regular::FOLDER_OPEN,
-            playlist_font(15.0, z),
-            Color32::from_rgb(138, 196, 108),
+            egui_phosphor::regular::FILM_STRIP,
+            playlist_font(17.0, z),
+            Color32::from_rgba_unmultiplied(155, 198, 255, alpha),
         );
 
         let text_left = icon_rect.right() + s(10.0);

@@ -19,6 +19,7 @@ mod preview;
 mod privacy;
 mod spout;
 mod tray;
+mod ui_theme;
 #[cfg(windows)]
 mod video;
 mod window_picker;
