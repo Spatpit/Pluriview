@@ -36,7 +36,7 @@ libloading = "0.8"
 
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
-wry = { version = "0.55", default-features = false }
+wry = { version = "0.56", default-features = false }
 # Same versions wry already pulls in; used to reach ICoreWebView2_8 (audio mute).
 webview2-com = "0.38"
 # Aliased: `windows_core` must stay 0.58 (matching `windows`) so the audio
