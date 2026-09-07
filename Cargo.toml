@@ -38,7 +38,7 @@ libloading = "0.8"
 [target.'cfg(windows)'.dependencies]
 wry = { version = "0.55", default-features = false }
 # Same versions wry already pulls in; used to reach ICoreWebView2_8 (audio mute).
-webview2-com = "0.38"
+webview2-com = "0.39"
 # Aliased: `windows_core` must stay 0.58 (matching `windows`) so the audio
 # monitor's #[implement] macro resolves against the right version;
 # webview2-com interfaces need the 0.61 Interface trait for casts.
