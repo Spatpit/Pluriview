@@ -400,6 +400,9 @@ impl BrowserHost {
             .with_browser_extensions_enabled(true)
             // Preserve transparent page backgrounds for overlay widgets.
             .with_transparent(true)
+            // Captured hosts start parked; focus belongs to the canvas until
+            // the user explicitly enters browser interaction.
+            .with_focused(false)
             // Wry enables autoplay by default, which passes WebView2 the
             // `no-user-gesture-required` Chromium policy. Do not opt into
             // that policy: restored media pages (notably YouTube watch URLs)
@@ -969,6 +972,13 @@ pub struct BrowserManager {
 }
 
 impl BrowserManager {
+    #[cfg(pluriview_performance)]
+    pub(crate) fn set_performance_profile(&mut self, directory: &std::path::Path) {
+        assert!(self.hosts.is_empty());
+        self.context = WebContext::new(Some(directory.join("webview2")));
+        self.extension_dir = Some(directory.join("extensions").join("ubol"));
+    }
+
     pub fn new() -> Self {
         let data_dir = directories::ProjectDirs::from("com", "pluriview", "Pluriview")
             .map(|dirs| dirs.data_dir().to_owned());

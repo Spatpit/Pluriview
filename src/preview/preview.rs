@@ -619,6 +619,8 @@ impl Preview {
         source_height: u32,
         data: Vec<u8>,
     ) {
+        #[cfg(all(windows, pluriview_performance))]
+        crate::app::performance::counters::capture_tile(self.id.0);
         self.clear_capture_error();
         let transparent_browser_startup = self.browser_waiting_for_content
             && !data.iter().skip(3).step_by(4).any(|alpha| *alpha != 0);

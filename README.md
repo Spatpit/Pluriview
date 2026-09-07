@@ -341,6 +341,11 @@ notices, and `SHA256SUMS.txt`.
 Keep the `lib` folder beside the executable. Do not distribute `pluriview.pdb`,
 which can contain local paths.
 
+The capture resize shader is included as precompiled bytecode, so normal builds
+need no shader compiler. After editing `src/capture/shaders/area_average.hlsl`,
+run `.\scripts\compile-capture-shader.ps1` with the Windows SDK installed and
+include the regenerated `.cso` alongside the shader source.
+
 </details>
 
 <details>

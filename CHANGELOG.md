@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Reduced CPU work when resizing captured windows by scaling frames on the capture GPU before readback, preserving the existing pixel averages and falling back to CPU resizing on unsupported devices.
+- Browser tiles no longer take keyboard focus while their background hosts are created, avoiding a startup stall observed when adding several tiles together.
 - Reduced redundant GIF and video redraws, including high-frequency canvas redraws driven by off-screen videos, while preserving playback and authored animation timing.
 
 ## [0.7.0] - Unreleased

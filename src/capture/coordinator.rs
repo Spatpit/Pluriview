@@ -505,6 +505,7 @@ fn capture_window_loop(
         last_frame: std::time::Instant,
         handled_target_generation: u32,
         downsampler: RgbaDownsampler,
+        gpu_downsampler: super::gpu_downsample::GpuDownsampler,
     }
 
     impl GraphicsCaptureApiHandler for Capture {
@@ -528,6 +529,10 @@ fn capture_window_loop(
                 // sentinel so the first callback is never FPS-throttled.
                 handled_target_generation: u32::MAX,
                 downsampler: RgbaDownsampler::default(),
+                gpu_downsampler: super::gpu_downsample::GpuDownsampler::new(
+                    ctx.device,
+                    ctx.device_context,
+                ),
             })
         }
 
@@ -567,10 +572,9 @@ fn capture_window_loop(
             }
             self.last_frame = std::time::Instant::now();
 
-            // Get frame buffer
-            let mut buffer = frame.buffer()?;
-            let width = buffer.width();
-            let height = buffer.height();
+            // Decide output geometry while the source is still GPU-only.
+            let width = frame.width();
+            let height = frame.height();
             let (out_width, out_height) = fitted_capture_size(
                 width,
                 height,
@@ -578,7 +582,24 @@ fn capture_window_loop(
                 self.target_height.load(Ordering::Relaxed),
             );
 
-            let captured_frame = if out_width == width && out_height == height {
+            let gpu_pixels = self.gpu_downsampler.downsample(
+                unsafe { frame.as_raw_texture() },
+                [width, height, out_width, out_height],
+            );
+            let captured_frame = if let Some(data) = gpu_pixels {
+                #[cfg(pluriview_performance)]
+                crate::app::performance::counters::record(
+                    crate::app::performance::counters::CAPTURE_GPU_RESIZED,
+                );
+                CapturedFrame {
+                    width: out_width,
+                    height: out_height,
+                    source_width: width,
+                    source_height: height,
+                    data,
+                }
+            } else if out_width == width && out_height == height {
+                let mut buffer = frame.buffer()?;
                 CapturedFrame {
                     width,
                     height,
@@ -587,7 +608,12 @@ fn capture_window_loop(
                     data: buffer.as_nopadding_buffer()?.to_vec(),
                 }
             } else {
+                let mut buffer = frame.buffer()?;
                 let stride = buffer.row_pitch();
+                #[cfg(pluriview_performance)]
+                crate::app::performance::counters::record(
+                    crate::app::performance::counters::CAPTURE_CPU_RESIZED,
+                );
                 let raw = buffer.as_raw_buffer();
                 let Some(data) = self
                     .downsampler

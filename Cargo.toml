@@ -43,6 +43,12 @@ webview2-com = "0.38"
 # monitor's #[implement] macro resolves against the right version;
 # webview2-com interfaces need the 0.61 Interface trait for casts.
 webview2-core = { package = "windows-core", version = "0.61" }
+# Reuse windows-capture's existing bindings without casting COM wrappers
+# between its windows version and the rest of the application's 0.58 bindings.
+capture-windows = { package = "windows", version = "0.61", features = [
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+] }
 windows-core = "0.58"
 windows = { version = "0.58", features = [
     "implement",
