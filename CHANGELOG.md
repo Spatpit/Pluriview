@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Reduced redundant GIF and video redraws, including high-frequency canvas redraws driven by off-screen videos, while preserving playback and authored animation timing.
+
 ## [0.7.0] - Unreleased
 
 ### Fixed

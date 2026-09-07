@@ -15,6 +15,15 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Performance runs must create a fresh directory, never reuse user data.
+    #[cfg(all(windows, pluriview_performance))]
+    pub(crate) fn create_isolated(directory: &Path) -> std::io::Result<Self> {
+        fs::create_dir(directory)?;
+        Ok(Self {
+            data_dir: directory.to_path_buf(),
+        })
+    }
+
     /// Create a new storage instance
     pub fn new() -> Option<Self> {
         // Development builds live under target/, which Cargo may erase at any

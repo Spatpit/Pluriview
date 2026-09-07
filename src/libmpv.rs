@@ -961,6 +961,12 @@ impl MpvCore {
             gl.disable(glow::SCISSOR_TEST);
         }
         let update = (self.api.render_context_update)(self.render_context);
+        #[cfg(pluriview_performance)]
+        if update & MPV_RENDER_UPDATE_FRAME != 0 {
+            crate::app::performance::counters::record(
+                crate::app::performance::counters::VIDEO_FRAME_READY,
+            );
+        }
         let render_result = if target_changed
             || !self.has_rendered_frame
             || update & MPV_RENDER_UPDATE_FRAME != 0
@@ -969,6 +975,10 @@ impl MpvCore {
             let checked = self.check(result, "render the video frame");
             if checked.is_ok() {
                 self.has_rendered_frame = true;
+                #[cfg(pluriview_performance)]
+                crate::app::performance::counters::record(
+                    crate::app::performance::counters::VIDEO_RENDER,
+                );
             }
             checked
         } else {
@@ -1145,12 +1155,21 @@ impl VideoRenderer {
         self.paint_cropped(info, gl, None);
     }
 
+    /// A connected decoder alone does not prove that the GL path has painted.
+    #[cfg(pluriview_performance)]
+    pub(crate) fn has_rendered_frame(&self) -> bool {
+        let core = self.core.lock();
+        core.has_rendered_frame && core.error.is_none()
+    }
+
     pub fn paint_cropped(
         &self,
         info: egui::PaintCallbackInfo,
         gl: &glow::Context,
         crop_uv: Option<(f32, f32, f32, f32)>,
     ) {
+        #[cfg(pluriview_performance)]
+        crate::app::performance::counters::record(crate::app::performance::counters::VIDEO_PAINT);
         let mut core = self.core.lock();
         let result = unsafe { core.paint(info, gl, crop_uv) };
         if let Err(error) = result {
@@ -1474,11 +1493,15 @@ impl VideoManager {
         tile.session.set_paused(paused)
     }
 
-    pub fn repaint_fps(&self) -> Option<u32> {
+    /// Only visible playback should drive the canvas's fast timer. All cores
+    /// keep playing and their state is still polled by normal app upkeep.
+    pub fn repaint_fps(&self, visible: impl Fn(PreviewId) -> bool) -> Option<u32> {
         self.tiles
-            .values()
-            .filter(|tile| tile.session.state.connected && !tile.session.state.paused)
-            .map(|tile| tile.target_fps)
+            .iter()
+            .filter(|(id, tile)| {
+                visible(**id) && tile.session.state.connected && !tile.session.state.paused
+            })
+            .map(|(_, tile)| tile.target_fps)
             .max()
     }
 

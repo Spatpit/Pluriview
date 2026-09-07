@@ -3,7 +3,15 @@
 /dist/
 /vendor/
 /pluriview_data/
+/performance-baselines/
 **/*.rs.bk
+
+# Workstation-only performance suite and instructions
+/src/app/performance.rs
+/scripts/performance-common.ps1
+/scripts/test-performance.ps1
+/scripts/test-performance-comparison.ps1
+/docs/performance-testing.md
 
 # Cargo lock (optional for applications, usually included)
 # Cargo.lock

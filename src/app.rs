@@ -28,6 +28,11 @@ use crate::privacy;
 use crate::tray::TrayManager;
 use crate::video::{self, VideoLaunch, VideoUpdate};
 use crate::window_picker::{enumerate_windows, spawn_preview, WindowInfo, WindowPicker};
+// The optional include also lets rustfmt work in clones without local tests.
+#[cfg(all(windows, pluriview_performance))]
+pub(crate) mod performance {
+    include!("app/performance.rs");
+}
 use eframe::egui::{self, Pos2, Vec2};
 #[cfg(windows)]
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -712,6 +717,14 @@ fn restored_browser_ready(
                 .is_some_and(|(tile, viewport)| tile.intersects(viewport)))
 }
 
+#[cfg(windows)]
+fn video_tile_needs_canvas_repaint(preview: &Preview, viewport: Option<egui::Rect>) -> bool {
+    preview.is_video()
+        && !preview.manually_frozen
+        && (preview.viewport_pin.is_some()
+            || viewport.is_none_or(|viewport| viewport.intersects(preview.rect())))
+}
+
 /// Main application state
 pub struct PluriviewApp {
     brand_icon: egui::TextureHandle,
@@ -925,6 +938,10 @@ pub struct PluriviewApp {
 
 impl PluriviewApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_storage(_cc, Storage::new())
+    }
+
+    fn with_storage(_cc: &eframe::CreationContext<'_>, storage: Option<Storage>) -> Self {
         // Register phosphor icon glyphs alongside the default font so we can
         // use crisp vector icons instead of emoji/text glyphs in the UI.
         let mut fonts = egui::FontDefinitions::default();
@@ -932,7 +949,6 @@ impl PluriviewApp {
         _cc.egui_ctx.set_fonts(fonts);
         crate::ui_theme::install(&_cc.egui_ctx);
 
-        let storage = Storage::new();
         let (app_config, config_error) = match &storage {
             Some(storage) => match storage.load_config() {
                 Ok(config) => (config, None),
@@ -1460,7 +1476,7 @@ impl PluriviewApp {
 
     /// Drain mpv IPC without waiting and mirror the latest state onto previews.
     #[cfg(windows)]
-    fn poll_video_manager(&mut self, ctx: &egui::Context) {
+    fn poll_video_manager(&mut self) {
         let updates = self.video_manager.poll();
         if updates.is_empty() {
             self.restore_ready_video_checkpoints();
@@ -1545,7 +1561,9 @@ impl PluriviewApp {
         }
 
         self.restore_ready_video_checkpoints();
-        ctx.request_repaint();
+        // Polling runs before the canvas is drawn, so the new playback state
+        // is already visible in this pass. Another immediate repaint would
+        // add egui's settling passes for every time-position update.
     }
 
     #[cfg(windows)]
@@ -6009,6 +6027,45 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn video_repaint_visibility_preserves_playback_and_viewport_pins() {
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "video".to_owned(),
+            Pos2::new(600.0, 0.0),
+            Vec2::splat(100.0),
+        );
+        preview.video_source = Some(VideoSource::LocalFile {
+            path: PathBuf::from("fixture.mp4"),
+        });
+        preview.video_playback.time_pos = Some(12.0);
+        preview.video_playback.paused = false;
+        assert!(!super::video_tile_needs_canvas_repaint(
+            &preview,
+            Some(viewport)
+        ));
+        assert!(super::video_tile_needs_canvas_repaint(&preview, None));
+        preview.viewport_pin = Some(ViewportPin::from_rect(viewport, viewport));
+        assert!(super::video_tile_needs_canvas_repaint(
+            &preview,
+            Some(viewport)
+        ));
+        preview.viewport_pin = None;
+        preview.position = Pos2::new(450.0, 0.0);
+        assert!(super::video_tile_needs_canvas_repaint(
+            &preview,
+            Some(viewport)
+        ));
+        preview.manually_frozen = true;
+        assert!(!super::video_tile_needs_canvas_repaint(
+            &preview,
+            Some(viewport)
+        ));
+        assert_eq!(preview.video_playback.time_pos, Some(12.0));
+        assert!(!preview.video_playback.paused);
+    }
+
+    #[test]
     fn saved_viewpoint_popup_stays_bounded_and_rows_remain_clickable() {
         use eframe::egui::{self, Event, Modifiers, PointerButton};
         let ctx = egui::Context::default();
@@ -6717,7 +6774,7 @@ impl eframe::App for PluriviewApp {
         #[cfg(windows)]
         self.wallpaper_memory_upkeep(ctx);
         #[cfg(windows)]
-        self.poll_video_manager(ctx);
+        self.poll_video_manager();
         #[cfg(windows)]
         if let Err(error) = self.ensure_wallpaper_video() {
             log::error!("Could not start wallpaper video: {error}");
@@ -7438,7 +7495,19 @@ impl eframe::App for PluriviewApp {
         // tray events while keeping the app near-idle on the CPU.
         // (egui repaints immediately on input regardless of this hint.)
         #[cfg(windows)]
-        let direct_video_fps = self.video_manager.repaint_fps();
+        let direct_video_fps = {
+            let viewport = self
+                .canvas
+                .last_screen_rect
+                .map(|rect| self.canvas.get_viewport(rect));
+            self.video_manager.repaint_fps(|id| {
+                id == WALLPAPER_VIDEO_ID
+                    || self
+                        .preview_manager
+                        .get(id)
+                        .is_some_and(|preview| video_tile_needs_canvas_repaint(preview, viewport))
+            })
+        };
         #[cfg(not(windows))]
         let direct_video_fps: Option<u32> = None;
         let repaint_after = self

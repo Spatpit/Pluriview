@@ -312,6 +312,10 @@ impl CaptureCoordinator {
                         preview.set_capture_error("Browser capture closed".to_owned());
                     }
                 } else if let Some(frame) = frame {
+                    #[cfg(all(windows, pluriview_performance))]
+                    crate::app::performance::counters::record(
+                        crate::app::performance::counters::CAPTURE_CONSUMED,
+                    );
                     preview.update_capture_frame(
                         frame.width,
                         frame.height,
@@ -532,6 +536,10 @@ fn capture_window_loop(
             frame: &mut Frame,
             capture_control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
+            #[cfg(pluriview_performance)]
+            crate::app::performance::counters::record(
+                crate::app::performance::counters::CAPTURE_ARRIVED,
+            );
             // Check if we should stop
             if !self.active.load(Ordering::Relaxed) {
                 capture_control.stop();
@@ -596,6 +604,10 @@ fn capture_window_loop(
                 }
             };
             *self.latest_frame.lock() = Some(captured_frame);
+            #[cfg(pluriview_performance)]
+            crate::app::performance::counters::record(
+                crate::app::performance::counters::CAPTURE_ACCEPTED,
+            );
             self.has_produced_frame.store(true, Ordering::Relaxed);
             self.handled_target_generation = requested_generation;
 
