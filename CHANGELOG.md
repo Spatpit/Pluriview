@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - Unreleased
+
 ### Fixed
 - Prevented shortcut rows from expanding popups to their provisional width, aligned toggle labels, and kept saved-viewpoint names, shortcut hints, and overflow controls within compact menu bounds.
 
