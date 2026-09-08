@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Updated Windows Graphics Capture integration to windows-capture 2.0.1, retaining GPU downsampling and reusable frame-readback storage.
 - Crop menus now offer an in-tile editing mode with highlighted edge/corner handles. Click empty canvas, press Escape, or choose Finish Cropping to leave the mode; Alt+drag remains available. Replaces the external source-window region selector.
 - Redesigned the browser and stream source dialogs with consistent headers, URL fields with adjacent Paste controls, clear primary actions, compact recent website rows, and editable stream quality with presets. Added Enter submission for streams and Escape cancellation for both dialogs.
 

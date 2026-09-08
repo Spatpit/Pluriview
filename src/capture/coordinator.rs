@@ -504,6 +504,9 @@ fn capture_window_loop(
         target_generation: Arc<AtomicU32>,
         last_frame: std::time::Instant,
         handled_target_generation: u32,
+        // windows-capture 2 lets the caller retain row-unpacking storage.
+        // Keep it per worker so padded frames do not allocate fresh scratch.
+        readback_scratch: Vec<u8>,
         downsampler: RgbaDownsampler,
         gpu_downsampler: super::gpu_downsample::GpuDownsampler,
     }
@@ -528,6 +531,7 @@ fn capture_window_loop(
                 // Generation zero is a valid initial request. Start at a
                 // sentinel so the first callback is never FPS-throttled.
                 handled_target_generation: u32::MAX,
+                readback_scratch: Vec::new(),
                 downsampler: RgbaDownsampler::default(),
                 gpu_downsampler: super::gpu_downsample::GpuDownsampler::new(
                     ctx.device,
@@ -583,7 +587,7 @@ fn capture_window_loop(
             );
 
             let gpu_pixels = self.gpu_downsampler.downsample(
-                unsafe { frame.as_raw_texture() },
+                frame.as_raw_texture(),
                 [width, height, out_width, out_height],
             );
             let captured_frame = if let Some(data) = gpu_pixels {
@@ -599,13 +603,15 @@ fn capture_window_loop(
                     data,
                 }
             } else if out_width == width && out_height == height {
-                let mut buffer = frame.buffer()?;
+                let buffer = frame.buffer()?;
                 CapturedFrame {
                     width,
                     height,
                     source_width: width,
                     source_height: height,
-                    data: buffer.as_nopadding_buffer()?.to_vec(),
+                    data: buffer
+                        .as_nopadding_buffer(&mut self.readback_scratch)
+                        .to_vec(),
                 }
             } else {
                 let mut buffer = frame.buffer()?;
@@ -813,6 +819,57 @@ mod tests {
         let hwnd = 0x1234isize;
         let target = capture_target_from_hwnd(hwnd);
         assert_eq!(target.as_raw_hwnd() as isize, hwnd);
+    }
+
+    #[test]
+    fn capture_readback_preserves_rgba_across_padded_frame_resizes() {
+        use windows_capture::{frame::FrameBuffer, settings::ColorFormat};
+
+        let mut scratch = Vec::new();
+        let mut largest_capacity = 0;
+        // Grow, shrink, then reuse the original size. Padding bytes must never
+        // become pixels, and shrinking must not append stale rows to the frame.
+        for (width, height, padding) in [(7, 5, 12), (3, 2, 4), (7, 5, 12), (4, 3, 0)] {
+            let stride = width * 4 + padding;
+            let mut raw = vec![0xee; (stride * height) as usize];
+            let mut expected = Vec::new();
+            for y in 0..height {
+                for x in 0..width {
+                    let pixel = [x as u8, y as u8, (x + y) as u8, (x * y) as u8];
+                    let start = (y * stride + x * 4) as usize;
+                    raw[start..start + 4].copy_from_slice(&pixel);
+                    expected.extend_from_slice(&pixel);
+                }
+            }
+            let buffer = FrameBuffer::new(
+                &mut raw,
+                width,
+                height,
+                stride,
+                stride * height,
+                ColorFormat::Rgba8,
+            );
+            assert_eq!(buffer.as_nopadding_buffer(&mut scratch), expected);
+            if largest_capacity == 0 {
+                largest_capacity = scratch.capacity();
+            } else {
+                assert_eq!(scratch.capacity(), largest_capacity);
+            }
+        }
+    }
+
+    #[test]
+    fn unpadded_capture_readback_does_not_allocate_scratch() {
+        use windows_capture::{frame::FrameBuffer, settings::ColorFormat};
+
+        let mut raw = vec![1, 2, 3, 0, 5, 6, 7, 255];
+        let source = raw.as_ptr();
+        let buffer = FrameBuffer::new(&mut raw, 2, 1, 8, 8, ColorFormat::Rgba8);
+        let mut scratch = Vec::new();
+        let pixels = buffer.as_nopadding_buffer(&mut scratch);
+        assert_eq!(pixels, [1, 2, 3, 0, 5, 6, 7, 255]);
+        assert_eq!(pixels.as_ptr(), source);
+        assert_eq!(scratch.capacity(), 0);
     }
 
     #[test]
