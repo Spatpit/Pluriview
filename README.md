@@ -74,6 +74,12 @@ Press `F1` to see shortcuts.
 Use the **Window Picker** to add an open application as a live tile. You can
 resize, crop, freeze, or pin its preview.
 
+Choose **Crop → Edit Crop** from a tile's right-click menu, then drag the
+highlighted edge or corner handles directly on the tile. Click empty canvas,
+press **Esc**, or choose **Finish Cropping** to finish. **Clear Crop** restores
+the full source. This also works for browser, image/GIF, video, and Spout tiles,
+including tiles pinned to the viewport. The **Alt+drag** shortcut remains available.
+
 Search by window title or application name, then use **+** to add the source.
 Clear the search with **×**; hover a shortened name to read it in full.
 Right-click a tile for its settings, including the **Frame Rate** submenu.
@@ -197,7 +203,7 @@ Live streams do not provide seek-bar thumbnails.
 
 | Option | What it does |
 |---|---|
-| **Crop** | Shows only the part of a tile you need. Hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
+| **Crop** | Shows only the part of a tile you need. Use **Crop → Edit Crop** to drag its handles, or hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
 | **Pin to Viewport** | Keeps any tile fixed on screen while you pan or zoom the canvas. |
 | **Freeze** | Holds the current frame of selected tiles until you resume them. |
 | **Focus on This Tile** | Fits a tile to the canvas. Press `Esc` to return. |

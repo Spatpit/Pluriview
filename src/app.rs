@@ -12,7 +12,6 @@ use crate::hotkeys::{Hotkey, HotkeyBindings, HotkeySlot, HotkeyTracker};
 #[cfg(windows)]
 use crate::libmpv::{SeekPreviewManager, VideoManager, VideoSnapshot};
 use crate::media;
-use crate::overlay::RegionSelector;
 use crate::persistence::{
     AppConfig, CanvasLayout, CanvasView, SavedLayout, Storage, WallpaperLayout, WindowLayout,
     WorkspaceIndex, WorkspaceSaveState,
@@ -869,12 +868,6 @@ pub struct PluriviewApp {
     /// Validation feedback for the keyboard shortcut editor.
     hotkey_error: Option<String>,
 
-    /// Active region selector overlay (if any)
-    region_selector: Option<RegionSelector>,
-
-    /// Preview ID that the region selector is for
-    region_select_preview_id: Option<PreviewId>,
-
     /// Active canvas right-click "Add Window..." popup, if any.
     quick_add: Option<QuickAddPopup>,
 
@@ -1054,8 +1047,6 @@ impl PluriviewApp {
             hotkey_recording: None,
             hotkey_recording_first: None,
             hotkey_error: None,
-            region_selector: None,
-            region_select_preview_id: None,
             quick_add: None,
             media_error: None,
             external_tool_error: None,
@@ -6777,49 +6768,6 @@ impl eframe::App for PluriviewApp {
             .process_frames(&mut self.preview_manager);
         #[cfg(windows)]
         self.browser_capture_frame_rate_upkeep();
-
-        // Handle pending region selection request (from context menu in canvas)
-        if let Some(preview_id) = self.canvas.pending_region_select.take() {
-            if let Some(preview) = self.preview_manager.get(preview_id) {
-                if let Some(ref handle) = preview.window_handle {
-                    // Start the region selector overlay
-                    if let Some(selector) = RegionSelector::show_for_window(handle.hwnd) {
-                        self.region_selector = Some(selector);
-                        self.region_select_preview_id = Some(preview_id);
-                    }
-                }
-            }
-        }
-
-        // Poll for region selection result
-        if let Some(ref mut selector) = self.region_selector {
-            if let Some(result) = selector.poll_result() {
-                if let Some(selection) = result {
-                    // Apply the crop to the preview
-                    if let Some(preview_id) = self.region_select_preview_id {
-                        let crop_uv = self.preview_manager.get(preview_id).and_then(|preview| {
-                            preview
-                                .source_frame_size
-                                .or(preview.frame_size)
-                                .map(|(width, height)| selection.to_uv(width, height))
-                        });
-                        if let (Some(crop_uv), Some(canvas_rect)) =
-                            (crop_uv, self.canvas.last_screen_rect)
-                        {
-                            self.canvas.set_preview_crop(
-                                preview_id,
-                                Some(crop_uv),
-                                canvas_rect,
-                                &mut self.preview_manager,
-                            );
-                        }
-                    }
-                }
-                // Clear the selector (whether successful or cancelled)
-                self.region_selector = None;
-                self.region_select_preview_id = None;
-            }
-        }
 
         // Menu bar (File / View / Help) now lives inline in the custom
         // title bar; see `title_bar_ui` / `menu_bar`.

@@ -12,7 +12,6 @@ mod hotkeys;
 #[cfg(windows)]
 mod libmpv;
 mod media;
-mod overlay;
 mod persistence;
 mod playlist;
 mod preview;
