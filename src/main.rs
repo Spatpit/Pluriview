@@ -17,6 +17,8 @@ mod persistence;
 mod playlist;
 mod preview;
 mod privacy;
+#[cfg(windows)]
+mod source_dialog;
 mod spout;
 mod tray;
 mod ui_theme;

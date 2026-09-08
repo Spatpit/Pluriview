@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Redesigned the browser and stream source dialogs with consistent headers, URL fields with adjacent Paste controls, clear primary actions, compact recent website rows, and editable stream quality with presets. Added Enter submission for streams and Escape cancellation for both dialogs.
+
 ### Fixed
+- Canvas shortcuts no longer act behind an open browser or stream source dialog.
 - Reduced CPU work when resizing captured windows by scaling frames on the capture GPU before readback, preserving the existing pixel averages and falling back to CPU resizing on unsupported devices.
 - Browser tiles no longer take keyboard focus while their background hosts are created, avoiding a startup stall observed when adding several tiles together.
 - Reduced redundant GIF and video redraws, including high-frequency canvas redraws driven by off-screen videos, while preserving playback and authored animation timing.

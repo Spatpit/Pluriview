@@ -3051,79 +3051,73 @@ impl PluriviewApp {
         if let Some(dialog) = self.add_browser.as_mut() {
             let editing = dialog.target.is_some();
             let recent_urls = &self.recent_urls;
-            egui::Window::new(if editing { "Change URL" } else { "Add Browser" })
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Paste a website URL");
-                    let mut paste_requested = false;
-                    let response = ui.add_sized(
-                        [420.0, 24.0],
-                        egui::TextEdit::singleline(&mut dialog.url)
-                            .hint_text("twitch.tv/channel or https://kick.com/channel"),
-                    );
-                    response.context_menu(|ui| {
-                        crate::ui_theme::menu(ui);
-                        if ui.button("Paste").clicked() {
-                            paste_requested = true;
-                            ui.close_menu();
+            let title = if editing { "Change URL" } else { "Add Browser" };
+            crate::source_dialog::window(ctx, title).show(ctx, |ui| {
+                cancel |= crate::source_dialog::header(
+                    ui,
+                    egui_phosphor::regular::GLOBE,
+                    title,
+                    if editing {
+                        "Open a different page in this tile."
+                    } else {
+                        "Websites, chats, and overlays on your canvas."
+                    },
+                );
+                let (response, paste_requested) =
+                    crate::source_dialog::url_input(ui, &mut dialog.url, "https://example.com");
+                if !dialog.focused {
+                    response.request_focus();
+                    dialog.focused = true;
+                }
+                if response.changed() {
+                    dialog.error = None;
+                }
+
+                // Pressing Enter in a TextEdit surrenders focus that same
+                // frame, so lost_focus + Enter is the reliable submit check.
+                let submitted =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+                if paste_requested {
+                    match clipboard_text() {
+                        Ok(text) if !text.trim().is_empty() => {
+                            dialog.url = text.trim().to_owned();
+                            dialog.error = None;
+                            response.request_focus();
                         }
-                    });
-                    if !dialog.focused {
-                        response.request_focus();
-                        dialog.focused = true;
+                        Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
+                        Err(error) => dialog.error = Some(error.to_owned()),
                     }
-                    if let Some(error) = &dialog.error {
-                        ui.colored_label(egui::Color32::from_rgb(255, 100, 100), error);
-                    }
+                }
 
-                    // Pressing Enter in a TextEdit surrenders focus that same
-                    // frame, so lost_focus + Enter is the reliable submit check.
-                    let submitted = response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
-
-                    ui.horizontal(|ui| {
-                        let label = if editing { "Load" } else { "Add" };
-                        if ui.button(label).clicked() || submitted {
-                            submit = Some((dialog.url.clone(), dialog.position, dialog.target));
-                        }
-                        if ui.button("Paste").clicked() {
-                            paste_requested = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-
-                    if paste_requested {
-                        match clipboard_text() {
-                            Ok(text) if !text.trim().is_empty() => {
-                                dialog.url = text.trim().to_owned();
-                                dialog.error = None;
-                                response.request_focus();
+                if !recent_urls.is_empty() {
+                    ui.add_space(14.0);
+                    crate::ui_theme::section(ui, "RECENT WEBSITES");
+                    egui::ScrollArea::vertical()
+                        .id_salt("recent_browser_urls")
+                        .max_height((ctx.screen_rect().height() - 290.0).clamp(50.0, 194.0))
+                        .show(ui, |ui| {
+                            for url in recent_urls.iter().take(5) {
+                                if crate::source_dialog::recent_url(ui, url).clicked() {
+                                    submit = Some((url.clone(), dialog.position, dialog.target));
+                                }
                             }
-                            Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
-                            Err(error) => dialog.error = Some(error.to_owned()),
-                        }
-                    }
-
-                    if !recent_urls.is_empty() {
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Recent").weak().small());
-                        for url in recent_urls.iter().take(5) {
-                            if ui
-                                .add(
-                                    egui::Button::new(egui::RichText::new(url).size(11.5))
-                                        .frame(false),
-                                )
-                                .clicked()
-                            {
-                                submit = Some((url.clone(), dialog.position, dialog.target));
-                            }
-                        }
-                    }
-                });
+                        });
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(crate::ui_theme::DANGER, error);
+                }
+                let ready = !dialog.url.trim().is_empty();
+                let (clicked, cancelled) = crate::source_dialog::footer(
+                    ui,
+                    if editing { "Load page" } else { "Add browser" },
+                    ready,
+                );
+                cancel |= cancelled;
+                if ready && (clicked || submitted) {
+                    submit = Some((dialog.url.clone(), dialog.position, dialog.target));
+                }
+            });
         }
 
         if cancel {
@@ -3215,99 +3209,77 @@ impl PluriviewApp {
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
 
-            egui::Window::new("Add Stream")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Stream URL");
-                    let mut paste_requested = false;
-                    let response = ui.add_sized(
-                        [460.0, 24.0],
-                        egui::TextEdit::singleline(&mut dialog.url)
-                            .hint_text("https://example.com/channel"),
-                    );
-                    response.context_menu(|ui| {
-                        crate::ui_theme::menu(ui);
-                        if ui.button("Paste").clicked() {
-                            paste_requested = true;
-                            ui.close_menu();
-                        }
-                    });
-                    if !dialog.focused {
-                        response.request_focus();
-                        dialog.focused = true;
+            crate::source_dialog::window(ctx, "Add Stream").show(ctx, |ui| {
+                cancel |= crate::source_dialog::header(
+                    ui,
+                    egui_phosphor::regular::BROADCAST,
+                    "Add Stream",
+                    "Play a live stream as a video tile.",
+                );
+                let (response, paste_requested) = crate::source_dialog::url_input(
+                    ui,
+                    &mut dialog.url,
+                    "https://example.com/channel",
+                );
+                if !dialog.focused {
+                    response.request_focus();
+                    dialog.focused = true;
+                }
+                if response.changed() {
+                    dialog.error = None;
+                    dialog.probe_error = None;
+                    dialog.probe_receiver = None;
+                    dialog.probing_url.clear();
+                    dialog.qualities.clear();
+                    if dialog.url.trim().is_empty() {
+                        dialog.probe_due = None;
+                    } else {
+                        dialog.probe_due = Some(Instant::now() + Duration::from_millis(400));
                     }
-                    if response.changed() {
-                        dialog.error = None;
-                        dialog.probe_error = None;
-                        if dialog.url.trim().is_empty() {
-                            dialog.probe_due = None;
+                }
+
+                let quality_response =
+                    crate::source_dialog::quality_input(ui, &mut dialog.quality, &dialog.qualities);
+                if dialog.probe_receiver.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(12.0));
+                        ui.label(
+                            egui::RichText::new("Finding available qualities...")
+                                .size(12.0)
+                                .color(crate::ui_theme::SECONDARY),
+                        );
+                    });
+                } else if let Some(error) = &dialog.probe_error {
+                    ui.colored_label(crate::ui_theme::GOLD, error);
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(crate::ui_theme::DANGER, error);
+                }
+
+                let ready = !dialog.url.trim().is_empty();
+                let (clicked, cancelled) = crate::source_dialog::footer(ui, "Add stream", ready);
+                let entered = (response.lost_focus() || quality_response.lost_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                submit = ready && (clicked || entered);
+                cancel |= cancelled;
+
+                if paste_requested {
+                    match clipboard_text() {
+                        Ok(text) if !text.trim().is_empty() => {
+                            dialog.url = text.trim().to_owned();
+                            dialog.error = None;
+                            dialog.probe_error = None;
                             dialog.probe_receiver = None;
                             dialog.probing_url.clear();
                             dialog.qualities.clear();
-                        } else {
                             dialog.probe_due = Some(Instant::now() + Duration::from_millis(400));
+                            response.request_focus();
                         }
+                        Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
+                        Err(error) => dialog.error = Some(error.to_owned()),
                     }
-
-                    ui.add_space(6.0);
-                    ui.label("Quality");
-                    ui.add_sized(
-                        [220.0, 24.0],
-                        egui::TextEdit::singleline(&mut dialog.quality).hint_text("best"),
-                    );
-                    if !dialog.qualities.is_empty() {
-                        egui::ComboBox::from_id_salt("stream_quality_choices")
-                            .selected_text("Detected qualities")
-                            .show_ui(ui, |ui| {
-                                for quality in &dialog.qualities {
-                                    if ui.selectable_label(false, quality).clicked() {
-                                        dialog.quality = quality.clone();
-                                    }
-                                }
-                            });
-                    }
-                    if dialog.probe_receiver.is_some() {
-                        ui.label(egui::RichText::new("Checking available qualities...").weak());
-                    } else if let Some(error) = &dialog.probe_error {
-                        ui.colored_label(egui::Color32::from_rgb(235, 170, 100), error);
-                    }
-                    if let Some(error) = &dialog.error {
-                        ui.colored_label(egui::Color32::from_rgb(255, 100, 100), error);
-                    }
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Add").clicked() {
-                            submit = true;
-                        }
-                        if ui.button("Paste").clicked() {
-                            paste_requested = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-
-                    if paste_requested {
-                        match clipboard_text() {
-                            Ok(text) if !text.trim().is_empty() => {
-                                dialog.url = text.trim().to_owned();
-                                dialog.error = None;
-                                dialog.probe_error = None;
-                                dialog.probe_receiver = None;
-                                dialog.probing_url.clear();
-                                dialog.qualities.clear();
-                                dialog.probe_due =
-                                    Some(Instant::now() + Duration::from_millis(400));
-                                response.request_focus();
-                            }
-                            Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
-                            Err(error) => dialog.error = Some(error.to_owned()),
-                        }
-                    }
-                });
+                }
+            });
         }
 
         if cancel {
@@ -6687,6 +6659,11 @@ impl eframe::App for PluriviewApp {
             && self.workspace_dialog.is_none()
             && !self.confirm_workspace_delete
             && self.hotkey_recording.is_none();
+        // Dialog controls retain keyboard ownership even when the URL field
+        // loses focus to a recent website or quality choice.
+        #[cfg(windows)]
+        let shortcut_listening =
+            shortcut_listening && self.add_browser.is_none() && self.add_stream.is_none();
         #[cfg(windows)]
         let webview_active = self.browser.active_id().is_some();
         #[cfg(not(windows))]

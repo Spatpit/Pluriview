@@ -88,6 +88,8 @@ Browser tiles let you place live web pages on the canvas, including streams,
 chats, dashboards, and overlay widgets.
 
 Right-click the canvas → **Add Browser...**, then paste a web address.
+Use **Paste** beside the URL field or select a recent website. Press **Enter**
+to add the page, or **Esc** to cancel.
 
 #### Arrange the tile or use the website
 
@@ -184,6 +186,9 @@ To open a supported stream URL in a **video tile**, install
 [Streamlink](https://streamlink.github.io/) and add the stream from the canvas
 menu. Configure Streamlink in **Settings** if Pluriview does not find it
 automatically.
+
+The Add Stream dialog lets you type a quality or use **Choose** for the best,
+lowest, or detected qualities. Custom quality values remain supported.
 
 Video-tile streams require the video runtime included in the Full download.
 Live streams do not provide seek-bar thumbnails.
