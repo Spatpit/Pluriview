@@ -12,15 +12,18 @@ mod hotkeys;
 #[cfg(windows)]
 mod libmpv;
 mod media;
-mod overlay;
 mod persistence;
 mod playlist;
 mod preview;
 mod privacy;
+#[cfg(windows)]
+mod source_dialog;
 mod spout;
 mod tray;
+mod ui_theme;
 #[cfg(windows)]
 mod video;
+mod window_controls;
 mod window_picker;
 
 use app::PluriviewApp;
@@ -32,6 +35,23 @@ fn main() -> eframe::Result<()> {
     configure_runtime_library_directory();
 
     env_logger::init();
+
+    // Dispatch before reading saved geometry or constructing normal storage.
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--performance-test")) {
+        #[cfg(pluriview_performance)]
+        {
+            let config = std::env::args_os()
+                .nth(2)
+                .expect("--performance-test requires a JSON config");
+            return app::performance::run(std::path::Path::new(&config));
+        }
+        // Reject before touching real workspaces if a runner reuses a normal build.
+        #[cfg(not(pluriview_performance))]
+        return Err(eframe::Error::AppCreation(
+            "This executable was built without local performance testing support".into(),
+        ));
+    }
 
     // Share the Canvas P branding with the tray and executable resource.
     let icon = create_window_icon();

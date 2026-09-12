@@ -3,7 +3,7 @@ use crate::persistence::WallpaperLayout;
 use crate::preview::PreviewId;
 use eframe::egui::{self, Color32, Pos2, Rect, TextureHandle};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Reserved video-session id. Tile ids start at 1, so this never collides.
 pub const WALLPAPER_VIDEO_ID: PreviewId = PreviewId(0);
@@ -177,7 +177,7 @@ impl CanvasWallpaper {
 
         let delay = self.frames[self.frame_index].duration;
         let remaining = delay.saturating_sub(self.frame_started.elapsed());
-        ctx.request_repaint_after(remaining.max(Duration::from_millis(1)));
+        crate::media::request_animation_repaint(ctx, remaining);
     }
 }
 

@@ -1,6 +1,7 @@
 use super::animation::{AnimationState, CameraTransition, DragTracker};
 use super::wallpaper::CanvasWallpaper;
 use crate::capture::{capture_lod_factor, window_capture_target, CaptureCoordinator};
+use crate::hotkeys::{HotkeyBindings, HotkeySlot};
 use crate::preview::{
     compact_title, BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager,
     RemovedPreviewInfo, VideoPlaybackState, VideoTileStatus, ViewportPin,
@@ -55,7 +56,7 @@ pub enum DragState {
         /// Pinned Spout tiles resize directly in viewport coordinates.
         screen_space: bool,
     },
-    /// Cropping a preview (Alt+drag to adjust UV coordinates)
+    /// Cropping a preview through crop mode or Alt+drag.
     Cropping {
         id: PreviewId,
         handle: ResizeHandle,
@@ -496,6 +497,68 @@ mod tests {
         assert_eq!(
             context.layer_id_at(pointer).map(|layer| layer.order),
             Some(Order::Foreground)
+        );
+    }
+
+    #[test]
+    fn long_tile_menu_scrolls_to_its_final_action_in_a_short_viewport() {
+        let ctx = Context::default();
+        crate::ui_theme::install(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let pointer = Pos2::new(300.0, 100.0);
+        let mut frame = 0;
+        let mut render = |events| {
+            frame += 1;
+            ctx.run(
+                RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(frame as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    CentralPanel::default().show(ctx, |ui| {
+                        let response = ui.allocate_rect(ui.max_rect(), Sense::click());
+                        super::show_context_menu_if(&response, true, |ui| {
+                            for index in 0..40 {
+                                let _ = ui.button(format!("Action {index}"));
+                            }
+                        });
+                    });
+                },
+            )
+        };
+        render(vec![Event::PointerMoved(pointer)]);
+        for pressed in [true, false] {
+            render(vec![Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }]);
+        }
+        let last_visible = |output: &egui::FullOutput| {
+            output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, Shape::Text(text) if text.galley.text() == "Action 39"
+                && shape.clip_rect.intersect(screen).contains_rect(Rect::from_min_size(text.pos, text.galley.size())))
+        })
+        };
+        assert!(!last_visible(&render(vec![])));
+        let mut reached_last = false;
+        for _ in 0..20 {
+            let output = render(vec![
+                Event::PointerMoved(pointer + Vec2::new(20.0, 10.0)),
+                Event::MouseWheel {
+                    unit: MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -150.0),
+                    modifiers: Modifiers::NONE,
+                },
+            ]);
+            reached_last |= last_visible(&output);
+        }
+        assert!(
+            reached_last,
+            "Scrolling should expose the last action inside the viewport"
         );
     }
 
@@ -1215,6 +1278,363 @@ mod tests {
         assert_eq!(crop, (0.375, 0.25, 0.75, 0.75));
         assert_eq!(rect.min, Pos2::new(75.0, 40.0));
         assert_eq!(rect.size(), Vec2::new(75.0, 50.0));
+    }
+
+    struct CropUiTest {
+        context: Context,
+        canvas: CanvasState,
+        previews: PreviewManager,
+        captures: CaptureCoordinator,
+        viewport: Rect,
+        time: f64,
+    }
+
+    impl CropUiTest {
+        fn new(kind: u8, pinned: bool) -> (Self, PreviewId) {
+            let mut previews = PreviewManager::new();
+            let position = Pos2::new(100.0, 100.0);
+            let size = Vec2::new(200.0, 100.0);
+            let id = match kind {
+                0 => previews.add_for_window(1, 42, "window".into(), position, size),
+                1 => previews.add_browser_placeholder(
+                    "https://example.com".into(),
+                    position,
+                    size,
+                    FpsPreset::Medium,
+                ),
+                2 | 3 => previews.add_media(
+                    PathBuf::from("fixture.png"),
+                    "image".into(),
+                    (0..if kind == 3 { 2 } else { 1 })
+                        .map(|_| crate::media::MediaFrame {
+                            width: 200,
+                            height: 100,
+                            rgba: vec![0; 200 * 100 * 4],
+                            duration: Duration::from_millis(100),
+                        })
+                        .collect(),
+                    position,
+                    size,
+                ),
+                4 => previews.add_video_placeholder(
+                    VideoSource::LocalFile {
+                        path: PathBuf::from("fixture.mp4"),
+                    },
+                    "video".into(),
+                    position,
+                    size,
+                    FpsPreset::Medium,
+                    false,
+                ),
+                5 => previews.add_for_spout("fixture".into(), position, size, FpsPreset::Medium),
+                _ => unreachable!(),
+            };
+            if matches!(kind, 0 | 1 | 5) {
+                previews
+                    .get_mut(id)
+                    .unwrap()
+                    .update_frame(200, 100, vec![0; 200 * 100 * 4]);
+            }
+            let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 750.0));
+            if pinned {
+                previews.get_mut(id).unwrap().viewport_pin =
+                    Some(crate::preview::ViewportPin::from_rect(
+                        Rect::from_min_size(position, size),
+                        viewport,
+                    ));
+            }
+            (
+                Self {
+                    context: Context::default(),
+                    canvas: CanvasState {
+                        pan: Vec2::new(17.0, -9.0),
+                        zoom: 1.25,
+                        ..Default::default()
+                    },
+                    previews,
+                    captures: CaptureCoordinator::new(),
+                    viewport,
+                    time: 0.0,
+                },
+                id,
+            )
+        }
+
+        fn frame(&mut self, events: Vec<Event>) -> egui::FullOutput {
+            self.time += 0.1;
+            self.context.run(
+                RawInput {
+                    screen_rect: Some(self.viewport),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(context, |ui| {
+                            self.canvas.ui(
+                                ui,
+                                &mut self.previews,
+                                &mut self.captures,
+                                context,
+                                true,
+                            );
+                        });
+                },
+            )
+        }
+
+        fn click(&mut self, pos: Pos2, button: PointerButton) -> egui::FullOutput {
+            self.frame(vec![Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                self.frame(vec![Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                }]);
+            }
+            self.frame(vec![])
+        }
+
+        fn label_pos(output: &egui::FullOutput, label: &str) -> Pos2 {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos + text.galley.rect.center().to_vec2())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Missing menu label: {label}; labels: {:?}",
+                        output
+                            .shapes
+                            .iter()
+                            .filter_map(|s| match &s.shape {
+                                Shape::Text(t) => Some(t.galley.text()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    )
+                })
+        }
+
+        fn open_crop_menu(&mut self, id: PreviewId) -> egui::FullOutput {
+            let rect = self
+                .canvas
+                .preview_screen_rect(self.previews.get(id).unwrap(), self.viewport);
+            let mut output = self.click(rect.center(), PointerButton::Secondary);
+            for _ in 0..12 {
+                if output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape,
+                    Shape::Text(text) if text.galley.text() == "Crop"
+                        && shape.clip_rect.contains(text.pos + text.galley.rect.center().to_vec2()))
+                }) {
+                    break;
+                }
+                self.frame(vec![
+                    Event::PointerMoved(rect.center() + Vec2::new(20.0, 10.0)),
+                    Event::MouseWheel {
+                        unit: MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, -150.0),
+                        modifiers: Modifiers::NONE,
+                    },
+                ]);
+                output = self.frame(vec![]);
+            }
+            self.click(Self::label_pos(&output, "Crop"), PointerButton::Primary)
+        }
+
+        fn drag(&mut self, start: Pos2, end: Pos2) {
+            self.frame(vec![Event::PointerMoved(start)]);
+            self.frame(vec![Event::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }]);
+            self.frame(vec![Event::PointerMoved(end)]);
+            self.frame(vec![Event::PointerButton {
+                pos: end,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }]);
+        }
+    }
+
+    #[test]
+    fn menu_crop_handles_work_for_all_sources_and_pinned_tiles() {
+        for kind in 0..6 {
+            for pinned in [false, true] {
+                let (mut test, id) = CropUiTest::new(kind, pinned);
+                test.frame(vec![]);
+                let output = test.open_crop_menu(id);
+                test.click(
+                    CropUiTest::label_pos(&output, "Edit Crop"),
+                    PointerButton::Primary,
+                );
+                assert_eq!(
+                    test.canvas.crop_mode,
+                    Some(id),
+                    "source {kind}, pinned {pinned}"
+                );
+                let pan = test.canvas.pan;
+                let before = test
+                    .canvas
+                    .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+                let start = before.right_center();
+                test.drag(start, start - Vec2::new(before.width() * 0.25, 0.0));
+                let preview = test.previews.get(id).unwrap();
+                let crop = preview.crop_uv.expect("Menu handle must crop without Alt");
+                assert!(
+                    (crop.2 - 0.75).abs() < 0.01,
+                    "source {kind}, pinned {pinned}: {crop:?}"
+                );
+                let after = test.canvas.preview_screen_rect(preview, test.viewport);
+                assert!((after.width() / before.width() - 0.75).abs() < 0.01);
+                assert!((after.height() - before.height()).abs() < 0.01);
+                assert_eq!(test.canvas.pan, pan);
+                assert_eq!(
+                    test.canvas.crop_mode,
+                    Some(id),
+                    "Mode must survive a handle release"
+                );
+                assert!(test.canvas.last_double_clicked.is_none());
+
+                test.drag(after.left_top(), after.left_top() + before.size() * 0.1);
+                let crop = test.previews.get(id).unwrap().crop_uv.unwrap();
+                assert!((crop.0 - 0.1).abs() < 0.01 && (crop.1 - 0.1).abs() < 0.01);
+                assert!(
+                    (crop.2 - 0.75).abs() < 0.01,
+                    "Repeated corner crop must keep the previous edge"
+                );
+                let output = test.open_crop_menu(id);
+                test.click(
+                    CropUiTest::label_pos(&output, "Clear Crop"),
+                    PointerButton::Primary,
+                );
+                let restored = test
+                    .canvas
+                    .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+                assert!((restored.width() - before.width()).abs() < 0.1);
+                assert!(test.previews.get(id).unwrap().crop_uv.is_none());
+                let output = test.open_crop_menu(id);
+                test.click(
+                    CropUiTest::label_pos(&output, "Finish Cropping"),
+                    PointerButton::Primary,
+                );
+                assert!(test.canvas.crop_mode.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_canvas_menu_queues_app_topmost_setting() {
+        let (mut test, _) = CropUiTest::new(2, false);
+        test.frame(vec![]);
+        let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+        test.click(
+            CropUiTest::label_pos(&output, "Always on Top"),
+            PointerButton::Primary,
+        );
+        assert_eq!(test.canvas.pending_always_on_top.take(), Some(true));
+        let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+        test.click(
+            CropUiTest::label_pos(&output, "Always on Top"),
+            PointerButton::Primary,
+        );
+        assert_eq!(test.canvas.pending_always_on_top.take(), Some(false));
+    }
+
+    #[test]
+    fn passing_input_through_cancels_crop_without_changing_geometry() {
+        let (mut test, id) = CropUiTest::new(1, true);
+        test.canvas.begin_crop(id, &test.previews);
+        let before = crate::preview::PreviewLayout::from(test.previews.get(id).unwrap());
+        test.canvas.interactive_browser = Some(id);
+        test.canvas.last_double_clicked = Some(id);
+        test.canvas.cancel_pointer_interaction();
+        assert!(test.canvas.crop_mode.is_none());
+        assert!(test.canvas.interactive_browser.is_none());
+        assert!(test.canvas.last_double_clicked.is_none());
+        assert_eq!(
+            serde_json::to_value(crate::preview::PreviewLayout::from(
+                test.previews.get(id).unwrap()
+            ))
+            .unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+
+    #[test]
+    fn crop_mode_keeps_tile_still_and_empty_canvas_restores_normal_resize() {
+        for pinned in [false, true] {
+            let (mut test, id) = CropUiTest::new(2, pinned);
+            test.canvas.begin_crop(id, &test.previews);
+            test.frame(vec![]);
+            let before = test
+                .canvas
+                .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+            test.drag(before.center(), before.center() + Vec2::new(30.0, 15.0));
+            assert_eq!(
+                test.canvas
+                    .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport),
+                before
+            );
+            test.click(Pos2::new(800.0, 650.0), PointerButton::Primary);
+            assert!(test.canvas.crop_mode.is_none());
+            test.click(before.center(), PointerButton::Primary);
+            test.drag(
+                before.right_center(),
+                before.right_center() + Vec2::new(50.0, 0.0),
+            );
+            let preview = test.previews.get(id).unwrap();
+            assert!(
+                preview.crop_uv.is_none(),
+                "Ordinary resize must resume after crop mode"
+            );
+            assert!(
+                test.canvas
+                    .preview_screen_rect(preview, test.viewport)
+                    .width()
+                    > before.width()
+            );
+        }
+    }
+
+    #[test]
+    fn crop_mode_exits_on_escape_removal_workspace_change_and_focus() {
+        let (mut test, id) = CropUiTest::new(2, false);
+        test.canvas.begin_crop(id, &test.previews);
+        test.frame(vec![]);
+        test.frame(vec![Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        assert!(test.canvas.crop_mode.is_none());
+        test.canvas.begin_crop(id, &test.previews);
+        test.canvas.clear_preview_interactions();
+        assert!(test.canvas.crop_mode.is_none());
+        test.canvas.begin_crop(id, &test.previews);
+        test.canvas
+            .focus_on_tile(id, test.previews.get(id).unwrap().rect(), test.viewport);
+        assert!(test.canvas.crop_mode.is_none());
+        test.canvas.begin_crop(id, &test.previews);
+        test.canvas.selection.clear();
+        test.canvas.prune_preview_interactions(&test.previews);
+        assert!(test.canvas.crop_mode.is_none());
+        test.canvas.begin_crop(id, &test.previews);
+        test.previews.start_removal(id);
+        test.canvas.prune_preview_interactions(&test.previews);
+        assert!(test.canvas.crop_mode.is_none());
     }
 
     fn alt_crop_right_edge(
@@ -2026,7 +2446,14 @@ fn show_context_menu_if(
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
     if active {
-        let _ = response.context_menu(add_contents);
+        let _ = response.context_menu(|ui| {
+            crate::ui_theme::menu(ui);
+            // Source-specific controls can exceed a short viewport. Keep the
+            // entire menu reachable instead of clipping its final actions.
+            egui::ScrollArea::vertical()
+                .max_height((ui.ctx().screen_rect().height() - 32.0).max(100.0))
+                .show(ui, add_contents);
+        });
     }
 }
 
@@ -2056,7 +2483,10 @@ fn saved_viewpoints_submenu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut eg
     if !open_left {
         ui.ctx()
             .data_mut(|data| data.insert_temp(state_id, LeftSubmenuState::default()));
-        ui.menu_button("Saved Viewpoints", add_contents);
+        ui.menu_button("Saved Viewpoints", |ui| {
+            crate::ui_theme::menu(ui);
+            add_contents(ui)
+        });
         return;
     }
 
@@ -2099,7 +2529,7 @@ fn saved_viewpoints_submenu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut eg
             .sense(Sense::hover())
             .show(ui.ctx(), |ui| {
                 let style = ui.style_mut();
-                style.spacing.button_padding = egui::vec2(2.0, 0.0);
+                style.spacing.button_padding = egui::vec2(9.0, 4.0);
                 style.visuals.widgets.active.bg_stroke = Stroke::NONE;
                 style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
                 style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
@@ -2107,6 +2537,7 @@ fn saved_viewpoints_submenu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut eg
 
                 egui::Frame::menu(ui.style())
                     .show(ui, |ui| {
+                        crate::ui_theme::menu(ui);
                         ui.with_layout(
                             egui::Layout::top_down_justified(egui::Align::LEFT),
                             add_contents,
@@ -2154,7 +2585,10 @@ fn show_canvas_context_menu_if(
         root.menu_state.write().rect = parent_rect;
     }
 
-    let _ = bar_state.show(response, add_contents);
+    let _ = bar_state.show(response, |ui| {
+        crate::ui_theme::menu(ui);
+        add_contents(ui);
+    });
     state = response.ctx.data_mut(|data| {
         data.get_temp::<LeftSubmenuState>(state_id)
             .unwrap_or_default()
@@ -2277,6 +2711,7 @@ struct CanvasFrameScope<'a> {
     canvas_rect: Rect,
     input: &'a FrameInput,
     show_overlays: bool,
+    keyboard_shortcuts: &'a HotkeyBindings,
 }
 
 /// Keyboard actions resolved by the app's configurable hotkey layer. `None`
@@ -2330,7 +2765,6 @@ struct TileInfo {
     title: String,
     target_fps: u32,
     fps_preset: FpsPreset,
-    has_crop: bool,
     crop_uv: Option<(f32, f32, f32, f32)>,
     is_removing: bool,
     spawn_t: f32,
@@ -2368,7 +2802,6 @@ impl TileInfo {
             title: preview.title.clone(),
             target_fps: preview.target_fps,
             fps_preset: preview.fps_preset,
-            has_crop: preview.crop_uv.is_some(),
             crop_uv: preview.crop_uv,
             is_removing: preview.removing.is_some(),
             spawn_t: preview.spawn_progress(),
@@ -2405,7 +2838,6 @@ impl TileInfo {
         self.title.clone_from(&preview.title);
         self.target_fps = preview.target_fps;
         self.fps_preset = preview.fps_preset;
-        self.has_crop = preview.crop_uv.is_some();
         self.crop_uv = preview.crop_uv;
         self.is_removing = preview.removing.is_some();
         self.spawn_t = preview.spawn_progress();
@@ -3022,8 +3454,8 @@ pub struct CanvasState {
     /// Drag tracker for canvas pan momentum
     pan_drag_tracker: DragTracker,
 
-    /// Preview ID pending region selection (set from context menu, consumed by app)
-    pub pending_region_select: Option<PreviewId>,
+    /// Tile whose handles crop without Alt. Runtime-only; ends on deselection.
+    crop_mode: Option<PreviewId>,
 
     /// Latest deletion batch, retained until undo, another deletion, or workspace change.
     last_removed: Option<(Instant, Vec<RemovedPreviewInfo>)>,
@@ -3075,6 +3507,10 @@ pub struct CanvasState {
     /// frame so the canvas can outline it in the accent color.
     pub interactive_browser: Option<PreviewId>,
 
+    /// App-global window state mirrored for the empty-canvas menu.
+    pub always_on_top: bool,
+    pub pending_always_on_top: Option<bool>,
+
     /// True when View → Stream Audio Monitor has a target device.
     pub stream_monitor_ready: bool,
 
@@ -3117,7 +3553,7 @@ impl Default for CanvasState {
             pinned_pointer_drag: None,
             canvas_panning: false,
             pan_drag_tracker: DragTracker::new(),
-            pending_region_select: None,
+            crop_mode: None,
             last_removed: None,
             removed_undo_requested: false,
             last_secondary_click: None,
@@ -3134,6 +3570,8 @@ impl Default for CanvasState {
             pending_removed_restore: None,
             pending_media_actions: Vec::new(),
             interactive_browser: None,
+            always_on_top: false,
+            pending_always_on_top: None,
             stream_monitor_ready: false,
             last_screen_rect: None,
             last_double_clicked: None,
@@ -3145,12 +3583,28 @@ impl Default for CanvasState {
 }
 
 impl CanvasState {
+    /// Cancel a gesture when the app switches to passing input through.
+    pub fn cancel_pointer_interaction(&mut self) {
+        self.finish_crop();
+        self.drag_state = None;
+        self.marquee = None;
+        self.preview_dragging = false;
+        self.pinned_drag_origins.clear();
+        self.pinned_pointer_drag = None;
+        self.canvas_panning = false;
+        self.pan_drag_tracker = DragTracker::new();
+        self.last_secondary_click = None;
+        self.last_double_clicked = None;
+        self.interactive_browser = None;
+    }
+
     pub fn set_keyboard_input(&mut self, input: CanvasKeyboardInput) {
         self.keyboard_input = Some(input);
     }
 
     /// Reset canvas to default view
     pub fn reset(&mut self) {
+        self.finish_crop();
         self.pan = Vec2::ZERO;
         self.zoom = 1.0;
         self.selection.clear();
@@ -3164,6 +3618,7 @@ impl CanvasState {
 
     /// Drop transient tile interaction state from a previous layout.
     pub fn clear_preview_interactions(&mut self) {
+        self.finish_crop();
         self.last_removed = None;
         self.removed_undo_requested = false;
         self.pending_removed_restore = None;
@@ -3174,6 +3629,12 @@ impl CanvasState {
     }
 
     fn prune_preview_interactions(&mut self, preview_manager: &PreviewManager) {
+        if self.crop_mode.is_some_and(|id| {
+            self.selection.as_slice() != [id]
+                || !preview_manager.get(id).is_some_and(Self::can_edit_crop)
+        }) {
+            self.finish_crop();
+        }
         if self
             .pinned_pointer_drag
             .is_some_and(|drag| preview_manager.get(drag.id).is_none())
@@ -3184,6 +3645,7 @@ impl CanvasState {
 
     /// Fit one tile in the current canvas without changing its saved geometry.
     pub fn focus_on_tile(&mut self, id: PreviewId, tile_rect: Rect, canvas_rect: Rect) {
+        self.finish_crop();
         self.cancel_camera_transition();
         if let Some(focus) = &mut self.focus {
             focus.id = id;
@@ -3335,9 +3797,94 @@ impl CanvasState {
             .unwrap_or_else(|| self.canvas_rect_to_screen(preview.rect(), canvas_rect))
     }
 
+    fn can_edit_crop(preview: &Preview) -> bool {
+        !preview.is_playlist()
+            && !preview.left_click_disabled
+            && preview.removing.is_none()
+            && (preview.source_frame_size.or(preview.frame_size).is_some() || preview.is_video())
+    }
+
+    fn begin_crop(&mut self, id: PreviewId, preview_manager: &PreviewManager) {
+        if !preview_manager.get(id).is_some_and(Self::can_edit_crop) {
+            return;
+        }
+        self.exit_focus();
+        self.cancel_camera_transition();
+        self.selection = vec![id];
+        self.crop_mode = Some(id);
+        self.animation.momentum_active = false;
+        self.animation.momentum_velocity = Vec2::ZERO;
+        self.drag_state = None;
+        self.marquee = None;
+        self.preview_dragging = false;
+        self.pinned_drag_origins.clear();
+        self.pinned_pointer_drag = None;
+        if self.interactive_browser == Some(id) {
+            self.last_double_clicked = Some(id);
+            self.interactive_browser = None;
+        }
+    }
+
+    fn finish_crop(&mut self) {
+        if let Some(id) = self.crop_mode.take() {
+            if matches!(self.drag_state, Some(DragState::Cropping { id: drag_id, .. }) if id == drag_id)
+            {
+                self.drag_state = None;
+            }
+        }
+    }
+
+    fn crop_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: PreviewId,
+        canvas_rect: Rect,
+        preview_manager: &mut PreviewManager,
+    ) {
+        ui.menu_button("Crop", |ui| {
+            crate::ui_theme::menu(ui);
+            let editing = self.crop_mode == Some(id);
+            let can_crop = preview_manager.get(id).is_some_and(Self::can_edit_crop);
+            if ui
+                .add_enabled(
+                    can_crop,
+                    egui::Button::new(if editing {
+                        "Finish Cropping"
+                    } else {
+                        "Edit Crop"
+                    }),
+                )
+                .clicked()
+            {
+                if editing {
+                    self.finish_crop();
+                } else {
+                    self.begin_crop(id, preview_manager);
+                }
+                ui.close_menu();
+            }
+            let has_crop = preview_manager
+                .get(id)
+                .is_some_and(|preview| preview.crop_uv.is_some());
+            if ui
+                .add_enabled(has_crop, egui::Button::new("Clear Crop"))
+                .clicked()
+            {
+                self.set_preview_crop(id, None, canvas_rect, preview_manager);
+                ui.close_menu();
+            }
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Alt+drag edges or corners also crops")
+                    .weak()
+                    .small(),
+            );
+        });
+    }
+
     /// Apply or clear crop UVs while changing the tile bounds by the same
-    /// source-space proportion. This keeps content scale stable for region
-    /// selection and Clear Crop as well as handle dragging.
+    /// source-space proportion, preserving content scale for Clear Crop and
+    /// handle dragging.
     pub fn set_preview_crop(
         &mut self,
         id: PreviewId,
@@ -3603,8 +4150,10 @@ impl CanvasState {
             canvas_rect,
             input,
             show_overlays,
+            keyboard_shortcuts: _,
         } = frame;
         if input.pointer_blocked
+            || self.crop_mode == Some(id)
             || preview_manager
                 .get(id)
                 .is_some_and(|preview| preview.left_click_disabled)
@@ -3671,6 +4220,7 @@ impl CanvasState {
             capture_coordinator,
             ctx,
             show_overlays,
+            &HotkeyBindings::default(),
             |_| false,
         );
     }
@@ -3682,6 +4232,7 @@ impl CanvasState {
         capture_coordinator: &mut CaptureCoordinator,
         ctx: &egui::Context,
         show_overlays: bool,
+        keyboard_shortcuts: &HotkeyBindings,
         mut canvas_views_menu: impl FnMut(&mut egui::Ui) -> bool,
     ) {
         let canvas_rect = ui.available_rect_before_wrap();
@@ -3731,10 +4282,14 @@ impl CanvasState {
                 .is_some_and(|layer| layer != ui.layer_id())
         });
 
-        if input.escape_pressed && !self.exit_focus() {
+        self.prune_preview_interactions(preview_manager);
+        if input.escape_pressed && self.crop_mode.is_some() {
+            self.finish_crop();
+        } else if input.escape_pressed && !self.exit_focus() {
             self.cancel_camera_transition();
         }
         if !show_overlays {
+            self.finish_crop();
             self.drag_state = None;
             self.marquee = None;
         }
@@ -3829,6 +4384,7 @@ impl CanvasState {
             canvas_rect,
             input: &input,
             show_overlays,
+            keyboard_shortcuts,
         };
 
         // Draw previews and handle their interactions (AFTER bg allocation)
@@ -3836,8 +4392,23 @@ impl CanvasState {
 
         // Draw selection rectangles and interactive resize handles
         // Handles are allocated AFTER previews so they have higher interaction priority
+        self.prune_preview_interactions(preview_manager);
         if show_overlays && self.marquee.is_none() && !self.is_focusing_tile() {
             self.draw_and_interact_selection(ui, canvas_rect, preview_manager, &input);
+            if self.crop_mode.is_some() {
+                let hint = Rect::from_center_size(
+                    egui::pos2(canvas_rect.center().x, canvas_rect.bottom() - 24.0),
+                    Vec2::new((canvas_rect.width() - 24.0).min(410.0).max(1.0), 28.0),
+                );
+                painter.rect_filled(hint, 6.0, crate::ui_theme::PANEL);
+                crate::ui_theme::clipped_text(
+                    ui,
+                    hint.shrink2(Vec2::new(10.0, 5.0)),
+                    "Crop mode · Drag handles · Click empty canvas to finish",
+                    12.0,
+                    Color32::from_rgb(255, 150, 100),
+                );
+            }
         }
 
         if show_overlays {
@@ -4118,6 +4689,12 @@ impl CanvasState {
                         .left_click_preview_at_screen(pointer, canvas_rect, preview_manager)
                         .is_none()
                 {
+                    if self
+                        .preview_at_screen(pointer, canvas_rect, preview_manager)
+                        .is_none()
+                    {
+                        self.finish_crop();
+                    }
                     self.marquee = Some(MarqueeSelection {
                         start: pointer,
                         current: pointer,
@@ -4159,6 +4736,7 @@ impl CanvasState {
             canvas_rect,
             input,
             show_overlays,
+            keyboard_shortcuts,
         } = frame;
         // Use the pre-allocated background response
 
@@ -4294,35 +4872,46 @@ impl CanvasState {
             &background_context_response,
             background_context_menu_active,
             |ui| {
-                if ui.button("Add Window...").clicked() {
+                crate::ui_theme::section(ui, "ADD TO CANVAS");
+                if crate::ui_theme::action(ui, egui_phosphor::regular::APP_WINDOW, "Add Window...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         let canvas_pos = self.screen_to_canvas(screen_pos, canvas_rect);
                         self.pending_quick_add = Some((canvas_pos, screen_pos));
                     }
                     ui.close_menu();
                 }
-                if ui.button("Add Browser...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::GLOBE, "Add Browser...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         self.pending_browser_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
                     ui.close_menu();
                 }
-                if ui.button("Add Image...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::IMAGE, "Add Image...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         self.pending_media_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
                     ui.close_menu();
                 }
-                if ui.button("Add Video...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::FILM_STRIP, "Add Video...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         self.pending_video_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
                     ui.close_menu();
                 }
-                if ui.button("Add Stream...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::BROADCAST, "Add Stream...")
+                    .clicked()
+                {
                     if let Some(screen_pos) = self.last_secondary_click {
                         self.pending_stream_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
@@ -4336,7 +4925,19 @@ impl CanvasState {
                     ui.close_menu();
                 }
                 ui.separator();
-                ui.checkbox(&mut self.show_grid, "Show Grid");
+                crate::ui_theme::shortcut_toggle(
+                    ui,
+                    &mut self.show_grid,
+                    "Show Grid",
+                    keyboard_shortcuts.get(HotkeySlot::ToggleGrid),
+                );
+                if ui
+                    .checkbox(&mut self.always_on_top, "Always on Top")
+                    .changed()
+                {
+                    self.pending_always_on_top = Some(self.always_on_top);
+                    ui.close_menu();
+                }
                 if ui.button("Set Wallpaper...").clicked() {
                     self.pending_wallpaper_pick = true;
                     ui.close_menu();
@@ -4367,7 +4968,13 @@ impl CanvasState {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Remove Selected").clicked() {
+                    if ui
+                        .add(crate::ui_theme::shortcut_button(
+                            egui::RichText::new("Remove Selected").color(crate::ui_theme::DANGER),
+                            keyboard_shortcuts.get(HotkeySlot::DeleteSelected),
+                        ))
+                        .clicked()
+                    {
                         for id in &self.selection {
                             capture_coordinator.stop_capture(*id);
                         }
@@ -4412,6 +5019,7 @@ impl CanvasState {
             canvas_rect,
             input,
             show_overlays,
+            keyboard_shortcuts,
         } = frame;
         let viewport = self.get_viewport(canvas_rect);
 
@@ -4445,7 +5053,6 @@ impl CanvasState {
             let title = &info.title;
             let target_fps = info.target_fps;
             let current_preset = info.fps_preset;
-            let has_crop = info.has_crop;
             let crop_uv = info.crop_uv;
             let is_removing = info.is_removing;
             let spawn_t = info.spawn_t;
@@ -5360,7 +5967,7 @@ impl CanvasState {
             // Handle double-click: browsers enter interaction mode (the app
             // consumes last_double_clicked); other previews focus their
             // source window.
-            if preview_response.double_clicked() && !manually_frozen {
+            if preview_response.double_clicked() && !manually_frozen && self.crop_mode != Some(id) {
                 if is_video {
                     self.pending_video_actions
                         .push((id, VideoAction::SetPaused(!video_playback.paused)));
@@ -5383,6 +5990,7 @@ impl CanvasState {
 
             // Handle drag start and remember screen-space origins for pinned tiles.
             if preview_response.drag_started()
+                && self.crop_mode != Some(id)
                 && !input.alt
                 && !input.middle_down
                 && !pinned_pointer_active
@@ -5408,6 +6016,7 @@ impl CanvasState {
             // Handle drag to move (only when not panning with Alt or middle mouse)
             // Resize is handled separately in draw_and_interact_selection()
             if preview_response.dragged()
+                && self.crop_mode != Some(id)
                 && !input.alt
                 && !input.middle_down
                 && !pinned_pointer_active
@@ -5457,6 +6066,7 @@ impl CanvasState {
             let context_menu_interaction_active =
                 context_response.context_menu_opened() || secondary_target;
             show_context_menu_if(&context_response, context_menu_interaction_active, |ui| {
+                crate::ui_theme::menu(ui);
                 ui.set_max_width(280.0);
                 ui.label(egui::RichText::new(compact_title(title, 42)).strong());
                 ui.separator();
@@ -5504,23 +6114,19 @@ impl CanvasState {
                 ui.separator();
 
                 if !is_media && !is_playlist {
-                    ui.label("Frame Rate:");
-                    for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
-                        let is_current = current_preset == preset;
-                        let label = if is_current {
-                            format!("  {} ✓", preset.label())
-                        } else {
-                            format!("  {}", preset.label())
-                        };
-
-                        if ui.selectable_label(is_current, label).clicked() {
-                            self.pending_fps_changes.push(PendingFpsChange {
-                                preview_id: id,
-                                new_fps: preset,
-                            });
-                            ui.close_menu();
+                    ui.menu_button(format!("Frame Rate: {}", current_preset.label()), |ui| {
+                        crate::ui_theme::menu(ui);
+                        for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
+                            let is_current = current_preset == preset;
+                            if ui.selectable_label(is_current, preset.label()).clicked() {
+                                self.pending_fps_changes.push(PendingFpsChange {
+                                    preview_id: id,
+                                    new_fps: preset,
+                                });
+                                ui.close_menu();
+                            }
                         }
-                    }
+                    });
                     ui.separator();
                 }
 
@@ -5637,18 +6243,7 @@ impl CanvasState {
                 } else if is_media {
                     ui.label(egui::RichText::new("Image / animated GIF tile").weak());
                     ui.separator();
-                    ui.menu_button("Crop", |ui| {
-                        if has_crop && ui.button("Clear Crop").clicked() {
-                            self.set_preview_crop(id, None, canvas_rect, preview_manager);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("Tip: Alt+drag edges or corners")
-                                .weak()
-                                .small(),
-                        );
-                    });
+                    self.crop_menu(ui, id, canvas_rect, preview_manager);
                 } else if is_browser {
                     let browser_ready =
                         *browser_status == BrowserTileStatus::Ready && !manually_frozen;
@@ -5658,7 +6253,10 @@ impl CanvasState {
                     if ui
                         .add_enabled(
                             browser_ready && !left_click_disabled,
-                            egui::Button::new("Interact"),
+                            crate::ui_theme::shortcut_button(
+                                "Interact",
+                                keyboard_shortcuts.get(HotkeySlot::InteractBrowser),
+                            ),
                         )
                         .clicked()
                     {
@@ -5709,18 +6307,7 @@ impl CanvasState {
                         ui.close_menu();
                     }
                     ui.separator();
-                    ui.menu_button("Crop", |ui| {
-                        if has_crop && ui.button("Clear Crop").clicked() {
-                            self.set_preview_crop(id, None, canvas_rect, preview_manager);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("Tip: Alt+drag edges or corners")
-                                .weak()
-                                .small(),
-                        );
-                    });
+                    self.crop_menu(ui, id, canvas_rect, preview_manager);
                 } else if is_video {
                     let controls_enabled = !manually_frozen
                         && video_playback.connected
@@ -5773,6 +6360,7 @@ impl CanvasState {
                         }
 
                         ui.menu_button(format!("Speed: {}×", video_playback.speed), |ui| {
+                            crate::ui_theme::menu(ui);
                             for speed in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
                                 let selected = (video_playback.speed - speed).abs() < 0.001;
                                 if ui.selectable_label(selected, format!("{speed}×")).clicked() {
@@ -5784,6 +6372,7 @@ impl CanvasState {
                         });
 
                         ui.menu_button("Audio Track", |ui| {
+                            crate::ui_theme::menu(ui);
                             let audio_tracks: Vec<_> = video_playback
                                 .tracks
                                 .iter()
@@ -5813,6 +6402,7 @@ impl CanvasState {
                         });
 
                         ui.menu_button("Subtitles", |ui| {
+                            crate::ui_theme::menu(ui);
                             if ui
                                 .selectable_label(video_playback.subtitle_track.is_none(), "Off")
                                 .clicked()
@@ -5857,36 +6447,9 @@ impl CanvasState {
                     }
 
                     ui.separator();
-                    ui.menu_button("Crop", |ui| {
-                        if !is_spout_capture && ui.button("Select Region...").clicked() {
-                            self.pending_region_select = Some(id);
-                            ui.close_menu();
-                        }
-                        if has_crop && ui.button("Clear Crop").clicked() {
-                            self.set_preview_crop(id, None, canvas_rect, preview_manager);
-                            ui.close_menu();
-                        }
-                    });
+                    self.crop_menu(ui, id, canvas_rect, preview_manager);
                 } else {
-                    // Crop section
-                    ui.menu_button("Crop", |ui| {
-                        if !is_spout_capture && ui.button("Select Region...").clicked() {
-                            self.pending_region_select = Some(id);
-                            ui.close_menu();
-                        }
-
-                        if has_crop && ui.button("Clear Crop").clicked() {
-                            self.set_preview_crop(id, None, canvas_rect, preview_manager);
-                            ui.close_menu();
-                        }
-
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("Tip: Alt+drag corners to fine-tune")
-                                .weak()
-                                .small(),
-                        );
-                    });
+                    self.crop_menu(ui, id, canvas_rect, preview_manager);
                 }
 
                 ui.separator();
@@ -5894,7 +6457,10 @@ impl CanvasState {
                 if ui
                     .add_enabled(
                         viewport_pin.is_none(),
-                        egui::Button::new("Focus on This Tile"),
+                        crate::ui_theme::shortcut_button(
+                            "Focus on This Tile",
+                            keyboard_shortcuts.get(HotkeySlot::FocusCurrentTile),
+                        ),
                     )
                     .clicked()
                 {
@@ -5914,7 +6480,7 @@ impl CanvasState {
 
                 ui.separator();
 
-                if ui.button("Remove").clicked() {
+                if crate::ui_theme::destructive(ui, "Remove").clicked() {
                     capture_coordinator.stop_capture(id);
                     preview_manager.start_removal(id);
                     self.selection.retain(|&x| x != id);
@@ -5992,14 +6558,14 @@ impl CanvasState {
         clipped.rect_filled(
             icon_rect,
             s(8.0),
-            Color32::from_rgba_unmultiplied(207, 161, 57, 38),
+            Color32::from_rgba_unmultiplied(94, 157, 235, (f32::from(alpha) * 0.14) as u8),
         );
         clipped.text(
             icon_rect.center(),
             egui::Align2::CENTER_CENTER,
-            egui_phosphor::regular::FOLDER_OPEN,
-            playlist_font(15.0, z),
-            Color32::from_rgb(138, 196, 108),
+            egui_phosphor::regular::FILM_STRIP,
+            playlist_font(17.0, z),
+            Color32::from_rgba_unmultiplied(155, 198, 255, alpha),
         );
 
         let text_left = icon_rect.right() + s(10.0);
@@ -6558,7 +7124,6 @@ impl CanvasState {
         input: &FrameInput,
     ) {
         let painter = ui.painter_at(canvas_rect);
-        let alt_held = input.alt;
 
         // Collect selection info to avoid borrow issues
         let selection_info: Vec<_> = self
@@ -6598,6 +7163,9 @@ impl CanvasState {
             is_playlist,
         ) in selection_info
         {
+            let cropping = (input.alt || self.crop_mode == Some(id))
+                && (frame_size.is_some() || is_video)
+                && !is_playlist;
             let screen_rect = viewport_pin
                 .map(|pin| pin.rect(canvas_rect))
                 .unwrap_or_else(|| self.canvas_rect_to_screen(preview_rect, canvas_rect));
@@ -6610,7 +7178,7 @@ impl CanvasState {
             // Minimal Void: Selection border with accent color.
             let border_color = if self.interactive_browser == Some(id) {
                 Color32::from_rgb(207, 161, 57) // Gold: live interaction mode
-            } else if alt_held && !is_playlist {
+            } else if cropping {
                 Color32::from_rgb(255, 150, 100) // Orange for crop mode
             } else {
                 Color32::from_rgb(74, 158, 255) // #4a9eff blue accent
@@ -6622,7 +7190,7 @@ impl CanvasState {
             );
 
             // Minimal Void: Smaller, more subtle resize handles
-            let handle_size = 6.0; // Reduced from 8.0
+            let handle_size = if self.crop_mode == Some(id) { 8.0 } else { 6.0 };
             let handles = [
                 (screen_rect.left_top(), ResizeHandle::TopLeft),
                 (screen_rect.center_top(), ResizeHandle::Top),
@@ -6640,7 +7208,7 @@ impl CanvasState {
                     Rect::from_center_size(handle_pos, Vec2::splat(RESIZE_HANDLE_HIT_SIZE));
 
                 // Minimal Void: Clean handles matching selection color
-                let handle_fill = if alt_held && !is_playlist {
+                let handle_fill = if cropping {
                     Color32::from_rgb(255, 150, 100) // Orange for crop mode
                 } else {
                     Color32::from_rgb(74, 158, 255) // Match accent color
@@ -6660,9 +7228,9 @@ impl CanvasState {
                     ui.ctx().set_cursor_icon(handle_type.cursor());
                 }
 
-                // Handle drag start - check if Alt is held for crop mode.
+                // The menu mode and Alt shortcut share the same crop geometry.
                 if handle_response.drag_started() {
-                    if alt_held && (frame_size.is_some() || is_video) && !is_playlist {
+                    if cropping {
                         // Start crop mode
                         let current_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
                         self.drag_state = Some(DragState::Cropping {

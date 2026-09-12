@@ -5,6 +5,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# The workstation harness uses ExecutableOnly; it must never enter release ZIPs.
+if (-not $ExecutableOnly -and $env:PLURIVIEW_LOCAL_PERFORMANCE -eq "1") {
+    throw "Release packaging requires PLURIVIEW_LOCAL_PERFORMANCE to be unset. Local performance builds are executable-only."
+}
+
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $sysroot = (& rustc --print sysroot).Trim()
 $rustupMarker = "$([IO.Path]::DirectorySeparatorChar).rustup$([IO.Path]::DirectorySeparatorChar)"
@@ -162,10 +167,14 @@ try {
     $libmpvHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distLibmpv).Hash
     $eglHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distEgl).Hash
     $glesHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distGles).Hash
+    $expectedLibmpvHash = "ADE5CAC46CFC397A3D5CD356A968CDA7ACF0DEBFFB705A16509DAFDF93029F5E"
     $expectedEglHash = "FFC4565AD5839AC9FE6719D399B7E90CF5C7984E609D7876DE1D9FA9BF9EDAF3"
     $expectedGlesHash = "CB302095BACCBEC3BD30184A837B342E3260970C9934558762A5415FB85D12BA"
     if ($eglHash -ne $expectedEglHash -or $glesHash -ne $expectedGlesHash) {
         throw "The ANGLE runtime does not match the pinned standalone build. Run .\scripts\prepare-angle.ps1, then build again."
+    }
+    if ($libmpvHash -ne $expectedLibmpvHash) {
+        throw "The libmpv runtime does not match the pinned build. Run .\scripts\prepare-libmpv.ps1, then build again."
     }
 
     $metadataJson = & cargo metadata --locked --no-deps --format-version 1
@@ -179,18 +188,18 @@ try {
     }
 
     $fullArchive = Join-Path $distDirectory "Pluriview-v$releaseVersion-windows-x64-full.zip"
-    $liteArchive = Join-Path $distDirectory "Pluriview-v$releaseVersion-windows-x64-lite.zip"
+    # Remove this version's obsolete Lite output when rebuilding an existing dist.
+    $legacyLiteArchive = Join-Path $distDirectory "Pluriview-v$releaseVersion-windows-x64-lite.zip"
     $checksumManifest = Join-Path $distDirectory "SHA256SUMS.txt"
     $fullStageDirectory = Join-Path $distDirectory ".full-package-stage"
-    $liteStageDirectory = Join-Path $distDirectory ".lite-package-stage"
 
-    foreach ($path in @($fullArchive, $liteArchive, $checksumManifest)) {
+    foreach ($path in @($fullArchive, $legacyLiteArchive, $checksumManifest)) {
         if (Test-Path -LiteralPath $path) {
             Remove-Item -LiteralPath $path -Force
         }
     }
 
-    foreach ($stageDirectory in @($fullStageDirectory, $liteStageDirectory)) {
+    foreach ($stageDirectory in @($fullStageDirectory)) {
         if (Test-Path -LiteralPath $stageDirectory) {
             $resolvedStage = (Resolve-Path -LiteralPath $stageDirectory).Path
             $expectedStage = [IO.Path]::GetFullPath($stageDirectory)
@@ -207,12 +216,9 @@ try {
 
     try {
         $fullStageLib = Join-Path $fullStageDirectory "lib"
-        $liteStageLib = Join-Path $liteStageDirectory "lib"
         New-Item -ItemType Directory -Path $fullStageLib -Force | Out-Null
-        New-Item -ItemType Directory -Path $liteStageLib -Force | Out-Null
 
         Copy-Item -LiteralPath $distExecutable -Destination $fullStageDirectory
-        Copy-Item -LiteralPath $distExecutable -Destination $liteStageDirectory
         foreach ($runtimeFile in @(
             $distEgl,
             $distGles,
@@ -222,7 +228,6 @@ try {
             $distApacheLicense
         )) {
             Copy-Item -LiteralPath $runtimeFile -Destination $fullStageLib
-            Copy-Item -LiteralPath $runtimeFile -Destination $liteStageLib
         }
         Copy-Item -LiteralPath $distLibmpv -Destination $fullStageLib
 
@@ -230,12 +235,8 @@ try {
             (Join-Path $fullStageDirectory "pluriview.exe"),
             $fullStageLib
         ) -DestinationPath $fullArchive -CompressionLevel Optimal
-        Compress-Archive -LiteralPath @(
-            (Join-Path $liteStageDirectory "pluriview.exe"),
-            $liteStageLib
-        ) -DestinationPath $liteArchive -CompressionLevel Optimal
     } finally {
-        foreach ($stageDirectory in @($fullStageDirectory, $liteStageDirectory)) {
+        foreach ($stageDirectory in @($fullStageDirectory)) {
             if (Test-Path -LiteralPath $stageDirectory) {
                 $resolvedStage = (Resolve-Path -LiteralPath $stageDirectory).Path
                 $expectedStage = [IO.Path]::GetFullPath($stageDirectory)
@@ -250,7 +251,7 @@ try {
         }
     }
 
-    $publishedAssets = @($fullArchive, $liteArchive)
+    $publishedAssets = @($fullArchive)
     $checksumLines = foreach ($asset in $publishedAssets) {
         $assetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
         "$assetHash  $(Split-Path -Leaf $asset)"
@@ -265,9 +266,8 @@ try {
     Write-Host "libEGL SHA-256: $eglHash"
     Write-Host "libGLESv2 SHA-256: $glesHash"
     Write-Host "Full release: $fullArchive"
-    Write-Host "Lite release: $liteArchive"
     Write-Host "Checksums: $checksumManifest"
-    Write-Warning "Publish the two versioned zip archives and SHA256SUMS.txt. Do not publish pluriview.pdb; debug symbols can contain local source paths."
+    Write-Warning "Publish the Full zip archive and SHA256SUMS.txt. Do not publish pluriview.pdb; debug symbols can contain local source paths."
 } finally {
     if ($null -eq $previousRustFlags) {
         Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue

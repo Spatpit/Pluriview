@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-11
+
+### Added
+- App-wide Always on Top in the empty-canvas and tray menus, remembered across launches. Tray-only Click Through lets mouse input reach apps underneath while previews keep playing; turn it off or use Show Pluriview in the tray to restore interaction. Click-through starts disabled on launch.
+
+### Changed
+- Disabled automatic Dependabot version-update pull requests for Cargo and GitHub Actions. Dependency updates are reviewed manually; scheduled and release-time RustSec audits remain enabled.
+- Starting with v0.7.0, releases provide only the Full package with the video runtime included. Discontinued Lite builds and their GitHub release assets.
+- Menu shortcut hints now use a separate right-aligned column and reflect configured bindings, including saved viewpoints and matching canvas/tile actions.
+- Replaced the playlist header's brown folder badge with a pale-blue filmstrip on a subtle blue background.
+- Refreshed the top bar, window picker, quick-add popup, and context menus with coordinated charcoal surfaces, warm gold accents, clearer headings, and roomier controls.
+- Window picker search now has a clear button and visible empty states; long window and Spout names are ellipsized with full-name tooltips. The Spout section stays out of the way when Spout is absent.
+- Tile menus put frame-rate choices in a submenu and scroll when needed to keep every action reachable on smaller windows.
+- Updated Windows Graphics Capture integration to windows-capture 2.0.1, retaining GPU downsampling and reusable frame-readback storage.
+- Crop menus now offer an in-tile editing mode with highlighted edge/corner handles. Click empty canvas, press Escape, or choose Finish Cropping to leave the mode; Alt+drag remains available. Replaces the external source-window region selector.
+- Redesigned the browser and stream source dialogs with consistent headers, URL fields with adjacent Paste controls, clear primary actions, compact recent website rows, and editable stream quality with presets. Added Enter submission for streams and Escape cancellation for both dialogs.
+
+### Fixed
+- Fixed Add Window occasionally closing immediately after selection from the canvas menu when popup placement shifted near a window edge. The picker now opens after the menu click finishes.
+- Prevented shortcut rows from expanding popups to their provisional width, aligned toggle labels, and kept saved-viewpoint names, shortcut hints, and overflow controls within compact menu bounds.
+- Release packaging rejects local performance builds and verifies the pinned libmpv runtime checksum alongside the ANGLE checksums.
+- Canvas shortcuts no longer act behind an open browser or stream source dialog.
+- Reduced CPU work when resizing captured windows by scaling frames on the capture GPU before readback, preserving the existing pixel averages and falling back to CPU resizing on unsupported devices.
+- Browser tiles no longer take keyboard focus while their background hosts are created, avoiding a startup stall observed when adding several tiles together.
+- Reduced redundant GIF and video redraws, including high-frequency canvas redraws driven by off-screen videos, while preserving playback and authored animation timing.
+
 ## [0.6.9] - 2026-09-06
 
 ### Added

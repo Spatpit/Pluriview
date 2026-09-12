@@ -1,5 +1,7 @@
 mod coordinator;
 mod downsample;
+#[cfg(windows)]
+mod gpu_downsample;
 mod spout;
 
 pub use coordinator::CaptureCoordinator;

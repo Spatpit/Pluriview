@@ -29,14 +29,17 @@ with transparent widgets and a moving wallpaper.
 
 Get the latest version from **[Releases](https://github.com/Spatpit/Pluriview/releases)**.
 
-| Version | Choose this if… |
-|---|---|
-| **Full — recommended** | You want all features, including local videos, folder playlists, and video wallpapers. |
-| **Lite** | You need live windows, browser tiles, Spout2 sources, images, and GIFs. |
+Starting with v0.7.0, Pluriview is available as a single **Full** download with
+all features, including local videos, folder playlists, and video wallpapers.
+The Lite package is no longer offered for new releases.
 
 1. Download and extract the ZIP.
 2. Keep the included `lib` folder beside `pluriview.exe`.
 3. Launch `pluriview.exe` and start adding content.
+
+**Updating:** close Pluriview before replacing `pluriview.exe` and the included
+`lib` folder. Keep your existing `pluriview_data` folder to preserve workspaces,
+settings, and browser data. See the [changelog](CHANGELOG.md) for changes.
 
 **Requirements:** Windows 10 version 1903 or newer, or Windows 11, with a
 DirectX 11-compatible GPU.
@@ -74,6 +77,17 @@ Press `F1` to see shortcuts.
 Use the **Window Picker** to add an open application as a live tile. You can
 resize, crop, freeze, or pin its preview.
 
+Choose **Crop → Edit Crop** from a tile's right-click menu, then drag the
+highlighted edge or corner handles directly on the tile. Click empty canvas,
+press **Esc**, or choose **Finish Cropping** to finish. **Clear Crop** restores
+the full source. This also works for browser, image/GIF, video, and Spout tiles,
+including tiles pinned to the viewport. The **Alt+drag** shortcut remains available.
+
+Search by window title or application name, then use **+** to add the source.
+Clear the search with **×**; hover a shortened name to read it in full.
+Right-click a tile for its settings, including the **Frame Rate** submenu.
+Menu shortcuts appear on the right and follow your bindings in **Settings**.
+
 Live Spout2 senders appear in the same picker. Select one to display its shared
 output on the canvas.
 
@@ -83,6 +97,8 @@ Browser tiles let you place live web pages on the canvas, including streams,
 chats, dashboards, and overlay widgets.
 
 Right-click the canvas → **Add Browser...**, then paste a web address.
+Use **Paste** beside the URL field or select a recent website. Press **Enter**
+to add the page, or **Esc** to cancel.
 
 #### Arrange the tile or use the website
 
@@ -180,6 +196,9 @@ To open a supported stream URL in a **video tile**, install
 menu. Configure Streamlink in **Settings** if Pluriview does not find it
 automatically.
 
+The Add Stream dialog lets you type a quality or use **Choose** for the best,
+lowest, or detected qualities. Custom quality values remain supported.
+
 Video-tile streams require the video runtime included in the Full download.
 Live streams do not provide seek-bar thumbnails.
 
@@ -187,13 +206,19 @@ Live streams do not provide seek-bar thumbnails.
 
 | Option | What it does |
 |---|---|
-| **Crop** | Shows only the part of a tile you need. Hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
+| **Crop** | Shows only the part of a tile you need. Use **Crop → Edit Crop** to drag its handles, or hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
 | **Pin to Viewport** | Keeps any tile fixed on screen while you pan or zoom the canvas. |
 | **Freeze** | Holds the current frame of selected tiles until you resume them. |
 | **Focus on This Tile** | Fits a tile to the canvas. Press `Esc` to return. |
 | **Canvas-only mode** | Hides the interface with `H`; right-click menus remain available. |
 | **Capture FPS** | Chooses 15, 30, or 60 FPS for live previews. |
 | **System tray** | Keeps Pluriview available while minimized to the tray. |
+| **Always on Top** | Keeps Pluriview above ordinary windows. Toggle it from the empty-canvas right-click menu or the tray menu; the setting is remembered across launches. |
+| **Click Through** | Passes mouse clicks to the apps underneath. Enable or disable it from the tray menu. Browser interaction ends while previews and playback continue. |
+
+For an overlay, enable **Always on Top**, then **Click Through** in the tray.
+To interact with Pluriview again, turn off **Click Through** or select
+**Show Pluriview** from the tray. Click-through starts disabled after a restart.
 
 ### Wallpapers
 
@@ -278,7 +303,7 @@ your installation still uses `Numpad 2`.
 <details>
 <summary><strong>Included components and optional tools</strong></summary>
 
-Both downloads include the ANGLE rendering runtime in the `lib` folder:
+The download includes the ANGLE rendering runtime in the `lib` folder:
 
 - `libEGL.dll`
 - `libGLESv2.dll`
@@ -328,13 +353,19 @@ cd Pluriview
 
 The release script builds with local path remapping, checks the executable for
 local-path and credential-like strings, and creates the packaged output in
-`dist`.
+`dist`. Packaging verifies the pinned runtime checksums and rejects local
+performance builds; leave `PLURIVIEW_LOCAL_PERFORMANCE` unset for releases.
 
-Output includes Full and Lite ZIP archives, runtime libraries, third-party
+Output includes the Full ZIP archive, runtime libraries, third-party
 notices, and `SHA256SUMS.txt`.
 
 Keep the `lib` folder beside the executable. Do not distribute `pluriview.pdb`,
 which can contain local paths.
+
+The capture resize shader is included as precompiled bytecode, so normal builds
+need no shader compiler. After editing `src/capture/shaders/area_average.hlsl`,
+run `.\scripts\compile-capture-shader.ps1` with the Windows SDK installed and
+include the regenerated `.cso` alongside the shader source.
 
 </details>
 

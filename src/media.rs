@@ -8,6 +8,21 @@ use std::time::Duration;
 /// Avoid allowing a pathological animation to consume unbounded memory.
 const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
+
+/// egui 0.29 subtracts its predicted frame time from repaint delays. GIF deadlines
+/// already use wall-clock time, so compensate to avoid repeatedly waking early.
+#[track_caller]
+pub fn request_animation_repaint(ctx: &eframe::egui::Context, remaining: Duration) {
+    let predicted = ctx.input(|input| input.predicted_dt);
+    ctx.request_repaint_after(animation_repaint_delay(remaining, predicted));
+}
+
+fn animation_repaint_delay(remaining: Duration, predicted: f32) -> Duration {
+    remaining
+        .max(Duration::from_millis(1))
+        .saturating_add(Duration::try_from_secs_f32(predicted).unwrap_or_default())
+}
+
 const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 const VIDEO_EXTENSIONS: [&str; 15] = [
     "mp4", "mkv", "webm", "avi", "mov", "m4v", "wmv", "flv", "mpeg", "mpg", "ts", "m2ts", "3gp",
@@ -230,6 +245,38 @@ mod tests {
     use image::{Delay, Frame, Rgba, RgbaImage};
     use std::fs::{self, File};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn animation_repaint_preserves_wall_clock_deadline() {
+        let ctx = eframe::egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |_| {});
+        }
+        for remaining in [Duration::from_millis(3), Duration::from_millis(83)] {
+            let output = ctx.run(Default::default(), |ctx| {
+                super::request_animation_repaint(ctx, remaining);
+            });
+            assert_eq!(
+                output.viewport_output[&eframe::egui::ViewportId::ROOT].repaint_delay,
+                remaining
+            );
+        }
+    }
+
+    #[test]
+    fn animation_repaint_handles_overdue_and_invalid_prediction() {
+        let predicted = 1.0 / 60.0;
+        assert_eq!(
+            super::animation_repaint_delay(Duration::ZERO, predicted),
+            Duration::from_millis(1) + Duration::from_secs_f32(predicted)
+        );
+        for predicted in [f32::NAN, f32::INFINITY, -1.0] {
+            assert_eq!(
+                super::animation_repaint_delay(Duration::from_millis(83), predicted),
+                Duration::from_millis(83)
+            );
+        }
+    }
 
     #[test]
     fn common_video_extensions_are_detected_case_insensitively() {

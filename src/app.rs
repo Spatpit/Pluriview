@@ -12,7 +12,6 @@ use crate::hotkeys::{Hotkey, HotkeyBindings, HotkeySlot, HotkeyTracker};
 #[cfg(windows)]
 use crate::libmpv::{SeekPreviewManager, VideoManager, VideoSnapshot};
 use crate::media;
-use crate::overlay::RegionSelector;
 use crate::persistence::{
     AppConfig, CanvasLayout, CanvasView, SavedLayout, Storage, WallpaperLayout, WindowLayout,
     WorkspaceIndex, WorkspaceSaveState,
@@ -27,7 +26,13 @@ use crate::preview::{
 use crate::privacy;
 use crate::tray::TrayManager;
 use crate::video::{self, VideoLaunch, VideoUpdate};
+use crate::window_controls::{WindowAction, WindowControls};
 use crate::window_picker::{enumerate_windows, spawn_preview, WindowInfo, WindowPicker};
+// The optional include also lets rustfmt work in clones without local tests.
+#[cfg(all(windows, pluriview_performance))]
+pub(crate) mod performance {
+    include!("app/performance.rs");
+}
 use eframe::egui::{self, Pos2, Vec2};
 #[cfg(windows)]
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -117,7 +122,7 @@ fn clipboard_text() -> Result<String, &'static str> {
 }
 
 /// Custom title bar height when fully visible (also the window-control hit size).
-const TITLE_BAR_HEIGHT: f32 = 34.0;
+const TITLE_BAR_HEIGHT: f32 = 40.0;
 /// Leftover strip while auto-hidden so the top window edge stays an egui hit
 /// target (native tiles cannot steal those pixels).
 const TITLE_BAR_COLLAPSED_HEIGHT: f32 = 2.0;
@@ -382,6 +387,112 @@ struct QuickAddPopup {
     /// Snapshot of open windows, taken when the popup was opened.
     windows: Vec<WindowInfo>,
     search: String,
+    /// Wait until the context-menu click has finished before accepting input.
+    opening: bool,
+}
+
+fn quick_add_popup_ui(popup: &mut QuickAddPopup, ctx: &egui::Context) -> (bool, Option<usize>) {
+    if std::mem::take(&mut popup.opening) {
+        // A constrained context menu may put Add Window outside this popup's
+        // bounds. Processing its release here would immediately dismiss the
+        // picker (or select a stale row from its previous placement).
+        ctx.request_repaint();
+        return (false, None);
+    }
+    // Read this before drawing the popup: the focused search box's
+    // TextEdit consumes the Escape key itself (to drop focus), so
+    // checking afterwards would always see it as already consumed.
+    let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let mut clicked_index = None;
+
+    let area_response = egui::Area::new(egui::Id::new("quick_add_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(popup.screen_pos)
+        .constrain(true)
+        .show(ctx, |ui| {
+            egui::Frame::menu(ui.style())
+                .inner_margin(egui::Margin::same(10.0))
+                .show(ui, |ui| {
+                    crate::ui_theme::menu(ui);
+                    ui.set_width(288.0);
+                    ui.label(egui::RichText::new("Add a window").size(17.0).strong());
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(egui_phosphor::regular::MAGNIFYING_GLASS)
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(140, 140, 150)),
+                        );
+                        ui.add_space(6.0);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut popup.search)
+                                .desired_width(ui.available_width())
+                                .hint_text("Search windows...")
+                                .frame(false),
+                        );
+                        resp.request_focus();
+                    });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    let filter = popup.search.to_lowercase();
+                    let matches = |w: &WindowInfo| w.matches_filter(&filter);
+
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            let mut any = false;
+                            for (idx, window) in popup.windows.iter().enumerate() {
+                                if !matches(window) {
+                                    continue;
+                                }
+                                any = true;
+
+                                let label = if window.title.is_empty() {
+                                    &window.exe_name
+                                } else {
+                                    &window.title
+                                };
+                                let resp = ui
+                                    .add_sized(
+                                        Vec2::new(ui.available_width(), 32.0),
+                                        egui::Button::new(egui::RichText::new(label).size(14.0))
+                                            .truncate()
+                                            .frame(false),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{}\n{}",
+                                        window.title, window.exe_name
+                                    ));
+                                if resp.clicked() {
+                                    clicked_index = Some(idx);
+                                }
+                            }
+
+                            if !any {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new("No matching windows")
+                                        .size(11.5)
+                                        .color(egui::Color32::from_rgb(120, 120, 128)),
+                                );
+                            }
+                        });
+                });
+        });
+
+    if ctx.input(|i| i.pointer.any_click()) {
+        if let Some(click_pos) = ctx.input(|i| i.pointer.interact_pos()) {
+            if !area_response.response.rect.contains(click_pos) {
+                close = true;
+            }
+        }
+    }
+
+    (close, clicked_index)
 }
 
 struct AddBrowserDialog {
@@ -466,25 +577,30 @@ fn canvas_views_menu_contents(
     active_canvas_view_modified: bool,
     keyboard_shortcuts: &HotkeyBindings,
 ) -> Option<CanvasViewMenuAction> {
+    // Fixed, bounded rows leave room for the shortcut and overflow button.
+    // Never expand to an Area's provisional width during popup measurement.
+    ui.set_width(264.0);
     let mut action = None;
     if canvas_views.is_empty() {
         ui.label(egui::RichText::new("No saved viewpoints").weak());
     } else {
-        let previous_label = format!(
-            "Previous Viewpoint ({})",
-            keyboard_shortcuts
-                .get(HotkeySlot::PreviousCanvasView)
-                .display()
-        );
-        if ui.button(previous_label).clicked() {
+        if ui
+            .add(crate::ui_theme::shortcut_button(
+                "Previous Viewpoint",
+                keyboard_shortcuts.get(HotkeySlot::PreviousCanvasView),
+            ))
+            .clicked()
+        {
             action = Some(CanvasViewMenuAction::Previous);
             ui.close_menu();
         }
-        let next_label = format!(
-            "Next Viewpoint ({})",
-            keyboard_shortcuts.get(HotkeySlot::NextCanvasView).display()
-        );
-        if ui.button(next_label).clicked() {
+        if ui
+            .add(crate::ui_theme::shortcut_button(
+                "Next Viewpoint",
+                keyboard_shortcuts.get(HotkeySlot::NextCanvasView),
+            ))
+            .clicked()
+        {
             action = Some(CanvasViewMenuAction::Next);
             ui.close_menu();
         }
@@ -501,9 +617,6 @@ fn canvas_views_menu_contents(
                     if is_active && active_canvas_view_modified {
                         label.push_str(" (modified)");
                     }
-                    if let Some(slot) = HotkeySlot::CANVAS_VIEWS.get(index) {
-                        label.push_str(&format!("  {}", keyboard_shortcuts.get(*slot).display()));
-                    }
                     let text = if is_active {
                         egui::RichText::new(label).color(if active_canvas_view_modified {
                             egui::Color32::from_rgb(220, 180, 95)
@@ -513,15 +626,27 @@ fn canvas_views_menu_contents(
                     } else {
                         egui::RichText::new(label)
                     };
+                    let mut button = egui::Button::new(text).truncate();
+                    if let Some(slot) = HotkeySlot::CANVAS_VIEWS.get(index) {
+                        button = button.shortcut_text(crate::ui_theme::shortcut_text(
+                            keyboard_shortcuts.get(*slot),
+                        ));
+                    }
                     if ui
-                        .button(text)
-                        .on_hover_text("Move smoothly to this saved viewpoint")
+                        // The nested menu includes an arrow as well as the
+                        // ellipsis, so reserve its full button width.
+                        .add_sized([200.0, 28.0], button)
+                        .on_hover_text(format!(
+                            "{}\nMove smoothly to this saved viewpoint",
+                            view.name
+                        ))
                         .clicked()
                     {
                         action = Some(CanvasViewMenuAction::Jump(index));
                         ui.close_menu();
                     }
                     ui.menu_button(egui_phosphor::regular::DOTS_THREE, |ui| {
+                        crate::ui_theme::menu(ui);
                         if ui.button("Update from Current Viewpoint").clicked() {
                             action = Some(CanvasViewMenuAction::Update(index));
                             ui.close_menu();
@@ -698,6 +823,14 @@ fn restored_browser_ready(
                 .is_some_and(|(tile, viewport)| tile.intersects(viewport)))
 }
 
+#[cfg(windows)]
+fn video_tile_needs_canvas_repaint(preview: &Preview, viewport: Option<egui::Rect>) -> bool {
+    preview.is_video()
+        && !preview.manually_frozen
+        && (preview.viewport_pin.is_some()
+            || viewport.is_none_or(|viewport| viewport.intersects(preview.rect())))
+}
+
 /// Main application state
 pub struct PluriviewApp {
     brand_icon: egui::TextureHandle,
@@ -819,6 +952,7 @@ pub struct PluriviewApp {
 
     /// System tray manager
     tray_manager: Option<TrayManager>,
+    window_controls: WindowControls,
 
     /// Has the window HWND been set for the tray manager?
     hwnd_set: bool,
@@ -841,12 +975,6 @@ pub struct PluriviewApp {
 
     /// Validation feedback for the keyboard shortcut editor.
     hotkey_error: Option<String>,
-
-    /// Active region selector overlay (if any)
-    region_selector: Option<RegionSelector>,
-
-    /// Preview ID that the region selector is for
-    region_select_preview_id: Option<PreviewId>,
 
     /// Active canvas right-click "Add Window..." popup, if any.
     quick_add: Option<QuickAddPopup>,
@@ -911,13 +1039,17 @@ pub struct PluriviewApp {
 
 impl PluriviewApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_storage(_cc, Storage::new())
+    }
+
+    fn with_storage(_cc: &eframe::CreationContext<'_>, storage: Option<Storage>) -> Self {
         // Register phosphor icon glyphs alongside the default font so we can
         // use crisp vector icons instead of emoji/text glyphs in the UI.
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         _cc.egui_ctx.set_fonts(fonts);
+        crate::ui_theme::install(&_cc.egui_ctx);
 
-        let storage = Storage::new();
         let (app_config, config_error) = match &storage {
             Some(storage) => match storage.load_config() {
                 Ok(config) => (config, None),
@@ -947,7 +1079,8 @@ impl PluriviewApp {
                 false,
             ),
         };
-        let tray_manager = TrayManager::new();
+        let window_controls = WindowControls::new(app_config.always_on_top);
+        let tray_manager = TrayManager::new(_cc.egui_ctx.clone(), app_config.always_on_top);
 
         #[cfg(debug_assertions)]
         if tray_manager.is_some() {
@@ -1016,6 +1149,7 @@ impl PluriviewApp {
             workspace_save: WorkspaceSaveState::default(),
             last_workspace_autosave_check: Instant::now(),
             tray_manager,
+            window_controls,
             hwnd_set: false,
             show_about: false,
             show_shortcuts: false,
@@ -1023,8 +1157,6 @@ impl PluriviewApp {
             hotkey_recording: None,
             hotkey_recording_first: None,
             hotkey_error: None,
-            region_selector: None,
-            region_select_preview_id: None,
             quick_add: None,
             media_error: None,
             external_tool_error: None,
@@ -1445,7 +1577,7 @@ impl PluriviewApp {
 
     /// Drain mpv IPC without waiting and mirror the latest state onto previews.
     #[cfg(windows)]
-    fn poll_video_manager(&mut self, ctx: &egui::Context) {
+    fn poll_video_manager(&mut self) {
         let updates = self.video_manager.poll();
         if updates.is_empty() {
             self.restore_ready_video_checkpoints();
@@ -1530,7 +1662,9 @@ impl PluriviewApp {
         }
 
         self.restore_ready_video_checkpoints();
-        ctx.request_repaint();
+        // Polling runs before the canvas is drawn, so the new playback state
+        // is already visible in this pass. Another immediate repaint would
+        // add egui's settling passes for every time-position update.
     }
 
     #[cfg(windows)]
@@ -3018,78 +3152,73 @@ impl PluriviewApp {
         if let Some(dialog) = self.add_browser.as_mut() {
             let editing = dialog.target.is_some();
             let recent_urls = &self.recent_urls;
-            egui::Window::new(if editing { "Change URL" } else { "Add Browser" })
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Paste a website URL");
-                    let mut paste_requested = false;
-                    let response = ui.add_sized(
-                        [420.0, 24.0],
-                        egui::TextEdit::singleline(&mut dialog.url)
-                            .hint_text("twitch.tv/channel or https://kick.com/channel"),
-                    );
-                    response.context_menu(|ui| {
-                        if ui.button("Paste").clicked() {
-                            paste_requested = true;
-                            ui.close_menu();
+            let title = if editing { "Change URL" } else { "Add Browser" };
+            crate::source_dialog::window(ctx, title).show(ctx, |ui| {
+                cancel |= crate::source_dialog::header(
+                    ui,
+                    egui_phosphor::regular::GLOBE,
+                    title,
+                    if editing {
+                        "Open a different page in this tile."
+                    } else {
+                        "Websites, chats, and overlays on your canvas."
+                    },
+                );
+                let (response, paste_requested) =
+                    crate::source_dialog::url_input(ui, &mut dialog.url, "https://example.com");
+                if !dialog.focused {
+                    response.request_focus();
+                    dialog.focused = true;
+                }
+                if response.changed() {
+                    dialog.error = None;
+                }
+
+                // Pressing Enter in a TextEdit surrenders focus that same
+                // frame, so lost_focus + Enter is the reliable submit check.
+                let submitted =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+                if paste_requested {
+                    match clipboard_text() {
+                        Ok(text) if !text.trim().is_empty() => {
+                            dialog.url = text.trim().to_owned();
+                            dialog.error = None;
+                            response.request_focus();
                         }
-                    });
-                    if !dialog.focused {
-                        response.request_focus();
-                        dialog.focused = true;
+                        Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
+                        Err(error) => dialog.error = Some(error.to_owned()),
                     }
-                    if let Some(error) = &dialog.error {
-                        ui.colored_label(egui::Color32::from_rgb(255, 100, 100), error);
-                    }
+                }
 
-                    // Pressing Enter in a TextEdit surrenders focus that same
-                    // frame, so lost_focus + Enter is the reliable submit check.
-                    let submitted = response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
-
-                    ui.horizontal(|ui| {
-                        let label = if editing { "Load" } else { "Add" };
-                        if ui.button(label).clicked() || submitted {
-                            submit = Some((dialog.url.clone(), dialog.position, dialog.target));
-                        }
-                        if ui.button("Paste").clicked() {
-                            paste_requested = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-
-                    if paste_requested {
-                        match clipboard_text() {
-                            Ok(text) if !text.trim().is_empty() => {
-                                dialog.url = text.trim().to_owned();
-                                dialog.error = None;
-                                response.request_focus();
+                if !recent_urls.is_empty() {
+                    ui.add_space(14.0);
+                    crate::ui_theme::section(ui, "RECENT WEBSITES");
+                    egui::ScrollArea::vertical()
+                        .id_salt("recent_browser_urls")
+                        .max_height((ctx.screen_rect().height() - 290.0).clamp(50.0, 194.0))
+                        .show(ui, |ui| {
+                            for url in recent_urls.iter().take(5) {
+                                if crate::source_dialog::recent_url(ui, url).clicked() {
+                                    submit = Some((url.clone(), dialog.position, dialog.target));
+                                }
                             }
-                            Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
-                            Err(error) => dialog.error = Some(error.to_owned()),
-                        }
-                    }
-
-                    if !recent_urls.is_empty() {
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Recent").weak().small());
-                        for url in recent_urls.iter().take(5) {
-                            if ui
-                                .add(
-                                    egui::Button::new(egui::RichText::new(url).size(11.5))
-                                        .frame(false),
-                                )
-                                .clicked()
-                            {
-                                submit = Some((url.clone(), dialog.position, dialog.target));
-                            }
-                        }
-                    }
-                });
+                        });
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(crate::ui_theme::DANGER, error);
+                }
+                let ready = !dialog.url.trim().is_empty();
+                let (clicked, cancelled) = crate::source_dialog::footer(
+                    ui,
+                    if editing { "Load page" } else { "Add browser" },
+                    ready,
+                );
+                cancel |= cancelled;
+                if ready && (clicked || submitted) {
+                    submit = Some((dialog.url.clone(), dialog.position, dialog.target));
+                }
+            });
         }
 
         if cancel {
@@ -3181,98 +3310,77 @@ impl PluriviewApp {
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
 
-            egui::Window::new("Add Stream")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("Stream URL");
-                    let mut paste_requested = false;
-                    let response = ui.add_sized(
-                        [460.0, 24.0],
-                        egui::TextEdit::singleline(&mut dialog.url)
-                            .hint_text("https://example.com/channel"),
-                    );
-                    response.context_menu(|ui| {
-                        if ui.button("Paste").clicked() {
-                            paste_requested = true;
-                            ui.close_menu();
-                        }
-                    });
-                    if !dialog.focused {
-                        response.request_focus();
-                        dialog.focused = true;
+            crate::source_dialog::window(ctx, "Add Stream").show(ctx, |ui| {
+                cancel |= crate::source_dialog::header(
+                    ui,
+                    egui_phosphor::regular::BROADCAST,
+                    "Add Stream",
+                    "Play a live stream as a video tile.",
+                );
+                let (response, paste_requested) = crate::source_dialog::url_input(
+                    ui,
+                    &mut dialog.url,
+                    "https://example.com/channel",
+                );
+                if !dialog.focused {
+                    response.request_focus();
+                    dialog.focused = true;
+                }
+                if response.changed() {
+                    dialog.error = None;
+                    dialog.probe_error = None;
+                    dialog.probe_receiver = None;
+                    dialog.probing_url.clear();
+                    dialog.qualities.clear();
+                    if dialog.url.trim().is_empty() {
+                        dialog.probe_due = None;
+                    } else {
+                        dialog.probe_due = Some(Instant::now() + Duration::from_millis(400));
                     }
-                    if response.changed() {
-                        dialog.error = None;
-                        dialog.probe_error = None;
-                        if dialog.url.trim().is_empty() {
-                            dialog.probe_due = None;
+                }
+
+                let quality_response =
+                    crate::source_dialog::quality_input(ui, &mut dialog.quality, &dialog.qualities);
+                if dialog.probe_receiver.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(12.0));
+                        ui.label(
+                            egui::RichText::new("Finding available qualities...")
+                                .size(12.0)
+                                .color(crate::ui_theme::SECONDARY),
+                        );
+                    });
+                } else if let Some(error) = &dialog.probe_error {
+                    ui.colored_label(crate::ui_theme::GOLD, error);
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(crate::ui_theme::DANGER, error);
+                }
+
+                let ready = !dialog.url.trim().is_empty();
+                let (clicked, cancelled) = crate::source_dialog::footer(ui, "Add stream", ready);
+                let entered = (response.lost_focus() || quality_response.lost_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                submit = ready && (clicked || entered);
+                cancel |= cancelled;
+
+                if paste_requested {
+                    match clipboard_text() {
+                        Ok(text) if !text.trim().is_empty() => {
+                            dialog.url = text.trim().to_owned();
+                            dialog.error = None;
+                            dialog.probe_error = None;
                             dialog.probe_receiver = None;
                             dialog.probing_url.clear();
                             dialog.qualities.clear();
-                        } else {
                             dialog.probe_due = Some(Instant::now() + Duration::from_millis(400));
+                            response.request_focus();
                         }
+                        Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
+                        Err(error) => dialog.error = Some(error.to_owned()),
                     }
-
-                    ui.add_space(6.0);
-                    ui.label("Quality");
-                    ui.add_sized(
-                        [220.0, 24.0],
-                        egui::TextEdit::singleline(&mut dialog.quality).hint_text("best"),
-                    );
-                    if !dialog.qualities.is_empty() {
-                        egui::ComboBox::from_id_salt("stream_quality_choices")
-                            .selected_text("Detected qualities")
-                            .show_ui(ui, |ui| {
-                                for quality in &dialog.qualities {
-                                    if ui.selectable_label(false, quality).clicked() {
-                                        dialog.quality = quality.clone();
-                                    }
-                                }
-                            });
-                    }
-                    if dialog.probe_receiver.is_some() {
-                        ui.label(egui::RichText::new("Checking available qualities...").weak());
-                    } else if let Some(error) = &dialog.probe_error {
-                        ui.colored_label(egui::Color32::from_rgb(235, 170, 100), error);
-                    }
-                    if let Some(error) = &dialog.error {
-                        ui.colored_label(egui::Color32::from_rgb(255, 100, 100), error);
-                    }
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Add").clicked() {
-                            submit = true;
-                        }
-                        if ui.button("Paste").clicked() {
-                            paste_requested = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-
-                    if paste_requested {
-                        match clipboard_text() {
-                            Ok(text) if !text.trim().is_empty() => {
-                                dialog.url = text.trim().to_owned();
-                                dialog.error = None;
-                                dialog.probe_error = None;
-                                dialog.probe_receiver = None;
-                                dialog.probing_url.clear();
-                                dialog.qualities.clear();
-                                dialog.probe_due =
-                                    Some(Instant::now() + Duration::from_millis(400));
-                                response.request_focus();
-                            }
-                            Ok(_) => dialog.error = Some("The clipboard is empty.".to_owned()),
-                            Err(error) => dialog.error = Some(error.to_owned()),
-                        }
-                    }
-                });
+                }
+            });
         }
 
         if cancel {
@@ -3743,10 +3851,48 @@ impl PluriviewApp {
         }
     }
 
+    fn apply_window_controls(&mut self, ctx: &egui::Context) {
+        if self.window_controls.apply(ctx) {
+            if let Some(tray) = &self.tray_manager {
+                tray.sync_window_controls(
+                    self.window_controls.always_on_top,
+                    self.window_controls.click_through,
+                );
+            }
+        }
+        self.canvas.always_on_top = self.window_controls.always_on_top;
+        if self.app_config.always_on_top != self.window_controls.always_on_top {
+            self.app_config.always_on_top = self.window_controls.always_on_top;
+            self.save_app_config();
+        }
+    }
+
+    fn handle_window_action(&mut self, ctx: &egui::Context, action: WindowAction) {
+        self.window_controls.handle(action);
+        if self.window_controls.click_through {
+            self.canvas.cancel_pointer_interaction();
+            self.hotkey_recording = None;
+            self.hotkey_recording_first = None;
+            ctx.memory_mut(|memory| memory.close_popup());
+            #[cfg(windows)]
+            {
+                // The live WebView is a separate native window. Park it before
+                // making the canvas pass clicks through, including during its
+                // delayed reveal, and keep the captured tile playing normally.
+                if let Some(id) = self.browser.active_id() {
+                    self.browser.park_all();
+                    self.capture_coordinator.resume_capture(id);
+                }
+                self.browser_activated_at = None;
+            }
+        }
+        self.apply_window_controls(ctx);
+    }
+
     /// Custom title bar (we run with `with_decorations(false)` so the OS
     /// doesn't draw its own white title bar over our dark theme).
     fn title_bar_ui(&mut self, ctx: &egui::Context) {
-        let bg = egui::Color32::from_rgb(13, 13, 13);
+        let bg = crate::ui_theme::PANEL;
         let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let workspace_name = self
             .workspaces
@@ -3780,6 +3926,11 @@ impl PluriviewApp {
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
                 ui.set_clip_rect(panel_rect);
+                ui.painter().hline(
+                    panel_rect.x_range(),
+                    panel_rect.bottom() - 0.5,
+                    egui::Stroke::new(1.0, crate::ui_theme::BORDER),
+                );
                 // Keep the chrome laid out at full height and slide it with the
                 // panel so the bar eases in from above instead of popping.
                 let title_bar_rect = egui::Rect::from_min_size(
@@ -3808,15 +3959,21 @@ impl PluriviewApp {
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("Pluriview")
-                                .size(13.0)
-                                .color(egui::Color32::from_rgb(170, 170, 175)),
+                                .size(14.0)
+                                .strong()
+                                .color(crate::ui_theme::TEXT),
                         );
                         ui.add_space(7.0);
-                        ui.label(
-                            egui::RichText::new(format!("/ {workspace_name}"))
-                                .size(12.0)
-                                .color(egui::Color32::from_rgb(105, 105, 112)),
-                        );
+                        ui.add_sized(
+                            [140.0, 24.0],
+                            egui::Label::new(
+                                egui::RichText::new(format!("/ {workspace_name}"))
+                                    .size(13.0)
+                                    .color(crate::ui_theme::SECONDARY),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&workspace_name);
                         ui.add_space(16.0);
                         // File / View / Help, inline next to the app name.
                         self.menu_bar(ui, ctx);
@@ -3909,12 +4066,19 @@ impl PluriviewApp {
         let mut canvas_view_action = None;
 
         ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-        ui.visuals_mut().widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(30, 30, 35);
-        ui.visuals_mut().widgets.active.weak_bg_fill = egui::Color32::from_rgb(40, 40, 45);
+        ui.visuals_mut().widgets.hovered.weak_bg_fill = crate::ui_theme::HOVER;
+        ui.visuals_mut().widgets.active.weak_bg_fill = crate::ui_theme::GOLD_DARK;
 
         egui::menu::bar(ui, |ui| {
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().interact_size.y = 28.0;
             ui.menu_button("File", |ui| {
-                if ui.button("Add Image...").clicked() {
+                crate::ui_theme::menu(ui);
+                crate::ui_theme::section(ui, "ADD TO CANVAS");
+                if crate::ui_theme::action(ui, egui_phosphor::regular::IMAGE, "Add Image...")
+                    .clicked()
+                {
                     let position = self
                         .canvas
                         .last_screen_rect
@@ -3924,7 +4088,9 @@ impl PluriviewApp {
                     ui.close_menu();
                 }
                 #[cfg(windows)]
-                if ui.button("Add Video...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::FILM_STRIP, "Add Video...")
+                    .clicked()
+                {
                     let position = self
                         .canvas
                         .last_screen_rect
@@ -3934,7 +4100,9 @@ impl PluriviewApp {
                     ui.close_menu();
                 }
                 #[cfg(windows)]
-                if ui.button("Add Stream...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::BROADCAST, "Add Stream...")
+                    .clicked()
+                {
                     let position = self
                         .canvas
                         .last_screen_rect
@@ -3944,13 +4112,25 @@ impl PluriviewApp {
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Save Workspace Now").clicked() {
+                if crate::ui_theme::action(
+                    ui,
+                    egui_phosphor::regular::FLOPPY_DISK,
+                    "Save Workspace Now",
+                )
+                .clicked()
+                {
                     if let Err(error) = self.save_active_workspace() {
                         self.workspace_error = Some(error);
                     }
                     ui.close_menu();
                 }
-                if ui.button("Reload Workspace").clicked() {
+                if crate::ui_theme::action(
+                    ui,
+                    egui_phosphor::regular::ARROW_CLOCKWISE,
+                    "Reload Workspace",
+                )
+                .clicked()
+                {
                     self.load_active_workspace();
                     ui.close_menu();
                 }
@@ -3968,6 +4148,8 @@ impl PluriviewApp {
             });
 
             ui.menu_button("Workspace", |ui| {
+                crate::ui_theme::menu(ui);
+                crate::ui_theme::section(ui, "WORKSPACES");
                 ui.label(egui::RichText::new(format!("Current: {active_workspace_name}")).strong());
                 ui.separator();
                 for workspace in &workspace_entries {
@@ -4010,7 +4192,7 @@ impl PluriviewApp {
                 if ui
                     .add_enabled(
                         workspace_entries.len() > 1,
-                        egui::Button::new("Delete Workspace..."),
+                        egui::Button::new(egui::RichText::new("Delete Workspace...").color(crate::ui_theme::DANGER)),
                     )
                     .clicked()
                 {
@@ -4020,29 +4202,15 @@ impl PluriviewApp {
             });
 
             ui.menu_button("View", |ui| {
-                let window_picker_label = format!(
-                    "Window Picker ({})",
-                    self.app_config
-                        .keyboard_shortcuts
-                        .get(HotkeySlot::ToggleWindowPicker)
-                        .display()
-                );
-                if ui
-                    .checkbox(&mut self.picker_open, window_picker_label)
-                    .clicked()
+                crate::ui_theme::menu(ui);
+                crate::ui_theme::section(ui, "APPEARANCE");
+                if crate::ui_theme::shortcut_toggle(ui, &mut self.picker_open, "Window Picker",
+                    self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleWindowPicker)).clicked()
                 {
                     ui.close_menu();
                 }
-                let grid_label = format!(
-                    "Show Grid ({})",
-                    self.app_config
-                        .keyboard_shortcuts
-                        .get(HotkeySlot::ToggleGrid)
-                        .display()
-                );
-                if ui
-                    .checkbox(&mut self.canvas.show_grid, grid_label)
-                    .clicked()
+                if crate::ui_theme::shortcut_toggle(ui, &mut self.canvas.show_grid, "Show Grid",
+                    self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleGrid)).clicked()
                 {
                     ui.close_menu();
                 }
@@ -4069,6 +4237,7 @@ impl PluriviewApp {
                 }
                 ui.separator();
                 ui.menu_button("Saved Viewpoints", |ui| {
+                    crate::ui_theme::menu(ui);
                     canvas_view_action = canvas_views_menu_contents(
                         ui,
                         &canvas_views,
@@ -4111,19 +4280,28 @@ impl PluriviewApp {
                     self.stream_audio_menu(ui);
                 }
                 ui.separator();
-                if ui.button("Settings...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::GEAR, "Settings...").clicked() {
                     self.show_settings = true;
                     ui.close_menu();
                 }
             });
 
             ui.menu_button("Help", |ui| {
-                if ui.button("Keyboard Shortcuts").clicked() {
+                crate::ui_theme::menu(ui);
+                if ui
+                    .add(crate::ui_theme::shortcut_button(
+                        format!("{}   Keyboard Shortcuts", egui_phosphor::regular::KEYBOARD),
+                        self.app_config
+                            .keyboard_shortcuts
+                            .get(HotkeySlot::ShowShortcutHelp),
+                    ))
+                    .clicked()
+                {
                     self.show_shortcuts = true;
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("About").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::INFO, "About").clicked() {
                     self.show_about = true;
                     ui.close_menu();
                 }
@@ -4953,6 +5131,7 @@ impl PluriviewApp {
             None => "Stream Audio Monitor: Off".to_owned(),
         };
         ui.menu_button(label, |ui| {
+            crate::ui_theme::menu(ui);
             ui.label("Replay tile audio to a device so Discord/OBS\nwindow shares carry sound. Pick one you don't\nlisten to (virtual cable, unused output).\nBrowser tiles replay automatically; window\ntiles use the Stream Audio toggle on hover.");
             if let Some(monitor) = &self.audio_monitor {
                 let status = monitor.status();
@@ -5057,93 +5236,7 @@ impl PluriviewApp {
         let Some(popup) = &mut self.quick_add else {
             return;
         };
-
-        // Read this before drawing the popup: the focused search box's
-        // TextEdit consumes the Escape key itself (to drop focus), so
-        // checking afterwards would always see it as already consumed.
-        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        let mut clicked_index = None;
-
-        let area_response = egui::Area::new(egui::Id::new("quick_add_popup"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(popup.screen_pos)
-            .constrain(true)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(22, 22, 26))
-                    .rounding(8.0)
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 45, 52)))
-                    .inner_margin(egui::Margin::same(10.0))
-                    .show(ui, |ui| {
-                        ui.set_width(240.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(egui_phosphor::regular::MAGNIFYING_GLASS)
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(140, 140, 150)),
-                            );
-                            ui.add_space(6.0);
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut popup.search)
-                                    .desired_width(ui.available_width())
-                                    .hint_text("Search windows...")
-                                    .frame(false),
-                            );
-                            resp.request_focus();
-                        });
-
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-
-                        let filter = popup.search.to_lowercase();
-                        let matches = |w: &WindowInfo| w.matches_filter(&filter);
-
-                        egui::ScrollArea::vertical()
-                            .max_height(260.0)
-                            .show(ui, |ui| {
-                                let mut any = false;
-                                for (idx, window) in popup.windows.iter().enumerate() {
-                                    if !matches(window) {
-                                        continue;
-                                    }
-                                    any = true;
-
-                                    let label = if window.title.is_empty() {
-                                        &window.exe_name
-                                    } else {
-                                        &window.title
-                                    };
-                                    let resp = ui.add_sized(
-                                        Vec2::new(ui.available_width(), 22.0),
-                                        egui::Button::new(egui::RichText::new(label).size(12.5))
-                                            .frame(false),
-                                    );
-                                    if resp.clicked() {
-                                        clicked_index = Some(idx);
-                                    }
-                                }
-
-                                if !any {
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        egui::RichText::new("No matching windows")
-                                            .size(11.5)
-                                            .color(egui::Color32::from_rgb(120, 120, 128)),
-                                    );
-                                }
-                            });
-                    });
-            });
-
-        if ctx.input(|i| i.pointer.any_click()) {
-            if let Some(click_pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                if !area_response.response.rect.contains(click_pos) {
-                    close = true;
-                }
-            }
-        }
+        let (mut close, clicked_index) = quick_add_popup_ui(popup, ctx);
 
         if let Some(idx) = clicked_index {
             if let Some(popup) = &self.quick_add {
@@ -5951,6 +6044,331 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    struct QuickAddUiTest {
+        ctx: eframe::egui::Context,
+        canvas: CanvasState,
+        previews: crate::preview::PreviewManager,
+        captures: crate::capture::CaptureCoordinator,
+        popup: Option<super::QuickAddPopup>,
+        selected_window: Option<usize>,
+        time: f64,
+        focused: bool,
+    }
+
+    impl QuickAddUiTest {
+        fn frame(&mut self, events: Vec<eframe::egui::Event>) -> eframe::egui::FullOutput {
+            use eframe::egui::{CentralPanel, Event, RawInput};
+            self.time += 0.1;
+            for event in &events {
+                if let Event::WindowFocused(focused) = event {
+                    self.focused = *focused;
+                }
+            }
+            self.ctx.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 750.0))),
+                    time: Some(self.time),
+                    events,
+                    focused: self.focused,
+                    ..Default::default()
+                },
+                |ctx| {
+                    CentralPanel::default().show(ctx, |ui| {
+                        self.canvas
+                            .ui(ui, &mut self.previews, &mut self.captures, ctx, true);
+                    });
+                    if let Some((canvas_pos, screen_pos)) = self.canvas.pending_quick_add.take() {
+                        self.popup = Some(super::QuickAddPopup {
+                            canvas_pos,
+                            screen_pos,
+                            search: String::new(),
+                            opening: true,
+                            windows: (0..15)
+                                .map(|i| {
+                                    WindowInfo::new(
+                                        i,
+                                        format!("Fixture window {i}"),
+                                        0,
+                                        "fixture.exe".into(),
+                                    )
+                                })
+                                .collect(),
+                        });
+                    }
+                    if let Some(popup) = &mut self.popup {
+                        let (close, selected) = super::quick_add_popup_ui(popup, ctx);
+                        if selected.is_some() {
+                            self.selected_window = selected;
+                        }
+                        if close || selected.is_some() {
+                            self.popup = None;
+                        }
+                    }
+                },
+            )
+        }
+
+        fn click(
+            &mut self,
+            pos: Pos2,
+            button: eframe::egui::PointerButton,
+        ) -> eframe::egui::FullOutput {
+            use eframe::egui::{Event, Modifiers};
+            self.frame(vec![Event::PointerMoved(pos)]);
+            let mut press = vec![Event::PointerButton {
+                pos,
+                button,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }];
+            if !self.focused {
+                press.insert(0, Event::WindowFocused(true));
+            }
+            self.frame(press);
+            self.frame(vec![Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            self.frame(vec![])
+        }
+    }
+
+    #[test]
+    fn quick_add_survives_launch_click_after_selection_and_focus_changes() {
+        use eframe::egui::{Event, PointerButton, Shape};
+        for selected in [false, true] {
+            for refocus in [false, true] {
+                for anchor in [
+                    Pos2::new(500.0, 50.0),
+                    Pos2::new(500.0, 600.0),
+                    Pos2::new(870.0, 720.0),
+                ] {
+                    let mut test = QuickAddUiTest {
+                        ctx: Default::default(),
+                        canvas: Default::default(),
+                        previews: Default::default(),
+                        captures: crate::capture::CaptureCoordinator::new(),
+                        popup: None,
+                        selected_window: None,
+                        time: 0.0,
+                        focused: true,
+                    };
+                    let id = test.previews.add_media(
+                        PathBuf::from("fixture.png"),
+                        "Fixture".into(),
+                        vec![crate::media::MediaFrame {
+                            width: 2,
+                            height: 2,
+                            rgba: vec![255; 16],
+                            duration: Duration::ZERO,
+                        }],
+                        Pos2::new(100.0, 100.0),
+                        Vec2::new(200.0, 100.0),
+                    );
+                    if selected {
+                        test.canvas.selection = vec![id];
+                    }
+                    test.frame(vec![]);
+                    for attempt in 0..3 {
+                        if refocus {
+                            test.frame(vec![Event::WindowFocused(false), Event::PointerGone]);
+                        }
+                        test.click(anchor, PointerButton::Secondary);
+                        let output = test.frame(vec![]);
+                        let action = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                Shape::Text(text)
+                                    if text.galley.text().ends_with("Add Window...") =>
+                                {
+                                    Some(text.pos + text.galley.rect.center().to_vec2())
+                                }
+                                _ => None,
+                            })
+                            .expect("canvas menu must open");
+                        test.click(action, PointerButton::Primary);
+                        assert!(
+                            test.selected_window.is_none(),
+                            "Opening click must not select a window"
+                        );
+                        assert!(test.popup.is_some(), "Add Window dismissed immediately: selected={selected}, refocus={refocus}, anchor={anchor:?}, menu action={action:?}");
+                        if attempt == 1 {
+                            test.click(Pos2::new(30.0, 30.0), PointerButton::Primary);
+                            assert!(
+                                test.popup.is_none(),
+                                "Outside click must still dismiss the picker"
+                            );
+                            if selected {
+                                test.canvas.selection = vec![id];
+                            }
+                            continue;
+                        }
+                        if attempt == 2 {
+                            test.frame(vec![Event::Text("window 2".into())]);
+                            let output = test.frame(vec![]);
+                            let row = output
+                                .shapes
+                                .iter()
+                                .find_map(|shape| match &shape.shape {
+                                    Shape::Text(text)
+                                        if text.galley.text() == "Fixture window 2" =>
+                                    {
+                                        Some(text.pos + text.galley.rect.center().to_vec2())
+                                    }
+                                    _ => None,
+                                })
+                                .expect("filtered window row");
+                            test.click(row, PointerButton::Primary);
+                            assert_eq!(test.selected_window, Some(2));
+                            assert!(test.popup.is_none());
+                            continue;
+                        }
+                        test.frame(vec![Event::Key {
+                            key: eframe::egui::Key::Escape,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }]);
+                        assert!(test.popup.is_none(), "Escape must still dismiss the picker");
+                        test.frame(vec![Event::Key {
+                            key: eframe::egui::Key::Escape,
+                            physical_key: None,
+                            pressed: false,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn video_repaint_visibility_preserves_playback_and_viewport_pins() {
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "video".to_owned(),
+            Pos2::new(600.0, 0.0),
+            Vec2::splat(100.0),
+        );
+        preview.video_source = Some(VideoSource::LocalFile {
+            path: PathBuf::from("fixture.mp4"),
+        });
+        preview.video_playback.time_pos = Some(12.0);
+        preview.video_playback.paused = false;
+        assert!(!super::video_tile_needs_canvas_repaint(
+            &preview,
+            Some(viewport)
+        ));
+        assert!(super::video_tile_needs_canvas_repaint(&preview, None));
+        preview.viewport_pin = Some(ViewportPin::from_rect(viewport, viewport));
+        assert!(super::video_tile_needs_canvas_repaint(
+            &preview,
+            Some(viewport)
+        ));
+        preview.viewport_pin = None;
+        preview.position = Pos2::new(450.0, 0.0);
+        assert!(super::video_tile_needs_canvas_repaint(
+            &preview,
+            Some(viewport)
+        ));
+        preview.manually_frozen = true;
+        assert!(!super::video_tile_needs_canvas_repaint(
+            &preview,
+            Some(viewport)
+        ));
+        assert_eq!(preview.video_playback.time_pos, Some(12.0));
+        assert!(!preview.video_playback.paused);
+    }
+
+    #[test]
+    fn saved_viewpoint_popup_stays_bounded_and_rows_remain_clickable() {
+        use eframe::egui::{self, Event, Modifiers, PointerButton};
+        let ctx = egui::Context::default();
+        crate::ui_theme::install(&ctx);
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        ctx.set_fonts(fonts);
+        let views = [CanvasView {
+            name: "A long saved viewpoint name that must not widen the popup".to_owned(),
+            center: (0.0, 0.0),
+            zoom: 1.0,
+        }];
+        let bindings = crate::hotkeys::HotkeyBindings::default();
+        let render = |events| {
+            let mut bounds = None;
+            let mut action = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
+                        response.context_menu(|ui| {
+                            crate::ui_theme::menu(ui);
+                            action = super::canvas_views_menu_contents(
+                                ui, &views, None, false, &bindings,
+                            );
+                            bounds = Some(ui.min_rect());
+                        });
+                    });
+                },
+            );
+            (bounds, action, output)
+        };
+        let pointer = Pos2::new(700.0, 100.0);
+        render(vec![Event::PointerMoved(pointer)]);
+        for pressed in [true, false] {
+            render(vec![Event::PointerButton {
+                pos: pointer,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }]);
+        }
+        let mut row_center = None;
+        for _ in 0..8 {
+            let (bounds, _, output) = render(vec![]);
+            let bounds = bounds.unwrap();
+            assert!(
+                bounds.width() <= 280.0,
+                "Saved viewpoints expanded: {bounds:?}"
+            );
+            for shape in output.shapes {
+                if let egui::Shape::Text(text) = shape.shape {
+                    if text.galley.text() == "Ctrl+1" {
+                        let rect = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(bounds.contains_rect(rect));
+                        row_center = Some(rect.center());
+                    }
+                }
+            }
+        }
+        let pos = row_center.expect("Shortcut must remain visible in its row");
+        render(vec![Event::PointerMoved(pos)]);
+        render(vec![Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }]);
+        let (_, action, _) = render(vec![Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]);
+        assert!(matches!(action, Some(super::CanvasViewMenuAction::Jump(0))));
+    }
+
     #[test]
     fn wallpaper_hibernation_keeps_a_quick_minimize_warm() {
         let now = Instant::now();
@@ -6441,6 +6859,12 @@ impl Drop for PluriviewApp {
 }
 
 impl eframe::App for PluriviewApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        // Filter before egui computes widget interactions, even if the main
+        // window still has keyboard focus after enabling mouse passthrough.
+        self.window_controls.filter_input(input);
+    }
+
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         // Auto-save the active named workspace on exit.
         if let Err(error) = self.save_active_workspace() {
@@ -6468,6 +6892,27 @@ impl eframe::App for PluriviewApp {
             }
         }
 
+        // Tray controls must also work on the workspace recovery screen.
+        self.setup_tray_hwnd();
+        while let Some(action) = self
+            .tray_manager
+            .as_ref()
+            .and_then(TrayManager::next_action)
+        {
+            self.handle_window_action(ctx, action);
+        }
+        self.apply_window_controls(ctx);
+        if self.window_controls.click_through {
+            // The window can still own keyboard focus until the next click.
+            // Do not let retained pointer state or keyboard events edit tiles.
+            ctx.input_mut(|input| {
+                input.events.clear();
+                input.pointer = Default::default();
+                input.raw.dropped_files.clear();
+                input.raw.hovered_files.clear();
+            });
+        }
+
         if !self.workspace_persistence_ready || !self.workspace_save.is_ready() {
             self.workspace_recovery_ui(ctx);
             return;
@@ -6475,13 +6920,14 @@ impl eframe::App for PluriviewApp {
 
         self.hotkey_tracker.sample(
             &self.app_config.keyboard_shortcuts,
-            self.hotkey_recording.is_some(),
+            self.hotkey_recording.is_some() && !self.window_controls.click_through,
         );
         #[cfg(windows)]
         let owns_foreground = self.owns_foreground();
         #[cfg(not(windows))]
         let owns_foreground = true;
         let shortcut_listening = owns_foreground
+            && !self.window_controls.click_through
             && !ctx.wants_keyboard_input()
             && !self.show_settings
             && !self.show_shortcuts
@@ -6490,6 +6936,11 @@ impl eframe::App for PluriviewApp {
             && self.workspace_dialog.is_none()
             && !self.confirm_workspace_delete
             && self.hotkey_recording.is_none();
+        // Dialog controls retain keyboard ownership even when the URL field
+        // loses focus to a recent website or quality choice.
+        #[cfg(windows)]
+        let shortcut_listening =
+            shortcut_listening && self.add_browser.is_none() && self.add_stream.is_none();
         #[cfg(windows)]
         let webview_active = self.browser.active_id().is_some();
         #[cfg(not(windows))]
@@ -6558,9 +7009,6 @@ impl eframe::App for PluriviewApp {
         #[cfg(windows)]
         self.pending_video_upkeep(ctx);
 
-        // Set up tray HWND on first frame (window now exists)
-        self.setup_tray_hwnd();
-
         if self.pending_maximize {
             self.pending_maximize = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
@@ -6577,7 +7025,7 @@ impl eframe::App for PluriviewApp {
         #[cfg(windows)]
         self.wallpaper_memory_upkeep(ctx);
         #[cfg(windows)]
-        self.poll_video_manager(ctx);
+        self.poll_video_manager();
         #[cfg(windows)]
         if let Err(error) = self.ensure_wallpaper_video() {
             log::error!("Could not start wallpaper video: {error}");
@@ -6604,62 +7052,19 @@ impl eframe::App for PluriviewApp {
         #[cfg(windows)]
         self.browser_capture_frame_rate_upkeep();
 
-        // Handle pending region selection request (from context menu in canvas)
-        if let Some(preview_id) = self.canvas.pending_region_select.take() {
-            if let Some(preview) = self.preview_manager.get(preview_id) {
-                if let Some(ref handle) = preview.window_handle {
-                    // Start the region selector overlay
-                    if let Some(selector) = RegionSelector::show_for_window(handle.hwnd) {
-                        self.region_selector = Some(selector);
-                        self.region_select_preview_id = Some(preview_id);
-                    }
-                }
-            }
-        }
-
-        // Poll for region selection result
-        if let Some(ref mut selector) = self.region_selector {
-            if let Some(result) = selector.poll_result() {
-                if let Some(selection) = result {
-                    // Apply the crop to the preview
-                    if let Some(preview_id) = self.region_select_preview_id {
-                        let crop_uv = self.preview_manager.get(preview_id).and_then(|preview| {
-                            preview
-                                .source_frame_size
-                                .or(preview.frame_size)
-                                .map(|(width, height)| selection.to_uv(width, height))
-                        });
-                        if let (Some(crop_uv), Some(canvas_rect)) =
-                            (crop_uv, self.canvas.last_screen_rect)
-                        {
-                            self.canvas.set_preview_crop(
-                                preview_id,
-                                Some(crop_uv),
-                                canvas_rect,
-                                &mut self.preview_manager,
-                            );
-                        }
-                    }
-                }
-                // Clear the selector (whether successful or cancelled)
-                self.region_selector = None;
-                self.region_select_preview_id = None;
-            }
-        }
-
         // Menu bar (File / View / Help) now lives inline in the custom
         // title bar; see `title_bar_ui` / `menu_bar`.
 
         // Minimal Void: Dark sidebar
         if self.picker_open && !self.canvas_only {
             egui::SidePanel::left("window_picker_panel")
-                .default_width(250.0)
-                .min_width(200.0)
+                .default_width(292.0)
+                .min_width(240.0)
                 .max_width(400.0)
                 .frame(
                     egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(18, 18, 18))
-                        .inner_margin(egui::Margin::same(8.0)),
+                        .fill(crate::ui_theme::PANEL)
+                        .inner_margin(egui::Margin::same(12.0)),
                 )
                 .show(ctx, |ui| {
                     self.window_picker.ui(
@@ -6697,6 +7102,7 @@ impl eframe::App for PluriviewApp {
                     capture_coordinator,
                     ctx,
                     show_canvas_overlays,
+                    keyboard_shortcuts,
                     |ui| {
                         canvas_view_action = canvas_views_menu_contents(
                             ui,
@@ -6711,6 +7117,9 @@ impl eframe::App for PluriviewApp {
             });
         if let Some(action) = canvas_view_action {
             self.handle_canvas_view_menu_action(action, ctx);
+        }
+        if let Some(value) = self.canvas.pending_always_on_top.take() {
+            self.handle_window_action(ctx, WindowAction::SetAlwaysOnTop(value));
         }
 
         #[cfg(windows)]
@@ -6746,6 +7155,7 @@ impl eframe::App for PluriviewApp {
             let browser_double_clicked = self
                 .canvas
                 .last_double_clicked
+                .filter(|_| !self.window_controls.click_through)
                 .filter(|id| self.browser.contains(*id));
 
             let browser_shortcut = (shortcut_presses.pressed(HotkeySlot::InteractBrowser)
@@ -6845,6 +7255,7 @@ impl eframe::App for PluriviewApp {
                 screen_pos,
                 windows: enumerate_windows(),
                 search: String::new(),
+                opening: true,
             });
         }
 
@@ -7297,7 +7708,19 @@ impl eframe::App for PluriviewApp {
         // tray events while keeping the app near-idle on the CPU.
         // (egui repaints immediately on input regardless of this hint.)
         #[cfg(windows)]
-        let direct_video_fps = self.video_manager.repaint_fps();
+        let direct_video_fps = {
+            let viewport = self
+                .canvas
+                .last_screen_rect
+                .map(|rect| self.canvas.get_viewport(rect));
+            self.video_manager.repaint_fps(|id| {
+                id == WALLPAPER_VIDEO_ID
+                    || self
+                        .preview_manager
+                        .get(id)
+                        .is_some_and(|preview| video_tile_needs_canvas_repaint(preview, viewport))
+            })
+        };
         #[cfg(not(windows))]
         let direct_video_fps: Option<u32> = None;
         let repaint_after = self

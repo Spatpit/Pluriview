@@ -1,7 +1,7 @@
 use eframe::egui::{self, Pos2, Rect, TextureHandle, Vec2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::media::MediaFrame;
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout};
@@ -619,6 +619,8 @@ impl Preview {
         source_height: u32,
         data: Vec<u8>,
     ) {
+        #[cfg(all(windows, pluriview_performance))]
+        crate::app::performance::counters::capture_tile(self.id.0);
         self.clear_capture_error();
         let transparent_browser_startup = self.browser_waiting_for_content
             && !data.iter().skip(3).step_by(4).any(|alpha| *alpha != 0);
@@ -691,6 +693,10 @@ impl Preview {
         });
 
         if let Some(image) = media_image.or(capture_image) {
+            #[cfg(all(windows, pluriview_performance))]
+            crate::app::performance::counters::record(
+                crate::app::performance::counters::TEXTURE_UPLOAD,
+            );
             if let Some(texture) = self.texture.as_mut() {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
@@ -722,6 +728,10 @@ impl Preview {
             }
             elapsed = elapsed.saturating_sub(delay);
             self.media_frame_index = (self.media_frame_index + 1) % self.media_frames.len();
+            #[cfg(all(windows, pluriview_performance))]
+            crate::app::performance::counters::record(
+                crate::app::performance::counters::GIF_ADVANCE,
+            );
             self.media_frame_started = Instant::now() - elapsed;
             advanced = true;
         }
@@ -732,7 +742,7 @@ impl Preview {
 
         let delay = self.media_frames[self.media_frame_index].duration;
         let remaining = delay.saturating_sub(self.media_frame_started.elapsed());
-        ctx.request_repaint_after(remaining.max(Duration::from_millis(1)));
+        crate::media::request_animation_repaint(ctx, remaining);
     }
 
     /// Check if this preview contains the given canvas point

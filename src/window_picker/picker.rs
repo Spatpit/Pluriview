@@ -3,6 +3,7 @@ use crate::canvas::CanvasState;
 use crate::capture::CaptureCoordinator;
 use crate::preview::{FpsPreset, PreviewManager};
 use crate::spout::{self, SpoutDetection, SpoutSender};
+use crate::ui_theme;
 use eframe::egui::{self, Pos2, RichText, Rounding, Stroke, Vec2};
 use std::borrow::Cow;
 
@@ -74,18 +75,30 @@ impl WindowPicker {
             self.refresh();
         }
 
-        // Colors for the modern theme
-        let card_bg = egui::Color32::from_rgb(28, 28, 32);
-        let card_hover = egui::Color32::from_rgb(38, 38, 45);
-        let accent_color = egui::Color32::from_rgb(207, 161, 57); // Canvas P honey gold
-        let text_secondary = egui::Color32::from_rgb(140, 140, 150);
-        let search_bg = egui::Color32::from_rgb(22, 22, 26);
+        let card_bg = ui_theme::SURFACE;
+        let card_hover = ui_theme::HOVER;
+        let accent_color = ui_theme::GOLD;
+        let text_secondary = ui_theme::SECONDARY;
+        let search_bg = ui_theme::PANEL;
 
         ui.add_space(4.0);
+        ui.label(
+            RichText::new("Window picker")
+                .size(19.0)
+                .strong()
+                .color(ui_theme::TEXT),
+        );
+        ui.label(
+            RichText::new("Add a live source to your canvas")
+                .size(12.0)
+                .color(text_secondary),
+        );
+        ui.add_space(12.0);
 
         // Modern search box with rounded corners
         let search_frame = egui::Frame::none()
             .fill(search_bg)
+            .stroke(Stroke::new(1.0, ui_theme::BORDER))
             .rounding(Rounding::same(8.0))
             .inner_margin(egui::Margin::symmetric(12.0, 8.0));
 
@@ -100,16 +113,30 @@ impl WindowPicker {
                 ui.add_space(6.0);
 
                 // Search input with placeholder
+                let show_clear = !self.search_filter.is_empty();
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search_filter)
-                        .desired_width(ui.available_width())
-                        .hint_text(
-                            RichText::new("Search windows and Spout...").color(text_secondary),
+                        .desired_width(
+                            (ui.available_width() - if show_clear { 28.0 } else { 0.0 }).max(20.0),
                         )
+                        .hint_text(RichText::new("Search sources…").color(text_secondary))
                         .frame(false),
                 );
                 if response.changed() {
                     self.filter_dirty = true;
+                }
+                if show_clear
+                    && ui
+                        .add_sized(
+                            [20.0, 20.0],
+                            egui::Button::new(egui_phosphor::regular::X).frame(false),
+                        )
+                        .on_hover_text("Clear search")
+                        .clicked()
+                {
+                    self.search_filter.clear();
+                    self.filter_dirty = true;
+                    response.request_focus();
                 }
 
                 // Escape clears search
@@ -124,23 +151,28 @@ impl WindowPicker {
 
         ui.add_space(8.0);
         self.update_filter();
-        self.spout_section(
-            ui,
-            preview_manager,
-            capture_coordinator,
-            canvas,
-            PickerPalette {
-                text_secondary,
-                card_bg,
-                card_hover,
-            },
-        );
+        // Active senders are useful here; absent Spout installations should not
+        // push the everyday window list down with implementation details.
+        if self.spout.is_present() || !self.filtered_spout_indices.is_empty() {
+            self.spout_section(
+                ui,
+                preview_manager,
+                capture_coordinator,
+                canvas,
+                PickerPalette {
+                    text_secondary,
+                    card_bg,
+                    card_hover,
+                },
+            );
+        }
 
         // Window count and refresh indicator
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("{} windows", self.filtered_indices.len()))
+                RichText::new(format!("WINDOWS  ·  {}", self.filtered_indices.len()))
                     .size(12.0)
+                    .strong()
                     .color(text_secondary),
             );
 
@@ -171,11 +203,33 @@ impl WindowPicker {
         ui.add_space(6.0);
         self.update_filter();
 
+        // Render empty states before the scroll area consumes the panel height.
+        if self.filtered_indices.is_empty() {
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new(if self.normalized_filter.is_empty() {
+                    "No windows available"
+                } else {
+                    "No matching windows"
+                })
+                .color(ui_theme::TEXT),
+            );
+            ui.label(
+                RichText::new(if self.normalized_filter.is_empty() {
+                    "Open an application, then refresh the list."
+                } else {
+                    "Try another title or application name."
+                })
+                .size(12.0)
+                .color(text_secondary),
+            );
+        }
+
         // Window list with fixed-height row virtualization, so only visible
         // cards allocate egui widgets and text each frame.
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show_rows(ui, 60.0, self.filtered_indices.len(), |ui, row_range| {
+            .show_rows(ui, 64.0, self.filtered_indices.len(), |ui, row_range| {
                 let available_width = ui.available_width();
 
                 for row in row_range {
@@ -184,8 +238,8 @@ impl WindowPicker {
 
                     // Card frame
                     let (rect, response) = ui.allocate_exact_size(
-                        Vec2::new(available_width, 56.0),
-                        egui::Sense::click(),
+                        Vec2::new(available_width, 64.0),
+                        egui::Sense::hover(),
                     );
 
                     let is_hovered = response.hovered();
@@ -200,7 +254,7 @@ impl WindowPicker {
                         ui.painter().rect_stroke(
                             rect,
                             Rounding::same(6.0),
-                            Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)),
+                            Stroke::new(1.0, ui_theme::BORDER),
                         );
                     }
 
@@ -215,36 +269,33 @@ impl WindowPicker {
                         egui::Pos2::new(inner_rect.max.x, inner_rect.max.y - 8.0),
                     );
 
-                    // Title (truncated, char-safe to avoid panics on multibyte titles)
-                    let max_title_chars = ((text_rect.width() - 10.0) / 7.0) as usize;
-                    let title: Cow<'_, str> = if window.title.chars().count() > max_title_chars {
-                        let kept: String = window
-                            .title
-                            .chars()
-                            .take(max_title_chars.saturating_sub(3))
-                            .collect();
-                        Cow::Owned(format!("{}...", kept))
-                    } else {
-                        Cow::Borrowed(&window.title)
-                    };
-
-                    // Draw title
-                    ui.painter().text(
-                        egui::Pos2::new(text_rect.min.x, text_rect.min.y + 2.0),
-                        egui::Align2::LEFT_TOP,
-                        title.as_ref(),
-                        egui::FontId::proportional(14.0),
-                        egui::Color32::WHITE,
+                    ui_theme::clipped_text(
+                        ui,
+                        egui::Rect::from_min_size(
+                            text_rect.min,
+                            Vec2::new(text_rect.width(), 20.0),
+                        ),
+                        if window.title.is_empty() {
+                            &window.exe_name
+                        } else {
+                            &window.title
+                        },
+                        14.0,
+                        ui_theme::TEXT,
                     );
-
-                    // Draw exe name
-                    ui.painter().text(
-                        egui::Pos2::new(text_rect.min.x, text_rect.min.y + 20.0),
-                        egui::Align2::LEFT_TOP,
+                    ui_theme::clipped_text(
+                        ui,
+                        egui::Rect::from_min_size(
+                            text_rect.min + Vec2::new(0.0, 23.0),
+                            Vec2::new(text_rect.width(), 18.0),
+                        ),
                         &window.exe_name,
-                        egui::FontId::proportional(11.0),
+                        12.0,
                         text_secondary,
                     );
+                    response
+                        .clone()
+                        .on_hover_text(format!("{}\n{}", window.title, window.exe_name));
 
                     // Add button (+ icon)
                     let btn_center = button_rect.center();
@@ -263,15 +314,15 @@ impl WindowPicker {
                         if btn_hovered {
                             accent_color
                         } else {
-                            egui::Color32::from_rgb(60, 60, 68)
+                            ui_theme::GOLD_DARK
                         },
                     );
 
                     // Draw + icon
                     let plus_color = if btn_hovered {
-                        egui::Color32::WHITE
+                        ui_theme::PANEL
                     } else {
-                        egui::Color32::from_rgb(180, 180, 190)
+                        ui_theme::GOLD
                     };
                     ui.painter().text(
                         btn_center,
@@ -290,24 +341,9 @@ impl WindowPicker {
                             canvas,
                         );
                     }
-
-                    ui.add_space(4.0);
+                    btn_response.on_hover_text("Add window to canvas");
                 }
             });
-
-        if self.filtered_indices.is_empty()
-            && self.filtered_spout_indices.is_empty()
-            && !self.normalized_filter.is_empty()
-        {
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new("No matching windows or Spout senders")
-                        .size(13.0)
-                        .color(text_secondary),
-                );
-            });
-        }
     }
 
     fn update_filter(&mut self) {
@@ -344,7 +380,7 @@ impl WindowPicker {
         palette: PickerPalette,
     ) {
         let text_secondary = palette.text_secondary;
-        let accent = egui::Color32::from_rgb(207, 161, 57);
+        let accent = ui_theme::GOLD;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(egui_phosphor::regular::BROADCAST)
@@ -356,13 +392,14 @@ impl WindowPicker {
                     }),
             );
             ui.label(
-                RichText::new("Spout2")
+                RichText::new("SPOUT2")
                     .size(12.0)
-                    .color(egui::Color32::WHITE),
+                    .strong()
+                    .color(ui_theme::TEXT),
             );
             ui.label(
                 RichText::new(self.spout.status_label())
-                    .size(11.0)
+                    .size(12.0)
                     .color(text_secondary),
             );
         });
@@ -374,9 +411,9 @@ impl WindowPicker {
                     RichText::new(if self.spout.is_present() {
                         "Start a sender such as VTube Studio, then add it here."
                     } else {
-                        "No Spout sender map or SpoutSettings key found."
+                        "Start a Spout application to see its sources here."
                     })
-                    .size(11.0)
+                    .size(12.0)
                     .color(text_secondary),
                 );
             }
@@ -384,7 +421,7 @@ impl WindowPicker {
             return;
         }
 
-        let row_height = 48.0;
+        let row_height = 56.0;
         let list_height = (self.filtered_spout_indices.len() as f32 * (row_height + 4.0))
             .min(160.0)
             .max(row_height);
@@ -484,7 +521,7 @@ fn draw_spout_sender_row(
         card_bg,
         card_hover,
     } = palette;
-    let accent_color = egui::Color32::from_rgb(207, 161, 57);
+    let accent_color = ui_theme::GOLD;
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(available_width, row_height), egui::Sense::hover());
     let is_hovered = response.hovered();
@@ -497,7 +534,7 @@ fn draw_spout_sender_row(
         ui.painter().rect_stroke(
             rect,
             Rounding::same(6.0),
-            Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)),
+            Stroke::new(1.0, ui_theme::BORDER),
         );
     }
 
@@ -510,20 +547,24 @@ fn draw_spout_sender_row(
     } else {
         Cow::Borrowed(&sender.name)
     };
-    ui.painter().text(
-        text_rect.min,
-        egui::Align2::LEFT_TOP,
+    ui_theme::clipped_text(
+        ui,
+        egui::Rect::from_min_size(text_rect.min, Vec2::new(text_rect.width(), 20.0)),
         title.as_ref(),
-        egui::FontId::proportional(13.0),
-        egui::Color32::WHITE,
+        14.0,
+        ui_theme::TEXT,
     );
-    ui.painter().text(
-        egui::Pos2::new(text_rect.min.x, text_rect.min.y + 18.0),
-        egui::Align2::LEFT_TOP,
-        format!("{} · {}", sender.size_label(), sender.host_filename()),
-        egui::FontId::proportional(11.0),
+    ui_theme::clipped_text(
+        ui,
+        egui::Rect::from_min_size(
+            text_rect.min + Vec2::new(0.0, 23.0),
+            Vec2::new(text_rect.width(), 18.0),
+        ),
+        &format!("{} · {}", sender.size_label(), sender.host_filename()),
+        12.0,
         text_secondary,
     );
+    response.clone().on_hover_text(title.as_ref());
 
     let btn_center = egui::Pos2::new(inner.max.x - 14.0, inner.center().y);
     let btn_radius = 14.0;
@@ -540,7 +581,7 @@ fn draw_spout_sender_row(
         if btn_hovered {
             accent_color
         } else {
-            egui::Color32::from_rgb(60, 60, 68)
+            ui_theme::GOLD_DARK
         },
     );
     ui.painter().text(
@@ -549,9 +590,9 @@ fn draw_spout_sender_row(
         egui_phosphor::regular::PLUS,
         egui::FontId::proportional(14.0),
         if btn_hovered {
-            egui::Color32::WHITE
+            ui_theme::PANEL
         } else {
-            egui::Color32::from_rgb(180, 180, 190)
+            ui_theme::GOLD
         },
     );
     let added = btn_response.clicked();
@@ -594,5 +635,103 @@ pub fn spawn_preview(
 impl Default for WindowPicker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(
+        picker: &mut WindowPicker,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        // Keep fixtures independent of applications open on the test machine.
+        picker.last_refresh = std::time::Instant::now();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(240.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    picker.ui(
+                        ui,
+                        &mut PreviewManager::new(),
+                        &mut CaptureCoordinator::new(),
+                        &CanvasState::default(),
+                    );
+                });
+            },
+        )
+    }
+
+    #[test]
+    fn empty_search_feedback_is_visible_at_minimum_picker_width() {
+        let ctx = egui::Context::default();
+        ui_theme::install(&ctx);
+        let mut picker = WindowPicker::new();
+        picker.search_filter = "missing source".to_owned();
+        let output = render(&mut picker, &ctx, vec![]);
+        let shape = output
+            .shapes
+            .iter()
+            .find(|shape| {
+                matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "No matching windows")
+            })
+            .unwrap();
+        let egui::Shape::Text(text) = &shape.shape else {
+            unreachable!()
+        };
+        assert!(shape
+            .clip_rect
+            .contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size())));
+    }
+
+    #[test]
+    fn clear_search_button_restores_the_filtered_window_list() {
+        let ctx = egui::Context::default();
+        ui_theme::install(&ctx);
+        let mut picker = WindowPicker::new();
+        picker.windows.push(WindowInfo::new(
+            0,
+            "Sample window".to_owned(),
+            0,
+            "sample.exe".to_owned(),
+        ));
+        picker.search_filter = "missing source".to_owned();
+        let output = render(&mut picker, &ctx, vec![]);
+        assert!(picker.filtered_indices.is_empty());
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == egui_phosphor::regular::X => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap();
+        render(&mut picker, &ctx, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            render(
+                &mut picker,
+                &ctx,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        assert!(picker.search_filter.is_empty());
+        assert_eq!(picker.filtered_indices, vec![0]);
     }
 }
