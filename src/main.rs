@@ -23,6 +23,7 @@ mod tray;
 mod ui_theme;
 #[cfg(windows)]
 mod video;
+mod window_controls;
 mod window_picker;
 
 use app::PluriviewApp;

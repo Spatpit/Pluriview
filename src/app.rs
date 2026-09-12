@@ -26,6 +26,7 @@ use crate::preview::{
 use crate::privacy;
 use crate::tray::TrayManager;
 use crate::video::{self, VideoLaunch, VideoUpdate};
+use crate::window_controls::{WindowAction, WindowControls};
 use crate::window_picker::{enumerate_windows, spawn_preview, WindowInfo, WindowPicker};
 // The optional include also lets rustfmt work in clones without local tests.
 #[cfg(all(windows, pluriview_performance))]
@@ -386,6 +387,112 @@ struct QuickAddPopup {
     /// Snapshot of open windows, taken when the popup was opened.
     windows: Vec<WindowInfo>,
     search: String,
+    /// Wait until the context-menu click has finished before accepting input.
+    opening: bool,
+}
+
+fn quick_add_popup_ui(popup: &mut QuickAddPopup, ctx: &egui::Context) -> (bool, Option<usize>) {
+    if std::mem::take(&mut popup.opening) {
+        // A constrained context menu may put Add Window outside this popup's
+        // bounds. Processing its release here would immediately dismiss the
+        // picker (or select a stale row from its previous placement).
+        ctx.request_repaint();
+        return (false, None);
+    }
+    // Read this before drawing the popup: the focused search box's
+    // TextEdit consumes the Escape key itself (to drop focus), so
+    // checking afterwards would always see it as already consumed.
+    let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let mut clicked_index = None;
+
+    let area_response = egui::Area::new(egui::Id::new("quick_add_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(popup.screen_pos)
+        .constrain(true)
+        .show(ctx, |ui| {
+            egui::Frame::menu(ui.style())
+                .inner_margin(egui::Margin::same(10.0))
+                .show(ui, |ui| {
+                    crate::ui_theme::menu(ui);
+                    ui.set_width(288.0);
+                    ui.label(egui::RichText::new("Add a window").size(17.0).strong());
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(egui_phosphor::regular::MAGNIFYING_GLASS)
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(140, 140, 150)),
+                        );
+                        ui.add_space(6.0);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut popup.search)
+                                .desired_width(ui.available_width())
+                                .hint_text("Search windows...")
+                                .frame(false),
+                        );
+                        resp.request_focus();
+                    });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    let filter = popup.search.to_lowercase();
+                    let matches = |w: &WindowInfo| w.matches_filter(&filter);
+
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            let mut any = false;
+                            for (idx, window) in popup.windows.iter().enumerate() {
+                                if !matches(window) {
+                                    continue;
+                                }
+                                any = true;
+
+                                let label = if window.title.is_empty() {
+                                    &window.exe_name
+                                } else {
+                                    &window.title
+                                };
+                                let resp = ui
+                                    .add_sized(
+                                        Vec2::new(ui.available_width(), 32.0),
+                                        egui::Button::new(egui::RichText::new(label).size(14.0))
+                                            .truncate()
+                                            .frame(false),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{}\n{}",
+                                        window.title, window.exe_name
+                                    ));
+                                if resp.clicked() {
+                                    clicked_index = Some(idx);
+                                }
+                            }
+
+                            if !any {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new("No matching windows")
+                                        .size(11.5)
+                                        .color(egui::Color32::from_rgb(120, 120, 128)),
+                                );
+                            }
+                        });
+                });
+        });
+
+    if ctx.input(|i| i.pointer.any_click()) {
+        if let Some(click_pos) = ctx.input(|i| i.pointer.interact_pos()) {
+            if !area_response.response.rect.contains(click_pos) {
+                close = true;
+            }
+        }
+    }
+
+    (close, clicked_index)
 }
 
 struct AddBrowserDialog {
@@ -845,6 +952,7 @@ pub struct PluriviewApp {
 
     /// System tray manager
     tray_manager: Option<TrayManager>,
+    window_controls: WindowControls,
 
     /// Has the window HWND been set for the tray manager?
     hwnd_set: bool,
@@ -971,7 +1079,8 @@ impl PluriviewApp {
                 false,
             ),
         };
-        let tray_manager = TrayManager::new();
+        let window_controls = WindowControls::new(app_config.always_on_top);
+        let tray_manager = TrayManager::new(_cc.egui_ctx.clone(), app_config.always_on_top);
 
         #[cfg(debug_assertions)]
         if tray_manager.is_some() {
@@ -1040,6 +1149,7 @@ impl PluriviewApp {
             workspace_save: WorkspaceSaveState::default(),
             last_workspace_autosave_check: Instant::now(),
             tray_manager,
+            window_controls,
             hwnd_set: false,
             show_about: false,
             show_shortcuts: false,
@@ -3741,6 +3851,44 @@ impl PluriviewApp {
         }
     }
 
+    fn apply_window_controls(&mut self, ctx: &egui::Context) {
+        if self.window_controls.apply(ctx) {
+            if let Some(tray) = &self.tray_manager {
+                tray.sync_window_controls(
+                    self.window_controls.always_on_top,
+                    self.window_controls.click_through,
+                );
+            }
+        }
+        self.canvas.always_on_top = self.window_controls.always_on_top;
+        if self.app_config.always_on_top != self.window_controls.always_on_top {
+            self.app_config.always_on_top = self.window_controls.always_on_top;
+            self.save_app_config();
+        }
+    }
+
+    fn handle_window_action(&mut self, ctx: &egui::Context, action: WindowAction) {
+        self.window_controls.handle(action);
+        if self.window_controls.click_through {
+            self.canvas.cancel_pointer_interaction();
+            self.hotkey_recording = None;
+            self.hotkey_recording_first = None;
+            ctx.memory_mut(|memory| memory.close_popup());
+            #[cfg(windows)]
+            {
+                // The live WebView is a separate native window. Park it before
+                // making the canvas pass clicks through, including during its
+                // delayed reveal, and keep the captured tile playing normally.
+                if let Some(id) = self.browser.active_id() {
+                    self.browser.park_all();
+                    self.capture_coordinator.resume_capture(id);
+                }
+                self.browser_activated_at = None;
+            }
+        }
+        self.apply_window_controls(ctx);
+    }
+
     /// Custom title bar (we run with `with_decorations(false)` so the OS
     /// doesn't draw its own white title bar over our dark theme).
     fn title_bar_ui(&mut self, ctx: &egui::Context) {
@@ -5088,100 +5236,7 @@ impl PluriviewApp {
         let Some(popup) = &mut self.quick_add else {
             return;
         };
-
-        // Read this before drawing the popup: the focused search box's
-        // TextEdit consumes the Escape key itself (to drop focus), so
-        // checking afterwards would always see it as already consumed.
-        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        let mut clicked_index = None;
-
-        let area_response = egui::Area::new(egui::Id::new("quick_add_popup"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(popup.screen_pos)
-            .constrain(true)
-            .show(ctx, |ui| {
-                egui::Frame::menu(ui.style())
-                    .inner_margin(egui::Margin::same(10.0))
-                    .show(ui, |ui| {
-                        crate::ui_theme::menu(ui);
-                        ui.set_width(288.0);
-                        ui.label(egui::RichText::new("Add a window").size(17.0).strong());
-                        ui.add_space(6.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(egui_phosphor::regular::MAGNIFYING_GLASS)
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(140, 140, 150)),
-                            );
-                            ui.add_space(6.0);
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut popup.search)
-                                    .desired_width(ui.available_width())
-                                    .hint_text("Search windows...")
-                                    .frame(false),
-                            );
-                            resp.request_focus();
-                        });
-
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-
-                        let filter = popup.search.to_lowercase();
-                        let matches = |w: &WindowInfo| w.matches_filter(&filter);
-
-                        egui::ScrollArea::vertical()
-                            .max_height(260.0)
-                            .show(ui, |ui| {
-                                let mut any = false;
-                                for (idx, window) in popup.windows.iter().enumerate() {
-                                    if !matches(window) {
-                                        continue;
-                                    }
-                                    any = true;
-
-                                    let label = if window.title.is_empty() {
-                                        &window.exe_name
-                                    } else {
-                                        &window.title
-                                    };
-                                    let resp =
-                                        ui.add_sized(
-                                            Vec2::new(ui.available_width(), 32.0),
-                                            egui::Button::new(
-                                                egui::RichText::new(label).size(14.0),
-                                            )
-                                            .truncate()
-                                            .frame(false),
-                                        )
-                                        .on_hover_text(
-                                            format!("{}\n{}", window.title, window.exe_name),
-                                        );
-                                    if resp.clicked() {
-                                        clicked_index = Some(idx);
-                                    }
-                                }
-
-                                if !any {
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        egui::RichText::new("No matching windows")
-                                            .size(11.5)
-                                            .color(egui::Color32::from_rgb(120, 120, 128)),
-                                    );
-                                }
-                            });
-                    });
-            });
-
-        if ctx.input(|i| i.pointer.any_click()) {
-            if let Some(click_pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                if !area_response.response.rect.contains(click_pos) {
-                    close = true;
-                }
-            }
-        }
+        let (mut close, clicked_index) = quick_add_popup_ui(popup, ctx);
 
         if let Some(idx) = clicked_index {
             if let Some(popup) = &self.quick_add {
@@ -5989,6 +6044,209 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    struct QuickAddUiTest {
+        ctx: eframe::egui::Context,
+        canvas: CanvasState,
+        previews: crate::preview::PreviewManager,
+        captures: crate::capture::CaptureCoordinator,
+        popup: Option<super::QuickAddPopup>,
+        selected_window: Option<usize>,
+        time: f64,
+        focused: bool,
+    }
+
+    impl QuickAddUiTest {
+        fn frame(&mut self, events: Vec<eframe::egui::Event>) -> eframe::egui::FullOutput {
+            use eframe::egui::{CentralPanel, Event, RawInput};
+            self.time += 0.1;
+            for event in &events {
+                if let Event::WindowFocused(focused) = event {
+                    self.focused = *focused;
+                }
+            }
+            self.ctx.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 750.0))),
+                    time: Some(self.time),
+                    events,
+                    focused: self.focused,
+                    ..Default::default()
+                },
+                |ctx| {
+                    CentralPanel::default().show(ctx, |ui| {
+                        self.canvas
+                            .ui(ui, &mut self.previews, &mut self.captures, ctx, true);
+                    });
+                    if let Some((canvas_pos, screen_pos)) = self.canvas.pending_quick_add.take() {
+                        self.popup = Some(super::QuickAddPopup {
+                            canvas_pos,
+                            screen_pos,
+                            search: String::new(),
+                            opening: true,
+                            windows: (0..15)
+                                .map(|i| {
+                                    WindowInfo::new(
+                                        i,
+                                        format!("Fixture window {i}"),
+                                        0,
+                                        "fixture.exe".into(),
+                                    )
+                                })
+                                .collect(),
+                        });
+                    }
+                    if let Some(popup) = &mut self.popup {
+                        let (close, selected) = super::quick_add_popup_ui(popup, ctx);
+                        if selected.is_some() {
+                            self.selected_window = selected;
+                        }
+                        if close || selected.is_some() {
+                            self.popup = None;
+                        }
+                    }
+                },
+            )
+        }
+
+        fn click(
+            &mut self,
+            pos: Pos2,
+            button: eframe::egui::PointerButton,
+        ) -> eframe::egui::FullOutput {
+            use eframe::egui::{Event, Modifiers};
+            self.frame(vec![Event::PointerMoved(pos)]);
+            let mut press = vec![Event::PointerButton {
+                pos,
+                button,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }];
+            if !self.focused {
+                press.insert(0, Event::WindowFocused(true));
+            }
+            self.frame(press);
+            self.frame(vec![Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            self.frame(vec![])
+        }
+    }
+
+    #[test]
+    fn quick_add_survives_launch_click_after_selection_and_focus_changes() {
+        use eframe::egui::{Event, PointerButton, Shape};
+        for selected in [false, true] {
+            for refocus in [false, true] {
+                for anchor in [
+                    Pos2::new(500.0, 50.0),
+                    Pos2::new(500.0, 600.0),
+                    Pos2::new(870.0, 720.0),
+                ] {
+                    let mut test = QuickAddUiTest {
+                        ctx: Default::default(),
+                        canvas: Default::default(),
+                        previews: Default::default(),
+                        captures: crate::capture::CaptureCoordinator::new(),
+                        popup: None,
+                        selected_window: None,
+                        time: 0.0,
+                        focused: true,
+                    };
+                    let id = test.previews.add_media(
+                        PathBuf::from("fixture.png"),
+                        "Fixture".into(),
+                        vec![crate::media::MediaFrame {
+                            width: 2,
+                            height: 2,
+                            rgba: vec![255; 16],
+                            duration: Duration::ZERO,
+                        }],
+                        Pos2::new(100.0, 100.0),
+                        Vec2::new(200.0, 100.0),
+                    );
+                    if selected {
+                        test.canvas.selection = vec![id];
+                    }
+                    test.frame(vec![]);
+                    for attempt in 0..3 {
+                        if refocus {
+                            test.frame(vec![Event::WindowFocused(false), Event::PointerGone]);
+                        }
+                        test.click(anchor, PointerButton::Secondary);
+                        let output = test.frame(vec![]);
+                        let action = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                Shape::Text(text)
+                                    if text.galley.text().ends_with("Add Window...") =>
+                                {
+                                    Some(text.pos + text.galley.rect.center().to_vec2())
+                                }
+                                _ => None,
+                            })
+                            .expect("canvas menu must open");
+                        test.click(action, PointerButton::Primary);
+                        assert!(
+                            test.selected_window.is_none(),
+                            "Opening click must not select a window"
+                        );
+                        assert!(test.popup.is_some(), "Add Window dismissed immediately: selected={selected}, refocus={refocus}, anchor={anchor:?}, menu action={action:?}");
+                        if attempt == 1 {
+                            test.click(Pos2::new(30.0, 30.0), PointerButton::Primary);
+                            assert!(
+                                test.popup.is_none(),
+                                "Outside click must still dismiss the picker"
+                            );
+                            if selected {
+                                test.canvas.selection = vec![id];
+                            }
+                            continue;
+                        }
+                        if attempt == 2 {
+                            test.frame(vec![Event::Text("window 2".into())]);
+                            let output = test.frame(vec![]);
+                            let row = output
+                                .shapes
+                                .iter()
+                                .find_map(|shape| match &shape.shape {
+                                    Shape::Text(text)
+                                        if text.galley.text() == "Fixture window 2" =>
+                                    {
+                                        Some(text.pos + text.galley.rect.center().to_vec2())
+                                    }
+                                    _ => None,
+                                })
+                                .expect("filtered window row");
+                            test.click(row, PointerButton::Primary);
+                            assert_eq!(test.selected_window, Some(2));
+                            assert!(test.popup.is_none());
+                            continue;
+                        }
+                        test.frame(vec![Event::Key {
+                            key: eframe::egui::Key::Escape,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }]);
+                        assert!(test.popup.is_none(), "Escape must still dismiss the picker");
+                        test.frame(vec![Event::Key {
+                            key: eframe::egui::Key::Escape,
+                            physical_key: None,
+                            pressed: false,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }]);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn video_repaint_visibility_preserves_playback_and_viewport_pins() {
         let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
@@ -6601,6 +6859,12 @@ impl Drop for PluriviewApp {
 }
 
 impl eframe::App for PluriviewApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        // Filter before egui computes widget interactions, even if the main
+        // window still has keyboard focus after enabling mouse passthrough.
+        self.window_controls.filter_input(input);
+    }
+
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         // Auto-save the active named workspace on exit.
         if let Err(error) = self.save_active_workspace() {
@@ -6628,6 +6892,27 @@ impl eframe::App for PluriviewApp {
             }
         }
 
+        // Tray controls must also work on the workspace recovery screen.
+        self.setup_tray_hwnd();
+        while let Some(action) = self
+            .tray_manager
+            .as_ref()
+            .and_then(TrayManager::next_action)
+        {
+            self.handle_window_action(ctx, action);
+        }
+        self.apply_window_controls(ctx);
+        if self.window_controls.click_through {
+            // The window can still own keyboard focus until the next click.
+            // Do not let retained pointer state or keyboard events edit tiles.
+            ctx.input_mut(|input| {
+                input.events.clear();
+                input.pointer = Default::default();
+                input.raw.dropped_files.clear();
+                input.raw.hovered_files.clear();
+            });
+        }
+
         if !self.workspace_persistence_ready || !self.workspace_save.is_ready() {
             self.workspace_recovery_ui(ctx);
             return;
@@ -6635,13 +6920,14 @@ impl eframe::App for PluriviewApp {
 
         self.hotkey_tracker.sample(
             &self.app_config.keyboard_shortcuts,
-            self.hotkey_recording.is_some(),
+            self.hotkey_recording.is_some() && !self.window_controls.click_through,
         );
         #[cfg(windows)]
         let owns_foreground = self.owns_foreground();
         #[cfg(not(windows))]
         let owns_foreground = true;
         let shortcut_listening = owns_foreground
+            && !self.window_controls.click_through
             && !ctx.wants_keyboard_input()
             && !self.show_settings
             && !self.show_shortcuts
@@ -6722,9 +7008,6 @@ impl eframe::App for PluriviewApp {
         }
         #[cfg(windows)]
         self.pending_video_upkeep(ctx);
-
-        // Set up tray HWND on first frame (window now exists)
-        self.setup_tray_hwnd();
 
         if self.pending_maximize {
             self.pending_maximize = false;
@@ -6835,6 +7118,9 @@ impl eframe::App for PluriviewApp {
         if let Some(action) = canvas_view_action {
             self.handle_canvas_view_menu_action(action, ctx);
         }
+        if let Some(value) = self.canvas.pending_always_on_top.take() {
+            self.handle_window_action(ctx, WindowAction::SetAlwaysOnTop(value));
+        }
 
         #[cfg(windows)]
         self.sync_wallpaper_under_tile_focus();
@@ -6869,6 +7155,7 @@ impl eframe::App for PluriviewApp {
             let browser_double_clicked = self
                 .canvas
                 .last_double_clicked
+                .filter(|_| !self.window_controls.click_through)
                 .filter(|id| self.browser.contains(*id));
 
             let browser_shortcut = (shortcut_presses.pressed(HotkeySlot::InteractBrowser)
@@ -6968,6 +7255,7 @@ impl eframe::App for PluriviewApp {
                 screen_pos,
                 windows: enumerate_windows(),
                 search: String::new(),
+                opening: true,
             });
         }
 

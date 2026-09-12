@@ -29,14 +29,17 @@ with transparent widgets and a moving wallpaper.
 
 Get the latest version from **[Releases](https://github.com/Spatpit/Pluriview/releases)**.
 
-| Version | Choose this if… |
-|---|---|
-| **Full — recommended** | You want all features, including local videos, folder playlists, and video wallpapers. |
-| **Lite** | You need live windows, browser tiles, Spout2 sources, images, and GIFs. |
+Starting with v0.7.0, Pluriview is available as a single **Full** download with
+all features, including local videos, folder playlists, and video wallpapers.
+The Lite package is no longer offered for new releases.
 
 1. Download and extract the ZIP.
 2. Keep the included `lib` folder beside `pluriview.exe`.
 3. Launch `pluriview.exe` and start adding content.
+
+**Updating:** close Pluriview before replacing `pluriview.exe` and the included
+`lib` folder. Keep your existing `pluriview_data` folder to preserve workspaces,
+settings, and browser data. See the [changelog](CHANGELOG.md) for changes.
 
 **Requirements:** Windows 10 version 1903 or newer, or Windows 11, with a
 DirectX 11-compatible GPU.
@@ -210,6 +213,12 @@ Live streams do not provide seek-bar thumbnails.
 | **Canvas-only mode** | Hides the interface with `H`; right-click menus remain available. |
 | **Capture FPS** | Chooses 15, 30, or 60 FPS for live previews. |
 | **System tray** | Keeps Pluriview available while minimized to the tray. |
+| **Always on Top** | Keeps Pluriview above ordinary windows. Toggle it from the empty-canvas right-click menu or the tray menu; the setting is remembered across launches. |
+| **Click Through** | Passes mouse clicks to the apps underneath. Enable or disable it from the tray menu. Browser interaction ends while previews and playback continue. |
+
+For an overlay, enable **Always on Top**, then **Click Through** in the tray.
+To interact with Pluriview again, turn off **Click Through** or select
+**Show Pluriview** from the tray. Click-through starts disabled after a restart.
 
 ### Wallpapers
 
@@ -294,7 +303,7 @@ your installation still uses `Numpad 2`.
 <details>
 <summary><strong>Included components and optional tools</strong></summary>
 
-Both downloads include the ANGLE rendering runtime in the `lib` folder:
+The download includes the ANGLE rendering runtime in the `lib` folder:
 
 - `libEGL.dll`
 - `libGLESv2.dll`
@@ -344,9 +353,10 @@ cd Pluriview
 
 The release script builds with local path remapping, checks the executable for
 local-path and credential-like strings, and creates the packaged output in
-`dist`.
+`dist`. Packaging verifies the pinned runtime checksums and rejects local
+performance builds; leave `PLURIVIEW_LOCAL_PERFORMANCE` unset for releases.
 
-Output includes Full and Lite ZIP archives, runtime libraries, third-party
+Output includes the Full ZIP archive, runtime libraries, third-party
 notices, and `SHA256SUMS.txt`.
 
 Keep the `lib` folder beside the executable. Do not distribute `pluriview.pdb`,

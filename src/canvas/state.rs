@@ -1534,6 +1534,44 @@ mod tests {
     }
 
     #[test]
+    fn empty_canvas_menu_queues_app_topmost_setting() {
+        let (mut test, _) = CropUiTest::new(2, false);
+        test.frame(vec![]);
+        let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+        test.click(
+            CropUiTest::label_pos(&output, "Always on Top"),
+            PointerButton::Primary,
+        );
+        assert_eq!(test.canvas.pending_always_on_top.take(), Some(true));
+        let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+        test.click(
+            CropUiTest::label_pos(&output, "Always on Top"),
+            PointerButton::Primary,
+        );
+        assert_eq!(test.canvas.pending_always_on_top.take(), Some(false));
+    }
+
+    #[test]
+    fn passing_input_through_cancels_crop_without_changing_geometry() {
+        let (mut test, id) = CropUiTest::new(1, true);
+        test.canvas.begin_crop(id, &test.previews);
+        let before = crate::preview::PreviewLayout::from(test.previews.get(id).unwrap());
+        test.canvas.interactive_browser = Some(id);
+        test.canvas.last_double_clicked = Some(id);
+        test.canvas.cancel_pointer_interaction();
+        assert!(test.canvas.crop_mode.is_none());
+        assert!(test.canvas.interactive_browser.is_none());
+        assert!(test.canvas.last_double_clicked.is_none());
+        assert_eq!(
+            serde_json::to_value(crate::preview::PreviewLayout::from(
+                test.previews.get(id).unwrap()
+            ))
+            .unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+
+    #[test]
     fn crop_mode_keeps_tile_still_and_empty_canvas_restores_normal_resize() {
         for pinned in [false, true] {
             let (mut test, id) = CropUiTest::new(2, pinned);
@@ -3469,6 +3507,10 @@ pub struct CanvasState {
     /// frame so the canvas can outline it in the accent color.
     pub interactive_browser: Option<PreviewId>,
 
+    /// App-global window state mirrored for the empty-canvas menu.
+    pub always_on_top: bool,
+    pub pending_always_on_top: Option<bool>,
+
     /// True when View → Stream Audio Monitor has a target device.
     pub stream_monitor_ready: bool,
 
@@ -3528,6 +3570,8 @@ impl Default for CanvasState {
             pending_removed_restore: None,
             pending_media_actions: Vec::new(),
             interactive_browser: None,
+            always_on_top: false,
+            pending_always_on_top: None,
             stream_monitor_ready: false,
             last_screen_rect: None,
             last_double_clicked: None,
@@ -3539,6 +3583,21 @@ impl Default for CanvasState {
 }
 
 impl CanvasState {
+    /// Cancel a gesture when the app switches to passing input through.
+    pub fn cancel_pointer_interaction(&mut self) {
+        self.finish_crop();
+        self.drag_state = None;
+        self.marquee = None;
+        self.preview_dragging = false;
+        self.pinned_drag_origins.clear();
+        self.pinned_pointer_drag = None;
+        self.canvas_panning = false;
+        self.pan_drag_tracker = DragTracker::new();
+        self.last_secondary_click = None;
+        self.last_double_clicked = None;
+        self.interactive_browser = None;
+    }
+
     pub fn set_keyboard_input(&mut self, input: CanvasKeyboardInput) {
         self.keyboard_input = Some(input);
     }
@@ -4872,6 +4931,13 @@ impl CanvasState {
                     "Show Grid",
                     keyboard_shortcuts.get(HotkeySlot::ToggleGrid),
                 );
+                if ui
+                    .checkbox(&mut self.always_on_top, "Always on Top")
+                    .changed()
+                {
+                    self.pending_always_on_top = Some(self.always_on_top);
+                    ui.close_menu();
+                }
                 if ui.button("Set Wallpaper...").clicked() {
                     self.pending_wallpaper_pick = true;
                     ui.close_menu();

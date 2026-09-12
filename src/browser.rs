@@ -33,10 +33,11 @@ use windows::{
         Graphics::Gdi::ClientToScreen,
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, IsChild,
-            RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_BOTTOM, HWND_TOP,
-            SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WNDCLASSW, WS_CLIPCHILDREN,
-            WS_EX_TOOLWINDOW, WS_POPUP,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindowLongW,
+            IsChild, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, GWL_EXSTYLE,
+            HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+            SW_SHOWNOACTIVATE, WNDCLASSW, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+            WS_POPUP,
         },
     },
 };
@@ -589,10 +590,24 @@ impl BrowserHost {
             pixels_per_point,
             (host_origin.x, host_origin.y),
         );
+        // Interactive hosts must share the canvas's z-order band, otherwise
+        // an always-on-top canvas covers the page that is receiving input.
+        let parent_topmost =
+            unsafe { GetWindowLongW(parent, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0;
+        let host_topmost =
+            unsafe { GetWindowLongW(self.window.0, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0;
+        let insert_after = if parent_topmost {
+            HWND_TOPMOST
+        } else if host_topmost {
+            HWND_NOTOPMOST
+        } else {
+            HWND_TOP
+        };
         if !take_focus
             && self.active
             && self.reveal_at.is_none()
             && self.last_geometry == Some(geometry)
+            && parent_topmost == host_topmost
         {
             return;
         }
@@ -661,7 +676,7 @@ impl BrowserHost {
             unsafe {
                 let _ = SetWindowPos(
                     self.window.0,
-                    HWND_TOP,
+                    insert_after,
                     geometry.host_x,
                     geometry.host_y,
                     geometry.host_width,
@@ -681,7 +696,7 @@ impl BrowserHost {
         unsafe {
             let _ = SetWindowPos(
                 self.window.0,
-                HWND_TOP,
+                insert_after,
                 geometry.host_x,
                 geometry.host_y,
                 geometry.host_width,
