@@ -2362,6 +2362,39 @@ mod tests {
     }
 
     #[test]
+    fn viewer_focus_uses_topmost_tile_toggles_restore_and_ignores_pinned_tiles() {
+        let mut canvas = CanvasState::default();
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        canvas.last_screen_rect = Some(viewport);
+        let mut previews = PreviewManager::new();
+        let lower = previews.add("lower".into(), Pos2::new(50.0, 50.0), Vec2::splat(100.0));
+        let upper = previews.add("upper".into(), Pos2::new(50.0, 50.0), Vec2::splat(100.0));
+        canvas.selection = vec![lower];
+        let geometry = previews.get(upper).unwrap().rect();
+        canvas.focus_viewer_at([100.0 / 800.0, 100.0 / 600.0], &previews);
+        assert!(canvas.is_focusing_tile());
+        assert_eq!(canvas.selection, vec![upper]);
+        assert_eq!(previews.get(upper).unwrap().rect(), geometry);
+        assert_eq!(
+            canvas.last_double_clicked, None,
+            "Never activate source content"
+        );
+        canvas.focus_viewer_at([0.5, 0.5], &previews);
+        assert!(!canvas.is_focusing_tile());
+        assert_eq!(canvas.selection, vec![lower]);
+        assert_eq!(canvas.pan, Vec2::ZERO);
+        assert_eq!(canvas.zoom, 1.0);
+        canvas.focus_viewer_at([0.95, 0.95], &previews);
+        assert!(!canvas.is_focusing_tile());
+        canvas.toggle_viewport_pin(upper, viewport, &mut previews);
+        canvas.focus_viewer_at([100.0 / 800.0, 100.0 / 600.0], &previews);
+        assert!(
+            !canvas.is_focusing_tile(),
+            "A pinned tile must not focus itself or a tile behind it"
+        );
+    }
+
+    #[test]
     fn focus_fits_tall_tile_without_cropping() {
         let mut canvas = CanvasState::default();
         let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0));
@@ -3674,9 +3707,51 @@ impl CanvasState {
         self.focus.is_some()
     }
 
+    /// Remote focus uses canvas hit testing, never tile clicks or source input.
+    pub fn focus_viewer_at(&mut self, at: [f32; 2], previews: &PreviewManager) {
+        let Some(rect) = self.last_screen_rect else {
+            return;
+        };
+        if !at.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
+            return;
+        }
+        let position = rect.min + rect.size() * egui::vec2(at[0], at[1]);
+        let Some(id) = self.preview_at_screen(position, rect, previews) else {
+            return;
+        };
+        let Some(preview) = previews.get(id).filter(|p| p.viewport_pin.is_none()) else {
+            return;
+        };
+        if self.focus.as_ref().is_some_and(|focus| focus.id == id) {
+            self.exit_focus();
+        } else {
+            self.focus_on_tile(id, preview.rect(), rect);
+        }
+    }
+
     /// Canvas-space point currently shown at the center of the viewport.
     pub fn camera_center(&self, canvas_rect: Rect) -> Pos2 {
         self.screen_to_canvas(canvas_rect.center(), canvas_rect)
+    }
+
+    /// Camera-only navigation shared by remote viewers. It never synthesizes
+    /// pointer events, so dragging over content cannot move or activate a tile.
+    pub fn apply_viewer_camera(&mut self, command: crate::remote_view::CameraCommand) {
+        let Some(rect) = self.last_screen_rect else {
+            return;
+        };
+        if !command.is_valid() || !rect.is_positive() {
+            return;
+        }
+        let anchor = rect.min + rect.size() * egui::vec2(command.anchor[0], command.anchor[1]);
+        let canvas_anchor = self.screen_to_canvas(anchor, rect);
+        self.focus = None;
+        self.cancel_camera_transition();
+        self.animation.momentum_active = false;
+        self.animation.momentum_velocity = Vec2::ZERO;
+        self.zoom = (self.zoom * command.scale).clamp(self.zoom_min, self.zoom_max);
+        self.pan = (anchor - rect.min) / self.zoom - canvas_anchor.to_vec2()
+            + rect.size() * egui::vec2(command.pan[0], command.pan[1]) / self.zoom;
     }
 
     /// Glide to a named view. A new request samples the camera's current

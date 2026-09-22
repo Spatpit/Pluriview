@@ -914,6 +914,8 @@ pub struct PluriviewApp {
     /// Show app-global Settings dialog.
     show_settings: bool,
 
+    remote_view: crate::remote_view::RemoteView,
+
     /// Last config persistence error, shown inside Settings.
     config_error: Option<String>,
 
@@ -1038,6 +1040,29 @@ pub struct PluriviewApp {
 }
 
 impl PluriviewApp {
+    fn viewer_is_blocked(&self, ctx: &egui::Context) -> bool {
+        let blocked = self.remote_view.is_blocking()
+            || self.show_settings
+            || self.show_shortcuts
+            || self.show_about
+            || self.workspace_dialog.is_some()
+            || self.canvas_view_dialog.is_some()
+            || self.confirm_workspace_delete
+            || self.quick_add.is_some()
+            || self.media_error.is_some()
+            || self.external_tool_error.is_some()
+            || self.video_action_error.is_some()
+            || self.workspace_error.is_some()
+            || ctx.memory(|memory| memory.any_popup_open())
+            || ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        #[cfg(windows)]
+        let blocked = blocked
+            || self.browser.active_id().is_some()
+            || self.add_browser.is_some()
+            || self.add_stream.is_some();
+        blocked
+    }
+
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self::with_storage(_cc, Storage::new())
     }
@@ -1136,6 +1161,7 @@ impl PluriviewApp {
             app_config,
             external_tools,
             show_settings: false,
+            remote_view: crate::remote_view::RemoteView::default(),
             config_error,
             workspaces,
             workspace_dialog: None,
@@ -4203,6 +4229,10 @@ impl PluriviewApp {
 
             ui.menu_button("View", |ui| {
                 crate::ui_theme::menu(ui);
+                if ui.button("Phone Viewer...").clicked() {
+                    self.remote_view.show_dialog = true;
+                    ui.close_menu();
+                }
                 crate::ui_theme::section(ui, "APPEARANCE");
                 if crate::ui_theme::shortcut_toggle(ui, &mut self.picker_open, "Window Picker",
                     self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleWindowPicker)).clicked()
@@ -6860,6 +6890,9 @@ impl Drop for PluriviewApp {
 
 impl eframe::App for PluriviewApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        // Screenshot replies are renderer output, not canvas input. Consume
+        // them before click-through filters events so viewing can continue.
+        self.remote_view.receive_screenshot(&input.events);
         // Filter before egui computes widget interactions, even if the main
         // window still has keyboard focus after enabling mouse passthrough.
         self.window_controls.filter_input(input);
@@ -6914,6 +6947,7 @@ impl eframe::App for PluriviewApp {
         }
 
         if !self.workspace_persistence_ready || !self.workspace_save.is_ready() {
+            self.remote_view.stop();
             self.workspace_recovery_ui(ctx);
             return;
         }
@@ -7089,6 +7123,13 @@ impl eframe::App for PluriviewApp {
         let canvas_views = &self.canvas_views;
         let keyboard_shortcuts = &self.app_config.keyboard_shortcuts;
         let show_canvas_overlays = !self.canvas_only;
+        let mut viewer_blocked = self.viewer_is_blocked(ctx);
+        self.remote_view.apply_camera_commands(
+            ctx,
+            &mut self.canvas,
+            &self.preview_manager,
+            viewer_blocked || self.window_controls.click_through,
+        );
         let canvas = &mut self.canvas;
         let preview_manager = &mut self.preview_manager;
         let capture_coordinator = &mut self.capture_coordinator;
@@ -7329,7 +7370,11 @@ impl eframe::App for PluriviewApp {
             self.handle_media_action(id, action);
         }
 
+        // Remember dialogs drawn this frame even if their Close action clears
+        // the flag: the screenshot still contains their final painted frame.
+        viewer_blocked |= self.viewer_is_blocked(ctx);
         self.quick_add_ui(ctx);
+        self.remote_view.ui(ctx);
         #[cfg(windows)]
         self.add_browser_ui(ctx);
         #[cfg(windows)]
@@ -7701,6 +7746,10 @@ impl eframe::App for PluriviewApp {
                     ui.add_space(5.0);
                 });
         }
+
+        viewer_blocked |= self.viewer_is_blocked(ctx);
+        self.remote_view
+            .capture(ctx, self.canvas.last_screen_rect, viewer_blocked);
 
         // Schedule the next repaint instead of spinning at uncapped frame rate.
         // When captures are live, match the fastest active preview's requested

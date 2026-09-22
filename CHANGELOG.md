@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added nearby-PC discovery and explicit PC approval for Android connection requests (preview 0.3.6). Both screens show a matching number; requests expire, cancel or deny without granting access. QR/link pairing remains available; encryption remains deferred.
+- Experimental Android companion viewer with opt-in LAN sharing, QR/link pairing, fullscreen viewing, and shared PC canvas pan/pinch-zoom. Phone commands cannot edit or interact with tiles. Fullscreen Fill/Fit preserves proportions and gesture mapping, with auto-hiding controls and cutout support. Continuous H.264 video uses a fixed 720p profile (1280×720 cap, 30 FPS / 4 Mbps targets), prefers PC hardware encoding, and retains software/JPEG fallbacks. Native Android decoding uses bounded buffering and fresh-stream recovery. Sharing has no audio or encryption and pauses for desktop dialogs or interactive browser mode.
+
+### Fixed
+- Replaced Android video HTTP-client reads with a dedicated, proxy-free socket that resumes partial records after short read timeouts. Brief delivery pauses no longer immediately discard the connection and decoder; silence, total record time and background cancellation remain bounded (APK 0.3.8; compatible with Windows preview 0.3.6).
+- Fixed the Android decoder watchdog counting idle network time against newly arrived work. Brief reconnects retain the last texture for a bounded interval with navigation disabled; explicit sharing pauses still clear immediately. Status retains the reconnect count and last reason for diagnosis (APK 0.3.7; compatible with Windows preview 0.3.6).
+- Removed Android's 10 FPS JPEG fallback and fixed background/resume treating interrupted decoder cleanup as a permanent video failure. Hidden apps pause streaming; returning reconnects fixed-quality H.264, with bounded decoder shutdown and no overlapping decoder workers (APK 0.3.5).
+- Improved Android stream pacing with absolute PC capture deadlines, independent receive/decode work and a bounded 50 ms playback cushion. Gesture commands reuse a persistent connection, transient decoder stalls recover H.264 instead of dropping to 10 FPS JPEG, and the viewer shows measured received/displayed frame rates (APK 0.3.4; fixed 720p retained).
+- Smoothed Android viewer pan/pinch updates with a short, interruptible PC camera interpolation; added double-tap tile focus/restore without source input (APK 0.3.3).
+- Fixed Android Viewer 0.3.0 crashing on launch when fullscreen setup queried the system-bar controller before the window decor existed (APK 0.3.1).
+
 ## [0.7.0] - 2026-09-11
 
 ### Added

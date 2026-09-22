@@ -60,6 +60,73 @@ reopen Pluriview. Built-in ad blocking requires WebView2 Runtime 122 or newer.
 Hover over tiles for controls, or right-click a tile for more options.
 Press `F1` to see shortcuts.
 
+## Android phone viewer (development preview)
+
+The companion **Pluriview Viewer** app shows the PC's visible canvas on Android
+8.0 or newer. Drag anywhere in the streamed canvas to pan, and pinch to zoom;
+both actions change the PC's view too. Double-tap a tile to enter its temporary
+focus mode; double-tap it again to restore the previous view. Pinned tiles keep
+their existing position and do not enter focus. A short camera interpolation
+smooths uneven network updates while preserving the full pinch/pan movement.
+The phone cannot interact with sources,
+edit tiles, or add/remove content. Portrait and landscape preserve the PC
+canvas's aspect ratio. Viewing starts fullscreen in **Fill screen** mode, which
+crops the edges to remove aspect-ratio borders without stretching. Tap the
+canvas to reveal controls, then choose **Fit whole canvas** to see every edge.
+Controls hide after a few seconds; Back exits fullscreen. The Fit/Fill choice
+is remembered, and gestures remain mapped to the shared PC camera in either mode.
+
+1. Build/install the test APK using [the Android build instructions](android/README.md).
+2. Connect the PC and phone to the same trusted private Wi-Fi.
+3. In Pluriview, choose **View → Phone Viewer...**, check the PC's Wi-Fi IPv4
+   address, and choose **Start sharing**.
+4. Open Pluriview Viewer and tap **Request connection** on the nearby PC
+   matching the name shown in the PC's Phone Viewer dialog.
+5. Compare the six-digit number on both screens, then choose **Allow connection**
+   on the PC. Viewing starts automatically. Open Phone Viewer again to stop sharing.
+
+Nearby discovery requires preview 0.3.6 on both devices. QR/link pairing remains
+a backup: scan the QR or paste **Copy pairing link** into Android, tap **Connect
+to PC**, then close the PC pairing dialog. That link already grants access;
+only share it with the intended viewer. If discovery is blocked by a router,
+try the link on the same LAN. Guest networks may block both methods.
+
+Sharing is opt-in, accepts one phone at a time, and starts disabled on every
+launch. Nearby requests expire after one minute and require explicit PC approval.
+The number is a visual match check, not a password or encryption. Restarting
+sharing invalidates all approvals and the old pairing link. Pairing credentials
+are not saved. If the phone cannot connect, check that Windows Firewall allows
+  this Pluriview build on your private network; the app does not change firewall rules.
+
+The viewer streams H.264 video up to 1280×720 with a 30 FPS capture target,
+using a Windows hardware encoder when available and Android's native video
+decoder. Video uses a fixed 720p profile (1280×720 cap, 30 FPS and 4 Mbps
+targets); it never automatically drops to 540p or 360p. Canvas proportions are
+preserved, so actual encoded dimensions depend on the PC canvas shape and size.
+Actual cadence depends on PC load and Wi-Fi. A software encoder is tried if
+hardware initialization or encoding fails. Android 0.3.5 removes the 10 FPS JPEG
+fallback: unavailable video shows a status and retries H.264. Older PC builds
+without video streaming need updating.
+The stream receives and decodes independently, with a small 50 ms playback
+cushion to absorb delivery jitter. Brief decoder stalls reconnect H.264 at the
+same quality. Backgrounding the Android app pauses streaming; returning starts
+a fresh 720p video connection. Gesture commands use
+a separate persistent connection. Tap to reveal **Received / Shown FPS**:
+these count received video frames and Android texture updates, rather than
+repeating the requested 30 FPS. Update both the PC executable and APK.
+APK 0.3.7 also retains the last reconnect reason/count in this status and fixes
+idle network time being counted as a decoder stall. Brief reconnects can retain
+the last picture for roughly one second with gestures disabled. Explicit sharing
+pauses and backgrounding still clear it immediately. This APK works with the
+Windows 0.3.6 preview. APK 0.3.8 adds a dedicated video socket that resumes partial
+records after short receive timeouts without resetting the decoder. Long stalls
+still have bounded deadlines, and backgrounding cancels the socket immediately.
+There is no audio or encryption; use trusted private networks without port forwarding.
+PC dialogs, menus, minimized windows and interactive browser mode pause sharing;
+close dialogs/menus, restore the PC window or exit browser interaction to resume.
+Click Through also disables phone navigation. The PC must remain running with
+its canvas available. An independent phone camera remains future work.
+
 ## What you can add
 
 | Source | What it does |

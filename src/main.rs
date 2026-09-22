@@ -16,6 +16,7 @@ mod persistence;
 mod playlist;
 mod preview;
 mod privacy;
+mod remote_view;
 #[cfg(windows)]
 mod source_dialog;
 mod spout;
