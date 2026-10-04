@@ -238,6 +238,13 @@ fn is_sensitive_query_key(key: &str) -> bool {
     .any(|marker| key.contains(marker))
 }
 
+/// Ordinary new-tab links keep navigating inside the tile. A sized popup
+/// (`window.open` with dimensions, as sign-in providers use) opens as its own
+/// WebView2 window while the user is interacting with the tile.
+fn opens_as_popup(interactive: bool, sized: bool) -> bool {
+    interactive && sized
+}
+
 /// Parked tiles are offscreen, so a site's camera, microphone, location,
 /// notification or clipboard prompt would be invisible and could be answered
 /// for every tile through the shared profile. Deny those requests while
@@ -430,6 +437,8 @@ impl BrowserHost {
         let nav_shared = shared.clone();
         let title_shared = shared.clone();
         let new_window_shared = shared.clone();
+        let interactive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let popup_interactive = interactive.clone();
 
         let webview = WebViewBuilder::new_with_web_context(context)
             // All tiles share one WebView2 environment/profile, so this must
@@ -466,7 +475,14 @@ impl BrowserHost {
                 state.current_title = Some(title);
                 state.dirty = true;
             })
-            .with_new_window_req_handler(move |url, _features| {
+            .with_new_window_req_handler(move |url, features| {
+                let interactive = popup_interactive.load(std::sync::atomic::Ordering::Relaxed);
+                if opens_as_popup(interactive, features.size.is_some()) && is_web_url(&url) {
+                    // Sign-in flows ("Continue with Google/Discord") open a
+                    // sized popup and talk back to this page through
+                    // window.opener; replacing the tile's page breaks them.
+                    return NewWindowResponse::Allow;
+                }
                 if is_web_url(&url) {
                     new_window_shared.lock().pending_navigation = Some(url);
                 }
@@ -474,7 +490,6 @@ impl BrowserHost {
             })
             .build_as_child(&window)
             .map_err(|error| error.to_string())?;
-        let interactive = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Err(error) = register_permission_policy(&webview, interactive.clone()) {
             log::warn!("Browser permission requests use WebView2 defaults: {error}");
         }
@@ -1865,6 +1880,14 @@ mod tests {
         assert!(normalize_url("file:///secret").is_err());
         assert!(normalize_url("javascript:alert(1)").is_err());
         assert!(normalize_url("https://user:password@example.com").is_err());
+    }
+
+    #[test]
+    fn only_sized_popups_from_interactive_tiles_open_windows() {
+        assert!(super::opens_as_popup(true, true));
+        assert!(!super::opens_as_popup(true, false));
+        assert!(!super::opens_as_popup(false, true));
+        assert!(!super::opens_as_popup(false, false));
     }
 
     #[test]
