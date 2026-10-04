@@ -32,6 +32,14 @@ const VIDEO_FPS: u64 = 30;
 const VIDEO_BITRATE: u32 = 4_000_000;
 const LEASE: Duration = Duration::from_secs(4);
 const MAX_REQUEST: usize = 4096;
+/// Fixed network workers. Video, control and audio streams can each hold one
+/// for as long as they are connected.
+const NETWORK_WORKERS: usize = 8;
+/// Connections from one address that may be reading headers at once. A
+/// device trickling bytes holds at most this many workers for the request
+/// deadline, so other devices (and the paired phone's own streams) are never
+/// starved.
+const MAX_PRE_AUTH_PER_ADDRESS: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -127,6 +135,37 @@ struct Shared {
     video_failed: AtomicBool,
     video_frames: Mutex<VecDeque<Arc<VideoFrame>>>,
     hardware: AtomicBool,
+    pre_auth: Mutex<std::collections::HashMap<std::net::IpAddr, u8>>,
+}
+
+/// A connection that has not yet been authenticated or answered.
+struct PreAuthSlot<'a> {
+    shared: &'a Shared,
+    address: std::net::IpAddr,
+}
+
+impl<'a> PreAuthSlot<'a> {
+    fn acquire(shared: &'a Shared, address: std::net::IpAddr) -> Option<Self> {
+        let mut counts = shared.pre_auth.lock();
+        let count = counts.entry(address).or_default();
+        if *count >= MAX_PRE_AUTH_PER_ADDRESS {
+            return None;
+        }
+        *count += 1;
+        Some(Self { shared, address })
+    }
+}
+
+impl Drop for PreAuthSlot<'_> {
+    fn drop(&mut self) {
+        let mut counts = self.shared.pre_auth.lock();
+        if let Some(count) = counts.get_mut(&self.address) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.address);
+            }
+        }
+    }
 }
 
 impl Shared {
@@ -506,6 +545,7 @@ impl Host {
             video_failed: AtomicBool::new(false),
             video_frames: Mutex::new(VecDeque::with_capacity(6)),
             hardware: AtomicBool::new(false),
+            pre_auth: Mutex::new(std::collections::HashMap::new()),
         });
         let (command_tx, commands) = mpsc::sync_channel(8);
         let (encoder, jobs) = mpsc::sync_channel::<CaptureJob>(1);
@@ -664,10 +704,11 @@ impl Host {
         if !ip.is_loopback() {
             discovery::start(ip, port, shared.clone(), ctx.clone());
         }
-        // Four fixed workers leave one for discovery status/pairing requests
-        // while the exclusive video, control and optional audio streams are active.
+        // Fixed workers leave several for pairing and camera requests while the
+        // exclusive video, control and optional audio streams are active, and
+        // per-address pre-auth limits stop one device from occupying the rest.
         // No per-request thread creation or unbounded connection/task queue.
-        for index in 0..4 {
+        for index in 0..NETWORK_WORKERS {
             let listener = listener.try_clone()?;
             // Windows socket duplicates need their own nonblocking mode;
             // otherwise Stop leaves accept() waiting until another client calls.
@@ -681,8 +722,13 @@ impl Host {
                 .spawn(move || {
                     while state.running.load(Ordering::Relaxed) {
                         match listener.accept() {
-                            Ok((mut stream, _)) => {
-                                let _ = serve(&mut stream, &state, &token, &commands, &ctx);
+                            Ok((mut stream, address)) => {
+                                // Over the limit: close at once instead of
+                                // spending a worker on reading its headers.
+                                if let Some(slot) = PreAuthSlot::acquire(&state, address.ip()) {
+                                    let _ =
+                                        serve(&mut stream, &state, slot, &token, &commands, &ctx);
+                                }
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(Duration::from_millis(10))
@@ -827,6 +873,7 @@ fn respond(stream: &mut TcpStream, status: u16, extra: &str, body: &[u8]) -> io:
 fn serve(
     stream: &mut TcpStream,
     shared: &Shared,
+    pre_auth: PreAuthSlot<'_>,
     token: &str,
     commands: &mpsc::SyncSender<QueuedCamera>,
     ctx: &egui::Context,
@@ -839,6 +886,9 @@ fn serve(
         Ok(r) => r,
         Err(_) => return respond(stream, 400, "", &[]),
     };
+    // Headers are complete; responses below are bounded by write timeouts,
+    // and long-lived streams require authentication first.
+    drop(pre_auth);
     if request.client.len() != 32 || !request.client.bytes().all(|v| v.is_ascii_hexdigit()) {
         return respond(stream, 401, "", &[]);
     }
@@ -1087,7 +1137,7 @@ fn serve_control(
     Ok(())
 }
 
-// A stream owns one of the four fixed network workers. A second stream cannot
+// A stream owns one of the fixed network workers. A second stream cannot
 // occupy the control worker, even when it presents the same pairing identity.
 struct VideoLease<'a>(&'a Shared);
 impl Drop for VideoLease<'_> {
@@ -1697,6 +1747,38 @@ mod tests {
             Duration::from_millis(500)
         )
         .is_err());
+    }
+
+    #[test]
+    fn slow_unauthenticated_connections_cannot_occupy_every_worker() {
+        let host = Host::start(Ipv4Addr::LOCALHOST, egui::Context::default()).unwrap();
+        let uri = url::Url::parse(&host.invite).unwrap();
+        let port = uri
+            .query_pairs()
+            .find(|(k, _)| k == "port")
+            .unwrap()
+            .1
+            .parse::<u16>()
+            .unwrap();
+        // Two silent connections from one address use its pre-auth budget.
+        let _held: Vec<_> = (0..MAX_PRE_AUTH_PER_ADDRESS)
+            .map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap())
+            .collect();
+        std::thread::sleep(Duration::from_millis(100));
+        // A further one is closed at once instead of waiting for headers.
+        let mut extra = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        extra
+            .set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
+        let started = Instant::now();
+        let mut byte = [0];
+        let closed = match extra.read(&mut byte) {
+            Ok(read) => read == 0,
+            Err(error) => {
+                error.kind() != io::ErrorKind::WouldBlock && error.kind() != io::ErrorKind::TimedOut
+            }
+        };
+        assert!(closed && started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
