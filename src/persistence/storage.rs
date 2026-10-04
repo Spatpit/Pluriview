@@ -524,12 +524,6 @@ fn remove_file_if_exists(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
-impl Default for Storage {
-    fn default() -> Self {
-        Self::new().expect("Failed to initialize storage")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::Storage;
