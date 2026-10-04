@@ -725,9 +725,11 @@ fn capture_window_loop(
         privacy::redact_title(&window_title)
     );
 
-    // Use default minimum update interval (windows-capture handles FPS internally)
-    // We do our own throttling in on_frame_arrived
-    let min_interval = MinimumUpdateIntervalSettings::Default;
+    // Exact per-tile FPS throttling stays in on_frame_arrived (presets change
+    // live). Where supported, also stop Windows from delivering, and copying
+    // on the GPU, frames faster than any preset can use: a 144/240 Hz source
+    // otherwise produces every refresh for us to discard.
+    let min_interval = probed_minimum_update_interval();
 
     // Configure capture settings
     let completion_active = active.clone();
@@ -751,7 +753,7 @@ fn capture_window_loop(
     // start if those settings are not Default and the API is missing.
     let cursor = probed_cursor_capture_setting();
     let border = probed_draw_border_setting();
-    let try_start = |cursor, border, flags| {
+    let try_start = |cursor, border, min_interval, flags| {
         let settings = Settings::new(
             capture_target_from_hwnd(hwnd),
             cursor,
@@ -765,16 +767,18 @@ fn capture_window_loop(
         Capture::start_free_threaded(settings)
     };
 
-    let start_result = match try_start(cursor, border, flags.clone()) {
+    let start_result = match try_start(cursor, border, min_interval, flags.clone()) {
         Err(error)
             if capture_settings_unsupported(&error)
                 && (cursor != CursorCaptureSettings::Default
-                    || border != DrawBorderSettings::Default) =>
+                    || border != DrawBorderSettings::Default
+                    || min_interval != MinimumUpdateIntervalSettings::Default) =>
         {
-            log::warn!("Retrying capture with default cursor and border settings: {error}");
+            log::warn!("Retrying capture with default capture settings: {error}");
             try_start(
                 CursorCaptureSettings::Default,
                 DrawBorderSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
                 flags,
             )
         }
@@ -846,8 +850,34 @@ fn capture_settings_unsupported<E>(error: &GraphicsCaptureApiError<E>) -> bool {
         GraphicsCaptureApiError::GraphicsCaptureApiError(
             windows_capture::graphics_capture_api::Error::BorderConfigUnsupported
                 | windows_capture::graphics_capture_api::Error::CursorConfigUnsupported
+                | windows_capture::graphics_capture_api::Error::MinimumUpdateIntervalUnsupported
         )
     )
+}
+
+/// Twice the highest FPS preset. Keeping headroom above every preset means
+/// delivery jitter can never make the FPS throttle skip a due frame.
+const CAPTURE_MIN_UPDATE_INTERVAL: Duration = Duration::from_micros(1_000_000 / 120);
+
+fn minimum_update_interval(
+    supported: bool,
+) -> windows_capture::settings::MinimumUpdateIntervalSettings {
+    use windows_capture::settings::MinimumUpdateIntervalSettings;
+    if supported {
+        MinimumUpdateIntervalSettings::Custom(CAPTURE_MIN_UPDATE_INTERVAL)
+    } else {
+        MinimumUpdateIntervalSettings::Default
+    }
+}
+
+fn probed_minimum_update_interval() -> windows_capture::settings::MinimumUpdateIntervalSettings {
+    match GraphicsCaptureApi::is_minimum_update_interval_supported() {
+        Ok(supported) => minimum_update_interval(supported),
+        Err(error) => {
+            log::debug!("Could not probe capture update interval support: {error}");
+            windows_capture::settings::MinimumUpdateIntervalSettings::Default
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1223,6 +1253,17 @@ mod tests {
         );
         assert_eq!(draw_border_setting(true), DrawBorderSettings::WithoutBorder);
         assert_eq!(draw_border_setting(false), DrawBorderSettings::Default);
+        use windows_capture::settings::MinimumUpdateIntervalSettings;
+        assert_eq!(
+            super::minimum_update_interval(false),
+            MinimumUpdateIntervalSettings::Default
+        );
+        let MinimumUpdateIntervalSettings::Custom(interval) = super::minimum_update_interval(true)
+        else {
+            panic!("supported systems request a custom interval");
+        };
+        // Faster than the 60 FPS preset, so the throttle never misses a frame.
+        assert!(interval < std::time::Duration::from_secs(1) / 60);
     }
 
     #[test]
