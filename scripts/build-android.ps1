@@ -39,6 +39,20 @@ Invoke-Checked javac (@('-encoding', 'UTF-8', '--release', '8', '-classpath', $a
 Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', $classes, '-d', $tests, "$source\tests\CameraTransformTest.java", "$source\tests\VideoPacketTest.java", "$source\tests\DisplayMappingTest.java", "$source\tests\DoubleTapTest.java", "$source\tests\StreamTimingTest.java", "$source\tests\DecoderLifecycleTest.java")
 Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', "$classes;$tests", '-d', $tests, "$source\tests\VideoConnectionTest.java")
 Invoke-Checked java @('-cp', "$classes;$tests", 'io.pluriview.viewer.VideoConnectionTest')
+Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', $classes, '-d', $tests, "$source\tests\AudioPacketTest.java")
+Invoke-Checked java @('-cp', "$classes;$tests", 'io.pluriview.viewer.AudioPacketTest')
+# Isolate the simulated decoder from both the real classes and APK inputs.
+$audioTests = Join-Path $build 'audio-tests'
+New-Item -ItemType Directory -Path $audioTests | Out-Null
+Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', $classes, '-d', $audioTests, "$source\tests\audio-fixture\AudioDecoder.java", "$source\tests\AudioStartupTest.java")
+Invoke-Checked java @('-cp', "$audioTests;$classes", 'io.pluriview.viewer.AudioStartupTest')
+# Exercise the real audio pump against bounded codec/speaker fixtures. These
+# fixtures replace Android APIs only for this JVM test, never in APK classes.
+$audioPumpTests = Join-Path $build 'audio-pump-tests'
+New-Item -ItemType Directory -Path $audioPumpTests | Out-Null
+$audioPlatform = @(Get-ChildItem -LiteralPath "$source\tests\audio-platform\android\media" -Filter '*.java' | ForEach-Object FullName)
+Invoke-Checked javac (@('-encoding', 'UTF-8', '--release', '8', '-classpath', $classes, '-d', $audioPumpTests) + $audioPlatform + @("$source\src\io\pluriview\viewer\AudioDecoder.java", "$source\tests\AudioDecoderTest.java"))
+Invoke-Checked java @('-cp', "$audioPumpTests;$classes", 'io.pluriview.viewer.AudioDecoderTest')
 Invoke-Checked java @('-cp', "$classes;$tests", 'CameraTransformTest')
 Invoke-Checked java @('-cp', "$classes;$tests", 'io.pluriview.viewer.VideoPacketTest')
 Invoke-Checked java @('-cp', "$classes;$tests", 'DisplayMappingTest')

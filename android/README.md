@@ -3,7 +3,10 @@
 Development preview of a **shared PC canvas camera**. Requires Android 8.0+
 and a running Windows Pluriview build with View → Phone Viewer. There is no
 cloud service or account. Use only trusted private Wi-Fi: the LAN transport is
-unencrypted and has no audio. Version 0.3.8 uses a dedicated video socket with
+unencrypted. Version 0.3.11 fixes audio queue-full reconnects and retains
+the optional tile audio introduced in 0.3.9. Use the updated Windows 0.7.1 build
+for simultaneous phone audio and desktop Stream Audio Monitor support.
+Version 0.3.8 uses a dedicated video socket with
 resumable reads: short socket timeouts preserve partially received records and
 decoder references, instead of restarting the stream. Reads poll at 250 ms,
 with a five-second silence limit and eight-second total record limit. The HTTP
@@ -22,11 +25,59 @@ It retains double-tap focus and fixed 720p H.264 quality,
 fullscreen Fill/Fit and PC hardware encoding with software encoding as backup.
 The status bar shows video resolution and **Received / Shown FPS**. Video failures
 show a status and retry H.264; the Android client no longer downloads JPEGs.
-APK 0.3.8 works with Windows preview 0.3.6; the PC does not need another update.
+Video remains compatible with Windows preview 0.3.6; audio requires 0.3.9.
 Nearby discovery requires Windows preview 0.3.6 or newer. QR/link pairing
 still works with earlier compatible PC previews.
 
 ## Build and install
+
+### Optional tile audio
+
+Version 0.3.11 allows bounded waiting for the decoder to drain a short network
+burst, while retaining the six-packet queue and 250 ms packet-age limit. Partial
+or zero speaker writes return to decoder-input processing; one output buffer
+is retained with a 150 ms deadline. AudioTrack starts in streaming mode without
+a hard-coded 8192-byte prefill requirement. Stuck input and speaker output have
+separate status labels. The production pump is tested with isolated media API
+fixtures for bursts, short/zero writes, stalls and cleanup; these do not replace
+device-level codec and listening checks.
+
+Version 0.3.10 prepares MediaCodec and AudioTrack before requesting the live
+audio stream, so slower device initialization cannot fill its six-packet queue.
+Preparation is cancellable and has a three-second deadline. Decoder stall
+timing excludes idle network waits. Reconnect status includes a fixed, safe
+failure label rather than hiding every failure behind “Reconnecting.”
+
+Tap the canvas to reveal **Audio off**, then tap it to enable sound. The control
+is also available outside fullscreen. Audio is off for each new connection;
+turning it off closes the audio socket and releases the PC capture/encoder and
+phone decoder/output. It is not just a speaker mute. The stream is AAC-LC,
+48 kHz stereo, at a 128 kbps target (roughly 16 KB/s plus transport overhead).
+Backgrounding and paused/unavailable video stop audio too. Returning resumes
+audio only if it was still enabled. Audio focus loss switches it off; tap again
+to enable after the other app finishes. Phone media volume controls loudness.
+
+With desktop monitoring off, native video and owned WebView tile audio comes from Pluriview's process tree.
+External window tiles must have their per-tile **Stream Audio** switch enabled.
+Only those application trees are added, with duplicate/nested PIDs removed.
+Windows captures an application's sound, not an individual window/tab; other
+sounds from the same source application can also be heard. The PC's unrelated
+applications and system notifications are not included. No microphone is used.
+
+Process loopback requires [Windows build 20348+](https://learn.microsoft.com/en-us/samples/microsoft/windows-classic-samples/applicationloopbackaudio-sample/), including Windows 11; unsupported PCs
+show an audio-unavailable status while video continues. Desktop **Stream Audio
+Monitor** and phone audio can run together. With monitoring enabled, the phone
+captures only Pluriview's application mix, including the monitor's rendered copies,
+as application sharing does. It does not add separate captures of those source
+applications. The desktop monitor keeps its selected output and existing behavior;
+phone streaming does not change desktop audio routing or mute settings.
+Changing the monitoring mode reconnects phone audio automatically. Existing
+companion 0.3.9 installations support this updated desktop behavior.
+The initial implementation has bounded latency buffering, not a shared audio/
+video presentation clock; precise lip-sync across devices is not guaranteed.
+Missing Windows media components or Android audio codecs also leave video usable.
+
+### Building the APK
 
 Version 0.3.1 fixes an immediate startup crash introduced by fullscreen setup:
 the pairing screen is installed before system-bar configuration, and controller
@@ -115,8 +166,8 @@ Windows advertises `_pluriview._tcp.local` on the selected private interface
 only while sharing. It advertises a generated PC display name, address/port and
 protocol version, never a token or canvas content. Android uses `NsdManager`,
 bounds results and resolves one service at a time. Discovery and approval stop
-when the pairing screen leaves the foreground. Three fixed host workers
-accommodate video, control and pairing.
+when the pairing screen leaves the foreground. Four fixed host workers
+accommodate video, control, optional audio and pairing.
 Foreground discovery holds a Wi-Fi multicast lock for older Android support;
 it releases the lock on failure, backgrounding or connection, as described in
 [Android's NSD documentation](https://developer.android.com/reference/android/net/nsd/NsdManager#Wi-Fi-Multicast-Lock).
@@ -141,6 +192,21 @@ by the desktop-dialog pause guard.
   through `X-Frame-Id`, `X-Canvas-Width`, `X-Canvas-Height`. Send `X-Last-Frame`
   to avoid downloading the same frame. A 204 means no new frame; the
   `X-Viewer-State: paused` header means the client should hide stale content.
+- `GET /v2/audio`: optional persistent response, `application/x-pluriview-aac`.
+  Requires the existing bearer/client authentication, a live viewer lease and
+  active unpaused video. It cannot claim or renew that lease. One audio stream
+  is allowed. Status 423 means paused;
+  503 means capture/codec/source availability prevents audio. A four-byte `PVA1`
+  magic plus two-byte AAC AudioSpecificConfig `11 90` announces fixed AAC-LC
+  48 kHz stereo. Each record contains a big-endian u32 length (1–8192) followed
+  by one raw AAC access unit representing 1024 stereo frames. No HTTP chunking.
+  Sources are supplied exclusively by the desktop; no PID or audio-routing
+  controls are accepted from the phone. Changed sources, pause, video epoch,
+  expired lease/UI source snapshot, client EOF and stale output close capture.
+  The phone bounds receive/decode/output queues, cancels the socket on off or
+  background, and keeps a single decoder slot across reconnects. Audio errors
+  retry independently of video; older PCs report audio as unsupported.
+  The codec uses the platform [AAC encoder](https://learn.microsoft.com/en-us/windows/win32/medfound/aac-encoder), without a bundled codec dependency.
 - `GET /v2/video`: one persistent HTTP response with content type
   `application/x-pluriview-h264`. Each record starts with a 32-byte header in
   network byte order: payload length (`u32`), coded width/height (`u32` each),

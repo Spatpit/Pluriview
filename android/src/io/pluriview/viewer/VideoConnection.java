@@ -13,13 +13,16 @@ final class VideoConnection implements AutoCloseable {
     private final DataInputStream input;
     final int status;
     VideoConnection(String base, String token, String client, Runnable waiting) throws IOException {
+        this(base, token, client, waiting, "/v2/video", "application/x-pluriview-h264", 2_000_000_000L);
+    }
+    VideoConnection(String base, String token, String client, Runnable waiting, String path, String contentType, long responseTimeout) throws IOException {
         URL url = new URL(base);
         try {
             socket.setTcpNoDelay(true); socket.setSoTimeout(250);
             socket.connect(new InetSocketAddress(url.getHost(), url.getPort()), 1500);
-            reader = new ResumableInput(socket.getInputStream(), System::nanoTime, waiting);
+            reader = new ResumableInput(socket.getInputStream(), System::nanoTime, waiting, responseTimeout);
             input = new DataInputStream(new BufferedInputStream(reader, 32768));
-            socket.getOutputStream().write(("GET /v2/video HTTP/1.1\r\nHost: " + url.getHost() + ":" + url.getPort()
+            socket.getOutputStream().write(("GET " + path + " HTTP/1.1\r\nHost: " + url.getHost() + ":" + url.getPort()
                 + "\r\nAuthorization: Bearer " + token + "\r\nX-Pluriview-Client: " + client
                 + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
             reader.begin(true);
@@ -42,7 +45,7 @@ final class VideoConnection implements AutoCloseable {
                     if (colon <= 0) throw new IOException("Invalid video response");
                     String name = lines[i].substring(0, colon).toLowerCase(Locale.ROOT);
                     String value = lines[i].substring(colon + 1).trim();
-                    if (name.equals("content-type")) type = value.equals("application/x-pluriview-h264");
+                    if (name.equals("content-type")) type = value.equals(contentType);
                     if (name.equals("transfer-encoding") || name.equals("content-encoding") || name.equals("content-length"))
                         throw new IOException("Unsupported video framing");
                 }
@@ -51,6 +54,7 @@ final class VideoConnection implements AutoCloseable {
         } catch (IOException | RuntimeException error) { close(); throw error; }
     }
     VideoPacket next() throws IOException { reader.begin(false); return new VideoPacket(input); }
+    DataInputStream record() { reader.begin(false); return input; }
     @Override public void close() { try { socket.close(); } catch (IOException ignored) {} }
 
     static final class ResumableInput extends InputStream {
@@ -59,14 +63,18 @@ final class VideoConnection implements AutoCloseable {
         private final Runnable waiting;
         private long started, progress;
         private boolean header;
+        private final long responseTimeout;
         ResumableInput(InputStream source, LongSupplier clock, Runnable waiting) {
-            this.source = source; this.clock = clock; this.waiting = waiting;
+            this(source, clock, waiting, 2_000_000_000L);
+        }
+        ResumableInput(InputStream source, LongSupplier clock, Runnable waiting, long responseTimeout) {
+            this.source = source; this.clock = clock; this.waiting = waiting; this.responseTimeout = responseTimeout;
         }
         void begin(boolean header) { this.header = header; started = progress = clock.getAsLong(); }
         private void check() throws SocketTimeoutException {
             long now = clock.getAsLong();
             // Bound both silence and slow-drip records. No unbounded retry loop.
-            if (now - started >= (header ? 2_000_000_000L : 8_000_000_000L)
+            if (now - started >= (header ? responseTimeout : 8_000_000_000L)
                 || now - progress >= 5_000_000_000L)
                 throw new SocketTimeoutException(header ? "Video response timeout" : "Video data timeout");
         }

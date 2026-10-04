@@ -1,6 +1,9 @@
 package io.pluriview.viewer;
 
 import android.app.Activity;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.content.Intent;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -41,6 +44,7 @@ public final class ViewerActivity extends Activity {
     private Session session;
     private PairingScreen nearby;
     private final DecoderSlot decoderSlot = new DecoderSlot();
+    private final DecoderSlot audioNetworkSlot = new DecoderSlot(), audioCodecSlot = new DecoderSlot();
     private TextView status;
     private CanvasView canvas;
     private EditText pairing;
@@ -51,10 +55,13 @@ public final class ViewerActivity extends Activity {
     private TextView viewerHint;
     private TextView viewerStats;
     private Button fitButton, overlayFit;
+    private Button audioButton, overlayAudio;
+    private TextView audioStatus, overlayAudioStatus;
     private final Runnable hideControls = () -> { if (fullscreen && overlay != null) overlay.setVisibility(View.GONE); };
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
         fill = getPreferences(MODE_PRIVATE).getBoolean("fill", true);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
         showPairing(null);
@@ -117,7 +124,7 @@ public final class ViewerActivity extends Activity {
         if (invite != null) pairing.setText(invite);
         root.addView(pairing);
         Button connect = new Button(this); connect.setText("Connect to PC"); root.addView(connect);
-        status = text("Use the same trusted private Wi-Fi as your PC. This preview streams without encryption or audio.", 14);
+        status = text("Use the same trusted private Wi-Fi as your PC. Streaming is unencrypted. Optional tile audio starts off.", 14);
         root.addView(status);
         connect.setOnClickListener(v -> connect(pairing.getText().toString().trim()));
         ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.addView(root);
@@ -179,6 +186,10 @@ public final class ViewerActivity extends Activity {
         Button expand = new Button(this); expand.setText("Full screen"); actions.addView(expand, new LinearLayout.LayoutParams(0, -2, 1));
         fitButton = new Button(this); actions.addView(fitButton, new LinearLayout.LayoutParams(0, -2, 1));
         fitButton.setOnClickListener(v -> toggleFit());
+        LinearLayout sound = new LinearLayout(this); bar.addView(sound);
+        audioButton = new Button(this); sound.addView(audioButton);
+        audioButton.setOnClickListener(v -> next.toggleAudio());
+        audioStatus = text("Audio: off", 12); sound.addView(audioStatus, new LinearLayout.LayoutParams(0, -2, 1));
         root.addView(bar);
         canvas = new CanvasView(next);
         root.addView(canvas, new LinearLayout.LayoutParams(-1, 0, 1));
@@ -193,6 +204,10 @@ public final class ViewerActivity extends Activity {
         LinearLayout overlayActions = new LinearLayout(this); overlay.addView(overlayActions);
         Button restore = new Button(this); restore.setText("Exit full screen"); overlayActions.addView(restore);
         overlayFit = new Button(this); overlayActions.addView(overlayFit); overlayFit.setOnClickListener(v -> toggleFit());
+        LinearLayout overlaySound = new LinearLayout(this); overlay.addView(overlaySound);
+        overlayAudio = new Button(this); overlaySound.addView(overlayAudio);
+        overlayAudio.setOnClickListener(v -> next.toggleAudio());
+        overlayAudioStatus = text("Audio: off", 12); overlaySound.addView(overlayAudioStatus, new LinearLayout.LayoutParams(0, -2, 1));
         FrameLayout.LayoutParams corner = new FrameLayout.LayoutParams(-2, -2, android.view.Gravity.TOP | android.view.Gravity.RIGHT);
         corner.setMargins(dp(8), dp(8), dp(8), dp(8));
         surface.addView(overlay, corner);
@@ -209,6 +224,7 @@ public final class ViewerActivity extends Activity {
         });
         expand.setOnClickListener(v -> setFullscreen(true)); restore.setOnClickListener(v -> setFullscreen(false));
         updateFitLabels();
+        next.updateAudioLabels();
         setContentView(surface);
         setFullscreen(true);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -307,6 +323,72 @@ public final class ViewerActivity extends Activity {
         final RecoveryWindow recovery = new RecoveryWindow();
         volatile int reconnects;
         volatile String lastRecovery = "";
+        boolean audioEnabled;
+        AudioStream audioStream;
+        AudioFocusRequest audioFocus;
+        int audioRevision;
+        int audioFocusRevision;
+        String audioText = "Audio: off";
+
+        void updateAudioLabels() {
+            if (session != this) return;
+            if (audioButton != null) audioButton.setText(audioEnabled ? "Audio on" : "Audio off");
+            if (overlayAudio != null) overlayAudio.setText(audioEnabled ? "Audio on" : "Audio off");
+            if (audioStatus != null) audioStatus.setText(audioText);
+            if (overlayAudioStatus != null) overlayAudioStatus.setText(audioText);
+        }
+
+        void toggleAudio() {
+            audioEnabled = !audioEnabled;
+            audioText = audioEnabled ? "Audio: waiting for canvas" : "Audio: off";
+            updateAudio(); updateAudioLabels(); revealControls();
+        }
+
+        void stopAudio() {
+            audioRevision++;
+            audioFocusRevision++;
+            if (audioStream != null) { audioStream.close(); audioStream = null; }
+            if (audioFocus != null) {
+                ((AudioManager) getSystemService(AUDIO_SERVICE)).abandonAudioFocusRequest(audioFocus);
+                audioFocus = null;
+            }
+        }
+
+        void updateAudio() {
+            if (!audioEnabled || !running.get() || !foreground || !ready) {
+                if (audioStream != null || audioFocus != null) stopAudio();
+                if (audioEnabled) audioText = "Audio: waiting for canvas";
+                updateAudioLabels(); return;
+            }
+            if (audioStream != null) return;
+            if (!audioNetworkSlot.available() || !audioCodecSlot.available()) {
+                audioText = "Audio: waiting for previous playback to stop"; updateAudioLabels(); return;
+            }
+            if (audioFocus == null) {
+                final int focusRevision = ++audioFocusRevision;
+                AudioManager manager = (AudioManager) getSystemService(AUDIO_SERVICE);
+                audioFocus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
+                    .setWillPauseWhenDucked(true)
+                    .setOnAudioFocusChangeListener(change -> {
+                        if (change < 0 && session == this && audioFocusRevision == focusRevision) {
+                            audioEnabled = false; stopAudio(); audioText = "Audio off: another app needs sound"; updateAudioLabels();
+                        }
+                    }).build();
+                if (manager.requestAudioFocus(audioFocus) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                    audioEnabled = false; stopAudio(); audioText = "Audio off: sound is in use"; updateAudioLabels(); return;
+                }
+            }
+            final int revision = ++audioRevision;
+            try {
+                audioStream = new AudioStream(base, token, client, audioNetworkSlot, audioCodecSlot, value -> runOnUiThread(() -> {
+                    if (session == this && audioRevision == revision && audioEnabled && running.get() && !value.equals(audioText)) {
+                        audioText = value; updateAudioLabels();
+                    }
+                }));
+            } catch (java.io.IOException error) { stopAudio(); audioText = "Audio: waiting for previous playback to stop"; }
+            updateAudioLabels();
+        }
 
         Session(String ip, int port, String token, String client) { base = "http://" + ip + ":" + port; this.token = token; this.client = client; }
 
@@ -322,13 +404,14 @@ public final class ViewerActivity extends Activity {
             workers.scheduleWithFixedDelay(() -> sendCamera(run), 0, 8, TimeUnit.MILLISECONDS);
             statsTask = new Runnable() { public void run() {
                 if (!current(run) || session != Session.this) return;
-                updateStats(); canvas.postDelayed(this, 500);
+                updateAudio(); updateStats(); canvas.postDelayed(this, 500);
             }};
             canvas.post(statsTask);
         }
 
         void pause() {
             running.set(false); generation++; ready = false; camera.clear(); pendingFocus.set(null);
+            stopAudio();
             recovery.reset();
             latestVideo = null;
             if (canvas != null && canvas.owner == this) { canvas.video.setAlpha(0); canvas.resetGesture(); canvas.invalidate(); }
@@ -361,6 +444,7 @@ public final class ViewerActivity extends Activity {
                 status.setText(message);
                 if (viewerStats != null) viewerStats.setText(message);
                 if (clear) { canvas.video.setAlpha(0); canvas.resetGesture(); canvas.invalidate(); }
+                if (clear) updateAudio();
             });
         }
 
