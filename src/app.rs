@@ -80,6 +80,8 @@ const RESTORED_VIDEO_START_INTERVAL: Duration = Duration::from_secs(2);
 /// Polling cadence for saved Windows tiles whose applications are not open.
 #[cfg(windows)]
 const INACTIVE_WINDOW_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+/// How often live window captures re-check the privacy filter.
+const PRIVACY_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// Pause a hidden video wallpaper immediately, then release its libmpv core
 /// after a grace period so quick minimize/restore cycles do not churn decoders.
 #[cfg(windows)]
@@ -1056,6 +1058,7 @@ pub struct PluriviewApp {
     /// Last scan for applications backing inactive saved window tiles.
     #[cfg(windows)]
     last_inactive_window_scan: Option<Instant>,
+    last_privacy_check: Option<Instant>,
 }
 
 impl PluriviewApp {
@@ -1232,6 +1235,7 @@ impl PluriviewApp {
             window_audio_monitors: HashMap::new(),
             #[cfg(windows)]
             last_inactive_window_scan: None,
+            last_privacy_check: None,
         };
 
         // Restore the active named workspace (or the migrated legacy autosave).
@@ -3098,6 +3102,44 @@ impl PluriviewApp {
     /// capturable top-level window. Enumeration uses the same privacy filters
     /// as the window picker.
     #[cfg(windows)]
+    /// Window titles change while captured (a browser switching to an
+    /// InPrivate window or a password page). Apply the same privacy filter
+    /// as the window list: stop capturing and drop the last frame. The tile
+    /// then waits as `Not active` and reconnects through the usual
+    /// privacy-filtered matching once the window is no longer sensitive.
+    fn privacy_upkeep(&mut self) {
+        if self
+            .last_privacy_check
+            .is_some_and(|last| last.elapsed() < PRIVACY_CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.last_privacy_check = Some(Instant::now());
+        for preview in self.preview_manager.all_mut() {
+            let Some(hwnd) = preview.window_handle.as_ref().map(|handle| handle.hwnd) else {
+                continue;
+            };
+            // A frozen tile shows a snapshot taken before any change and no
+            // longer captures, so leave it alone.
+            if !preview.is_window_capture() || preview.removing.is_some() || preview.manually_frozen
+            {
+                continue;
+            }
+            let Some(title) = crate::window_picker::window_title(hwnd) else {
+                continue;
+            };
+            let exe = preview.window_exe.as_deref().unwrap_or_default();
+            if privacy::is_sensitive_window(exe, &title) {
+                log::info!(
+                    "Stopped capturing {} because its title became private",
+                    privacy::redact_title(&title)
+                );
+                self.capture_coordinator.stop_capture(preview.id);
+                preview.mark_window_inactive();
+            }
+        }
+    }
+
     fn inactive_window_upkeep(&mut self, ctx: &egui::Context) {
         let has_inactive = self.preview_manager.all().any(|preview| {
             (preview.is_inactive_window()
@@ -5504,6 +5546,8 @@ impl eframe::App for PluriviewApp {
             self.title_bar_ui(ctx);
         }
 
+        #[cfg(windows)]
+        self.privacy_upkeep();
         #[cfg(windows)]
         self.inactive_window_upkeep(ctx);
 
