@@ -3133,10 +3133,10 @@ impl PluriviewApp {
                 continue;
             };
             let exe = preview.window_exe.as_deref().unwrap_or_default();
-            if privacy::is_sensitive_window(exe, &title) {
+            if crate::privacy::is_sensitive_window(exe, &title) {
                 log::info!(
                     "Stopped capturing {} because its title became private",
-                    privacy::redact_title(&title)
+                    crate::privacy::redact_title(&title)
                 );
                 self.capture_coordinator.stop_capture(preview.id);
                 preview.mark_window_inactive();
