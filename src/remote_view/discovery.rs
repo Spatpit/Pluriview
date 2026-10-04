@@ -199,7 +199,6 @@ mod tests {
             QueryName: windows_core::PWSTR(service.as_ptr() as *mut _),
             pResolveCompletionCallback: Some(resolved),
             pQueryContext: context.cast(),
-            ..Default::default()
         };
         let mut cancel = DNS_SERVICE_CANCEL::default();
         let status = unsafe { DnsServiceResolve(&request, &mut cancel) };

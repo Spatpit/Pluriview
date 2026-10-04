@@ -482,12 +482,12 @@ impl RemoteView {
             }
             if queued.received.elapsed() > Duration::from_millis(500)
                 || queued.epoch != host.shared.epoch.load(Ordering::Relaxed)
-                || !host
+                || host
                     .shared
                     .peer
                     .lock()
                     .as_ref()
-                    .is_some_and(|peer| peer.id == queued.client)
+                    .is_none_or(|peer| peer.id != queued.client)
             {
                 continue;
             }

@@ -1120,15 +1120,17 @@ fn canvas_only_hides_empty_canvas_overlays() {
 #[test]
 fn canvas_only_cancels_active_handle_drag() {
     let context = Context::default();
-    let mut canvas = CanvasState::default();
-    canvas.drag_state = Some(DragState::Resizing {
-        id: PreviewId(1),
-        handle: ResizeHandle::BottomRight,
-        start_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
-        start_mouse: Pos2::new(100.0, 100.0),
-        aspect_ratio: Some(1.0),
-        screen_space: false,
-    });
+    let mut canvas = CanvasState {
+        drag_state: Some(DragState::Resizing {
+            id: PreviewId(1),
+            handle: ResizeHandle::BottomRight,
+            start_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
+            start_mouse: Pos2::new(100.0, 100.0),
+            aspect_ratio: Some(1.0),
+            screen_space: false,
+        }),
+        ..Default::default()
+    };
     let mut previews = PreviewManager::new();
     let mut captures = CaptureCoordinator::new();
 
@@ -2191,8 +2193,10 @@ fn playlist_row_stays_clickable_after_canvas_zoom() {
     std::fs::write(&video, b"").unwrap();
 
     let context = Context::default();
-    let mut canvas = CanvasState::default();
-    canvas.zoom = 2.0;
+    let mut canvas = CanvasState {
+        zoom: 2.0,
+        ..Default::default()
+    };
     let mut previews = PreviewManager::new();
     let playlist = FolderPlaylist::scan(root.clone(), None).unwrap();
     let id = previews.add_folder_playlist(
@@ -2249,10 +2253,12 @@ fn playlist_row_stays_clickable_after_canvas_zoom() {
 
 #[test]
 fn focus_fits_tile_and_restores_canvas_view() {
-    let mut canvas = CanvasState::default();
-    canvas.pan = Vec2::new(21.0, -8.0);
-    canvas.zoom = 0.75;
-    canvas.selection = vec![PreviewId(9)];
+    let mut canvas = CanvasState {
+        pan: Vec2::new(21.0, -8.0),
+        zoom: 0.75,
+        selection: vec![PreviewId(9)],
+        ..Default::default()
+    };
     canvas.animation.momentum_active = true;
     canvas.animation.momentum_velocity = Vec2::splat(10.0);
     let viewport = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(1200.0, 700.0));
@@ -2331,8 +2337,10 @@ fn focus_fits_tall_tile_without_cropping() {
 fn removing_focused_tile_exits_focus_without_restoring_deleted_selection() {
     let mut previews = PreviewManager::new();
     let id = previews.add("focused".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
-    let mut canvas = CanvasState::default();
-    canvas.selection = vec![id, PreviewId(99)];
+    let mut canvas = CanvasState {
+        selection: vec![id, PreviewId(99)],
+        ..Default::default()
+    };
     let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
     canvas.focus_on_tile(id, previews.get(id).unwrap().rect(), viewport);
 

@@ -1290,6 +1290,7 @@ impl CanvasState {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn ui_with_canvas_views_menu(
         &mut self,
         ui: &mut egui::Ui,
@@ -1492,7 +1493,7 @@ impl CanvasState {
             if self.crop_mode.is_some() {
                 let hint = Rect::from_center_size(
                     egui::pos2(canvas_rect.center().x, canvas_rect.bottom() - 24.0),
-                    Vec2::new((canvas_rect.width() - 24.0).min(410.0).max(1.0), 28.0),
+                    Vec2::new((canvas_rect.width() - 24.0).clamp(1.0, 410.0), 28.0),
                 );
                 painter.rect_filled(hint, 6.0, crate::ui_theme::PANEL);
                 crate::ui_theme::clipped_text(
@@ -3212,10 +3213,8 @@ impl CanvasState {
                             if let Some(preview) = preview_manager.get_mut(sel_id) {
                                 preview.viewport_pin = Some(moved_pin);
                             }
-                        } else {
-                            if let Some(preview) = preview_manager.get_mut(sel_id) {
-                                preview.translate(canvas_delta);
-                            }
+                        } else if let Some(preview) = preview_manager.get_mut(sel_id) {
+                            preview.translate(canvas_delta);
                         }
                     }
                 }

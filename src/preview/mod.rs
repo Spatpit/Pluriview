@@ -1,4 +1,6 @@
 mod manager;
+// `preview::preview` holds the `Preview` tile model itself.
+#[allow(clippy::module_inception)]
 mod preview;
 mod video_preferences;
 
