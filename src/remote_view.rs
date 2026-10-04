@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod aac;
+#[cfg(windows)]
+mod audio;
 mod cadence;
 #[cfg(windows)]
 mod discovery;
@@ -118,6 +122,8 @@ struct Shared {
     frame: Mutex<Option<Arc<EncodedFrame>>>,
     video_active: AtomicBool,
     control_active: AtomicBool,
+    #[cfg(windows)]
+    audio: audio::State,
     video_failed: AtomicBool,
     video_frames: Mutex<VecDeque<Arc<VideoFrame>>>,
     hardware: AtomicBool,
@@ -198,6 +204,13 @@ impl Default for RemoteView {
 }
 
 impl RemoteView {
+    #[cfg(windows)]
+    pub fn set_audio_sources(&self, pids: impl IntoIterator<Item = u32>, monitor_enabled: bool) {
+        if let Some(host) = &self.host {
+            host.shared.audio.update(pids, monitor_enabled);
+        }
+    }
+
     pub fn is_blocking(&self) -> bool {
         self.show_dialog
             || self.approval_drawn
@@ -227,6 +240,7 @@ impl RemoteView {
                     .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                     .show(ctx, |ui| {
                         ui.label(format!("{name} wants to view and navigate your canvas."));
+                        ui.label("The phone can also enable tile audio while connected.");
                         ui.label("Only approve if this number matches the one on your phone:");
                         ui.heading(&code);
                         ui.small("Device names are provided by the requesting phone.");
@@ -297,7 +311,7 @@ impl RemoteView {
                     }
                     if ui.button("Copy pairing link").clicked() { ctx.copy_text(host.invite.clone()); }
                     ui.label("Close this dialog to begin viewing. Drag to pan; pinch to zoom. Both screens share the same view.");
-                    ui.label("Sharing pauses for dialogs and interactive browser mode. No audio in this preview.");
+                    ui.label("Sharing pauses for dialogs and interactive browser mode. Optional tile audio is controlled on the phone.");
                     if ui.button("Stop sharing / disconnect phone").clicked() { self.stop(); }
                     ctx.request_repaint_after(Duration::from_secs(1));
                 } else {
@@ -487,6 +501,8 @@ impl Host {
             frame: Mutex::new(None),
             video_active: AtomicBool::new(false),
             control_active: AtomicBool::new(false),
+            #[cfg(windows)]
+            audio: audio::State::default(),
             video_failed: AtomicBool::new(false),
             video_frames: Mutex::new(VecDeque::with_capacity(6)),
             hardware: AtomicBool::new(false),
@@ -648,10 +664,10 @@ impl Host {
         if !ip.is_loopback() {
             discovery::start(ip, port, shared.clone(), ctx.clone());
         }
-        // Three fixed workers leave one for discovery status/pairing requests
-        // while the exclusive video and control streams are active.
+        // Four fixed workers leave one for discovery status/pairing requests
+        // while the exclusive video, control and optional audio streams are active.
         // No per-request thread creation or unbounded connection/task queue.
-        for index in 0..3 {
+        for index in 0..4 {
             let listener = listener.try_clone()?;
             // Windows socket duplicates need their own nonblocking mode;
             // otherwise Stop leaves accept() waiting until another client calls.
@@ -843,6 +859,7 @@ fn serve(
     let frame_request = request.method == "GET" && request.path == "/v1/frame";
     let video_request = request.method == "GET" && request.path == "/v2/video";
     let control_request = request.method == "GET" && request.path == "/v2/control";
+    let audio_request = request.method == "GET" && request.path == "/v2/audio";
     let camera_request = request.method == "POST" && request.path == "/v1/camera";
     let focus_request = request.method == "POST" && request.path == "/v1/focus";
     let feedback_request = request.method == "POST" && request.path == "/v2/feedback";
@@ -852,6 +869,7 @@ fn serve(
         && !video_request
         && !feedback_request
         && !control_request
+        && !audio_request
     {
         return respond(stream, 404, "", &[]);
     }
@@ -875,6 +893,12 @@ fn serve(
     };
     if !peer_allowed {
         return respond(stream, 409, "", &[]);
+    }
+    if audio_request {
+        #[cfg(windows)]
+        return audio::serve(stream, shared, &request.client);
+        #[cfg(not(windows))]
+        return respond(stream, 503, "", &[]);
     }
     if control_request {
         return serve_control(stream, shared, &request.client, commands, ctx);
@@ -1063,7 +1087,7 @@ fn serve_control(
     Ok(())
 }
 
-// A stream owns one of the three fixed network workers. A second stream cannot
+// A stream owns one of the four fixed network workers. A second stream cannot
 // occupy the control worker, even when it presents the same pairing identity.
 struct VideoLease<'a>(&'a Shared);
 impl Drop for VideoLease<'_> {

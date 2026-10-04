@@ -50,6 +50,19 @@ pub struct FolderPlaylist {
 }
 
 impl FolderPlaylist {
+    pub fn loading(layout: &FolderPlaylistLayout) -> Self {
+        Self {
+            folder: layout.folder.clone(),
+            entries: Vec::new(),
+            selected: layout.selected.clone(),
+            autoplay: layout.autoplay,
+            shuffle: layout.shuffle,
+            repeat: layout.repeat,
+            scroll_offset: 0.0,
+            error: Some("Loading folder…".to_owned()),
+        }
+    }
+
     pub fn scan(folder: PathBuf, selected: Option<PathBuf>) -> Result<Self, String> {
         if !folder.is_dir() {
             return Err(format!("Video folder is unavailable: {}", folder.display()));

@@ -26,6 +26,7 @@ pub struct VideoLaunch {
     pub source: VideoSource,
     pub streamlink_path: Option<PathBuf>,
     pub start_paused: bool,
+    pub preferences: crate::preview::VideoPlaybackPreferences,
     /// Loop muted, fill the paint rectangle, and disable audio output.
     pub wallpaper: bool,
 }

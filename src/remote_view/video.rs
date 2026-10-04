@@ -64,17 +64,17 @@ impl Runtime {
         }
     }
 
-    unsafe fn media_type(&self) -> Result<IMFMediaType> {
+    pub(super) unsafe fn media_type(&self) -> Result<IMFMediaType> {
         let mut raw = std::ptr::null_mut();
         (self.create_type)(&mut raw).ok()?;
         Ok(IMFMediaType::from_raw(raw))
     }
-    unsafe fn sample(&self) -> Result<IMFSample> {
+    pub(super) unsafe fn sample(&self) -> Result<IMFSample> {
         let mut raw = std::ptr::null_mut();
         (self.create_sample)(&mut raw).ok()?;
         Ok(IMFSample::from_raw(raw))
     }
-    unsafe fn buffer(&self, length: u32) -> Result<IMFMediaBuffer> {
+    pub(super) unsafe fn buffer(&self, length: u32) -> Result<IMFMediaBuffer> {
         let mut raw = std::ptr::null_mut();
         (self.create_buffer)(length, &mut raw).ok()?;
         Ok(IMFMediaBuffer::from_raw(raw))

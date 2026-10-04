@@ -57,6 +57,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
+mod media_sources;
+mod settings;
+mod source_loading;
+mod workspaces;
+use source_loading::{PreparedSource, SourceLoads, SourceTarget};
+
 /// How long after activating a browser we skip the focus-loss check, so the
 /// WebView has time to actually take the foreground.
 const BROWSER_FOCUS_GRACE: Duration = Duration::from_millis(300);
@@ -193,6 +199,8 @@ fn browser_tile_screen_rect(
     preview: &Preview,
     canvas_rect: egui::Rect,
 ) -> egui::Rect {
+    // Layout transitions animate the captured tile; keep the native page at
+    // its destination size to avoid relayout/capture allocation every frame.
     preview
         .viewport_pin
         .map(|pin| pin.rect(canvas_rect))
@@ -246,6 +254,11 @@ fn browser_capture_display_size(preview: &Preview) -> Vec2 {
 }
 
 fn restore_layout_tile_state(preview: &mut Preview, saved: &PreviewLayout) {
+    preview.video_preferences = saved.video_preferences.clone().normalized();
+    preview
+        .video_preferences
+        .apply_to_state(&mut preview.video_playback);
+    preview.tile_group = saved.tile_group.clone();
     preview.lock_aspect_ratio = saved.lock_aspect_ratio;
     preview.crop_uv = saved.crop_uv;
     preview.stream_audio = saved.stream_audio;
@@ -263,6 +276,11 @@ fn restore_layout_tile_state(preview: &mut Preview, saved: &PreviewLayout) {
 }
 
 fn restore_removed_tile_state(preview: &mut Preview, removed: &RemovedPreviewInfo) {
+    preview.video_preferences = removed.video_preferences.clone();
+    preview
+        .video_preferences
+        .apply_to_state(&mut preview.video_playback);
+    preview.tile_group = removed.tile_group.clone();
     preview.set_fps_preset(removed.fps_preset);
     preview.crop_uv = removed.crop_uv;
     preview.stream_audio = removed.stream_audio;
@@ -281,9 +299,8 @@ fn restore_browser_geometry(preview: &mut Preview, saved: &PreviewLayout) {
 }
 
 fn original_image_path(source: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    if !source.is_file() {
-        return Err(format!("Image file does not exist: {}", source.display()));
-    }
+    // File availability and decoding belong to the source worker, including
+    // slow network paths. Absolute conversion is lexical and performs no I/O.
     std::path::absolute(source)
         .map_err(|error| format!("Could not resolve the original image path: {error}"))
 }
@@ -347,6 +364,7 @@ fn video_launch_for_source(
         streamlink_path,
         start_paused,
         wallpaper: false,
+        preferences: Default::default(),
     }))
 }
 
@@ -983,6 +1001,7 @@ pub struct PluriviewApp {
 
     /// Last image import/decode error, shown as a dismissible dialog.
     media_error: Option<String>,
+    source_loads: SourceLoads,
 
     /// Missing optional tools encountered by a video creation action.
     external_tool_error: Option<String>,
@@ -1063,11 +1082,10 @@ impl PluriviewApp {
         blocked
     }
 
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self::with_storage(_cc, Storage::new())
-    }
-
-    fn with_storage(_cc: &eframe::CreationContext<'_>, storage: Option<Storage>) -> Self {
+    pub(crate) fn with_storage(
+        _cc: &eframe::CreationContext<'_>,
+        storage: Option<Storage>,
+    ) -> Self {
         // Register phosphor icon glyphs alongside the default font so we can
         // use crisp vector icons instead of emoji/text glyphs in the UI.
         let mut fonts = egui::FontDefinitions::default();
@@ -1185,6 +1203,7 @@ impl PluriviewApp {
             hotkey_error: None,
             quick_add: None,
             media_error: None,
+            source_loads: SourceLoads::new(_cc.egui_ctx.clone()),
             external_tool_error: None,
             video_action_error: None,
             main_hwnd: None,
@@ -1320,20 +1339,18 @@ impl PluriviewApp {
         &mut self,
         folder: std::path::PathBuf,
         position: Pos2,
-    ) -> Result<(PreviewId, PreviewId), String> {
+    ) -> Result<PreviewId, String> {
         Self::require_libmpv("Adding a video folder")?;
-        let playlist = FolderPlaylist::scan(folder.clone(), None)?;
-        let first = playlist
-            .selected
-            .clone()
-            .ok_or_else(|| "The video folder is empty".to_owned())?;
+        let layout = FolderPlaylistLayout {
+            folder: std::path::absolute(&folder).map_err(|e| e.to_string())?,
+            selected: None,
+            autoplay: true,
+            shuffle: false,
+            repeat: false,
+        };
+        let playlist = FolderPlaylist::loading(&layout);
         let group = self.next_playlist_group;
         self.next_playlist_group = self.next_playlist_group.saturating_add(1);
-
-        let video_id = self.add_local_video_path(first, position)?;
-        if let Some(preview) = self.preview_manager.get_mut(video_id) {
-            preview.playlist_group = Some(group);
-        }
 
         let title = folder
             .file_name()
@@ -1347,9 +1364,10 @@ impl PluriviewApp {
             position + Vec2::new(664.0, 0.0),
             Vec2::new(380.0, 360.0),
             group,
-            Some(video_id),
+            None,
         );
-        Ok((video_id, playlist_id))
+        self.queue_playlist_load(playlist_id, layout, true);
+        Ok(playlist_id)
     }
 
     #[cfg(windows)]
@@ -1362,15 +1380,17 @@ impl PluriviewApp {
         group: u64,
         linked_video: Option<PreviewId>,
     ) -> PreviewId {
-        let playlist = FolderPlaylist::from_layout(layout);
-        self.preview_manager.add_folder_playlist(
+        let playlist = FolderPlaylist::loading(layout);
+        let id = self.preview_manager.add_folder_playlist(
             playlist,
             title,
             position,
             size,
             group,
             linked_video,
-        )
+        );
+        self.queue_playlist_load(id, layout.clone(), false);
+        id
     }
 
     #[cfg(windows)]
@@ -1420,11 +1440,12 @@ impl PluriviewApp {
             return Ok(false);
         };
         let target_fps = preview.fps_preset.as_u32();
+        let preferences = preview.video_preferences.clone();
         let start_paused = self
             .pending_video_tiles
             .get(&id)
             .is_some_and(|pending| pending.start_paused);
-        let Some(launch) = video_launch_for_source(
+        let Some(mut launch) = video_launch_for_source(
             &source,
             self.external_tools.status(ToolKind::Streamlink),
             start_paused,
@@ -1447,6 +1468,7 @@ impl PluriviewApp {
                 VideoTileStatus::Starting
             };
         }
+        launch.preferences = preferences;
         let renderer = self.video_manager.launch(id, launch, target_fps)?;
         if let Some(preview) = self.preview_manager.get_mut(id) {
             preview.window_handle = None;
@@ -1473,11 +1495,9 @@ impl PluriviewApp {
     /// playback settings. Normal Play never takes this process-restart path.
     #[cfg(windows)]
     fn reload_video_tile(&mut self, id: PreviewId) -> Result<(), String> {
-        let playback = self
-            .preview_manager
+        self.preview_manager
             .get(id)
             .filter(|preview| preview.is_video())
-            .map(|preview| preview.video_playback.clone())
             .ok_or_else(|| "The video tile no longer exists".to_owned())?;
 
         self.capture_coordinator.stop_capture(id);
@@ -1504,24 +1524,7 @@ impl PluriviewApp {
             preview.video_playback.duration = None;
         }
 
-        if self.try_activate_video_tile(id)? {
-            let tile = self
-                .video_manager
-                .get_mut(id)
-                .ok_or_else(|| "The reloaded video session was not created".to_owned())?;
-            tile.session.set_volume(playback.volume)?;
-            tile.session.set_muted(playback.muted)?;
-            tile.session.set_speed(playback.speed)?;
-            tile.session.set_looping(playback.looping)?;
-            if let Some(track) = playback.audio_track {
-                tile.session.select_audio_track(track)?;
-            }
-            if let Some(track) = playback.subtitle_track {
-                tile.session.select_subtitle_track(track)?;
-            } else {
-                tile.session.disable_subtitles()?;
-            }
-        }
+        self.try_activate_video_tile(id)?;
         Ok(())
     }
 
@@ -1638,11 +1641,12 @@ impl PluriviewApp {
                 }
                 continue;
             }
-            let Some(state) = self
-                .video_manager
-                .get(id)
-                .map(|tile| tile.session.state().clone())
-            else {
+            let Some((state, preferences)) = self.video_manager.get(id).map(|tile| {
+                (
+                    tile.session.state().clone(),
+                    tile.session.preferences().clone(),
+                )
+            }) else {
                 continue;
             };
             if pause_changed.contains(&id) && !state.paused {
@@ -1650,6 +1654,7 @@ impl PluriviewApp {
             }
             if let Some(preview) = self.preview_manager.get_mut(id) {
                 preview.video_playback.clone_from(&state);
+                preview.video_preferences = preferences;
                 if let Some(title) = state
                     .media_title
                     .as_ref()
@@ -1848,20 +1853,10 @@ impl PluriviewApp {
                         failures.push(format!("{label}: {error}"));
                     }
                 };
-                apply("volume", session.set_volume(checkpoint.playback.volume));
-                apply("mute", session.set_muted(checkpoint.playback.muted));
-                apply("speed", session.set_speed(checkpoint.playback.speed));
-                apply("loop", session.set_looping(checkpoint.playback.looping));
+                // Preferences were applied before loading. Checkpoints restore
+                // only the runtime position/play state, not automatic track choices.
                 if let Some(position) = checkpoint.seek_position {
                     apply("position", session.seek_absolute(position));
-                }
-                if let Some(track) = checkpoint.playback.audio_track {
-                    apply("audio track", session.select_audio_track(track));
-                }
-                if let Some(track) = checkpoint.playback.subtitle_track {
-                    apply("subtitle track", session.select_subtitle_track(track));
-                } else {
-                    apply("subtitles", session.disable_subtitles());
                 }
                 if !checkpoint.playback.paused {
                     apply("playback", session.play());
@@ -1875,9 +1870,10 @@ impl PluriviewApp {
             }
             self.video_resume_checkpoints.remove(&id);
             self.restored_paused_videos.remove(&id);
-            if let Some(preview) = self.preview_manager.get_mut(id) {
-                preview.video_playback = checkpoint.playback;
-                preview.video_playback.connected = true;
+            if let (Some(preview), Some(tile)) =
+                (self.preview_manager.get_mut(id), self.video_manager.get(id))
+            {
+                preview.video_playback.clone_from(tile.session.state());
             }
         }
     }
@@ -2118,16 +2114,13 @@ impl PluriviewApp {
             });
 
         if result.is_ok() {
-            if let Some(preview) = self.preview_manager.get_mut(id) {
-                match action {
-                    VideoAction::SetPaused(paused) => {
-                        preview.video_playback.paused = paused;
-                    }
-                    VideoAction::SetVolume(volume) => {
-                        preview.video_playback.volume = volume.clamp(0.0, 100.0);
-                    }
-                    _ => {}
-                }
+            if let (Some(preview), Some(tile)) =
+                (self.preview_manager.get_mut(id), self.video_manager.get(id))
+            {
+                preview.video_playback.clone_from(tile.session.state());
+                preview
+                    .video_preferences
+                    .clone_from(tile.session.preferences());
             }
         }
 
@@ -2185,10 +2178,7 @@ impl PluriviewApp {
                     .and_then(|preview| preview.folder_playlist.as_ref())
                     .map(FolderPlaylist::layout);
                 if let Some(layout) = layout {
-                    let playlist = FolderPlaylist::from_layout(&layout);
-                    if let Some(preview) = self.preview_manager.get_mut(id) {
-                        preview.folder_playlist = Some(playlist);
-                    }
+                    self.queue_playlist_load(id, layout, false);
                     self.playlist_thumbnail_queue
                         .retain(|(playlist_id, _)| *playlist_id != id);
                 }
@@ -2649,525 +2639,6 @@ impl PluriviewApp {
         self.recent_urls.retain(|u| u != &url);
         self.recent_urls.insert(0, url);
         self.recent_urls.truncate(MAX_RECENT_URLS);
-    }
-
-    /// Decode an external image in place and retain its original local path.
-    fn import_media_tile(
-        &mut self,
-        source: &std::path::Path,
-        position: Pos2,
-    ) -> Result<PreviewId, String> {
-        let path = original_image_path(source)?;
-        let asset = media::load(&path)?;
-        let title = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Image")
-            .to_owned();
-        let size = media_tile_size(asset.width, asset.height);
-        Ok(self
-            .preview_manager
-            .add_media(path, title, asset.frames, position, size))
-    }
-
-    /// Recreate a tile from its original path. Relative filenames from older
-    /// layouts still resolve through the legacy managed-media directory.
-    fn restore_media_tile(
-        &mut self,
-        saved_path: &std::path::Path,
-        title: String,
-        position: Pos2,
-        size: Vec2,
-    ) -> Result<PreviewId, String> {
-        let path = self.resolve_saved_image_path(saved_path)?;
-        let (frames, error) = media::load_or_placeholder(&path);
-        let id = self
-            .preview_manager
-            .add_media(path, title, frames, position, size);
-        if let Some(error) = error {
-            if let Some(preview) = self.preview_manager.get_mut(id) {
-                preview.set_capture_error(error);
-            }
-        }
-        Ok(id)
-    }
-
-    fn handle_media_action(&mut self, id: PreviewId, action: MediaAction) {
-        let Some(path) = self
-            .preview_manager
-            .get(id)
-            .filter(|preview| preview.is_media())
-            .and_then(|preview| preview.media_path.clone())
-        else {
-            return;
-        };
-        let result = match action {
-            MediaAction::Retry => self.resolve_saved_image_path(&path),
-            MediaAction::Locate => {
-                let Some(path) = media::pick_file(self.main_hwnd) else {
-                    return;
-                };
-                original_image_path(&path)
-            }
-        };
-        let path = match result {
-            Ok(path) => path,
-            Err(error) => {
-                self.media_error = Some(error);
-                return;
-            }
-        };
-        let (frames, error) = media::load_or_placeholder(&path);
-        if let Some(preview) = self.preview_manager.get_mut(id) {
-            // Repairing a source must not move, unpin, uncrop, or unfreeze it.
-            preview.set_media(path, frames);
-            if let Some(error) = error {
-                preview.set_capture_error(error);
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    fn restore_removed_preview(&mut self, info: RemovedPreviewInfo) -> Option<PreviewId> {
-        let id = if let Some(playlist) = info.folder_playlist.as_ref() {
-            let group = info.playlist_group?;
-            let linked = self.preview_manager.all().find_map(|preview| {
-                (preview.playlist_group == Some(group) && preview.is_video()).then_some(preview.id)
-            });
-            self.restore_folder_playlist(
-                &playlist.layout(),
-                info.title.clone(),
-                info.position,
-                info.size,
-                group,
-                linked,
-            )
-        } else if let Some(url) = info.browser_url.as_deref() {
-            match self.create_browser_tile(url, info.position, info.size, info.fps_preset) {
-                Ok(id) => {
-                    self.apply_browser_mute(id, info.browser_muted);
-                    id
-                }
-                Err(error) => {
-                    self.media_error = Some(error);
-                    return None;
-                }
-            }
-        } else if let Some(media_path) = info.media_path.as_deref() {
-            match self.restore_media_tile(media_path, info.title.clone(), info.position, info.size)
-            {
-                Ok(id) => id,
-                Err(error) => {
-                    self.media_error = Some(error);
-                    return None;
-                }
-            }
-        } else if let Some(source) = info.video_source.clone() {
-            let id = self.create_video_tile(
-                source,
-                info.title.clone(),
-                info.position,
-                info.size,
-                info.fps_preset,
-                true,
-            );
-            let checkpoint = FrozenVideoCheckpoint {
-                playback: info.video_playback.clone(),
-                seek_position: resumable_video_position(&info.video_playback),
-            };
-            if info.manually_frozen {
-                self.frozen_video_checkpoints.insert(id, checkpoint);
-            } else {
-                self.video_resume_checkpoints.insert(id, checkpoint);
-            }
-            id
-        } else if let Some(sender) = info.spout_sender.as_ref() {
-            let id = self.preview_manager.add_for_spout(
-                sender.clone(),
-                info.position,
-                info.size,
-                info.fps_preset,
-            );
-            if !info.manually_frozen {
-                self.capture_coordinator.start_spout_capture(
-                    id,
-                    sender.clone(),
-                    info.fps_preset.as_u32(),
-                );
-            }
-            id
-        } else if info.window_waiting_for_match || info.window_handle.is_some() {
-            // HWNDs can be recycled while the Undo toast is visible. Reconnect
-            // through the approved window list instead of trusting the old handle.
-            self.preview_manager.add_inactive_window(
-                info.title.clone(),
-                info.window_exe.clone(),
-                info.position,
-                info.size,
-                info.fps_preset,
-                info.z_order,
-            )
-        } else {
-            return None;
-        };
-        if let Some(preview) = self.preview_manager.get_mut(id) {
-            restore_removed_tile_state(preview, &info);
-        }
-        Some(id)
-    }
-
-    #[cfg(windows)]
-    fn restore_removed_previews(&mut self, mut removed: Vec<RemovedPreviewInfo>) {
-        let groups: HashSet<_> = removed
-            .iter()
-            .filter_map(|info| info.playlist_group)
-            .collect();
-        // Recreate video sources before rebuilding their playlist links.
-        removed.sort_by_key(|info| (info.folder_playlist.is_some(), info.z_order));
-        self.canvas.selection.clear();
-        for info in removed {
-            let selectable = !info.left_click_disabled;
-            if let Some(id) = self.restore_removed_preview(info) {
-                if selectable {
-                    self.canvas.selection.push(id);
-                }
-            }
-        }
-        for group in groups {
-            let linked = self.preview_manager.all().find_map(|preview| {
-                (preview.playlist_group == Some(group) && preview.is_video()).then_some(preview.id)
-            });
-            for preview in self.preview_manager.all_mut() {
-                if preview.is_playlist() && preview.playlist_group == Some(group) {
-                    preview.playlist_linked_video = linked;
-                }
-            }
-        }
-    }
-
-    fn resolve_saved_image_path(
-        &self,
-        saved_path: &std::path::Path,
-    ) -> Result<std::path::PathBuf, String> {
-        if saved_path.is_absolute() {
-            return Ok(saved_path.to_owned());
-        }
-        let filename = saved_path
-            .to_str()
-            .ok_or_else(|| "Saved legacy image path is invalid".to_owned())?;
-        self.storage
-            .as_ref()
-            .ok_or_else(|| "Pluriview storage is unavailable".to_owned())?
-            .resolve_media(filename)
-            .ok_or_else(|| "Saved legacy image path is invalid".to_owned())
-    }
-
-    fn pick_wallpaper(&mut self) {
-        let Some(path) = media::pick_wallpaper_file(self.main_hwnd) else {
-            return;
-        };
-        if let Err(error) = self.set_wallpaper_from_path(path) {
-            log::error!("Failed to set wallpaper: {error}");
-            self.media_error = Some(error);
-        }
-    }
-
-    fn clear_wallpaper(&mut self) {
-        #[cfg(windows)]
-        {
-            if self.video_manager.contains(WALLPAPER_VIDEO_ID) {
-                self.video_manager.remove(WALLPAPER_VIDEO_ID);
-            }
-            self.wallpaper_sleep_since = None;
-            self.wallpaper_hibernated = false;
-        }
-        self.canvas.wallpaper = None;
-    }
-
-    fn set_wallpaper_from_path(&mut self, path: std::path::PathBuf) -> Result<(), String> {
-        if media::is_supported_video_path(&path) {
-            #[cfg(windows)]
-            Self::require_libmpv("Setting a video wallpaper")?;
-            self.set_video_wallpaper(path)
-        } else if media::is_supported_image_path(&path) {
-            self.set_image_wallpaper(&path)
-        } else {
-            Err(format!("Unsupported wallpaper file: {}", path.display()))
-        }
-    }
-
-    fn set_image_wallpaper(&mut self, source: &std::path::Path) -> Result<(), String> {
-        let path = original_image_path(source)?;
-        let asset = media::load(&path)?;
-        self.clear_wallpaper();
-        self.canvas.wallpaper = Some(CanvasWallpaper::from_image(path, asset.frames));
-        Ok(())
-    }
-
-    fn restore_image_wallpaper(&mut self, saved_path: &std::path::Path) -> Result<(), String> {
-        let path = self.resolve_saved_image_path(saved_path)?;
-        if !path.is_file() {
-            self.clear_wallpaper();
-            let mut wallpaper = CanvasWallpaper::from_image(path, Vec::new());
-            wallpaper.error = Some(
-                "Can't find wallpaper image\nThe original file may have moved or its path changed"
-                    .to_owned(),
-            );
-            self.canvas.wallpaper = Some(wallpaper);
-            return Ok(());
-        }
-        let asset = media::load(&path)?;
-        self.clear_wallpaper();
-        self.canvas.wallpaper = Some(CanvasWallpaper::from_image(path, asset.frames));
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn set_video_wallpaper(&mut self, path: std::path::PathBuf) -> Result<(), String> {
-        if !path.is_file() {
-            return Err(format!("Video file does not exist: {}", path.display()));
-        }
-        self.clear_wallpaper();
-        self.canvas.wallpaper = Some(CanvasWallpaper::from_video(path));
-        match self.ensure_wallpaper_video() {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
-                    wallpaper.error = Some(error.clone());
-                }
-                Err(error)
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    fn set_video_wallpaper(&mut self, path: std::path::PathBuf) -> Result<(), String> {
-        Err(format!(
-            "Video wallpaper requires Windows and libmpv: {}",
-            path.display()
-        ))
-    }
-
-    fn restore_wallpaper(&mut self, layout: WallpaperLayout) -> Result<(), String> {
-        match layout {
-            WallpaperLayout::Image { path } => self.restore_image_wallpaper(&path),
-            WallpaperLayout::Video { path } => self.set_video_wallpaper(path),
-        }
-    }
-
-    /// Attach libmpv to the current video wallpaper when the file is ready.
-    #[cfg(windows)]
-    fn ensure_wallpaper_video(&mut self) -> Result<bool, String> {
-        if self.wallpaper_hibernated || self.wallpaper_sleep_since.is_some() {
-            return Ok(false);
-        }
-        let path = match self.canvas.wallpaper.as_ref() {
-            Some(wallpaper) if wallpaper.video_renderer.is_none() => match &wallpaper.source {
-                WallpaperSource::Video { path } => path.clone(),
-                WallpaperSource::Image { .. } => return Ok(false),
-            },
-            _ => return Ok(false),
-        };
-        if let Some(tile) = self.video_manager.get(WALLPAPER_VIDEO_ID) {
-            let renderer = tile.session.renderer();
-            if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
-                wallpaper.video_renderer = Some(renderer);
-                wallpaper.video_sleeping = false;
-            }
-            return Ok(true);
-        }
-        if self
-            .canvas
-            .wallpaper
-            .as_ref()
-            .is_some_and(|wallpaper| wallpaper.error.is_some())
-        {
-            return Ok(false);
-        }
-        let source = VideoSource::LocalFile { path };
-        let Some(mut launch) = video_launch_for_source(
-            &source,
-            self.external_tools.status(ToolKind::Streamlink),
-            false,
-        )?
-        else {
-            return Ok(false);
-        };
-        launch.wallpaper = true;
-        let renderer =
-            self.video_manager
-                .launch(WALLPAPER_VIDEO_ID, launch, FpsPreset::Medium.as_u32())?;
-        if let Some(tile) = self.video_manager.get_mut(WALLPAPER_VIDEO_ID) {
-            let _ = tile.session.set_looping(true);
-            let _ = tile.session.set_muted(true);
-            let _ = tile.session.set_fill_frame(true);
-        }
-        if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
-            wallpaper.video_renderer = Some(renderer);
-            wallpaper.video_sleeping = false;
-            wallpaper.error = None;
-        }
-        Ok(true)
-    }
-
-    /// Keep a muted video wallpaper from consuming decoder/GPU resources while
-    /// the window cannot display it. This reuses normal libmpv cleanup and adds
-    /// no polling thread; the existing egui upkeep tick drives the deadline.
-    #[cfg(windows)]
-    fn wallpaper_memory_upkeep(&mut self, ctx: &egui::Context) {
-        let is_video = self
-            .canvas
-            .wallpaper
-            .as_ref()
-            .is_some_and(|wallpaper| matches!(wallpaper.source, WallpaperSource::Video { .. }));
-        if !is_video {
-            self.wallpaper_sleep_since = None;
-            self.wallpaper_hibernated = false;
-            return;
-        }
-
-        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
-        let hidden = minimized || self.canvas.is_focusing_tile();
-        if !hidden {
-            self.wallpaper_sleep_since = None;
-            self.wallpaper_hibernated = false;
-            if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
-                wallpaper.video_sleeping = false;
-            }
-            return;
-        }
-
-        let now = Instant::now();
-        let since = *self.wallpaper_sleep_since.get_or_insert(now);
-        if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
-            wallpaper.video_sleeping = true;
-        }
-        if let Err(error) = self.video_manager.set_paused(WALLPAPER_VIDEO_ID, true) {
-            log::warn!("Could not pause minimized wallpaper: {error}");
-        }
-        if !self.wallpaper_hibernated && wallpaper_hibernation_due(since, now) {
-            if let Some(wallpaper) = self.canvas.wallpaper.as_mut() {
-                wallpaper.video_renderer = None;
-            }
-            self.video_manager.remove(WALLPAPER_VIDEO_ID);
-            self.wallpaper_hibernated = true;
-        }
-    }
-
-    /// Video wallpaper keeps decoding while focused tiles cover it. Pause the
-    /// player (and skip painting) until tile focus is cleared.
-    #[cfg(windows)]
-    fn sync_wallpaper_under_tile_focus(&mut self) {
-        let covered = self.canvas.is_focusing_tile() || self.wallpaper_sleep_since.is_some();
-        if let Err(error) = self.video_manager.set_paused(WALLPAPER_VIDEO_ID, covered) {
-            log::warn!("Could not pause wallpaper under a focused tile: {error}");
-        }
-    }
-
-    /// Open files dropped anywhere over the app and place them where the
-    /// pointer meets the canvas. Images use managed storage; videos launch as
-    /// MPV-backed tiles. Multiple files fan out so each remains selectable.
-    fn import_dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
-        if dropped.is_empty() {
-            return;
-        }
-
-        let Some(canvas_rect) = self.canvas.last_screen_rect else {
-            return;
-        };
-        let pointer = ctx
-            .input(|input| input.pointer.hover_pos())
-            .unwrap_or_else(|| canvas_rect.center());
-        let pointer = Pos2::new(
-            pointer.x.clamp(canvas_rect.left(), canvas_rect.right()),
-            pointer.y.clamp(canvas_rect.top(), canvas_rect.bottom()),
-        );
-        let base_position = self.canvas.screen_to_canvas(pointer, canvas_rect);
-        let mut imported = Vec::new();
-        let mut errors = Vec::new();
-
-        for (index, file) in dropped.into_iter().enumerate() {
-            let Some(path) = file.path else {
-                let name = if file.name.is_empty() {
-                    "dragged item"
-                } else {
-                    &file.name
-                };
-                errors.push(format!(
-                    "{name}: this drag source did not provide a local file"
-                ));
-                continue;
-            };
-            let offset = Vec2::splat(index as f32 * 24.0 / self.canvas.zoom.max(0.1));
-            let position = base_position + offset;
-            let result: Result<Vec<PreviewId>, String> = if path.is_dir() {
-                #[cfg(windows)]
-                {
-                    self.add_video_folder(path.clone(), position)
-                        .map(|(video, playlist)| vec![video, playlist])
-                }
-                #[cfg(not(windows))]
-                {
-                    Err("Video playback is currently available only on Windows".to_owned())
-                }
-            } else if media::is_supported_video_path(&path) {
-                #[cfg(windows)]
-                {
-                    self.add_local_video_path(path.clone(), position)
-                        .map(|id| vec![id])
-                }
-                #[cfg(not(windows))]
-                {
-                    Err("Video playback is currently available only on Windows".to_owned())
-                }
-            } else {
-                self.import_media_tile(&path, position).map(|id| vec![id])
-            };
-            match result {
-                Ok(ids) => imported.extend(ids),
-                Err(error) => errors.push(format!("{}: {error}", path.display())),
-            }
-        }
-
-        if !imported.is_empty() {
-            self.canvas.selection = imported;
-        }
-        if !errors.is_empty() {
-            self.media_error = Some(errors.join("\n\n"));
-        }
-    }
-
-    /// Highlight the canvas while Windows is carrying files over the app.
-    fn file_drop_overlay(&self, ctx: &egui::Context) {
-        if !ctx.input(|input| !input.raw.hovered_files.is_empty()) {
-            return;
-        }
-        let Some(rect) = self.canvas.last_screen_rect else {
-            return;
-        };
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("media_drop_overlay"),
-        ));
-        painter.rect_filled(
-            rect,
-            8.0,
-            egui::Color32::from_rgba_unmultiplied(35, 95, 55, 90),
-        );
-        painter.rect_stroke(
-            rect.shrink(8.0),
-            8.0,
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(107, 200, 110)),
-        );
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "Drop images, videos, or a video folder onto the canvas",
-            egui::FontId::proportional(18.0),
-            egui::Color32::WHITE,
-        );
-        ctx.request_repaint();
     }
 
     #[cfg(windows)]
@@ -3725,6 +3196,24 @@ impl PluriviewApp {
     #[cfg(windows)]
     fn browser_frame(&mut self, ctx: &egui::Context, exit_hotkey_pressed: bool) {
         self.audio_monitor_upkeep();
+        // Without monitoring, include opted-in external windows alongside our
+        // native video/WebViews. With monitoring, RemoteView captures only our
+        // emitted desktop mix, which already contains the monitored copies.
+        let audio_pids = std::iter::once(std::process::id()).chain(
+            self.preview_manager
+                .all()
+                .filter(|p| {
+                    p.is_window_capture()
+                        && p.stream_audio
+                        && !p.manually_frozen
+                        && p.removing.is_none()
+                        && p.capture_error.is_none()
+                })
+                .filter_map(|p| p.window_handle.as_ref().map(|h| h.process_id))
+                .filter(|pid| *pid != 0),
+        );
+        self.remote_view
+            .set_audio_sources(audio_pids, self.monitor_device.is_some());
 
         let frozen: HashSet<_> = self
             .preview_manager
@@ -4278,6 +3767,7 @@ impl PluriviewApp {
                 });
                 ui.separator();
                 if ui.button("Reset View").clicked() {
+                    self.canvas.exit_spotlight(&mut self.preview_manager);
                     self.canvas.reset();
                     ui.close_menu();
                 }
@@ -4371,389 +3861,6 @@ impl PluriviewApp {
         }
     }
 
-    fn hotkey_capture_upkeep(&mut self, ctx: &egui::Context) {
-        let Some(slot) = self.hotkey_recording else {
-            return;
-        };
-        ctx.request_repaint_after(Duration::from_millis(30));
-
-        #[cfg(windows)]
-        if !self.owns_foreground() {
-            return;
-        }
-
-        if let Some(first_key) = self.hotkey_recording_first {
-            if let Some(second_key) = self
-                .hotkey_tracker
-                .newly_pressed_key_except(Some(first_key))
-            {
-                self.assign_recorded_hotkey(slot, Hotkey::pair(first_key, second_key));
-            } else if !self.hotkey_tracker.is_down(first_key) {
-                self.assign_recorded_hotkey(slot, Hotkey::key(first_key));
-            }
-        } else if let Some(first_key) = self.hotkey_tracker.newly_pressed_key_except(None) {
-            let simultaneous_second = self
-                .hotkey_tracker
-                .newly_pressed_key_except(Some(first_key))
-                .filter(|second| self.hotkey_tracker.is_down(*second));
-            if let Some(second_key) = simultaneous_second {
-                self.assign_recorded_hotkey(slot, Hotkey::pair(first_key, second_key));
-            } else if self.hotkey_tracker.is_down(first_key) {
-                self.hotkey_recording_first = Some(first_key);
-                self.hotkey_error = None;
-            } else {
-                // A quick tap can begin and end between polls; Windows retains
-                // the pressed edge, so it is still a valid single-key binding.
-                self.assign_recorded_hotkey(slot, Hotkey::key(first_key));
-            }
-        }
-    }
-
-    fn assign_recorded_hotkey(&mut self, slot: HotkeySlot, hotkey: Hotkey) {
-        if let Some(conflict) = self.app_config.keyboard_shortcuts.conflict(slot, hotkey) {
-            self.hotkey_error = Some(format!(
-                "{} is already assigned to {}.",
-                hotkey.display(),
-                conflict.label()
-            ));
-            self.hotkey_recording_first = None;
-        } else {
-            self.app_config.keyboard_shortcuts.set(slot, hotkey);
-            self.hotkey_recording = None;
-            self.hotkey_recording_first = None;
-            self.hotkey_error = None;
-            self.save_app_config();
-        }
-    }
-
-    fn shortcut_settings_row(&mut self, ui: &mut egui::Ui, slot: HotkeySlot) {
-        ui.label(slot.label());
-        let recording = self.hotkey_recording == Some(slot);
-        let text = if recording {
-            self.hotkey_recording_first.map_or_else(
-                || "Press a key…".to_owned(),
-                |first| format!("{} + …", Hotkey::key(first).display()),
-            )
-        } else {
-            self.app_config.keyboard_shortcuts.get(slot).display()
-        };
-        let button = egui::Button::new(text).min_size(Vec2::new(180.0, 24.0));
-        if ui.add(button).clicked() {
-            self.hotkey_recording = Some(slot);
-            self.hotkey_recording_first = None;
-            self.hotkey_error = None;
-        }
-        ui.end_row();
-    }
-
-    fn settings_ui(&mut self, ctx: &egui::Context) {
-        if !self.show_settings {
-            self.hotkey_recording = None;
-            self.hotkey_recording_first = None;
-            return;
-        }
-
-        self.hotkey_capture_upkeep(ctx);
-
-        let mut open = self.show_settings;
-        let mut close = false;
-        let mut action = None;
-        let mut restore_hotkeys = false;
-        let is_viewpoint_shortcut = |slot: HotkeySlot| {
-            matches!(
-                slot,
-                HotkeySlot::PreviousCanvasView | HotkeySlot::NextCanvasView
-            ) || HotkeySlot::CANVAS_VIEWS.contains(&slot)
-        };
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(600.0)
-            .default_height(680.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(
-                egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 28)),
-            )
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(580.0)
-                    .show(ui, |ui| {
-                        ui.heading("External tools");
-                        ui.label(
-                            egui::RichText::new(
-                                "Video files play with bundled libmpv. Streamlink is only needed for live stream URLs.",
-                            )
-                            .weak(),
-                        );
-                        ui.add_space(8.0);
-                        for kind in ToolKind::SETTINGS {
-                            ui.group(|ui| {
-                                Self::external_tool_settings_row(
-                                    ui,
-                                    kind,
-                                    &self.external_tools,
-                                    &mut action,
-                                );
-                            });
-                            ui.add_space(8.0);
-                        }
-                        ui.separator();
-                        ui.add_space(12.0);
-                        ui.heading("Keyboard shortcuts");
-                        ui.label(
-                            egui::RichText::new(
-                                "Click a shortcut, then tap one key, or hold one key and press a second. Mouse controls are not changed here.",
-                            )
-                            .weak(),
-                        );
-                        ui.add_space(8.0);
-
-                        egui::Grid::new("settings_hotkeys_grid")
-                            .num_columns(2)
-                            .spacing([24.0, 7.0])
-                            .show(ui, |ui| {
-                                for slot in HotkeySlot::ALL.into_iter().filter(|slot| !is_viewpoint_shortcut(*slot)) {
-                                    self.shortcut_settings_row(ui, slot);
-                                }
-                            });
-
-                        ui.add_space(12.0);
-                        let viewpoints = egui::CollapsingHeader::new("Saved Viewpoints")
-                            .id_salt("settings_saved_viewpoint_shortcuts")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                egui::Grid::new("settings_viewpoint_hotkeys_grid")
-                                    .num_columns(2)
-                                    .spacing([24.0, 7.0])
-                                    .show(ui, |ui| {
-                                        for slot in HotkeySlot::ALL.into_iter().filter(|slot| is_viewpoint_shortcut(*slot)) {
-                                            self.shortcut_settings_row(ui, slot);
-                                        }
-                                    });
-                            });
-                        if viewpoints.body_response.is_none()
-                            && self.hotkey_recording.is_some_and(is_viewpoint_shortcut)
-                        {
-                            self.hotkey_recording = None;
-                            self.hotkey_recording_first = None;
-                            self.hotkey_error = None;
-                        }
-
-                        if let Some(error) = &self.hotkey_error {
-                            ui.add_space(6.0);
-                            ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
-                        } else if self.hotkey_recording.is_some() {
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Listening… release for one key, or hold it and press another for a two-key shortcut.",
-                                )
-                                .weak(),
-                            );
-                        }
-
-                        ui.add_space(8.0);
-                        if ui.button("Restore Default Keys").clicked() {
-                            restore_hotkeys = true;
-                        }
-
-                        if let Some(error) = &self.config_error {
-                            ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
-                            ui.add_space(6.0);
-                        }
-                    });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Re-scan All").clicked() {
-                        self.external_tools.rescan_all();
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Close").clicked() {
-                            close = true;
-                        }
-                    });
-                });
-            });
-        self.show_settings = open && !close;
-        if !self.show_settings {
-            self.hotkey_recording = None;
-            self.hotkey_recording_first = None;
-            self.hotkey_error = None;
-        }
-
-        if restore_hotkeys {
-            self.app_config.keyboard_shortcuts = HotkeyBindings::default();
-            self.hotkey_recording = None;
-            self.hotkey_recording_first = None;
-            self.hotkey_error = None;
-            self.save_app_config();
-        }
-
-        match action {
-            Some(SettingsAction::Browse(kind)) => {
-                if let Some(path) = external_tools::pick_executable(self.main_hwnd, kind) {
-                    self.set_external_tool_override(kind, Some(path));
-                }
-            }
-            Some(SettingsAction::UseAutoDetected(kind)) => {
-                self.set_external_tool_override(kind, None);
-            }
-            Some(SettingsAction::Rescan(kind)) => self.external_tools.rescan(kind),
-            None => {}
-        }
-    }
-
-    fn external_tool_error_ui(&mut self, ctx: &egui::Context) {
-        let Some(message) = self.external_tool_error.clone() else {
-            return;
-        };
-        let mut open_settings = false;
-        let mut close = false;
-        egui::Window::new("External Tools Required")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(message);
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Open Settings").clicked() {
-                        open_settings = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        close = true;
-                    }
-                });
-            });
-        if open_settings {
-            self.external_tool_error = None;
-            self.show_settings = true;
-        } else if close {
-            self.external_tool_error = None;
-        }
-    }
-
-    fn video_action_error_ui(&mut self, ctx: &egui::Context) {
-        let Some(message) = self.video_action_error.clone() else {
-            return;
-        };
-        let mut dismiss = false;
-        egui::Window::new("Video Control Error")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(message);
-                ui.add_space(8.0);
-                if ui.button("Dismiss").clicked() {
-                    dismiss = true;
-                }
-            });
-        if dismiss {
-            self.video_action_error = None;
-        }
-    }
-
-    fn external_tool_settings_row(
-        ui: &mut egui::Ui,
-        kind: ToolKind,
-        tools: &ExternalTools,
-        action: &mut Option<SettingsAction>,
-    ) {
-        let status = tools.status(kind);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(kind.display_name()).strong().size(16.0));
-            let (label, color) = match status {
-                ToolStatus::Checking => ("Checking...", egui::Color32::from_rgb(140, 170, 235)),
-                ToolStatus::Available { .. } => {
-                    ("Available", egui::Color32::from_rgb(110, 205, 135))
-                }
-                ToolStatus::Invalid { .. } => ("Invalid", egui::Color32::from_rgb(235, 120, 120)),
-                ToolStatus::Missing => ("Not found", egui::Color32::from_rgb(220, 180, 95)),
-            };
-            ui.colored_label(color, label);
-        });
-
-        let displayed_path = status.path().or_else(|| tools.override_path(kind));
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Path:").strong());
-            ui.label(
-                displayed_path
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "No executable detected".to_owned()),
-            );
-        });
-
-        match status {
-            ToolStatus::Available {
-                version, source, ..
-            } => {
-                ui.label(format!("Version: {version}"));
-                ui.label(egui::RichText::new(source.label()).small().weak());
-            }
-            ToolStatus::Invalid { error, source, .. } => {
-                ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
-                ui.label(egui::RichText::new(source.label()).small().weak());
-            }
-            ToolStatus::Checking => {
-                ui.label(
-                    egui::RichText::new("Running --version off the UI thread")
-                        .small()
-                        .weak(),
-                );
-            }
-            ToolStatus::Missing => {
-                ui.label(
-                    egui::RichText::new(
-                        "Checked beside Pluriview, PATH, and common Windows install locations.",
-                    )
-                    .small()
-                    .weak(),
-                );
-            }
-        }
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button("Browse...").clicked() {
-                *action = Some(SettingsAction::Browse(kind));
-            }
-            if ui
-                .add_enabled(
-                    tools.override_path(kind).is_some(),
-                    egui::Button::new("Use Auto-detected"),
-                )
-                .clicked()
-            {
-                *action = Some(SettingsAction::UseAutoDetected(kind));
-            }
-            if ui.button("Re-scan").clicked() {
-                *action = Some(SettingsAction::Rescan(kind));
-            }
-        });
-    }
-
-    fn set_external_tool_override(&mut self, kind: ToolKind, path: Option<std::path::PathBuf>) {
-        match kind {
-            ToolKind::Mpv => {}
-            ToolKind::Streamlink => self.app_config.external_tools.streamlink_path = path.clone(),
-        }
-        self.external_tools.set_override(kind, path);
-        self.save_app_config();
-    }
-
-    fn save_app_config(&mut self) {
-        self.config_error = match &self.storage {
-            Some(storage) => storage
-                .save_config(&self.app_config)
-                .err()
-                .map(|error| format!("Could not save settings: {error}")),
-            None => Some("Settings storage is unavailable.".to_owned()),
-        };
-    }
-
     fn validate_canvas_view_name(
         &self,
         name: &str,
@@ -4805,6 +3912,7 @@ impl PluriviewApp {
     }
 
     fn jump_to_canvas_view(&mut self, index: usize, ctx: &egui::Context) {
+        self.canvas.exit_spotlight(&mut self.preview_manager);
         let Some(view) = self.canvas_views.get(index).cloned() else {
             return;
         };
@@ -5287,768 +4395,6 @@ impl PluriviewApp {
             self.quick_add = None;
         }
     }
-
-    /// Keep source editing out of a failed-load canvas until the user recovers
-    /// it or explicitly opens a different workspace.
-    fn workspace_recovery_ui(&mut self, ctx: &egui::Context) {
-        self.handle_frameless_resize(ctx);
-        egui::TopBottomPanel::top("workspace_recovery_title").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let title = ui.label("Pluriview — Workspace Recovery");
-                if title.interact(egui::Sense::drag()).drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    if ui.button("Minimize").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    }
-                });
-            });
-        });
-        let mut retry = false;
-        let mut recover = false;
-        let mut create = false;
-        let mut switch = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(24.0);
-                ui.heading("This workspace could not be opened");
-                ui.label("Editing and saving are paused to protect your saved files.");
-                ui.add_space(12.0);
-                if let Some(error) = self
-                    .workspace_error
-                    .as_deref()
-                    .or(self.workspace_save.load_error())
-                {
-                    ui.label(error);
-                }
-                ui.add_space(16.0);
-                retry = ui.button("Retry Load").clicked();
-                if self.workspace_persistence_ready {
-                    let backup_available = self.storage.as_ref().is_some_and(|storage| {
-                        storage.workspace_backup_exists(&self.workspaces.active_workspace_id)
-                    });
-                    recover = ui
-                        .add_enabled(
-                            backup_available,
-                            egui::Button::new("Restore Previous Save as New Workspace"),
-                        )
-                        .clicked();
-                    create = ui.button("Open New Workspace…").clicked();
-                    ui.add_space(16.0);
-                    for workspace in &self.workspaces.workspaces {
-                        if workspace.id != self.workspaces.active_workspace_id
-                            && ui.button(format!("Open {}", workspace.name)).clicked()
-                        {
-                            switch = Some(workspace.id.clone());
-                        }
-                    }
-                }
-            });
-        });
-        if retry {
-            if !self.workspace_persistence_ready {
-                if let Some(storage) = &self.storage {
-                    match storage.load_or_initialize_workspaces() {
-                        Ok(index) => {
-                            self.workspaces = index;
-                            self.workspace_persistence_ready = true;
-                        }
-                        Err(error) => self.workspace_error = Some(error.to_string()),
-                    }
-                }
-            }
-            self.load_active_workspace();
-        } else if recover {
-            if let Err(error) = self.restore_previous_workspace_save() {
-                self.workspace_error = Some(error);
-            }
-        } else if let Some(id) = switch {
-            if let Err(error) = self.switch_workspace(&id) {
-                self.workspace_error = Some(error);
-            }
-        } else if create {
-            self.workspace_dialog = Some(WorkspaceDialog {
-                kind: WorkspaceDialogKind::Create,
-                name: "Untitled Workspace".to_owned(),
-                focused: false,
-            });
-        }
-        self.workspace_dialog_ui(ctx);
-        ctx.request_repaint_after(Duration::from_millis(250));
-    }
-
-    /// Load the active named workspace if it has been saved before.
-    fn load_active_workspace(&mut self) {
-        if !self.workspace_persistence_ready {
-            return;
-        }
-        let Some(storage) = &self.storage else {
-            return;
-        };
-        let id = self.workspaces.active_workspace_id.clone();
-        match self.workspace_save.load(storage, &id) {
-            Ok(layout) => {
-                self.apply_layout(&layout);
-                self.remember_saved_workspace(&layout);
-                #[cfg(debug_assertions)]
-                println!(
-                    "Loaded workspace {id} with {} previews",
-                    layout.previews.len()
-                );
-            }
-            Err(error) => {
-                self.workspace_error = Some(error);
-            }
-        }
-    }
-
-    /// Save the current workspace and mirror it to legacy autosave.json.
-    fn save_active_workspace(&mut self) -> Result<(), String> {
-        if !self.workspace_persistence_ready {
-            return Err(
-                "Workspace saving is disabled because the catalog could not be loaded safely. Restart after repairing the workspace files."
-                    .to_owned(),
-            );
-        }
-        let Some(storage) = &self.storage else {
-            return Err("Workspace storage is unavailable.".to_owned());
-        };
-        let layout = self.create_layout();
-        self.workspace_save
-            .save(storage, &self.workspaces, &layout)?;
-        self.last_workspace_autosave_check = Instant::now();
-        #[cfg(debug_assertions)]
-        println!(
-            "Saved workspace {} with {} previews",
-            self.workspaces.active_workspace_id,
-            layout.previews.len()
-        );
-        Ok(())
-    }
-
-    fn remember_saved_workspace(&mut self, layout: &SavedLayout) {
-        self.workspace_save.remember(layout);
-        self.workspace_error = None;
-        self.last_workspace_autosave_check = Instant::now();
-    }
-
-    fn workspace_autosave_upkeep(&mut self, ctx: &egui::Context) {
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last_workspace_autosave_check);
-        if elapsed < WORKSPACE_AUTOSAVE_INTERVAL {
-            ctx.request_repaint_after(WORKSPACE_AUTOSAVE_INTERVAL - elapsed);
-            return;
-        }
-        self.last_workspace_autosave_check = now;
-        if !self.workspace_persistence_ready || !self.workspace_save.is_ready() {
-            return;
-        }
-        if let Err(error) = self.save_active_workspace() {
-            self.workspace_error = Some(error);
-        }
-    }
-
-    fn save_before_workspace_change(&mut self) -> Result<(), String> {
-        if !self.workspace_persistence_ready {
-            return Err("The workspace catalog must be recovered first.".to_owned());
-        }
-        if self.workspace_save.is_ready() {
-            self.save_active_workspace()?;
-        }
-        Ok(())
-    }
-
-    fn blank_workspace_layout(&self) -> SavedLayout {
-        let mut layout = self.create_layout();
-        layout.canvas = CanvasLayout::default();
-        layout.previews.clear();
-        layout
-    }
-
-    fn switch_workspace(&mut self, id: &str) -> Result<(), String> {
-        if id == self.workspaces.active_workspace_id {
-            return Ok(());
-        }
-        if self
-            .workspaces
-            .workspaces
-            .iter()
-            .all(|workspace| workspace.id != id)
-        {
-            return Err("That workspace no longer exists.".to_owned());
-        }
-        self.save_before_workspace_change()?;
-
-        let layout = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "Workspace storage is unavailable.".to_owned())?
-            .load_workspace(id)
-            .map_err(|error| format!("Could not load workspace: {error}"))?;
-        let previous_id =
-            std::mem::replace(&mut self.workspaces.active_workspace_id, id.to_owned());
-        if let Some(storage) = &self.storage {
-            if let Err(error) = storage.save_workspace_index(&self.workspaces) {
-                self.workspaces.active_workspace_id = previous_id;
-                return Err(format!("Could not select workspace: {error}"));
-            }
-            if let Err(error) = storage.save_autosave(&layout) {
-                self.workspaces.active_workspace_id = previous_id;
-                let _ = storage.save_workspace_index(&self.workspaces);
-                return Err(format!(
-                    "Could not update the compatibility autosave: {error}"
-                ));
-            }
-        }
-        self.apply_layout(&layout);
-        self.remember_saved_workspace(&layout);
-        Ok(())
-    }
-
-    fn create_workspace(&mut self, name: &str, duplicate: bool) -> Result<(), String> {
-        let name = self.valid_workspace_name(name, None)?;
-        if duplicate && !self.workspace_save.is_ready() {
-            return Err("Load or recover the workspace before duplicating it.".to_owned());
-        }
-        self.save_before_workspace_change()?;
-        let layout = if duplicate {
-            self.create_layout()
-        } else {
-            self.blank_workspace_layout()
-        };
-        let previous_index = self.workspaces.clone();
-        let id = self.workspaces.add(name);
-        self.workspaces.active_workspace_id = id;
-
-        let Some(storage) = &self.storage else {
-            self.workspaces = previous_index;
-            return Err("Workspace storage is unavailable.".to_owned());
-        };
-        if let Err(error) = storage.save_active_workspace(&self.workspaces, &layout) {
-            self.workspaces = previous_index;
-            return Err(format!("Could not create workspace: {error}"));
-        }
-        self.apply_layout(&layout);
-        self.remember_saved_workspace(&layout);
-        Ok(())
-    }
-
-    fn rename_active_workspace(&mut self, name: &str) -> Result<(), String> {
-        let active_id = self.workspaces.active_workspace_id.clone();
-        let name = self.valid_workspace_name(name, Some(&active_id))?;
-        let previous_index = self.workspaces.clone();
-        if !self.workspaces.rename(&active_id, name) {
-            return Err("The active workspace no longer exists.".to_owned());
-        }
-        let result = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "Workspace storage is unavailable.".to_owned())?
-            .save_workspace_index(&self.workspaces);
-        if let Err(error) = result {
-            self.workspaces = previous_index;
-            return Err(format!("Could not rename workspace: {error}"));
-        }
-        Ok(())
-    }
-
-    fn delete_active_workspace(&mut self) -> Result<(), String> {
-        if self.workspaces.workspaces.len() <= 1 {
-            return Err("The only workspace cannot be deleted.".to_owned());
-        }
-        let deleted_id = self.workspaces.active_workspace_id.clone();
-        let previous_index = self.workspaces.clone();
-        if !self.workspaces.remove(&deleted_id) {
-            return Err("The active workspace could not be removed.".to_owned());
-        }
-        let next_id = self.workspaces.active_workspace_id.clone();
-        let Some(storage) = &self.storage else {
-            self.workspaces = previous_index;
-            return Err("Workspace storage is unavailable.".to_owned());
-        };
-        let layout = match storage.load_workspace(&next_id) {
-            Ok(layout) => layout,
-            Err(error) => {
-                self.workspaces = previous_index;
-                return Err(format!("Could not open the next workspace: {error}"));
-            }
-        };
-        if let Err(error) = storage.save_workspace_index(&self.workspaces) {
-            self.workspaces = previous_index;
-            return Err(format!("Could not update the workspace list: {error}"));
-        }
-        if let Err(error) = storage.save_autosave(&layout) {
-            self.workspaces = previous_index;
-            let _ = storage.save_workspace_index(&self.workspaces);
-            return Err(format!(
-                "Could not update the compatibility autosave: {error}"
-            ));
-        }
-        let deletion_error = storage.delete_workspace(&deleted_id).err().map(|error| {
-            format!(
-                "The workspace was removed from the list, but its old file could not be deleted: {error}"
-            )
-        });
-        self.apply_layout(&layout);
-        self.remember_saved_workspace(&layout);
-        self.workspace_error = deletion_error;
-        Ok(())
-    }
-
-    fn restore_previous_workspace_save(&mut self) -> Result<(), String> {
-        if !self.workspace_persistence_ready {
-            return Err(
-                "Workspace saving is unavailable until the catalog is repaired.".to_owned(),
-            );
-        }
-        let active_id = self.workspaces.active_workspace_id.clone();
-        let active_name = self
-            .workspaces
-            .active()
-            .map(|workspace| workspace.name.clone())
-            .unwrap_or_else(|| "Workspace".to_owned());
-        let recovered_layout = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| "Workspace storage is unavailable.".to_owned())?
-            .load_workspace_backup(&active_id)
-            .map_err(|error| format!("Could not load the previous workspace save: {error}"))?;
-
-        // Preserve the current state first. The old backup is already in memory,
-        // so rotating the current primary cannot destroy the recovery candidate.
-        self.save_before_workspace_change()?;
-        let previous_index = self.workspaces.clone();
-        let recovered_name = self.unique_recovered_workspace_name(&active_name);
-        let recovered_id = self.workspaces.add(recovered_name);
-        self.workspaces.active_workspace_id = recovered_id;
-        let save_result = self
-            .storage
-            .as_ref()
-            .expect("workspace storage checked above")
-            .save_active_workspace(&self.workspaces, &recovered_layout);
-        if let Err(error) = save_result {
-            self.workspaces = previous_index;
-            return Err(format!("Could not create the recovered workspace: {error}"));
-        }
-        self.apply_layout(&recovered_layout);
-        self.remember_saved_workspace(&recovered_layout);
-        Ok(())
-    }
-
-    fn unique_recovered_workspace_name(&self, active_name: &str) -> String {
-        let shortened = active_name.chars().take(38).collect::<String>();
-        let base = format!("{shortened} Recovered");
-        if self
-            .workspaces
-            .workspaces
-            .iter()
-            .all(|workspace| !workspace.name.eq_ignore_ascii_case(&base))
-        {
-            return base;
-        }
-        for suffix in 2.. {
-            let candidate = format!("{shortened} Recovered {suffix}");
-            if self
-                .workspaces
-                .workspaces
-                .iter()
-                .all(|workspace| !workspace.name.eq_ignore_ascii_case(&candidate))
-            {
-                return candidate;
-            }
-        }
-        unreachable!("an unused recovered workspace name always exists")
-    }
-
-    fn valid_workspace_name(&self, name: &str, except_id: Option<&str>) -> Result<String, String> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err("Enter a workspace name.".to_owned());
-        }
-        if name.chars().count() > 60 {
-            return Err("Workspace names can contain at most 60 characters.".to_owned());
-        }
-        if self.workspaces.workspaces.iter().any(|workspace| {
-            Some(workspace.id.as_str()) != except_id && workspace.name.eq_ignore_ascii_case(name)
-        }) {
-            return Err("A workspace with that name already exists.".to_owned());
-        }
-        Ok(name.to_owned())
-    }
-
-    /// Mirror the window's geometry into [`Self::window_layout`]. Minimized
-    /// and maximized windows report the geometry they currently occupy, not
-    /// the one to reopen at, so only the restored size and position are kept.
-    fn remember_window_geometry(&mut self, ctx: &egui::Context) {
-        let (position, size, maximized, minimized) = ctx.input(|i| {
-            let viewport = i.viewport();
-            (
-                viewport.outer_rect.map(|rect| (rect.min.x, rect.min.y)),
-                viewport
-                    .inner_rect
-                    .map(|rect| (rect.width(), rect.height())),
-                viewport.maximized.unwrap_or(false),
-                viewport.minimized.unwrap_or(false),
-            )
-        });
-        if minimized {
-            return;
-        }
-
-        self.window_layout.maximized = maximized;
-        if maximized {
-            return;
-        }
-        if let Some(position) = position {
-            self.window_layout.position = Some(position);
-        }
-        if let Some(size) = size {
-            self.window_layout.size = size;
-        }
-    }
-
-    /// Create a SavedLayout from current state
-    fn create_layout(&self) -> SavedLayout {
-        let mut layout = SavedLayout::new();
-
-        // Save canvas state
-        layout.canvas = CanvasLayout {
-            pan: (self.canvas.pan.x, self.canvas.pan.y),
-            zoom: self.canvas.zoom,
-            show_grid: self.canvas.show_grid,
-            wallpaper: self
-                .canvas
-                .wallpaper
-                .as_ref()
-                .map(CanvasWallpaper::to_layout),
-            views: self.canvas_views.clone(),
-            active_view: self.active_canvas_view,
-        };
-
-        // Save all previews
-        layout.previews = self
-            .preview_manager
-            .all()
-            .map(|p| {
-                let mut saved = PreviewLayout::from(p);
-                #[cfg(windows)]
-                {
-                    // Ask the live WebView where it actually is, so the tile
-                    // reopens on the last page browsed rather than the one it
-                    // was created with. Falls back to the mirrored URL for
-                    // tiles whose host is gone.
-                    saved.browser_url = self
-                        .browser
-                        .get(p.id)
-                        .and_then(|host| host.live_url())
-                        .or(saved.browser_url)
-                        .as_deref()
-                        .and_then(scrub_url_for_storage);
-                }
-                saved
-            })
-            .collect();
-
-        layout.recent_browser_urls = self.recent_urls.clone();
-        layout.picker_open = self.picker_open;
-        layout.window = Some(self.window_layout);
-        #[cfg(windows)]
-        {
-            layout.monitor_device = self.monitor_device.clone();
-            layout.adblock_enabled = self.browser.adblock_enabled();
-        }
-
-        layout
-    }
-
-    /// Apply a SavedLayout to restore state
-    fn apply_layout(&mut self, layout: &SavedLayout) {
-        self.canvas_view_dialog = None;
-        self.active_canvas_view = None;
-        self.deleted_canvas_view = None;
-        self.clear_wallpaper();
-        // Clear existing state
-        self.capture_coordinator.stop_all();
-        #[cfg(windows)]
-        {
-            self.video_manager.clear();
-            self.pending_video_tiles.clear();
-            self.last_restored_video_start = None;
-            self.restored_paused_videos.clear();
-            self.pending_video_freezes.clear();
-            self.frozen_video_checkpoints.clear();
-            self.video_resume_checkpoints.clear();
-            self.seek_preview_manager.clear();
-            self.playlist_thumbnail_queue.clear();
-            self.playlist_thumbnail_jobs.clear();
-            self.next_playlist_group = layout
-                .previews
-                .iter()
-                .filter_map(|preview| preview.playlist_group)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-        }
-        self.preview_manager.clear();
-        self.canvas.clear_preview_interactions();
-        #[cfg(windows)]
-        {
-            self.browser.clear();
-            self.pending_browser_tiles.clear();
-            self.last_restored_browser_start = None;
-            self.audio_monitor = None;
-            self.audio_monitor_checked = None;
-            self.window_audio_monitors.clear();
-            self.last_inactive_window_scan = None;
-        }
-
-        // Restore canvas state
-        self.canvas.pan = Vec2::new(layout.canvas.pan.0, layout.canvas.pan.1);
-        self.canvas.zoom = layout.canvas.zoom;
-        self.canvas.show_grid = layout.canvas.show_grid;
-        self.canvas.cancel_camera_transition();
-        self.canvas_views = layout.canvas.views.clone();
-        self.active_canvas_view = layout
-            .canvas
-            .active_view
-            .filter(|index| *index < self.canvas_views.len());
-        if let Some(wallpaper) = layout.canvas.wallpaper.clone() {
-            if let Err(error) = self.restore_wallpaper(wallpaper) {
-                log::error!("Failed to restore wallpaper: {error}");
-                self.media_error = Some(error);
-            }
-        }
-        self.picker_open = layout.picker_open;
-        // The window is not moved from here — main.rs opens it at the saved
-        // geometry, and reloading a layout mid-session should not move the
-        // window out from under the user. Mirroring the value only keeps
-        // `pending_maximize` (read once, in `new`) in sync.
-        self.window_layout = layout.window.unwrap_or(self.window_layout);
-
-        #[cfg(windows)]
-        {
-            self.recent_urls = layout
-                .recent_browser_urls
-                .iter()
-                .filter_map(|url| scrub_url_for_storage(url))
-                .collect();
-        }
-        #[cfg(not(windows))]
-        {
-            self.recent_urls = layout.recent_browser_urls.clone();
-        }
-        #[cfg(windows)]
-        {
-            self.monitor_device = layout.monitor_device.clone();
-            if let Err(error) = self.browser.set_adblock_enabled(layout.adblock_enabled) {
-                log::error!("Could not restore ad blocker state: {error}");
-            }
-        }
-
-        // Enumerate current windows to find matching ones
-        let current_windows = enumerate_windows();
-        let mut claimed_hwnds = HashSet::new();
-
-        // Restore previews
-        for preview_layout in &layout.previews {
-            // Browser tiles restore by recreating their WebView at the saved
-            // URL; a failed host creation skips just this tile.
-            #[cfg(windows)]
-            if let Some(url) = &preview_layout.browser_url {
-                match self.create_browser_tile(
-                    url,
-                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
-                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
-                    preview_layout.fps_preset,
-                ) {
-                    Ok(id) => {
-                        if let Some(pending) = self.pending_browser_tiles.get_mut(&id) {
-                            pending.restore_deferred = true;
-                        }
-                        self.preview_manager.set_z_order(id, preview_layout.z_order);
-                        if let Some(preview) = self.preview_manager.get_mut(id) {
-                            restore_browser_geometry(preview, preview_layout);
-                        }
-                        self.apply_browser_mute(id, preview_layout.browser_muted);
-                    }
-                    Err(error) => {
-                        log::error!("Failed to restore browser tile: {error}");
-                    }
-                }
-                continue;
-            }
-
-            if let Some(media_path) = &preview_layout.media_path {
-                match self.restore_media_tile(
-                    media_path,
-                    preview_layout.window_title.clone(),
-                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
-                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
-                ) {
-                    Ok(id) => {
-                        self.preview_manager.set_z_order(id, preview_layout.z_order);
-                        if let Some(preview) = self.preview_manager.get_mut(id) {
-                            restore_layout_tile_state(preview, preview_layout);
-                        }
-                    }
-                    Err(error) => {
-                        log::error!("Failed to restore image tile: {error}");
-                        self.media_error = Some(error);
-                    }
-                }
-                continue;
-            }
-
-            #[cfg(windows)]
-            if let Some(folder_playlist) = &preview_layout.folder_playlist {
-                let group = preview_layout.playlist_group.unwrap_or_else(|| {
-                    let group = self.next_playlist_group;
-                    self.next_playlist_group = self.next_playlist_group.saturating_add(1);
-                    group
-                });
-                let id = self.restore_folder_playlist(
-                    folder_playlist,
-                    preview_layout.window_title.clone(),
-                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
-                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
-                    group,
-                    None,
-                );
-                self.preview_manager.set_z_order(id, preview_layout.z_order);
-                if let Some(preview) = self.preview_manager.get_mut(id) {
-                    restore_layout_tile_state(preview, preview_layout);
-                }
-                continue;
-            }
-
-            #[cfg(windows)]
-            if let Some(source) = &preview_layout.video_source {
-                let id = self.create_video_tile(
-                    source.clone(),
-                    preview_layout.window_title.clone(),
-                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
-                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
-                    preview_layout.fps_preset,
-                    true,
-                );
-                self.preview_manager.set_z_order(id, preview_layout.z_order);
-                if let Some(preview) = self.preview_manager.get_mut(id) {
-                    restore_layout_tile_state(preview, preview_layout);
-                }
-                continue;
-            }
-
-            if let Some(sender) = &preview_layout.spout_sender {
-                let id = self.preview_manager.add_for_spout(
-                    sender.clone(),
-                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
-                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
-                    preview_layout.fps_preset,
-                );
-                self.preview_manager.set_z_order(id, preview_layout.z_order);
-                if let Some(preview) = self.preview_manager.get_mut(id) {
-                    restore_layout_tile_state(preview, preview_layout);
-                }
-                if !preview_layout.manually_frozen {
-                    self.capture_coordinator.start_spout_capture(
-                        id,
-                        sender.clone(),
-                        preview_layout.fps_preset.as_u32(),
-                    );
-                }
-                continue;
-            }
-
-            // Prefer the exact saved title, but use the executable identity
-            // when dynamic titles (Spotify tracks, documents, etc.) changed.
-            let matching_window = find_saved_window(
-                &preview_layout.window_title,
-                preview_layout.window_exe.as_deref(),
-                &current_windows,
-                &claimed_hwnds,
-            );
-
-            if let Some(window_info) = matching_window {
-                claimed_hwnds.insert(window_info.hwnd);
-                // Create preview with saved position/size
-                let id = self.preview_manager.add_with_window(
-                    window_info.title.clone(),
-                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
-                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
-                    WindowHandle {
-                        hwnd: window_info.hwnd,
-                        process_id: window_info.process_id,
-                    },
-                    preview_layout.fps_preset,
-                    preview_layout.z_order,
-                );
-
-                // Restore crop region if it was saved
-                if let Some(preview) = self.preview_manager.get_mut(id) {
-                    preview.window_exe = Some(window_info.exe_name.clone());
-                    preview.window_waiting_for_match = false;
-                    restore_layout_tile_state(preview, preview_layout);
-                }
-
-                if !preview_layout.manually_frozen {
-                    self.capture_coordinator.start_capture(
-                        id,
-                        window_info.hwnd,
-                        window_info.title.clone(),
-                        preview_layout.fps_preset.as_u32(),
-                    );
-                }
-
-                #[cfg(debug_assertions)]
-                println!(
-                    "Restored preview: {}",
-                    privacy::redact_title(&window_info.title)
-                );
-            } else {
-                let id = self.preview_manager.add_inactive_window(
-                    preview_layout.window_title.clone(),
-                    preview_layout.window_exe.clone(),
-                    Pos2::new(preview_layout.position.0, preview_layout.position.1),
-                    Vec2::new(preview_layout.size.0, preview_layout.size.1),
-                    preview_layout.fps_preset,
-                    preview_layout.z_order,
-                );
-                if let Some(preview) = self.preview_manager.get_mut(id) {
-                    restore_layout_tile_state(preview, preview_layout);
-                }
-                #[cfg(debug_assertions)]
-                println!(
-                    "Window inactive; keeping saved tile: {}",
-                    privacy::redact_title(&preview_layout.window_title)
-                );
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            let group_to_video = self
-                .preview_manager
-                .all()
-                .filter_map(|preview| {
-                    preview
-                        .playlist_group
-                        .filter(|_| preview.is_video())
-                        .map(|group| (group, preview.id))
-                })
-                .collect::<HashMap<_, _>>();
-            for preview in self.preview_manager.all_mut() {
-                if preview.is_playlist() {
-                    preview.playlist_linked_video = preview
-                        .playlist_group
-                        .and_then(|group| group_to_video.get(&group).copied());
-                }
-            }
-        }
-    }
 }
 
 #[cfg(all(test, windows))]
@@ -6489,6 +4835,11 @@ mod tests {
         preview.stream_audio = true;
         preview.left_click_disabled = true;
         preview.playlist_group = Some(3);
+        preview.tile_group = Some(crate::preview::TileGroup {
+            id: 17,
+            name: "Streams".into(),
+            order: 1,
+        });
         preview.viewport_pin = Some(crate::preview::ViewportPin::from_rect(
             preview.rect(),
             Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0)),
@@ -6521,6 +4872,60 @@ mod tests {
         assert!(pending.get(&id).unwrap().shown_once);
         assert!(!mark_pending_browser_placeholders_shown(&mut pending));
         assert!(pending.contains_key(&id));
+    }
+
+    #[test]
+    fn video_preferences_survive_restore_loading_freeze_and_deletion_undo() {
+        use crate::preview::{PreviewManager, VideoPlaybackPreferences, VideoTrackPreference};
+        let mut previews = PreviewManager::new();
+        let id = previews.add_video_placeholder(
+            VideoSource::LocalFile {
+                path: std::path::PathBuf::from("missing.mp4"),
+            },
+            "missing".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+            FpsPreset::Medium,
+            true,
+        );
+        let preview = previews.get_mut(id).unwrap();
+        preview.video_preferences = VideoPlaybackPreferences {
+            volume: 25.0,
+            muted: true,
+            speed: 1.5,
+            looping: true,
+            audio_track: VideoTrackPreference::Track(2),
+            subtitle_track: VideoTrackPreference::Off,
+        };
+        preview.manually_frozen = true;
+        let saved = PreviewLayout::from(&*preview);
+        // A restore must not depend on any live player or overwrite the preferences
+        // with the runtime defaults of a loading/missing source.
+        preview.video_preferences = Default::default();
+        super::restore_layout_tile_state(preview, &saved);
+        assert_eq!(preview.video_playback.volume, 25.0);
+        assert!(preview.video_playback.muted);
+        assert!(preview.video_playback.paused);
+        assert!(!preview.video_playback.connected);
+        assert_eq!(
+            PreviewLayout::from(&*preview).video_preferences,
+            saved.video_preferences
+        );
+
+        previews.start_removal(id);
+        previews.get_mut(id).unwrap().removing = Some(Instant::now() - Duration::from_secs(1));
+        let removed = previews.finalize_removals().pop().unwrap().pop().unwrap();
+        let mut restored = Preview::new(
+            PreviewId(9),
+            "undo".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        restored.video_source = removed.video_source.clone();
+        super::restore_removed_tile_state(&mut restored, &removed);
+        assert_eq!(restored.video_preferences, saved.video_preferences);
+        assert_eq!(restored.video_playback.speed, 1.5);
+        assert!(restored.manually_frozen);
     }
 
     #[test]
@@ -6611,6 +5016,11 @@ mod tests {
         saved.crop_uv = Some((0.25, 0.0, 1.0, 1.0));
         saved.manually_frozen = true;
         saved.left_click_disabled = true;
+        saved.tile_group = Some(crate::preview::TileGroup {
+            id: 81,
+            name: "Sources".into(),
+            order: 2,
+        });
         saved.viewport_pin = Some(ViewportPin::from_rect(
             Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(240.0, 180.0)),
             Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)),
@@ -6626,6 +5036,7 @@ mod tests {
         restore_browser_geometry(&mut restored, &layout);
 
         assert_eq!(restored.crop_uv, saved.crop_uv);
+        assert_eq!(restored.tile_group, saved.tile_group);
         assert_eq!(restored.viewport_pin, saved.viewport_pin);
         assert_eq!(restored.lock_aspect_ratio, saved.lock_aspect_ratio);
         assert!(restored.manually_frozen);
@@ -7015,6 +5426,11 @@ impl eframe::App for PluriviewApp {
         } else if shortcut_presses.pressed(HotkeySlot::NextCanvasView) {
             self.jump_to_adjacent_canvas_view(true, ctx);
         }
+        self.canvas.handle_group_shortcuts(
+            &shortcut_presses,
+            ctx.input(|i| i.pointer.hover_pos()),
+            &mut self.preview_manager,
+        );
         self.canvas.set_keyboard_input(CanvasKeyboardInput {
             delete_selected: shortcut_presses.pressed(HotkeySlot::DeleteSelected),
             select_all: shortcut_presses.pressed(HotkeySlot::SelectAll),
@@ -7040,6 +5456,7 @@ impl eframe::App for PluriviewApp {
         if self.external_tools.is_scanning() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        self.poll_source_loads();
         #[cfg(windows)]
         self.pending_video_upkeep(ctx);
 
@@ -7124,11 +5541,13 @@ impl eframe::App for PluriviewApp {
         let keyboard_shortcuts = &self.app_config.keyboard_shortcuts;
         let show_canvas_overlays = !self.canvas_only;
         let mut viewer_blocked = self.viewer_is_blocked(ctx);
+        let viewer_navigation_blocked =
+            viewer_blocked || self.window_controls.click_through || self.canvas.is_spotlighting();
         self.remote_view.apply_camera_commands(
             ctx,
             &mut self.canvas,
             &self.preview_manager,
-            viewer_blocked || self.window_controls.click_through,
+            viewer_navigation_blocked,
         );
         let canvas = &mut self.canvas;
         let preview_manager = &mut self.preview_manager;
@@ -7263,22 +5682,8 @@ impl eframe::App for PluriviewApp {
 
             // Fit the current tile to the canvas, or restore the pre-focus
             // view if a tile is already focused.
-            if shortcut_presses.pressed(HotkeySlot::FocusCurrentTile) && !self.canvas.exit_focus() {
-                let target = self
-                    .browser
-                    .active_id()
-                    .or_else(|| self.canvas.selection.first().copied());
-                let tile_rect = target.and_then(|id| {
-                    self.preview_manager
-                        .get(id)
-                        .filter(|preview| preview.removing.is_none())
-                        .map(|preview| preview.rect())
-                });
-                if let (Some(id), Some(rect), Some(canvas_rect)) =
-                    (target, tile_rect, self.canvas.last_screen_rect)
-                {
-                    self.canvas.focus_on_tile(id, rect, canvas_rect);
-                }
+            if shortcut_presses.pressed(HotkeySlot::FocusCurrentTile) {
+                self.canvas.toggle_current_tile_focus(&self.preview_manager);
             }
 
             // Per-frame browser housekeeping: mirror page titles/URLs onto
@@ -7475,6 +5880,8 @@ impl eframe::App for PluriviewApp {
             egui::Window::new("Keyboard Shortcuts")
                 .collapsible(false)
                 .resizable(false)
+                .max_height((ctx.screen_rect().height() - 100.0).max(200.0))
+                .vscroll(true)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 28)))
                 .show(ctx, |ui| {
@@ -7649,6 +6056,31 @@ impl eframe::App for PluriviewApp {
                             );
                             ui.end_row();
 
+                            ui.add_space(10.0);
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new("Groups and Layouts").strong());
+                            ui.label("");
+                            ui.end_row();
+                            for slot in [
+                                HotkeySlot::GroupTiles,
+                                HotkeySlot::UngroupTiles,
+                                HotkeySlot::LayoutGrid,
+                                HotkeySlot::LayoutRow,
+                                HotkeySlot::LayoutColumn,
+                                HotkeySlot::LayoutSideStack,
+                                HotkeySlot::SizeMedium,
+                                HotkeySlot::SizeLarge,
+                                HotkeySlot::ToggleSpotlight,
+                                HotkeySlot::PreviousSpotlight,
+                                HotkeySlot::NextSpotlight,
+                            ] {
+                                ui.label(slot.label());
+                                ui.label(crate::ui_theme::shortcut_text(
+                                    self.app_config.keyboard_shortcuts.get(slot),
+                                ));
+                                ui.end_row();
+                            }
                             ui.add_space(10.0);
                             ui.end_row();
 

@@ -40,6 +40,104 @@ fn send(stream: &mut TcpStream, body: &str) -> u16 {
 }
 
 #[test]
+#[cfg(windows)]
+fn optional_audio_preserves_authentication_lease_and_pause_guards() {
+    let host = Host::start(Ipv4Addr::LOCALHOST, egui::Context::default()).unwrap();
+    host.shared.audio.update([std::process::id()], false);
+    assert!(connect(&host.invite, "/v2/audio", CLIENT, false)
+        .1
+        .starts_with("HTTP/1.1 401"));
+    assert!(connect(&host.invite, "/v2/audio", CLIENT, true)
+        .1
+        .starts_with("HTTP/1.1 409"));
+    assert!(
+        !host.shared.watching(),
+        "Audio cannot claim the video lease"
+    );
+    connect(&host.invite, "/v1/frame", CLIENT, true);
+    let seen = host.shared.peer.lock().as_ref().unwrap().seen;
+    assert!(connect(&host.invite, "/v2/audio", CLIENT, true)
+        .1
+        .starts_with("HTTP/1.1 423"));
+    host.shared.blocked.store(false, Ordering::Relaxed);
+    assert!(
+        connect(&host.invite, "/v2/audio", CLIENT, true)
+            .1
+            .starts_with("HTTP/1.1 423"),
+        "Audio requires active video"
+    );
+    host.shared.audio.update([std::process::id()], true);
+    assert!(connect(&host.invite, "/v2/audio", CLIENT, true)
+        .1
+        .starts_with("HTTP/1.1 423"));
+    assert_eq!(
+        host.shared.peer.lock().as_ref().unwrap().seen,
+        seen,
+        "Audio cannot renew the lease"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "requires Windows process loopback and the installed AAC encoder"]
+fn native_audio_stream_stops_on_toggle_off_and_source_change() {
+    for monitor in [false, true] {
+        native_audio_stream_lifecycle(monitor);
+    }
+}
+
+#[cfg(windows)]
+fn native_audio_stream_lifecycle(monitor: bool) {
+    let host = Host::start(Ipv4Addr::LOCALHOST, egui::Context::default()).unwrap();
+    host.shared.audio.update([std::process::id()], monitor);
+    connect(&host.invite, "/v1/frame", CLIENT, true);
+    host.shared.blocked.store(false, Ordering::Relaxed);
+    host.shared.video_active.store(true, Ordering::Relaxed);
+    let (mut stream, header) = connect(&host.invite, "/v2/audio", CLIENT, true);
+    assert!(header.starts_with("HTTP/1.1 200"), "{header}");
+    let mut format = [0; 6];
+    stream.read_exact(&mut format).unwrap();
+    assert_eq!(&format, b"PVA1\x11\x90");
+    let packets = if monitor { 750 } else { 20 };
+    for _ in 0..packets {
+        // Model the UI/source heartbeat and live video's lease renewal. A
+        // sub-second test misses capture queue drift and stale-source expiry.
+        host.shared.audio.update([std::process::id()], monitor);
+        host.shared.peer.lock().as_mut().unwrap().seen = Instant::now();
+        let mut length = [0; 4];
+        stream.read_exact(&mut length).unwrap();
+        let length = u32::from_be_bytes(length) as usize;
+        assert!((1..=8192).contains(&length));
+        stream.read_exact(&mut vec![0; length]).unwrap();
+    }
+    assert!(connect(&host.invite, "/v2/audio", CLIENT, true)
+        .1
+        .starts_with("HTTP/1.1 409"));
+    // Video + audio + control still leave a worker for status/pairing requests.
+    let (_control, header) = connect(&host.invite, "/v2/control", CLIENT, true);
+    assert!(header.starts_with("HTTP/1.1 200"));
+    assert!(connect(&host.invite, "/v3/info", CLIENT, true)
+        .1
+        .starts_with("HTTP/1.1 200"));
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(150));
+    host.shared.audio.update([std::process::id()], monitor);
+    let (mut stream, header) = connect(&host.invite, "/v2/audio", CLIENT, true);
+    assert!(
+        header.starts_with("HTTP/1.1 200"),
+        "Toggle-off did not release capture: {header}"
+    );
+    stream.read_exact(&mut format).unwrap();
+    host.shared.audio.update([std::process::id()], !monitor);
+    let mut tail = Vec::new();
+    stream.read_to_end(&mut tail).unwrap();
+    assert!(
+        tail.len() < 8196 * 6,
+        "Old audio accumulated after source change"
+    );
+}
+
+#[test]
 fn persistent_control_preserves_auth_bounds_pause_and_peer_lease() {
     let host = Host::start(Ipv4Addr::LOCALHOST, egui::Context::default()).unwrap();
     assert!(connect(&host.invite, "/v2/control", CLIENT, false)

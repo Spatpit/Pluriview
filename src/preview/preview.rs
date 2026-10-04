@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use super::VideoPlaybackPreferences;
 use crate::media::MediaFrame;
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout};
 
@@ -19,6 +20,14 @@ fn ease_out_cubic(t: f32) -> f32 {
 /// Unique identifier for a preview
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct PreviewId(pub u64);
+
+/// Workspace group identity travels with each member, including deletion undo.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TileGroup {
+    pub id: u64,
+    pub name: String,
+    pub order: u32,
+}
 
 /// Browser-specific startup state shown inside a tile before capture begins.
 #[derive(Clone, Debug, PartialEq)]
@@ -209,6 +218,8 @@ pub struct Preview {
     /// Unique ID
     pub id: PreviewId,
 
+    pub tile_group: Option<TileGroup>,
+
     /// Position on canvas (top-left corner, in canvas coordinates)
     pub position: Pos2,
 
@@ -315,6 +326,8 @@ pub struct Preview {
     /// Original local path for image and GIF tiles. Legacy layouts may still
     /// point into Pluriview's former managed-media directory.
     pub media_path: Option<PathBuf>,
+    /// Runtime-only background decode status.
+    pub media_loading: bool,
 
     /// Local file or Streamlink URL when this is an mpv-backed video tile.
     pub video_source: Option<VideoSource>,
@@ -334,6 +347,7 @@ pub struct Preview {
 
     /// Last playback state received from mpv.
     pub video_playback: VideoPlaybackState,
+    pub video_preferences: VideoPlaybackPreferences,
 
     /// In-process libmpv renderer. Unlike a captured external mpv window,
     /// this paints directly into Pluriview's OpenGL canvas.
@@ -403,12 +417,15 @@ impl Preview {
             browser_status: BrowserTileStatus::Ready,
             browser_waiting_for_content: false,
             media_path: None,
+            media_loading: false,
             video_source: None,
             folder_playlist: None,
             playlist_group: None,
+            tile_group: None,
             playlist_linked_video: None,
             video_status: VideoTileStatus::Ready,
             video_playback: VideoPlaybackState::default(),
+            video_preferences: VideoPlaybackPreferences::default(),
             #[cfg(windows)]
             video_renderer: None,
             seek_preview_time: None,
@@ -554,6 +571,7 @@ impl Preview {
 
     /// Attach decoded image data to this preview.
     pub fn set_media(&mut self, path: PathBuf, frames: Vec<MediaFrame>) {
+        self.media_loading = false;
         self.texture = None;
         self.frame_buffer = None;
         self.clear_capture_error();
@@ -783,6 +801,8 @@ impl Preview {
 /// Serializable layout for persistence
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreviewLayout {
+    #[serde(default)]
+    pub tile_group: Option<TileGroup>,
     pub position: (f32, f32),
     pub size: (f32, f32),
     pub window_title: String,
@@ -815,6 +835,9 @@ pub struct PreviewLayout {
     /// Optional mpv-backed local file or Streamlink source.
     #[serde(default)]
     pub video_source: Option<VideoSource>,
+    /// Playback choices survive missing files and delayed player startup.
+    #[serde(default)]
+    pub video_preferences: VideoPlaybackPreferences,
     /// Relationship shared by a folder playlist and its linked video.
     #[serde(default)]
     pub playlist_group: Option<u64>,
@@ -835,6 +858,7 @@ pub struct PreviewLayout {
 impl From<&Preview> for PreviewLayout {
     fn from(preview: &Preview) -> Self {
         Self {
+            tile_group: preview.tile_group.clone(),
             position: (preview.position.x, preview.position.y),
             size: (preview.size.x, preview.size.y),
             window_title: match preview.video_source.as_ref() {
@@ -852,6 +876,7 @@ impl From<&Preview> for PreviewLayout {
             stream_audio: preview.stream_audio,
             media_path: preview.media_path.clone(),
             video_source: preview.video_source.as_ref().map(scrub_video_source),
+            video_preferences: preview.video_preferences.clone().normalized(),
             playlist_group: preview.playlist_group,
             folder_playlist: preview.folder_playlist.as_ref().map(FolderPlaylist::layout),
             spout_sender: preview.spout_sender.clone(),
@@ -1057,6 +1082,40 @@ mod tests {
     use eframe::egui::{Context, Pos2, Rect, Vec2};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn video_preferences_round_trip_without_runtime_state() {
+        use crate::preview::{VideoPlaybackPreferences, VideoTrackPreference};
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "video".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        preview.video_source = Some(VideoSource::LocalFile {
+            path: PathBuf::from("movie.mp4"),
+        });
+        preview.video_preferences = VideoPlaybackPreferences {
+            volume: 31.0,
+            muted: true,
+            speed: 1.5,
+            looping: true,
+            audio_track: VideoTrackPreference::Track(2),
+            subtitle_track: VideoTrackPreference::Off,
+        };
+        preview.video_playback.time_pos = Some(42.0);
+        preview.video_playback.connected = true;
+        let json = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert!(json.get("video_playback").is_none());
+        assert!(json["video_preferences"].get("time_pos").is_none());
+        let saved: PreviewLayout = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(saved.video_preferences, preview.video_preferences);
+
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("video_preferences");
+        let saved: PreviewLayout = serde_json::from_value(legacy).unwrap();
+        assert_eq!(saved.video_preferences, VideoPlaybackPreferences::default());
+    }
 
     #[test]
     fn frame_updates_reuse_the_texture() {

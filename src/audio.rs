@@ -207,10 +207,18 @@ impl Drop for AudioMonitor {
     }
 }
 
+#[cfg(test)]
 fn wait_for_activation(receiver: &mpsc::Receiver<()>, stop: &AtomicBool) -> Result<(), String> {
+    wait_for_activation_until(receiver, &|| stop.load(Ordering::Relaxed))
+}
+
+fn wait_for_activation_until(
+    receiver: &mpsc::Receiver<()>,
+    stopped: &impl Fn() -> bool,
+) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stopped() {
             return Err("Audio monitoring stopped".to_owned());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -446,6 +454,14 @@ impl Capture {
     }
 
     fn start_cancellable(pid: u32, format: &MixFormat, stop: &AtomicBool) -> Result<Self, String> {
+        Self::start_until(pid, format, &|| stop.load(Ordering::Relaxed))
+    }
+
+    fn start_until(
+        pid: u32,
+        format: &MixFormat,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<Self, String> {
         let params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -476,7 +492,10 @@ impl Capture {
             )
         }
         .map_err(|e| e.to_string())?;
-        wait_for_activation(&receiver, stop)?;
+        wait_for_activation_until(&receiver, stopped)?;
+        if stopped() {
+            return Err("Audio capture stopped".into());
+        }
 
         let mut result = HRESULT(0);
         let mut unknown: Option<windows::core::IUnknown> = None;
@@ -488,23 +507,28 @@ impl Capture {
             .cast()
             .map_err(|e| e.to_string())?;
 
-        let event = unsafe {
+        let (capture, event) = unsafe {
             client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK
+                        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                     2_000_000, // 200 ms
                     0,
                     format.as_wave_format(),
                     None,
                 )
                 .map_err(|e| e.to_string())?;
+            let capture = client.GetService().map_err(|e| e.to_string())?;
             let event = CreateEventW(None, false, false, None).map_err(|e| e.to_string())?;
-            client.SetEventHandle(event).map_err(|e| e.to_string())?;
-            client.Start().map_err(|e| e.to_string())?;
-            event
+            if let Err(error) = client.SetEventHandle(event).and_then(|_| client.Start()) {
+                let _ = CloseHandle(event);
+                return Err(error.to_string());
+            }
+            (capture, event)
         };
-        let capture = unsafe { client.GetService() }.map_err(|e| e.to_string())?;
         Ok(Self {
             client,
             capture,
@@ -532,7 +556,23 @@ impl Capture {
                 .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
                 .map_err(|e| e.to_string())?;
             let count = frames as usize * channels as usize;
-            samples.extend_from_slice(std::slice::from_raw_parts(data as *const f32, count));
+            if count > 48_000 * 32 {
+                self.capture
+                    .ReleaseBuffer(frames)
+                    .map_err(|e| e.to_string())?;
+                return Err("Invalid audio capture packet".into());
+            }
+            // WASAPI may return a null data pointer for a silent packet.
+            if flags & windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                samples.resize(count, 0.0);
+            } else if data.is_null() {
+                self.capture
+                    .ReleaseBuffer(frames)
+                    .map_err(|e| e.to_string())?;
+                return Err("Invalid audio capture packet".into());
+            } else {
+                samples.extend_from_slice(std::slice::from_raw_parts(data as *const f32, count));
+            }
             self.capture
                 .ReleaseBuffer(frames)
                 .map_err(|e| e.to_string())?;
@@ -547,6 +587,41 @@ impl Drop for Capture {
             let _ = self.client.Stop();
             let _ = CloseHandle(self.event);
         }
+    }
+}
+
+/// Worker-local tile process capture. Retain the endpoint's channel layout so
+/// surround sources use our unity-gain stereo fold, with WASAPI resampling to 48 kHz.
+pub(crate) struct TileAudioCapture {
+    capture: Capture,
+    channels: u16,
+    scratch: Vec<f32>,
+}
+impl TileAudioCapture {
+    pub(crate) fn start(pid: u32, stopped: &impl Fn() -> bool) -> Result<Self, String> {
+        let mut format = MixFormat::for_default_device()?;
+        if format.channels == 0 || format.channels > 32 {
+            return Err("Unsupported channel layout".into());
+        }
+        unsafe {
+            let wave = &mut *(format.blob.as_mut_ptr() as *mut WAVEFORMATEX);
+            wave.nSamplesPerSec = 48_000;
+            wave.nAvgBytesPerSec = 48_000 * wave.nBlockAlign as u32;
+        }
+        format.sample_rate = 48_000;
+        let capture = Capture::start_until(pid, &format, stopped)?;
+        Ok(Self {
+            capture,
+            channels: format.channels,
+            scratch: Vec::new(),
+        })
+    }
+    pub(crate) fn read(&mut self, stereo: &mut Vec<f32>) -> Result<bool, String> {
+        if self.capture.read(&mut self.scratch, self.channels)? == 0 {
+            return Ok(false);
+        }
+        fold_to_stereo(&self.scratch, self.channels as usize, stereo);
+        Ok(true)
     }
 }
 
@@ -638,7 +713,11 @@ impl Drop for Render {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_to_stereo, render_devices, AudioMonitor, Capture, MixFormat};
+    use super::{
+        fold_to_stereo, render_devices, AudioMonitor, AudioMonitorStatus, Capture, MixFormat,
+        TileAudioCapture,
+    };
+    use std::os::windows::process::CommandExt;
     use std::time::{Duration, Instant};
     use windows::core::HSTRING;
     use windows::Win32::{
@@ -824,18 +903,27 @@ mod tests {
 
         let wav = std::env::temp_dir().join("pluriview_monitor_test_tone.wav");
         write_tone_wav(&wav);
-        let mut child = std::process::Command::new("powershell.exe")
+        struct ToneChild(std::process::Child);
+        impl Drop for ToneChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = std::process::Command::new("powershell.exe")
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .args([
                 "-NoProfile",
                 "-Command",
                 &format!(
                     "(New-Object Media.SoundPlayer '{}').PlayLooping(); Start-Sleep 60",
-                    wav.display()
+                    wav.display().to_string().replace('\'', "''")
                 ),
             ])
             .spawn()
             .expect("spawn tone player");
-        let child_pid = child.id();
+        let child = ToneChild(child);
+        let child_pid = child.0.id();
         std::thread::sleep(Duration::from_secs(2));
 
         let monitor = AudioMonitor::start(child_pid, monitor_device.id);
@@ -852,9 +940,8 @@ mod tests {
             "tone child should be audible to the tap, got RMS {child_rms:.5}"
         );
 
-        // What a per-app capture of Pluriview hears: our own process tree
-        // (the child is a subprocess of the test runner, not of us — but the
-        // monitor's render stream is ours).
+        // Application sharing captures our process tree, including the monitor
+        // render stream. This fixture also owns the tone child.
         let self_capture = Capture::start(std::process::id(), &format).expect("self capture");
         let self_rms = rms_of(&self_capture, format.channels, 2.0);
         drop(self_capture);
@@ -865,9 +952,30 @@ mod tests {
             "monitor should replay at a comparable level: child {child_rms:.5}, self {self_rms:.5}, ratio {ratio:.3}"
         );
 
+        // Starting and stopping the phone's 48 kHz tap must leave the existing
+        // desktop monitor running and receiving audio throughout.
+        assert!(matches!(monitor.status(), AudioMonitorStatus::Active));
+        let mut phone = TileAudioCapture::start(std::process::id(), &|| false)
+            .expect("phone capture alongside monitor");
+        let mut samples = Vec::new();
+        let mut peak = 0.0f32;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if phone.read(&mut samples).expect("phone samples") {
+                peak = samples
+                    .iter()
+                    .fold(peak, |peak, sample| peak.max(sample.abs()));
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(peak > 0.01, "phone should receive the desktop mix");
+        drop(phone);
+        assert!(matches!(monitor.status(), AudioMonitorStatus::Active));
+        let continued = Capture::start(std::process::id(), &format).expect("desktop capture");
+        assert!(rms_of(&continued, format.channels, 0.5) > 0.01);
+
         drop(monitor);
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     fn write_tone_wav(path: &std::path::Path) {

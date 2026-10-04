@@ -25,7 +25,10 @@ use libloading::Library;
 use parking_lot::Mutex;
 
 use crate::{
-    preview::{PreviewId, VideoPlaybackState, VideoSource, VideoTrack},
+    preview::{
+        PreviewId, VideoPlaybackPreferences, VideoPlaybackState, VideoSource, VideoTrack,
+        VideoTrackPreference,
+    },
     video::{self, VideoLaunch, VideoUpdate},
 };
 
@@ -161,6 +164,7 @@ struct MpvApi {
     set_property_string:
         unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
     get_property: unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int,
+    free_node_contents: unsafe extern "C" fn(*mut MpvNode),
     #[cfg(test)]
     get_property_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char) -> *mut c_char,
     command: unsafe extern "C" fn(*mut MpvHandle, *const *const c_char) -> c_int,
@@ -211,6 +215,7 @@ impl MpvApi {
         let set_option_string = unsafe { symbol(&library, b"mpv_set_option_string\0")? };
         let set_property_string = unsafe { symbol(&library, b"mpv_set_property_string\0")? };
         let get_property = unsafe { symbol(&library, b"mpv_get_property\0")? };
+        let free_node_contents = unsafe { symbol(&library, b"mpv_free_node_contents\0")? };
         #[cfg(test)]
         let get_property_string = unsafe { symbol(&library, b"mpv_get_property_string\0")? };
         let command = unsafe { symbol(&library, b"mpv_command\0")? };
@@ -232,6 +237,7 @@ impl MpvApi {
             set_option_string,
             set_property_string,
             get_property,
+            free_node_contents,
             #[cfg(test)]
             get_property_string,
             command,
@@ -754,6 +760,24 @@ impl MpvCore {
         Some(result)
     }
 
+    fn tracks(&self) -> Result<Vec<VideoTrack>, String> {
+        let mut node: MpvNode = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            (self.api.get_property)(
+                self.handle,
+                c"track-list".as_ptr(),
+                MPV_FORMAT_NODE,
+                (&mut node as *mut MpvNode).cast(),
+            )
+        };
+        if result < 0 {
+            return Err(self.api.error(result));
+        }
+        let tracks = unsafe { parse_track_list_node(&node) };
+        unsafe { (self.api.free_node_contents)(&mut node) };
+        Ok(tracks)
+    }
+
     fn drain_events(&mut self, state: &mut VideoPlaybackState) -> EventChanges {
         let mut changes = EventChanges::default();
         for _ in 0..256 {
@@ -1211,12 +1235,33 @@ pub struct VideoSnapshot {
 pub struct VideoSession {
     renderer: Arc<VideoRenderer>,
     state: VideoPlaybackState,
+    preferences: VideoPlaybackPreferences,
+    restore_tracks: bool,
     first_poll: bool,
     stream_receiver: Option<mpsc::Receiver<Result<OsString, String>>>,
 }
 
 impl VideoSession {
     fn new(renderer: Arc<VideoRenderer>, launch: &VideoLaunch) -> Result<Self, String> {
+        let preferences = launch.preferences.clone().normalized();
+        let mut state = VideoPlaybackState {
+            connected: true,
+            paused: launch.start_paused,
+            core_idle: true,
+            ..Default::default()
+        };
+        if !launch.wallpaper {
+            // Configure before loadfile (and before Streamlink resolution), so
+            // even an immediately playing tile starts at its remembered volume.
+            let core = renderer.core.lock();
+            core.set_property("volume", &preferences.volume.to_string())?;
+            core.set_property("mute", if preferences.muted { "yes" } else { "no" })?;
+            core.set_property("speed", &preferences.speed.to_string())?;
+            core.set_property("loop-file", if preferences.looping { "inf" } else { "no" })?;
+            core.set_property("aid", &preferences.audio_track.mpv_value())?;
+            core.set_property("sid", &preferences.subtitle_track.mpv_value())?;
+            preferences.apply_to_state(&mut state);
+        }
         let stream_receiver = match &launch.source {
             VideoSource::LocalFile { path } => {
                 renderer.load_source(path.as_os_str().to_owned())?;
@@ -1238,12 +1283,9 @@ impl VideoSession {
         };
         Ok(Self {
             renderer,
-            state: VideoPlaybackState {
-                connected: true,
-                paused: launch.start_paused,
-                core_idle: true,
-                ..Default::default()
-            },
+            state,
+            preferences,
+            restore_tracks: !launch.wallpaper,
             first_poll: true,
             stream_receiver,
         })
@@ -1251,6 +1293,10 @@ impl VideoSession {
 
     pub fn state(&self) -> &VideoPlaybackState {
         &self.state
+    }
+
+    pub fn preferences(&self) -> &VideoPlaybackPreferences {
+        &self.preferences
     }
 
     pub fn source_ready(&self) -> bool {
@@ -1295,6 +1341,26 @@ impl VideoSession {
 
         let mut core = self.renderer.core.lock();
         let changes = core.drain_events(&mut self.state);
+        if self.restore_tracks && core.file_loaded {
+            self.restore_tracks = false;
+            // Read once after FILE_LOADED rather than relying on the order of
+            // property notifications, which can still contain the old file's tracks.
+            let result = (|| {
+                let tracks = core.tracks()?;
+                for (property, kind, preference) in [
+                    ("aid", "audio", self.preferences.audio_track),
+                    ("sid", "sub", self.preferences.subtitle_track),
+                ] {
+                    core.set_property(property, &preference.available(kind, &tracks).mpv_value())?;
+                }
+                Ok::<_, String>(())
+            })();
+            if let Err(error) = result {
+                updates.push(VideoUpdate::Error(format!(
+                    "Could not restore video tracks: {error}"
+                )));
+            }
+        }
         if let Some(error) = core.error.take() {
             updates.push(VideoUpdate::Error(error));
         }
@@ -1337,6 +1403,7 @@ impl VideoSession {
             .core
             .lock()
             .load_source(path.as_os_str().to_os_string())?;
+        self.restore_tracks = true;
         self.state.time_pos = None;
         self.state.duration = None;
         self.state.eof_reached = false;
@@ -1366,6 +1433,7 @@ impl VideoSession {
             .lock()
             .set_property("volume", &volume.to_string())?;
         self.state.volume = volume;
+        self.preferences.volume = volume;
         Ok(())
     }
 
@@ -1375,6 +1443,7 @@ impl VideoSession {
             .lock()
             .set_property("mute", if muted { "yes" } else { "no" })?;
         self.state.muted = muted;
+        self.preferences.muted = muted;
         Ok(())
     }
 
@@ -1387,6 +1456,7 @@ impl VideoSession {
             .lock()
             .set_property("speed", &speed.to_string())?;
         self.state.speed = speed;
+        self.preferences.speed = speed;
         Ok(())
     }
 
@@ -1396,6 +1466,7 @@ impl VideoSession {
             .lock()
             .set_property("loop-file", if enabled { "inf" } else { "no" })?;
         self.state.looping = enabled;
+        self.preferences.looping = enabled;
         Ok(())
     }
 
@@ -1414,6 +1485,7 @@ impl VideoSession {
             .lock()
             .set_property("aid", &id.to_string())?;
         self.state.audio_track = Some(id);
+        self.preferences.audio_track = VideoTrackPreference::Track(id);
         Ok(())
     }
 
@@ -1423,12 +1495,14 @@ impl VideoSession {
             .lock()
             .set_property("sid", &id.to_string())?;
         self.state.subtitle_track = Some(id);
+        self.preferences.subtitle_track = VideoTrackPreference::Track(id);
         Ok(())
     }
 
     pub fn disable_subtitles(&mut self) -> Result<(), String> {
         self.renderer.core.lock().set_property("sid", "no")?;
         self.state.subtitle_track = None;
+        self.preferences.subtitle_track = VideoTrackPreference::Off;
         Ok(())
     }
 }
@@ -2736,6 +2810,152 @@ mod tests {
     }
 
     #[test]
+    fn video_preferences_apply_before_loading_and_controls_update_intent() {
+        let renderer = VideoRenderer::new(MpvApi::load().unwrap(), true, false, false).unwrap();
+        let launch = VideoLaunch {
+            source: VideoSource::LocalFile {
+                path: PathBuf::from("not-loaded.mp4"),
+            },
+            streamlink_path: None,
+            start_paused: true,
+            wallpaper: false,
+            preferences: VideoPlaybackPreferences {
+                volume: 23.0,
+                muted: true,
+                speed: 1.5,
+                looping: true,
+                audio_track: VideoTrackPreference::Track(2),
+                subtitle_track: VideoTrackPreference::Off,
+            },
+        };
+        let mut session = VideoSession::new(renderer.clone(), &launch).unwrap();
+        {
+            let core = renderer.core.lock();
+            assert!(!core.source_loaded);
+            assert_eq!(
+                core.property("volume").unwrap().parse::<f64>().unwrap(),
+                23.0
+            );
+            assert_eq!(core.property("mute").as_deref(), Some("yes"));
+            assert_eq!(core.property("speed").unwrap().parse::<f64>().unwrap(), 1.5);
+            assert_eq!(core.property("loop-file").as_deref(), Some("inf"));
+            assert_eq!(core.property("aid").as_deref(), Some("2"));
+            assert_eq!(core.property("sid").as_deref(), Some("no"));
+        }
+        session.poll();
+        assert_eq!(session.preferences(), &launch.preferences);
+        session.set_volume(37.0).unwrap();
+        session.set_muted(false).unwrap();
+        session.set_speed(0.75).unwrap();
+        session.set_looping(false).unwrap();
+        session.select_audio_track(1).unwrap();
+        session.select_subtitle_track(3).unwrap();
+        let expected = VideoPlaybackPreferences {
+            volume: 37.0,
+            muted: false,
+            speed: 0.75,
+            looping: false,
+            audio_track: VideoTrackPreference::Track(1),
+            subtitle_track: VideoTrackPreference::Track(3),
+        };
+        assert_eq!(session.preferences(), &expected);
+        session.disable_subtitles().unwrap();
+        assert_eq!(
+            session.preferences().subtitle_track,
+            VideoTrackPreference::Off
+        );
+        renderer.core.lock().destroy_without_render_context();
+    }
+
+    #[test]
+    fn video_preferences_do_not_override_silent_looping_wallpaper() {
+        let renderer = VideoRenderer::new(MpvApi::load().unwrap(), true, false, true).unwrap();
+        let launch = VideoLaunch {
+            source: VideoSource::LocalFile {
+                path: PathBuf::from("not-loaded.mp4"),
+            },
+            streamlink_path: None,
+            start_paused: true,
+            wallpaper: true,
+            preferences: Default::default(),
+        };
+        let _session = VideoSession::new(renderer.clone(), &launch).unwrap();
+        let mut core = renderer.core.lock();
+        assert_eq!(core.property("mute").as_deref(), Some("yes"));
+        assert_eq!(core.property("loop-file").as_deref(), Some("inf"));
+        assert_eq!(core.property("aid").as_deref(), Some("no"));
+        assert_eq!(core.property("sid").as_deref(), Some("no"));
+        core.destroy_without_render_context();
+    }
+
+    #[test]
+    fn video_preferences_missing_tracks_fall_back_after_real_file_load() {
+        // Audio-only PCM fixture exercises FILE_LOADED and track discovery with
+        // null audio output, without a desktop, GPU context, or external media.
+        let path =
+            std::env::temp_dir().join(format!("pluriview-preferences-{}.wav", std::process::id()));
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36_u32 + 16000).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&8000_u32.to_le_bytes());
+        wav.extend_from_slice(&16000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&16000_u32.to_le_bytes());
+        wav.resize(44 + 16000, 0);
+        std::fs::write(&path, wav).unwrap();
+        let renderer = VideoRenderer::new(MpvApi::load().unwrap(), true, false, false).unwrap();
+        renderer.core.lock().set_property("ao", "null").unwrap();
+        let launch = VideoLaunch {
+            source: VideoSource::LocalFile { path: path.clone() },
+            streamlink_path: None,
+            start_paused: true,
+            wallpaper: false,
+            preferences: VideoPlaybackPreferences {
+                muted: true,
+                audio_track: VideoTrackPreference::Track(99),
+                subtitle_track: VideoTrackPreference::Off,
+                ..Default::default()
+            },
+        };
+        let mut session = VideoSession::new(renderer.clone(), &launch).unwrap();
+        renderer.core.lock().start_pending_source().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.restore_tracks && Instant::now() < deadline {
+            let updates = session.poll();
+            assert!(
+                !updates
+                    .iter()
+                    .any(|update| matches!(update, VideoUpdate::Error(_))),
+                "{updates:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.restore_tracks, "file did not load");
+        let core = renderer.core.lock();
+        let tracks = core.tracks().unwrap();
+        assert!(tracks
+            .iter()
+            .any(|track| track.kind == "audio" && track.id == 1));
+        assert_ne!(core.property("aid").as_deref(), Some("99"));
+        assert_eq!(core.property("sid").as_deref(), Some("no"));
+        assert_eq!(session.preferences(), &launch.preferences);
+        drop(core);
+        // Changing playlist files keeps intent and rechecks the available tracks.
+        session.load_local_file(&path).unwrap();
+        session.set_paused(true).unwrap();
+        assert!(session.restore_tracks);
+        assert_eq!(session.preferences(), &launch.preferences);
+        renderer.core.lock().destroy_without_render_context();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     #[ignore = "requires PLURIVIEW_TEST_VIDEO and a desktop OpenGL context"]
     fn direct_renderer_pause_then_resume_advances_a_real_video() {
         use windows::Win32::{
@@ -2796,6 +3016,7 @@ mod tests {
             streamlink_path: None,
             start_paused: false,
             wallpaper,
+            preferences: Default::default(),
         };
         let mut session = VideoSession::new(renderer.clone(), &launch).expect("create session");
         // Keep the diagnostic silent even when the supplied video has audio;

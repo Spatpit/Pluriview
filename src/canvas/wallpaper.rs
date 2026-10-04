@@ -73,6 +73,17 @@ impl CanvasWallpaper {
         }
     }
 
+    /// Completion changes pixels/status, never the saved source identity.
+    pub fn finish_image_load(&mut self, result: Result<crate::media::MediaAsset, String>) {
+        let WallpaperSource::Image { path } = &self.source else {
+            return;
+        };
+        match result {
+            Ok(asset) => *self = Self::from_image(path.clone(), asset.frames),
+            Err(error) => self.error = Some(error),
+        }
+    }
+
     pub fn paint(&mut self, painter: &egui::Painter, canvas_rect: Rect, ctx: &egui::Context) {
         #[cfg(windows)]
         if matches!(self.source, WallpaperSource::Video { .. }) {
@@ -90,7 +101,7 @@ impl CanvasWallpaper {
                 }
             } else {
                 self.paint_video_status(painter, canvas_rect);
-                if !self.video_sleeping {
+                if !self.video_sleeping && self.error.is_none() {
                     ctx.request_repaint();
                 }
             }
@@ -245,5 +256,55 @@ mod tests {
         wallpaper.error = Some("missing".to_owned());
 
         assert_eq!(wallpaper.to_layout(), WallpaperLayout::Image { path });
+    }
+
+    #[test]
+    fn corrupt_and_missing_wallpaper_sources_survive_a_workspace_save() {
+        let path = std::env::temp_dir().join(format!(
+            "pluriview-wallpaper-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"not a valid image").unwrap();
+        for source in [&path, &path.with_extension("missing.png")] {
+            let mut wallpaper = CanvasWallpaper::from_image(source.clone(), Vec::new());
+            wallpaper.finish_image_load(crate::media::load(source));
+            assert!(wallpaper.error.is_some());
+            let mut layout = crate::persistence::SavedLayout::new();
+            layout.canvas.wallpaper = Some(wallpaper.to_layout());
+            let saved: crate::persistence::SavedLayout =
+                serde_json::from_slice(&serde_json::to_vec(&layout).unwrap()).unwrap();
+            assert_eq!(
+                saved.canvas.wallpaper,
+                Some(WallpaperLayout::Image {
+                    path: source.clone()
+                })
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn failed_video_wallpaper_keeps_source_without_a_busy_repaint_loop() {
+        let path = PathBuf::from(r"C:\missing-wallpaper.mp4");
+        let mut wallpaper = CanvasWallpaper::from_video(path.clone());
+        wallpaper.error = Some("Video unavailable".into());
+        let ctx = eframe::egui::Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run(Default::default(), |_| {});
+        }
+        let output = ctx.run(Default::default(), |ctx| {
+            eframe::egui::CentralPanel::default()
+                .show(ctx, |ui| wallpaper.paint(ui.painter(), ui.max_rect(), ctx));
+        });
+        assert!(
+            output.viewport_output[&eframe::egui::ViewportId::ROOT].repaint_delay
+                > std::time::Duration::ZERO
+        );
+        assert_eq!(wallpaper.to_layout(), WallpaperLayout::Video { path });
     }
 }

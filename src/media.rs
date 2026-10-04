@@ -132,6 +132,7 @@ fn load_gif(path: &Path) -> Result<MediaAsset, String> {
 }
 
 /// Preserve a saved source when it cannot currently be decoded.
+#[cfg(test)]
 pub fn load_or_placeholder(path: &Path) -> (Vec<MediaFrame>, Option<String>) {
     match load(path) {
         Ok(asset) => (asset.frames, None),

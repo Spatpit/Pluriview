@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 /// the manager, so the canvas can offer an "Undo" toast that restores it.
 #[derive(Clone)]
 pub struct RemovedPreviewInfo {
+    pub tile_group: Option<super::TileGroup>,
     pub title: String,
     pub window_handle: Option<WindowHandle>,
     pub window_exe: Option<String>,
@@ -23,6 +24,7 @@ pub struct RemovedPreviewInfo {
     pub lock_aspect_ratio: bool,
     pub manually_frozen: bool,
     pub video_playback: VideoPlaybackState,
+    pub video_preferences: super::VideoPlaybackPreferences,
     pub fps_preset: FpsPreset,
     pub crop_uv: Option<(f32, f32, f32, f32)>,
     /// Set for browser tiles; undo recreates the WebView from this URL
@@ -291,6 +293,7 @@ impl PreviewManager {
                         lock_aspect_ratio: preview.lock_aspect_ratio,
                         manually_frozen: preview.manually_frozen,
                         video_playback: preview.video_playback,
+                        video_preferences: preview.video_preferences,
                         fps_preset: preview.fps_preset,
                         crop_uv: preview.crop_uv,
                         browser_url: preview.browser_url,
@@ -298,6 +301,7 @@ impl PreviewManager {
                         stream_audio: preview.stream_audio,
                         spout_sender: preview.spout_sender,
                         viewport_pin: preview.viewport_pin,
+                        tile_group: preview.tile_group.clone(),
                         left_click_disabled: preview.left_click_disabled,
                         media_path: preview.media_path,
                         video_source: preview.video_source,

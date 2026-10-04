@@ -786,6 +786,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn data_directory_lease_excludes_another_writer_and_releases_on_drop() {
+        let root = temp_root("exclusive-storage");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let lease = storage.acquire_lease().unwrap();
+        let second = Storage {
+            data_dir: root.join("."),
+        };
+        assert_eq!(
+            second.acquire_lease().err().unwrap().raw_os_error(),
+            Some(32)
+        );
+        // Locks are scoped to a directory, not to all Pluriview processes.
+        let other_root = temp_root("independent-storage");
+        let other = Storage {
+            data_dir: other_root.clone(),
+        };
+        let independent = other.acquire_lease().unwrap();
+        drop(lease);
+        let reopened = second.acquire_lease().unwrap();
+        drop(reopened);
+        drop(independent);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[test]
     fn failed_load_blocks_autosave_and_exit_save_until_a_successful_retry() {
         let root = temp_root("failed-workspace-load");
         let storage = Storage {

@@ -41,6 +41,10 @@ The Lite package is no longer offered for new releases.
 `lib` folder. Keep your existing `pluriview_data` folder to preserve workspaces,
 settings, and browser data. See the [changelog](CHANGELOG.md) for changes.
 
+Only one Pluriview instance can use a data folder at a time. If a second launch
+reports that the folder is already in use, close the existing instance, including
+one minimized to the tray. Separate portable folders can run independently.
+
 **Requirements:** Windows 10 version 1903 or newer, or Windows 11, with a
 DirectX 11-compatible GPU.
 
@@ -121,7 +125,30 @@ pauses and backgrounding still clear it immediately. This APK works with the
 Windows 0.3.6 preview. APK 0.3.8 adds a dedicated video socket that resumes partial
 records after short receive timeouts without resetting the decoder. Long stalls
 still have bounded deadlines, and backgrounding cancels the socket immediately.
-There is no audio or encryption; use trusted private networks without port forwarding.
+Preview 0.3.9 adds **Audio on/off** in the phone controls (off by default).
+APK 0.3.10 prepares phone audio playback before requesting the live stream,
+fixes idle time being counted as an audio decoder stall, and shows a specific
+reconnect reason. Use it with the updated PC 0.7.1 build; desktop audio routing
+and Discord/OBS monitoring are unchanged.
+APK 0.3.11 fixes immediate “Audio queue full” reconnects during packet bursts
+and speaker-buffer pressure. It keeps the same bounded audio queue, services
+decoder input between partial speaker writes, and lets the phone's audio output
+manage playback startup. Install it over the previous APK; PC 0.7.1 is unchanged.
+Update both the PC executable and APK for audio. It sends AAC stereo at a
+128 kbps target; switching it off stops audio capture and transmission.
+Browser/video tile audio is included, plus window tiles with **Stream Audio**
+enabled. Capture is per application, so other sounds from the same source app
+may also be heard. It does not capture all PC sound. Windows 11 (or build 20348+)
+is required for process audio capture. **Stream Audio Monitor** can stay enabled
+for Discord/OBS while the phone receives Pluriview's same application audio mix.
+In this mode, the phone captures that mix once instead of adding separate window
+audio copies. Your selected monitor output, desktop volume and routing stay unchanged.
+With monitoring off, phone audio still captures the tile sources directly.
+Phone backgrounding and sharing
+pauses stop audio; it resumes with video if still enabled. Losing Android audio
+focus switches it off. A new connection starts with audio off. Audio and video
+use bounded buffering but do not yet share a synchronization clock.
+There is no encryption; use trusted private networks without port forwarding.
 PC dialogs, menus, minimized windows and interactive browser mode pause sharing;
 close dialogs/menus, restore the PC window or exit browser interaction to resume.
 Click Through also disables phone navigation. The PC must remain running with
@@ -157,6 +184,61 @@ Menu shortcuts appear on the right and follow your bindings in **Settings**.
 
 Live Spout2 senders appear in the same picker. Select one to display its shared
 output on the canvas.
+
+### Groups, layouts, and Spotlight
+
+Select tiles with **Ctrl+click** or a selection box, then press **Ctrl+G**
+or choose **Group → Group Selected** from a tile's context menu. Click any
+member to select the group and drag it to move everything together. Drag the
+group's bottom-right handle to resize it proportionally.
+
+The **Group** menu lets you name the group, add selected tiles to an existing
+group, remove a member, or ungroup with **Ctrl+U**. **Select This Tile Only**
+lets you adjust one member; click another member or choose **Select Whole
+Group** to return to group editing. Groups are saved with the workspace and
+survive deletion undo. Groups have one level and each tile belongs to at most
+one group.
+
+Use **Arrange** or **Alt+1–4** to arrange the group without entering Spotlight:
+
+- **Alt+1:** one large tile.
+- **Alt+2:** two large tiles.
+- **Alt+3:** three large tiles.
+- **Alt+4:** all tiles have equal visible area, preserving their proportions.
+
+The large tiles sit together with a compact companion stack beside them. With
+fewer tiles than the requested number, all available tiles receive equal size.
+**Alt+5** is unassigned. **Arrange → Size**, **Alt+6**, and **Alt+7** still set
+the selection's width to **960** or **1440** canvas units (screen points when pinned).
+
+Select a group member and press **Shift+F**, or choose **Spotlight This
+Tile** to enter Spotlight. Every tile keeps its existing position and size,
+including manually arranged layouts; membership order does not rearrange them.
+Moving the group in normal mode simply moves it without entering Spotlight.
+In Spotlight, drag any tile onto another and release to exchange their exact
+positions and sizes. Only those two tiles change. Swap a small tile
+with a large one to choose which sources are prominent, or swap peers to reorder
+them. A gold outline marks the drop target; dropping outside a tile returns it
+to its place. Layout changes and swaps animate in about 180 ms and can be
+interrupted by another layout change. Playback continues.
+Clicking selects a tile for **F** without rearranging it. **Shift+Left / Shift+Right**
+and **Previous / Next** change the selection without moving any tiles.
+Panning and zooming keep Spotlight open and remember the active tile. Press
+**F** to fill the view with that tile, including when it belongs to a group;
+press **F** or **Esc** again to return to the Spotlight arrangement.
+Use **Shift+F**, **Esc**, or **Exit** to leave Spotlight and keep its current
+arrangement and tile order. These are saved with the workspace. Exiting keeps the current canvas position and zoom;
+jumping to a saved viewpoint also leaves Spotlight. While Spotlight is still open,
+autosave retains the arrangement from before entry.
+Use **Ctrl+B** to interact with a browser in Spotlight; double-click source
+activation is disabled there so rearranging tiles cannot activate the wrong source.
+
+**Pin to Viewport** applies to the whole group. Pinned members keep their
+positions relative to one another when the canvas or window changes. Grouping
+a mixture of pinned and unpinned tiles places the group on the canvas without
+changing its visible placement. All group shortcuts can be changed in Settings.
+Android viewers can watch Spotlight; remote camera navigation is suspended
+until Spotlight ends.
 
 ### Browser tiles
 
@@ -231,6 +313,10 @@ Drag an image onto the canvas, or choose **File → Add Image...**.
 Supported formats include **PNG, JPEG, GIF, WebP, and BMP**. Animated GIFs
 retain their original timing and pause when the tile is frozen.
 
+Images and GIFs decode in the background. A loading placeholder appears immediately;
+the canvas stays usable while files load. Moving or editing a tile during loading
+preserves your changes, and unavailable files keep a recoverable tile.
+
 Pluriview uses the original file without creating a separate copy. Keep the
 file in its saved location, or use **Locate Image…** from the tile's right-click
 menu if you move it.
@@ -248,11 +334,20 @@ include:
 - Audio and subtitle track selection.
 - A seek-bar preview so you can inspect another moment without moving playback.
 
+Volume, mute, playback speed, looping, and your audio/subtitle track choices are
+saved per video tile with its workspace. These preferences also survive reload,
+freeze/resume, deletion undo, and playlist file changes. If a chosen track is
+unavailable in a different file, the player uses automatic selection; explicitly
+disabled subtitles stay off. Restored videos still start paused at the beginning.
+
 Hold `Alt` and drag an edge or corner to crop the video.
 
 Drag a **folder of videos** onto the canvas to create a linked player and
 playlist. Playlists include previous/next, shuffle, and repeat controls, and
 use files directly inside the selected folder.
+
+Folder scans and rescans run in the background. A newly dropped folder shows its
+playlist first and starts its linked player when the scan finishes.
 
 ### Live streams
 
@@ -299,7 +394,9 @@ Video wallpapers require the Full download's video runtime. They loop without
 audio and pause while a tile is in focus mode.
 
 Wallpaper files stay in their original locations, so keep them available after
-adding them.
+adding them. Missing videos and unreadable images retain their saved wallpaper
+path and show an error. Restore the original file and reopen the workspace, or
+use **Set Wallpaper...** to choose a replacement.
 
 ### Workspaces and saved viewpoints
 
@@ -359,6 +456,11 @@ your installation still uses `Numpad 2`.
 | Delete selected tiles | `Delete` |
 | Undo the latest tile deletion | `Ctrl+Z` |
 | Focus current tile | `F` |
+| Group / ungroup selected tiles | `Ctrl+G` / `Ctrl+U` |
+| One / two / three large tiles / equal tiles | `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
+| Medium / large selection size | `Alt+6` / `Alt+7` |
+| Toggle group Spotlight | `Shift+F` |
+| Previous / next Spotlight tile | `Shift+Left` / `Shift+Right` |
 | Interact with browser tile | Double-click, `Ctrl+B`, or `Numpad 1` |
 | Exit focus or browser interaction | `Esc` |
 | Open saved viewpoints 1–9 | `Ctrl+1` through `Ctrl+9` |

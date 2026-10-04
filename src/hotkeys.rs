@@ -63,6 +63,17 @@ pub enum HotkeySlot {
     InteractBrowser,
     InteractBrowserAlternate,
     ShowShortcutHelp,
+    GroupTiles,
+    UngroupTiles,
+    LayoutGrid,
+    LayoutRow,
+    LayoutColumn,
+    LayoutSideStack,
+    ToggleSpotlight,
+    PreviousSpotlight,
+    NextSpotlight,
+    SizeMedium,
+    SizeLarge,
 }
 
 impl HotkeySlot {
@@ -78,7 +89,7 @@ impl HotkeySlot {
         Self::CanvasView9,
     ];
 
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 33] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
@@ -101,6 +112,17 @@ impl HotkeySlot {
         Self::InteractBrowser,
         Self::InteractBrowserAlternate,
         Self::ShowShortcutHelp,
+        Self::GroupTiles,
+        Self::UngroupTiles,
+        Self::LayoutGrid,
+        Self::LayoutRow,
+        Self::LayoutColumn,
+        Self::LayoutSideStack,
+        Self::ToggleSpotlight,
+        Self::PreviousSpotlight,
+        Self::NextSpotlight,
+        Self::SizeMedium,
+        Self::SizeLarge,
     ];
 
     pub fn label(self) -> &'static str {
@@ -127,6 +149,17 @@ impl HotkeySlot {
             Self::InteractBrowser => "Interact with browser",
             Self::InteractBrowserAlternate => "Interact with browser (alternate)",
             Self::ShowShortcutHelp => "Show shortcut help",
+            Self::GroupTiles => "Group selected tiles",
+            Self::UngroupTiles => "Ungroup selected tiles",
+            Self::LayoutGrid => "Layout: one large tile",
+            Self::LayoutRow => "Layout: two large tiles",
+            Self::LayoutColumn => "Layout: three large tiles",
+            Self::LayoutSideStack => "Layout: equal tiles",
+            Self::ToggleSpotlight => "Toggle group Spotlight",
+            Self::PreviousSpotlight => "Previous Spotlight tile",
+            Self::NextSpotlight => "Next Spotlight tile",
+            Self::SizeMedium => "Medium group size",
+            Self::SizeLarge => "Large group size",
         }
     }
 }
@@ -156,6 +189,17 @@ pub struct HotkeyBindings {
     pub interact_browser: Hotkey,
     pub interact_browser_alternate: Hotkey,
     pub show_shortcut_help: Hotkey,
+    pub group_tiles: Hotkey,
+    pub ungroup_tiles: Hotkey,
+    pub layout_grid: Hotkey,
+    pub layout_row: Hotkey,
+    pub layout_column: Hotkey,
+    pub layout_side_stack: Hotkey,
+    pub toggle_spotlight: Hotkey,
+    pub previous_spotlight: Hotkey,
+    pub next_spotlight: Hotkey,
+    pub size_medium: Hotkey,
+    pub size_large: Hotkey,
 }
 
 impl Default for HotkeyBindings {
@@ -183,6 +227,17 @@ impl Default for HotkeyBindings {
             interact_browser: Hotkey::pair(0x11, 0x42),     // Ctrl+B
             interact_browser_alternate: Hotkey::key(0x61),  // Numpad 1
             show_shortcut_help: Hotkey::key(0x70),          // F1
+            group_tiles: Hotkey::pair(0x11, 0x47),
+            ungroup_tiles: Hotkey::pair(0x11, 0x55),
+            layout_grid: Hotkey::pair(0x12, 0x31),
+            layout_row: Hotkey::pair(0x12, 0x32),
+            layout_column: Hotkey::pair(0x12, 0x33),
+            layout_side_stack: Hotkey::pair(0x12, 0x34),
+            toggle_spotlight: Hotkey::pair(0x10, 0x46),
+            previous_spotlight: Hotkey::pair(0x10, 0x25),
+            next_spotlight: Hotkey::pair(0x10, 0x27),
+            size_medium: Hotkey::pair(0x12, 0x36),
+            size_large: Hotkey::pair(0x12, 0x37),
         }
     }
 }
@@ -212,6 +267,17 @@ impl HotkeyBindings {
             HotkeySlot::InteractBrowser => self.interact_browser,
             HotkeySlot::InteractBrowserAlternate => self.interact_browser_alternate,
             HotkeySlot::ShowShortcutHelp => self.show_shortcut_help,
+            HotkeySlot::GroupTiles => self.group_tiles,
+            HotkeySlot::UngroupTiles => self.ungroup_tiles,
+            HotkeySlot::LayoutGrid => self.layout_grid,
+            HotkeySlot::LayoutRow => self.layout_row,
+            HotkeySlot::LayoutColumn => self.layout_column,
+            HotkeySlot::LayoutSideStack => self.layout_side_stack,
+            HotkeySlot::ToggleSpotlight => self.toggle_spotlight,
+            HotkeySlot::PreviousSpotlight => self.previous_spotlight,
+            HotkeySlot::NextSpotlight => self.next_spotlight,
+            HotkeySlot::SizeMedium => self.size_medium,
+            HotkeySlot::SizeLarge => self.size_large,
         }
     }
 
@@ -239,6 +305,17 @@ impl HotkeyBindings {
             HotkeySlot::InteractBrowser => self.interact_browser = hotkey,
             HotkeySlot::InteractBrowserAlternate => self.interact_browser_alternate = hotkey,
             HotkeySlot::ShowShortcutHelp => self.show_shortcut_help = hotkey,
+            HotkeySlot::GroupTiles => self.group_tiles = hotkey,
+            HotkeySlot::UngroupTiles => self.ungroup_tiles = hotkey,
+            HotkeySlot::LayoutGrid => self.layout_grid = hotkey,
+            HotkeySlot::LayoutRow => self.layout_row = hotkey,
+            HotkeySlot::LayoutColumn => self.layout_column = hotkey,
+            HotkeySlot::LayoutSideStack => self.layout_side_stack = hotkey,
+            HotkeySlot::ToggleSpotlight => self.toggle_spotlight = hotkey,
+            HotkeySlot::PreviousSpotlight => self.previous_spotlight = hotkey,
+            HotkeySlot::NextSpotlight => self.next_spotlight = hotkey,
+            HotkeySlot::SizeMedium => self.size_medium = hotkey,
+            HotkeySlot::SizeLarge => self.size_large = hotkey,
         }
     }
 
@@ -265,8 +342,14 @@ impl HotkeyBindings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct HotkeyPresses([bool; HotkeySlot::ALL.len()]);
+
+impl Default for HotkeyPresses {
+    fn default() -> Self {
+        Self([false; HotkeySlot::ALL.len()])
+    }
+}
 
 impl HotkeyPresses {
     pub fn pressed(self, slot: HotkeySlot) -> bool {
@@ -563,6 +646,55 @@ mod tests {
     }
 
     #[test]
+    fn spotlight_presets_keep_saved_bindings_and_remove_alt_five() {
+        let old = serde_json::json!({
+            "layout_row": {"first_key": 17, "second_key": 81},
+            "size_small": {"first_key": 18, "second_key": 53}
+        });
+        let restored: HotkeyBindings = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.layout_row, Hotkey::pair(0x11, 0x51));
+        let defaults = HotkeyBindings::default();
+        for (slot, number) in [
+            (HotkeySlot::LayoutGrid, 0x31),
+            (HotkeySlot::LayoutRow, 0x32),
+            (HotkeySlot::LayoutColumn, 0x33),
+            (HotkeySlot::LayoutSideStack, 0x34),
+        ] {
+            assert_eq!(defaults.get(slot), Hotkey::pair(0x12, number));
+        }
+        assert!(!HotkeySlot::ALL
+            .iter()
+            .any(|slot| defaults.get(*slot) == Hotkey::pair(0x12, 0x35)));
+        assert!(serde_json::to_value(restored)
+            .unwrap()
+            .get("size_small")
+            .is_none());
+    }
+
+    #[test]
+    fn group_shortcuts_migrate_without_changing_existing_bindings() {
+        let old = serde_json::json!({"focus_current_tile": {"first_key": null, "second_key": 98}});
+        let restored: HotkeyBindings = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.focus_current_tile, Hotkey::key(0x62));
+        assert_eq!(restored.group_tiles.display(), "Ctrl+G");
+        assert_eq!(restored.toggle_spotlight.display(), "Shift+F");
+        let defaults = HotkeyBindings::default();
+        for slot in HotkeySlot::ALL {
+            assert_eq!(defaults.conflict(slot, defaults.get(slot)), None);
+        }
+        let mut tracker = HotkeyTracker::default();
+        tracker.held[0x10] = true;
+        tracker.held[0x46] = true;
+        tracker.newly_pressed.push(0x46);
+        let presses = tracker.presses(&defaults, true);
+        assert!(presses.pressed(HotkeySlot::ToggleSpotlight));
+        assert!(!presses.pressed(HotkeySlot::FocusCurrentTile));
+        assert!(!tracker
+            .presses(&defaults, false)
+            .pressed(HotkeySlot::ToggleSpotlight));
+    }
+
+    #[test]
     fn focus_defaults_to_f_when_missing_from_saved_settings() {
         let mut value = serde_json::to_value(HotkeyBindings::default()).unwrap();
         value.as_object_mut().unwrap().remove("focus_current_tile");
@@ -663,7 +795,7 @@ mod tests {
         let configured = shortcuts.configured_keys();
         assert_eq!(
             configured.into_iter().filter(|enabled| *enabled).count(),
-            23
+            28
         );
         assert!(configured[0x11]); // Ctrl
         assert!(configured[0x31]); // 1
