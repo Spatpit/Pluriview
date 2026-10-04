@@ -93,6 +93,7 @@ const MAX_RECENT_URLS: usize = 8;
 const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
 /// Recoverable deletion window for a named canvas view.
 const CANVAS_VIEW_UNDO_SECS: f32 = 4.0;
+const CANVAS_NOTICE_SECS: f32 = 4.0;
 
 #[cfg(windows)]
 fn clipboard_text() -> Result<String, &'static str> {
@@ -1003,6 +1004,8 @@ pub struct PluriviewApp {
 
     /// Last image import/decode error, shown as a dismissible dialog.
     media_error: Option<String>,
+    /// Short-lived message shown at the top of the canvas.
+    canvas_notice: Option<(String, Instant)>,
     source_loads: SourceLoads,
 
     /// Missing optional tools encountered by a video creation action.
@@ -1206,6 +1209,7 @@ impl PluriviewApp {
             hotkey_error: None,
             quick_add: None,
             media_error: None,
+            canvas_notice: None,
             source_loads: SourceLoads::new(_cc.egui_ctx.clone()),
             external_tool_error: None,
             video_action_error: None,
@@ -3282,6 +3286,12 @@ impl PluriviewApp {
                 continue;
             }
             let update = host.poll();
+            if update.download_blocked {
+                self.canvas_notice = Some((
+                    "Downloads are not available in browser tiles.".to_owned(),
+                    Instant::now(),
+                ));
+            }
             if update.title.is_some() || update.url.is_some() {
                 updates.push((*id, update));
             }
@@ -4133,6 +4143,39 @@ impl PluriviewApp {
                 }
             }
         }
+    }
+
+    fn canvas_notice_ui(&mut self, ctx: &egui::Context) {
+        let Some((message, shown)) = self.canvas_notice.as_ref() else {
+            return;
+        };
+        let age = shown.elapsed().as_secs_f32();
+        if age >= CANVAS_NOTICE_SECS {
+            self.canvas_notice = None;
+            return;
+        }
+        let Some(canvas_rect) = self.canvas.last_screen_rect else {
+            return;
+        };
+        let fade = (age / 0.15)
+            .clamp(0.0, 1.0)
+            .min(((CANVAS_NOTICE_SECS - age) / 0.5).clamp(0.0, 1.0));
+        egui::Area::new(egui::Id::new("canvas_notice"))
+            .order(egui::Order::Foreground)
+            .anchor(
+                egui::Align2::CENTER_TOP,
+                egui::vec2(0.0, canvas_rect.top() + 56.0),
+            )
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.multiply_opacity(fade);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(24, 24, 28))
+                    .rounding(10.0)
+                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                    .show(ui, |ui| ui.label(message.as_str()));
+            });
+        ctx.request_repaint();
     }
 
     fn canvas_view_undo_toast_ui(&mut self, ctx: &egui::Context) {
@@ -5846,6 +5889,7 @@ impl eframe::App for PluriviewApp {
         self.workspace_dialog_ui(ctx);
         self.workspace_delete_confirmation_ui(ctx);
         self.canvas_view_undo_toast_ui(ctx);
+        self.canvas_notice_ui(ctx);
 
         if self.media_error.is_some() {
             let mut dismiss = false;

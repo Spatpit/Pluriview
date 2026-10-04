@@ -313,6 +313,8 @@ struct SharedState {
     current_title: Option<String>,
     /// A page requested a new window; we navigate the same tile instead.
     pending_navigation: Option<String>,
+    /// A download was refused since the last poll.
+    download_blocked: bool,
     dirty: bool,
 }
 
@@ -321,6 +323,8 @@ struct SharedState {
 pub struct BrowserUpdate {
     pub title: Option<String>,
     pub url: Option<String>,
+    /// The page tried to download a file, which browser tiles do not allow.
+    pub download_blocked: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -437,6 +441,7 @@ impl BrowserHost {
         let nav_shared = shared.clone();
         let title_shared = shared.clone();
         let new_window_shared = shared.clone();
+        let download_shared = shared.clone();
         let interactive = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let popup_interactive = interactive.clone();
 
@@ -458,7 +463,12 @@ impl BrowserHost {
             .with_initialization_script(MEDIA_AUTOPLAY_GUARD)
             .with_url(url)
             .with_bounds(parked_bounds())
-            .with_download_started_handler(|_, _| false)
+            .with_download_started_handler(move |_, _| {
+                let mut state = download_shared.lock();
+                state.download_blocked = true;
+                state.dirty = true;
+                false
+            })
             .with_navigation_handler(move |url| {
                 if !is_allowed_navigation(&url) {
                     return false;
@@ -609,6 +619,7 @@ impl BrowserHost {
                 BrowserUpdate {
                     title: state.current_title.clone(),
                     url: Some(state.current_url.clone()),
+                    download_blocked: std::mem::take(&mut state.download_blocked),
                 },
                 navigate,
             )
