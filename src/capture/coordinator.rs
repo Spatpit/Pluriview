@@ -2,10 +2,11 @@ use crate::preview::{PreviewId, PreviewManager};
 use crate::privacy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use windows_capture::capture::GraphicsCaptureApiError;
 use windows_capture::graphics_capture_api::GraphicsCaptureApi;
 use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
@@ -40,6 +41,45 @@ impl CapturedFrame {
     }
 }
 
+/// Wakes the UI when a worker publishes a frame. A static source therefore
+/// costs no repaints, while busy sources still repaint at most once per UI
+/// frame and no faster than the fastest live capture FPS.
+#[derive(Default)]
+pub(crate) struct FrameWake {
+    context: std::sync::OnceLock<eframe::egui::Context>,
+    pending: AtomicBool,
+    min_interval_micros: AtomicU64,
+    last_ui_frame: Mutex<Option<Instant>>,
+}
+
+impl FrameWake {
+    pub fn notify(&self) {
+        let Some(context) = self.context.get() else {
+            return;
+        };
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let interval = Duration::from_micros(self.min_interval_micros.load(Ordering::Relaxed));
+        let elapsed = self
+            .last_ui_frame
+            .lock()
+            .map_or(interval, |frame| frame.elapsed());
+        context.request_repaint_after(interval.saturating_sub(elapsed));
+    }
+
+    /// Called by the UI before it takes pending frames, so any frame stored
+    /// afterwards schedules the next wake.
+    fn frames_consumed(&self, min_interval: Duration) {
+        *self.last_ui_frame.lock() = Some(Instant::now());
+        self.min_interval_micros.store(
+            u64::try_from(min_interval.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
 /// Shared controls and result slots passed to either capture worker type.
 pub(crate) struct CaptureWorkerState {
     pub target_fps: Arc<AtomicU32>,
@@ -52,6 +92,7 @@ pub(crate) struct CaptureWorkerState {
     pub has_produced_frame: Arc<AtomicBool>,
     pub latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
     pub failure: Arc<Mutex<Option<String>>>,
+    pub frame_wake: Arc<FrameWake>,
 }
 
 /// Manages all window capture sessions
@@ -62,6 +103,8 @@ pub struct CaptureCoordinator {
     /// Stopped/replaced workers are retained until they actually finish, then
     /// joined during regular UI upkeep instead of being silently detached.
     retired_workers: Vec<JoinHandle<()>>,
+
+    frame_wake: Arc<FrameWake>,
 }
 
 /// A single capture session
@@ -125,7 +168,13 @@ impl CaptureCoordinator {
         Self {
             sessions: HashMap::new(),
             retired_workers: Vec::new(),
+            frame_wake: Arc::default(),
         }
+    }
+
+    /// Let capture workers wake this UI when they publish a frame.
+    pub fn set_repaint_context(&self, context: &eframe::egui::Context) {
+        let _ = self.frame_wake.context.set(context.clone());
     }
 
     /// Start capturing a window for a preview
@@ -161,6 +210,7 @@ impl CaptureCoordinator {
             has_produced_frame: has_produced_frame.clone(),
             latest_frame: latest_frame.clone(),
             failure: failure.clone(),
+            frame_wake: self.frame_wake.clone(),
         };
         let (stop_sender, stop_receiver) = mpsc::channel();
 
@@ -225,6 +275,7 @@ impl CaptureCoordinator {
             has_produced_frame: has_produced_frame.clone(),
             latest_frame: latest_frame.clone(),
             failure: failure.clone(),
+            frame_wake: self.frame_wake.clone(),
         };
         let (stop_sender, stop_receiver) = mpsc::channel();
 
@@ -318,6 +369,10 @@ impl CaptureCoordinator {
 
     /// Process the newest pending frame for each preview.
     pub fn process_frames(&mut self, preview_manager: &mut PreviewManager) {
+        let min_interval = self
+            .max_live_fps()
+            .map_or(Duration::ZERO, |fps| Duration::from_secs(1) / fps);
+        self.frame_wake.frames_consumed(min_interval);
         for (preview_id, session) in &self.sessions {
             let frame = session.latest_frame.lock().take();
             let failure = session.failure.lock().take();
@@ -491,6 +546,7 @@ fn capture_window_loop(
         has_produced_frame,
         latest_frame,
         failure,
+        frame_wake,
     } = worker_state;
 
     // Capture flags passed to the handler
@@ -506,6 +562,7 @@ fn capture_window_loop(
         target_width: Arc<AtomicU32>,
         target_height: Arc<AtomicU32>,
         target_generation: Arc<AtomicU32>,
+        frame_wake: Arc<FrameWake>,
     }
 
     struct Capture {
@@ -519,6 +576,7 @@ fn capture_window_loop(
         target_width: Arc<AtomicU32>,
         target_height: Arc<AtomicU32>,
         target_generation: Arc<AtomicU32>,
+        frame_wake: Arc<FrameWake>,
         last_frame: std::time::Instant,
         handled_target_generation: u32,
         // windows-capture 2 lets the caller retain row-unpacking storage.
@@ -544,6 +602,7 @@ fn capture_window_loop(
                 target_width: ctx.flags.target_width,
                 target_height: ctx.flags.target_height,
                 target_generation: ctx.flags.target_generation,
+                frame_wake: ctx.flags.frame_wake,
                 last_frame: std::time::Instant::now(),
                 // Generation zero is a valid initial request. Start at a
                 // sentinel so the first callback is never FPS-throttled.
@@ -647,6 +706,7 @@ fn capture_window_loop(
             );
             self.has_produced_frame.store(true, Ordering::Relaxed);
             self.handled_target_generation = requested_generation;
+            self.frame_wake.notify();
 
             Ok(())
         }
@@ -654,6 +714,7 @@ fn capture_window_loop(
         fn on_closed(&mut self) -> Result<(), Self::Error> {
             self.closed.store(true, Ordering::Release);
             self.active.store(false, Ordering::Relaxed);
+            self.frame_wake.notify();
             log::info!("Capture closed for preview {:?}", self.preview_id);
             Ok(())
         }
@@ -681,6 +742,7 @@ fn capture_window_loop(
         target_width,
         target_height,
         target_generation,
+        frame_wake: frame_wake.clone(),
     };
 
     // Request WithoutCursor / WithoutBorder only when those Graphics Capture
@@ -736,6 +798,7 @@ fn capture_window_loop(
         Err(error) => {
             log::error!("Failed to start capture: {error}");
             *failure.lock() = Some(error.to_string());
+            frame_wake.notify();
         }
     }
     completion_active.store(false, Ordering::Relaxed);
@@ -987,6 +1050,29 @@ mod tests {
         assert_eq!(generation.load(std::sync::atomic::Ordering::Acquire), 1);
         coordinator.set_target_size(preview_id, 1280, 720);
         assert_eq!(generation.load(std::sync::atomic::Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn frame_wake_schedules_one_repaint_per_consumed_frame() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let wake = super::FrameWake::default();
+        // Without a UI context there is nothing to wake.
+        wake.notify();
+        assert!(!wake.pending.load(Ordering::Acquire));
+
+        let _ = wake.context.set(eframe::egui::Context::default());
+        wake.notify();
+        assert!(wake.pending.load(Ordering::Acquire));
+        // Further frames before the UI runs share the scheduled repaint.
+        wake.notify();
+        assert!(wake.pending.load(Ordering::Acquire));
+
+        wake.frames_consumed(Duration::from_millis(33));
+        assert!(!wake.pending.load(Ordering::Acquire));
+        assert_eq!(wake.min_interval_micros.load(Ordering::Relaxed), 33_000);
+        wake.notify();
+        assert!(wake.pending.load(Ordering::Acquire));
     }
 
     #[test]

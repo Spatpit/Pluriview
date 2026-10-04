@@ -38,6 +38,7 @@ pub fn capture_spout_loop(
         has_produced_frame,
         latest_frame,
         failure,
+        frame_wake,
     } = worker_state;
     log::info!(
         "Receiving Spout sender {}",
@@ -49,6 +50,7 @@ pub fn capture_spout_loop(
         Err(error) => {
             *failure.lock() = Some(error);
             active.store(false, Ordering::Relaxed);
+            frame_wake.notify();
             return;
         }
     };
@@ -75,12 +77,14 @@ pub fn capture_spout_loop(
                 last_error = None;
                 *latest_frame.lock() = Some(frame);
                 has_produced_frame.store(true, Ordering::Relaxed);
+                frame_wake.notify();
             }
             Ok(None) => {}
             Err(error) => {
                 if last_error.as_deref() != Some(error.as_str()) {
                     last_error = Some(error.clone());
                     *failure.lock() = Some(error);
+                    frame_wake.notify();
                 }
             }
         }

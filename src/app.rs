@@ -5498,6 +5498,7 @@ impl eframe::App for PluriviewApp {
         self.inactive_window_upkeep(ctx);
 
         // Process any pending captured frames
+        self.capture_coordinator.set_repaint_context(ctx);
         self.capture_coordinator
             .process_frames(&mut self.preview_manager);
         #[cfg(windows)]
@@ -6184,9 +6185,10 @@ impl eframe::App for PluriviewApp {
             .capture(ctx, self.canvas.last_screen_rect, viewer_blocked);
 
         // Schedule the next repaint instead of spinning at uncapped frame rate.
-        // When captures are live, match the fastest active preview's requested
-        // FPS; otherwise tick slowly, which is still frequent enough to process
-        // tray events while keeping the app near-idle on the CPU.
+        // Capture workers wake the UI themselves when a frame arrives (capped
+        // at the fastest live capture FPS), so static sources cost nothing.
+        // Direct video still paces by FPS; otherwise tick slowly, which is
+        // frequent enough to process tray events while staying near-idle.
         // (egui repaints immediately on input regardless of this hint.)
         #[cfg(windows)]
         let direct_video_fps = {
@@ -6204,12 +6206,7 @@ impl eframe::App for PluriviewApp {
         };
         #[cfg(not(windows))]
         let direct_video_fps: Option<u32> = None;
-        let repaint_after = self
-            .capture_coordinator
-            .max_live_fps()
-            .into_iter()
-            .chain(direct_video_fps)
-            .max()
+        let repaint_after = direct_video_fps
             .map(|fps| Duration::from_secs_f64(1.0 / f64::from(fps)))
             .unwrap_or_else(|| Duration::from_millis(250));
         ctx.request_repaint_after(repaint_after);
