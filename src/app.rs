@@ -5363,14 +5363,15 @@ impl eframe::App for PluriviewApp {
             return;
         }
 
-        self.hotkey_tracker.sample(
-            &self.app_config.keyboard_shortcuts,
-            self.hotkey_recording.is_some() && !self.window_controls.click_through,
-        );
         #[cfg(windows)]
         let owns_foreground = self.owns_foreground();
         #[cfg(not(windows))]
         let owns_foreground = true;
+        self.hotkey_tracker.sample(
+            &self.app_config.keyboard_shortcuts,
+            self.hotkey_recording.is_some() && !self.window_controls.click_through,
+            owns_foreground,
+        );
         let shortcut_listening = owns_foreground
             && !self.window_controls.click_through
             && !ctx.wants_keyboard_input()
