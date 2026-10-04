@@ -39,12 +39,13 @@ const MAX_REQUEST: usize = 4096;
 const INVITE_LIFETIME: Duration = Duration::from_secs(10 * 60);
 /// Fixed network workers. Video, control and audio streams can each hold one
 /// for as long as they are connected.
-const NETWORK_WORKERS: usize = 8;
-/// Connections from one address that may be reading headers at once. A
+const NETWORK_WORKERS: usize = 12;
+/// Connections from one address that may be reading headers at once. The
+/// phone itself opens video, control and audio together on reconnect. A
 /// device trickling bytes holds at most this many workers for the request
 /// deadline, so other devices (and the paired phone's own streams) are never
 /// starved.
-const MAX_PRE_AUTH_PER_ADDRESS: u8 = 2;
+const MAX_PRE_AUTH_PER_ADDRESS: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

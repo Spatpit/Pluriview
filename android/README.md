@@ -177,9 +177,9 @@ Windows advertises `_pluriview._tcp.local` on the selected private interface
 only while sharing. It advertises a generated PC display name, address/port and
 protocol version, never a token or canvas content. Android uses `NsdManager`,
 bounds results and resolves one service at a time. Discovery and approval stop
-when the pairing screen leaves the foreground. Eight fixed host workers
+when the pairing screen leaves the foreground. Twelve fixed host workers
 accommodate video, control, optional audio and pairing; each address may have
-at most two connections waiting to send their headers.
+at most four connections waiting to send their headers.
 Foreground discovery holds a Wi-Fi multicast lock for older Android support;
 it releases the lock on failure, backgrounding or connection, as described in
 [Android's NSD documentation](https://developer.android.com/reference/android/net/nsd/NsdManager#Wi-Fi-Multicast-Lock).
