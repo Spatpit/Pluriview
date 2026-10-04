@@ -234,8 +234,16 @@ pub fn probe_stream_qualities(streamlink_path: PathBuf, url: String) -> StreamQu
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
     std::thread::spawn(move || {
+        let url = match normalize_stream_url(&url) {
+            Ok(url) => url,
+            Err(error) => {
+                let _ = sender.send(Err(error.to_owned()));
+                return;
+            }
+        };
         let mut command = Command::new(streamlink_path);
-        command.arg("--json").arg(url);
+        // `--` ends option parsing, so the URL is always positional.
+        command.arg("--json").arg("--").arg(url);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -394,6 +402,44 @@ impl Drop for HelperProcessJob {
     }
 }
 
+/// Stream sources become Streamlink/libmpv command-line arguments. Accept
+/// only web URLs (adding `https://` when no scheme is given), so a value can
+/// never be read as an option or reach mpv as a local or special protocol.
+pub fn normalize_stream_url(input: &str) -> Result<String, &'static str> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("Enter a stream URL.");
+    }
+    if input.starts_with('-') {
+        return Err("Enter a valid stream URL.");
+    }
+    let parsed = match url::Url::parse(input) {
+        Ok(url) => url,
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            url::Url::parse(&format!("https://{input}")).map_err(|_| "Enter a valid stream URL.")?
+        }
+        Err(_) => return Err("Enter a valid stream URL."),
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("Only HTTP and HTTPS stream URLs are supported.");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Stream URLs containing usernames or passwords are not supported.");
+    }
+    Ok(parsed.into())
+}
+
+/// Streamlink quality names such as `best`, `720p60`, `audio_only` or a
+/// fallback list like `720p,480p`. Never starts with `-`.
+pub fn is_valid_stream_quality(quality: &str) -> bool {
+    !quality.is_empty()
+        && quality.len() <= 64
+        && !quality.starts_with('-')
+        && quality
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | ',' | '-'))
+}
+
 pub fn normalize_stream_quality(quality: &str) -> String {
     let quality = quality.trim();
     if quality.is_empty() {
@@ -412,7 +458,7 @@ fn parse_stream_qualities(json: &str) -> Result<Vec<String>, String> {
         .ok_or_else(|| "Streamlink returned no streams object.".to_owned())?;
     let mut qualities: Vec<String> = streams
         .keys()
-        .filter(|quality| !quality.trim().is_empty())
+        .filter(|quality| is_valid_stream_quality(quality))
         .cloned()
         .collect();
     qualities.sort_by(|left, right| compare_stream_qualities(left, right));
@@ -840,6 +886,44 @@ pub fn pick_executable(_owner: Option<isize>, _kind: ToolKind) -> Option<PathBuf
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stream_sources_cannot_become_options_or_local_protocols() {
+        use super::{is_valid_stream_quality, normalize_stream_url};
+        assert_eq!(
+            normalize_stream_url(" twitch.tv/example ").unwrap(),
+            "https://twitch.tv/example"
+        );
+        assert_eq!(
+            normalize_stream_url("http://kick.com/live").unwrap(),
+            "http://kick.com/live"
+        );
+        for rejected in [
+            "",
+            "--player=calc.exe",
+            "-o",
+            "file:///C:/Windows/win.ini",
+            "edl://x",
+            "lavfi://anullsrc",
+            "https://user:pass@example.com/live",
+        ] {
+            assert!(normalize_stream_url(rejected).is_err(), "{rejected}");
+        }
+
+        for quality in [
+            "best",
+            "worst",
+            "720p60",
+            "audio_only",
+            "1080p+",
+            "720p,480p",
+        ] {
+            assert!(is_valid_stream_quality(quality), "{quality}");
+        }
+        for quality in ["", "--player=calc.exe", "-a", "720p 60", "best;rm"] {
+            assert!(!is_valid_stream_quality(quality), "{quality}");
+        }
+    }
+
     use super::{
         discover_from_locations, normalize_stream_quality, parse_stream_qualities, DiscoverySource,
         ToolKind,

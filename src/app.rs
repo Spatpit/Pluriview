@@ -2791,7 +2791,7 @@ impl PluriviewApp {
                 if remaining.is_zero() {
                     dialog.probe_due = None;
                     let url = dialog.url.trim().to_owned();
-                    if !url.is_empty() {
+                    if external_tools::normalize_stream_url(&url).is_ok() {
                         dialog.probing_url = url.clone();
                         dialog.probe_error = None;
                         dialog.probe_receiver = Some(external_tools::probe_stream_qualities(
@@ -2886,13 +2886,22 @@ impl PluriviewApp {
             let Some(dialog) = self.add_stream.as_mut() else {
                 return;
             };
-            let url = dialog.url.trim().to_owned();
-            if url.is_empty() {
-                dialog.error = Some("Enter a stream URL.".to_owned());
+            let url = match external_tools::normalize_stream_url(&dialog.url) {
+                Ok(url) => url,
+                Err(error) => {
+                    dialog.error = Some(error.to_owned());
+                    dialog.focused = false;
+                    return;
+                }
+            };
+            let quality = external_tools::normalize_stream_quality(&dialog.quality);
+            if !external_tools::is_valid_stream_quality(&quality) {
+                dialog.error = Some(
+                    "Quality may only contain letters, numbers and _ + , - characters.".to_owned(),
+                );
                 dialog.focused = false;
                 return;
             }
-            let quality = external_tools::normalize_stream_quality(&dialog.quality);
             let position = dialog.position;
             let id = self.create_video_tile(
                 VideoSource::Stream {

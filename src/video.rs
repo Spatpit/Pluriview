@@ -101,8 +101,14 @@ fn extract_video_thumbnail(
                 streamlink_path,
                 url,
                 quality,
-            } => resolve_stream_url(streamlink_path, url, quality)
-                .unwrap_or_else(|_| OsString::from(url)),
+            } => match resolve_stream_url(streamlink_path, url, quality) {
+                Ok(resolved) => resolved,
+                // mpv can often read the page URL itself, but only ever
+                // hand it a validated web URL.
+                Err(error) => OsString::from(
+                    crate::external_tools::normalize_stream_url(url).map_err(|_| error)?,
+                ),
+            },
         };
         let mut command = Command::new(mpv_path);
         command
@@ -120,6 +126,8 @@ fn extract_video_thumbnail(
             ])
             .arg(format!("--vo-image-outdir={}", directory.to_string_lossy()))
             .arg(format!("--start={time:.3}"))
+            // `--` ends option parsing: the input is always a file name/URL.
+            .arg("--")
             .arg(input)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -189,9 +197,14 @@ pub(crate) fn resolve_stream_url(
     url: &str,
     quality: &str,
 ) -> Result<OsString, String> {
+    let url = crate::external_tools::normalize_stream_url(url).map_err(str::to_owned)?;
+    if !crate::external_tools::is_valid_stream_quality(quality) {
+        return Err(format!("Unsupported stream quality \"{quality}\""));
+    }
     let mut command = Command::new(streamlink_path);
     command
         .arg("--stream-url")
+        .arg("--")
         .arg(url)
         .arg(quality)
         .stdin(Stdio::null())
