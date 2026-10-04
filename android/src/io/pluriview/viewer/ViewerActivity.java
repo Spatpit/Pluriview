@@ -323,6 +323,8 @@ public final class ViewerActivity extends Activity {
         final RecoveryWindow recovery = new RecoveryWindow();
         volatile int reconnects;
         volatile String lastRecovery = "";
+        /** Video is briefly recovering (Wi-Fi hiccup), not paused or stopped. */
+        volatile boolean videoHeld;
         boolean audioEnabled;
         AudioStream audioStream;
         AudioFocusRequest audioFocus;
@@ -355,7 +357,9 @@ public final class ViewerActivity extends Activity {
         }
 
         void updateAudio() {
-            if (!audioEnabled || !running.get() || !foreground || !ready) {
+            // Keep playing while video briefly recovers: restarting audio takes
+            // seconds, and the PC ends audio itself on a real pause or loss.
+            if (!audioEnabled || !running.get() || !foreground || (!ready && !(videoHeld && audioStream != null))) {
                 if (audioStream != null || audioFocus != null) stopAudio();
                 if (audioEnabled) audioText = "Audio: waiting for canvas";
                 updateAudioLabels(); return;
@@ -438,7 +442,7 @@ public final class ViewerActivity extends Activity {
 
         void message(int run, String message, boolean clear) {
             if (!current(run)) return;
-            if (clear) { recovery.reset(); ready = false; camera.clear(); pendingFocus.set(null); latestVideo = null; }
+            if (clear) { recovery.reset(); ready = false; videoHeld = false; camera.clear(); pendingFocus.set(null); latestVideo = null; }
             runOnUiThread(() -> {
                 if (!current(run) || session != this) return;
                 status.setText(message);
@@ -460,7 +464,7 @@ public final class ViewerActivity extends Activity {
 
         void holdVideo(int run, String text) {
             if (!current(run)) return;
-            ready = false; camera.clear(); pendingFocus.set(null); latestVideo = null;
+            ready = false; videoHeld = true; camera.clear(); pendingFocus.set(null); latestVideo = null;
             message(run, text, false);
             if (recovery.begin(System.nanoTime())) {
                 runOnUiThread(() -> {
@@ -505,7 +509,7 @@ public final class ViewerActivity extends Activity {
                 if (newest == null || latestVideoRevision != decoderRevision) return;
                 recovery.reset();
                 if (width != newest.viewportWidth || height != newest.viewportHeight) canvas.resetGesture();
-                width = newest.viewportWidth; height = newest.viewportHeight; ready = true;
+                width = newest.viewportWidth; height = newest.viewportHeight; ready = true; videoHeld = false;
                 canvas.showVideo(newest.width, newest.height);
             });
         }
