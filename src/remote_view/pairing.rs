@@ -2,6 +2,9 @@ use super::*;
 
 const REQUEST_LIFETIME: Duration = Duration::from_secs(60);
 const PROMPT_INTERVAL: Duration = Duration::from_secs(10);
+/// Repeated denied or ignored prompts double the wait up to this, so an
+/// unknown device cannot keep interrupting the desktop. Approval resets it.
+const MAX_PROMPT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 pub(super) fn random_id() -> io::Result<String> {
     let mut bytes = [0u8; 16];
@@ -49,6 +52,7 @@ pub(super) struct Pairing {
     pending: Option<Pending>,
     grant: Option<Grant>,
     last_prompt: Option<Instant>,
+    refusals: u32,
 }
 
 impl Pairing {
@@ -58,8 +62,17 @@ impl Pairing {
             .as_ref()
             .is_some_and(|p| now.duration_since(p.created) >= REQUEST_LIFETIME)
         {
+            if self.pending.as_ref().is_some_and(|p| p.decision.is_none()) {
+                self.refusals += 1;
+            }
             self.pending = None;
         }
+    }
+
+    fn prompt_interval(&self) -> Duration {
+        PROMPT_INTERVAL
+            .saturating_mul(1 << self.refusals.min(8))
+            .min(MAX_PROMPT_INTERVAL)
     }
 
     pub(super) fn prompt(&mut self, now: Instant) -> Option<(String, String, String)> {
@@ -101,6 +114,9 @@ impl Pairing {
             .filter(|p| p.request == request && p.decision.is_none())
         {
             p.decision = Some(false);
+            if !allow {
+                self.refusals += 1;
+            }
             if allow && !busy {
                 if let Ok(token) = random_id() {
                     self.grant = Some(Grant {
@@ -109,6 +125,7 @@ impl Pairing {
                         replay: Default::default(),
                     });
                     p.decision = Some(true);
+                    self.refusals = 0;
                 }
             }
         }
@@ -162,7 +179,7 @@ impl Pairing {
         }
         if self
             .last_prompt
-            .is_some_and(|last| now.duration_since(last) < PROMPT_INTERVAL)
+            .is_some_and(|last| now.duration_since(last) < self.prompt_interval())
         {
             return (429, vec![]);
         }
@@ -404,6 +421,36 @@ mod tests {
         assert!(!authorized(&mut state, "phone"));
         assert_eq!(state.poll(input(&id), "phone", false, false, now).0, 403);
     }
+    #[test]
+    fn denied_and_ignored_prompts_back_off_until_an_approval() {
+        let mut state = Pairing::default();
+        let mut now = Instant::now();
+        let prompt = |state: &mut Pairing, now: Instant| {
+            let id = random_id().unwrap();
+            (state.poll(input(&id), "phone", false, false, now).0, id)
+        };
+        let (status, id) = prompt(&mut state, now);
+        assert_eq!(status, 202);
+        state.decide(&id, false, false, now);
+        // One denial doubles the ten-second cooldown.
+        now += PROMPT_INTERVAL;
+        assert_eq!(prompt(&mut state, now).0, 429);
+        now += PROMPT_INTERVAL;
+        let (status, _) = prompt(&mut state, now);
+        assert_eq!(status, 202);
+        // Ignoring the prompt until it expires counts too.
+        now += REQUEST_LIFETIME;
+        assert!(state.prompt(now).is_none());
+        assert_eq!(state.prompt_interval(), PROMPT_INTERVAL * 4);
+        let (status, id) = prompt(&mut state, now);
+        assert_eq!(status, 202);
+        // Approval restores the normal interval.
+        state.decide(&id, true, false, now);
+        state.pending = None;
+        assert_eq!(prompt(&mut state, now + PROMPT_INTERVAL).0, 202);
+        assert!(state.prompt_interval() <= MAX_PROMPT_INTERVAL);
+    }
+
     #[test]
     fn pending_requests_are_bounded_expire_and_cannot_interrupt_a_viewer() {
         let mut state = Pairing::default();
