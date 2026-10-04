@@ -91,6 +91,51 @@ fn native_audio_stream_stops_on_toggle_off_and_source_change() {
     }
 }
 
+#[test]
+#[cfg(windows)]
+#[ignore = "requires Windows process loopback and the installed AAC encoder"]
+fn native_audio_survives_video_stream_restarts() {
+    let host = Host::start(Ipv4Addr::LOCALHOST, egui::Context::default()).unwrap();
+    host.shared.audio.update([std::process::id()], false);
+    connect(&host.invite, "/v1/frame", CLIENT, true);
+    host.shared.blocked.store(false, Ordering::Relaxed);
+    host.shared.video_active.store(true, Ordering::Relaxed);
+    let (mut stream, header) = connect(&host.invite, "/v2/audio", CLIENT, true);
+    assert!(header.starts_with("HTTP/1.1 200"), "{header}");
+    let mut format = [0; 6];
+    stream.read_exact(&mut format).unwrap();
+    let mut read_packets = |count: usize| {
+        for _ in 0..count {
+            host.shared.audio.update([std::process::id()], false);
+            host.shared.peer.lock().as_mut().unwrap().seen = Instant::now();
+            let mut length = [0; 4];
+            stream
+                .read_exact(&mut length)
+                .expect("audio ended while the phone was still watching");
+            let length = u32::from_be_bytes(length) as usize;
+            assert!((1..=8192).contains(&length));
+            stream.read_exact(&mut vec![0; length]).unwrap();
+        }
+    };
+    read_packets(20);
+    // A Wi-Fi hiccup makes the phone reconnect H.264: the old video stream
+    // ends (VideoLease) and the new one starts. Neither is a pause, so tile
+    // audio must keep playing instead of restarting with it.
+    for _ in 0..3 {
+        host.shared.invalidate();
+        host.shared.video_active.store(false, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(150));
+        host.shared.video_active.store(true, Ordering::Relaxed);
+        host.shared.invalidate();
+        read_packets(20);
+    }
+    // A real pause still releases audio.
+    host.shared.blocked.store(true, Ordering::Relaxed);
+    let mut tail = Vec::new();
+    stream.read_to_end(&mut tail).unwrap();
+    assert!(tail.len() < 8196 * 6);
+}
+
 #[cfg(windows)]
 fn native_audio_stream_lifecycle(monitor: bool) {
     let host = Host::start(Ipv4Addr::LOCALHOST, egui::Context::default()).unwrap();

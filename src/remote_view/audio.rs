@@ -56,12 +56,15 @@ impl State {
     }
 }
 
-fn allowed(shared: &Shared, client: &str, sources: Sources, epoch: u64) -> bool {
+/// Whether this audio connection may keep streaming. Video epochs are not
+/// checked: the phone restarts H.264 after ordinary Wi-Fi hiccups, and tying
+/// audio to that made it tear down (and spend seconds restarting) on every
+/// video recovery. Pauses, source changes, sharing stopping and the viewer
+/// lease expiring still release it.
+fn allowed(shared: &Shared, client: &str, sources: Sources) -> bool {
     let latest = shared.audio.sources.lock();
     shared.running.load(Ordering::Relaxed)
         && !shared.blocked.load(Ordering::Relaxed)
-        && shared.video_active.load(Ordering::Relaxed)
-        && shared.epoch.load(Ordering::Relaxed) == epoch
         && latest.0 == sources
         && latest.1.elapsed() < Duration::from_secs(2)
         && shared
@@ -83,6 +86,11 @@ fn connected(stream: &TcpStream) -> bool {
     }
 }
 
+/// Interleaved stereo samples in one 1024-frame AAC packet.
+const PACKET_SAMPLES: usize = 2048;
+/// About 85 ms of stereo audio per source waiting to be mixed.
+const MAX_QUEUED_SAMPLES: usize = 4 * PACKET_SAMPLES;
+
 struct Lease<'a>(&'a AtomicBool);
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
@@ -92,11 +100,11 @@ impl Drop for Lease<'_> {
 
 pub(super) fn serve(stream: &mut TcpStream, shared: &Shared, client: &str) -> io::Result<()> {
     let sources = shared.audio.sources.lock().0;
-    let epoch = shared.epoch.load(Ordering::Relaxed);
     if sources.unavailable || sources.count == 0 {
         return respond(stream, 503, "", &[]);
     }
-    if !allowed(shared, client, sources, epoch) {
+    // Starting still requires live video, so audio cannot outlive a viewer.
+    if !shared.video_active.load(Ordering::Relaxed) || !allowed(shared, client, sources) {
         return respond(stream, 423, "", &[]);
     }
     if shared
@@ -118,7 +126,7 @@ pub(super) fn serve(stream: &mut TcpStream, shared: &Shared, client: &str) -> io
         for pid in roots {
             let capture = TileAudioCapture::start(pid, &|| {
                 started.elapsed() > Duration::from_secs(4)
-                    || !allowed(shared, client, sources, epoch)
+                    || !allowed(shared, client, sources)
                     || !connected(stream)
             })?;
             captures.push((capture, VecDeque::<f32>::with_capacity(8192)));
@@ -130,7 +138,7 @@ pub(super) fn serve(stream: &mut TcpStream, shared: &Shared, client: &str) -> io
         Ok(result) => result,
         Err(_) => return respond(stream, 503, "", &[]),
     };
-    if !allowed(shared, client, sources, epoch) || !connected(stream) {
+    if !allowed(shared, client, sources) || !connected(stream) {
         return Ok(());
     }
     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-pluriview-aac\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
@@ -149,24 +157,32 @@ pub(super) fn serve(stream: &mut TcpStream, shared: &Shared, client: &str) -> io
     let mut next = Instant::now() + Duration::from_millis(22);
     let mut last_output = Instant::now();
     let mut wire = Vec::with_capacity(8196);
-    while allowed(shared, client, sources, epoch) && connected(stream) {
+    while allowed(shared, client, sources) && connected(stream) {
         for (capture, queue) in &mut captures {
             for _ in 0..32 {
                 if !capture.read(&mut stereo).map_err(io::Error::other)? {
                     break;
                 }
-                if queue.len() + stereo.len() > 8192 {
-                    return Ok(());
-                }
                 queue.extend(stereo.iter().copied());
+                // Keep the live mix bounded. Drop the oldest audio instead of
+                // ending the stream, which made the phone restart its decoder.
+                let excess = queue.len().saturating_sub(MAX_QUEUED_SAMPLES);
+                queue.drain(..excess);
             }
         }
-        if Instant::now() >= next {
-            // Never catch up a stalled socket by replaying a burst of old audio.
+        // Encode every packet that is due: one loop pass can take longer than
+        // a packet on a busy PC, and falling behind used to end the stream.
+        while Instant::now() >= next {
+            // Never catch up a long stall by replaying a burst of old audio:
+            // skip ahead and continue with current sound.
             if next.elapsed() > Duration::from_millis(100) {
-                break;
+                next = Instant::now();
+                for (_, queue) in &mut captures {
+                    let excess = queue.len().saturating_sub(PACKET_SAMPLES);
+                    queue.drain(..excess);
+                }
             }
-            let mut mix = [0.0f32; 2048];
+            let mut mix = [0.0f32; PACKET_SAMPLES];
             for (_, queue) in &mut captures {
                 for sample in &mut mix {
                     *sample += queue.pop_front().unwrap_or(0.0);
@@ -174,7 +190,7 @@ pub(super) fn serve(stream: &mut TcpStream, shared: &Shared, client: &str) -> io
             }
             let pcm = mix.map(to_pcm);
             if let Some(packet) = encoder.encode(&pcm).map_err(io::Error::other)? {
-                if !allowed(shared, client, sources, epoch) {
+                if !allowed(shared, client, sources) {
                     break;
                 }
                 wire.clear();
@@ -183,10 +199,10 @@ pub(super) fn serve(stream: &mut TcpStream, shared: &Shared, client: &str) -> io
                 stream.write_all(&wire)?;
                 last_output = Instant::now();
             }
-            if last_output.elapsed() > Duration::from_millis(500) {
-                break;
-            }
             next += Duration::from_nanos(1_024_000_000_000 / 48_000);
+        }
+        if last_output.elapsed() > Duration::from_millis(500) {
+            break;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
