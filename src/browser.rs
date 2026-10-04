@@ -19,11 +19,13 @@ use parking_lot::Mutex;
 use webview2_com::{
     take_pwstr, BrowserExtensionEnableCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2BrowserExtension, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_3,
-        ICoreWebView2_8,
+        ICoreWebView2BrowserExtension, ICoreWebView2PermissionRequestedEventArgs3,
+        ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_3, ICoreWebView2_8,
+        COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
+        COREWEBVIEW2_PERMISSION_STATE_DENY,
     },
-    ProfileAddBrowserExtensionCompletedHandler, ProfileGetBrowserExtensionsCompletedHandler,
-    TrySuspendCompletedHandler,
+    PermissionRequestedEventHandler, ProfileAddBrowserExtensionCompletedHandler,
+    ProfileGetBrowserExtensionsCompletedHandler, TrySuspendCompletedHandler,
 };
 use webview2_core::{Interface, HSTRING as WebViewHString, PWSTR as WebViewPWSTR};
 use windows::{
@@ -236,6 +238,39 @@ fn is_sensitive_query_key(key: &str) -> bool {
     .any(|marker| key.contains(marker))
 }
 
+/// Parked tiles are offscreen, so a site's camera, microphone, location,
+/// notification or clipboard prompt would be invisible and could be answered
+/// for every tile through the shared profile. Deny those requests while
+/// parked; an interactive tile is visible, so WebView2 asks the user as usual.
+fn deny_permission(kind: COREWEBVIEW2_PERMISSION_KIND, interactive: bool) -> bool {
+    !interactive && kind != COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY
+}
+
+fn register_permission_policy(
+    webview: &WebView,
+    interactive: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let handler = PermissionRequestedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+        unsafe { args.PermissionKind(&mut kind)? };
+        if deny_permission(kind, interactive.load(std::sync::atomic::Ordering::Relaxed)) {
+            // Do not remember the refusal: the same site may ask again once
+            // the user is interacting with the tile.
+            if let Ok(args) = args.cast::<ICoreWebView2PermissionRequestedEventArgs3>() {
+                let _ = unsafe { args.SetSavesInProfile(false) };
+            }
+            unsafe { args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)? };
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe { core.add_PermissionRequested(&handler, &mut token) }.map_err(|e| e.to_string())
+}
+
 /// Schemes a page may navigate to while staying inside the tile. `about:` is
 /// needed because sites navigate iframes/blank targets through it.
 fn is_allowed_navigation(url: &str) -> bool {
@@ -332,6 +367,8 @@ pub struct BrowserHost {
     webview: Option<WebView>,
     window: NativeWindow,
     active: bool,
+    /// Mirrors `active` for the WebView2 permission handler.
+    interactive: Arc<std::sync::atomic::AtomicBool>,
     muted: bool,
     /// Last host/page geometry applied while active (physical px), to skip
     /// redundant positioning calls while glued to the tile.
@@ -437,11 +474,16 @@ impl BrowserHost {
             })
             .build_as_child(&window)
             .map_err(|error| error.to_string())?;
+        let interactive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Err(error) = register_permission_policy(&webview, interactive.clone()) {
+            log::warn!("Browser permission requests use WebView2 defaults: {error}");
+        }
 
         Ok(Self {
             webview: Some(webview),
             window,
             active: false,
+            interactive,
             muted: false,
             last_geometry: None,
             reveal_at: None,
@@ -641,7 +683,7 @@ impl BrowserHost {
             if let Some(webview) = self.webview.as_ref() {
                 resize_webview(webview);
             }
-            self.active = true;
+            self.set_active(true);
             self.last_geometry = Some(geometry);
             self.reveal_at = Some(Instant::now() + INTERACTION_PREP_DELAY);
             return;
@@ -709,8 +751,14 @@ impl BrowserHost {
         if let Some(webview) = self.webview.as_ref() {
             resize_webview(webview);
         }
-        self.active = true;
+        self.set_active(true);
         self.last_geometry = Some(geometry);
+    }
+
+    fn set_active(&mut self, active: bool) {
+        self.active = active;
+        self.interactive
+            .store(active, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Move the host back offscreen at capture resolution. Audio keeps
@@ -735,7 +783,7 @@ impl BrowserHost {
             });
             let _ = webview.zoom((width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
         }
-        self.active = false;
+        self.set_active(false);
         self.last_geometry = None;
         self.reveal_at = None;
     }
@@ -1758,6 +1806,30 @@ mod tests {
         assert!(normalize_url("file:///secret").is_err());
         assert!(normalize_url("javascript:alert(1)").is_err());
         assert!(normalize_url("https://user:password@example.com").is_err());
+    }
+
+    #[test]
+    fn parked_tiles_cannot_request_device_or_data_permissions() {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+            COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION,
+            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS,
+        };
+        for kind in [
+            COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+            COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION,
+            COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS,
+            COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ,
+        ] {
+            assert!(super::deny_permission(kind, false));
+            // Interactive tiles are visible, so WebView2 asks the user.
+            assert!(!super::deny_permission(kind, true));
+        }
+        assert!(!super::deny_permission(
+            COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
+            false
+        ));
     }
 
     #[test]
