@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 mod aac;
 #[cfg(windows)]
 mod audio;
+mod auth;
 mod cadence;
 #[cfg(windows)]
 mod discovery;
@@ -32,6 +33,10 @@ const VIDEO_FPS: u64 = 30;
 const VIDEO_BITRATE: u32 = 4_000_000;
 const LEASE: Duration = Duration::from_secs(4);
 const MAX_REQUEST: usize = 4096;
+/// An unused QR/link invitation stops working after this long. Once a phone
+/// uses it, it stays bound to that phone until sharing stops or a new link
+/// is created.
+const INVITE_LIFETIME: Duration = Duration::from_secs(10 * 60);
 /// Fixed network workers. Video, control and audio streams can each hold one
 /// for as long as they are connected.
 const NETWORK_WORKERS: usize = 8;
@@ -136,6 +141,47 @@ struct Shared {
     video_frames: Mutex<VecDeque<Arc<VideoFrame>>>,
     hardware: AtomicBool,
     pre_auth: Mutex<std::collections::HashMap<std::net::IpAddr, u8>>,
+    invite: Mutex<Invite>,
+}
+
+/// The secret carried by the QR code/pairing link. It never crosses the
+/// network: requests prove knowledge of it with `auth` signatures.
+struct Invite {
+    token: String,
+    created: Instant,
+    client: Option<String>,
+    replay: auth::ReplayGuard,
+}
+
+impl Invite {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            token: pairing::random_id()?,
+            created: Instant::now(),
+            client: None,
+            replay: auth::ReplayGuard::default(),
+        })
+    }
+
+    fn expired(&self) -> bool {
+        self.client.is_none() && self.created.elapsed() >= INVITE_LIFETIME
+    }
+
+    fn authorized(&mut self, request: &Request, credentials: &auth::Credentials) -> bool {
+        if self.expired()
+            || self
+                .client
+                .as_ref()
+                .is_some_and(|client| *client != request.client)
+            || !credentials.signed_by(&self.token, &request.method, &request.path, &request.client)
+            || !self.replay.accept(credentials)
+        {
+            return false;
+        }
+        // Single use: the first phone to present the link keeps it.
+        self.client.get_or_insert_with(|| request.client.clone());
+        true
+    }
 }
 
 /// A connection that has not yet been authenticated or answered.
@@ -201,8 +247,20 @@ struct Host {
     shared: Arc<Shared>,
     commands: mpsc::Receiver<QueuedCamera>,
     encoder: mpsc::SyncSender<CaptureJob>,
+    address: SocketAddrV4,
     invite: String,
     qr: qrcode::QrCode,
+}
+
+fn invite_link(address: SocketAddrV4, token: &str) -> io::Result<(String, qrcode::QrCode)> {
+    let link = format!(
+        "pluriview://viewer?host={}&port={}&token={token}",
+        address.ip(),
+        address.port()
+    );
+    let qr =
+        qrcode::QrCode::new(link.as_bytes()).map_err(|_| io::Error::other("Pairing QR failed"))?;
+    Ok((link, qr))
 }
 
 impl Drop for Host {
@@ -335,6 +393,15 @@ impl RemoteView {
                     if host.shared.video_active.load(Ordering::Relaxed) {
                         ui.label(format!("{} encoding · fixed 720p / 30 FPS", if host.shared.hardware.load(Ordering::Relaxed) { "Hardware" } else { "Software" }));
                     }
+                    let (expired, used) = {
+                        let invite = host.shared.invite.lock();
+                        (invite.expired(), invite.client.is_some())
+                    };
+                    let mut new_link = false;
+                    if expired {
+                        ui.label("The pairing link expired after 10 minutes without use.");
+                        new_link = ui.button("New pairing link").clicked();
+                    } else {
                     ui.label("Scan with your phone's camera and open Pluriview Viewer, or paste the pairing link in the app.");
                     let count = host.qr.width() + 8;
                     let cell = 240.0 / count as f32;
@@ -348,10 +415,26 @@ impl RemoteView {
                             }
                         }
                     }
-                    if ui.button("Copy pairing link").clicked() { ctx.copy_text(host.invite.clone()); }
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy pairing link").clicked() { ctx.copy_text(host.invite.clone()); }
+                        new_link = ui.button("New pairing link").clicked();
+                    });
+                    ui.small(if used {
+                        "This link is in use by one phone. A new link disconnects it and works for another phone."
+                    } else {
+                        "The link works for one phone and expires after 10 minutes unless used."
+                    });
+                    }
                     ui.label("Close this dialog to begin viewing. Drag to pan; pinch to zoom. Both screens share the same view.");
                     ui.label("Sharing pauses for dialogs and interactive browser mode. Optional tile audio is controlled on the phone.");
                     if ui.button("Stop sharing / disconnect phone").clicked() { self.stop(); }
+                    else if new_link {
+                        if let Some(host) = &mut self.host {
+                            if host.refresh_invite().is_err() {
+                                self.error = Some("Could not create a new pairing link.".into());
+                            }
+                        }
+                    }
                     ctx.request_repaint_after(Duration::from_secs(1));
                 } else {
                     ui.label("PC Wi-Fi IPv4 address");
@@ -516,17 +599,24 @@ impl RemoteView {
 }
 
 impl Host {
+    /// Replace the QR/link secret. A phone still using the old link loses
+    /// access on its next request; approved nearby pairings are unaffected.
+    fn refresh_invite(&mut self) -> io::Result<()> {
+        let invite = Invite::new()?;
+        let (link, qr) = invite_link(self.address, &invite.token)?;
+        *self.shared.invite.lock() = invite;
+        self.invite = link;
+        self.qr = qr;
+        Ok(())
+    }
+
     fn start(ip: Ipv4Addr, ctx: egui::Context) -> io::Result<Self> {
         let listener = TcpListener::bind(SocketAddrV4::new(ip, 0))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
-        let mut random = [0u8; 16];
-        getrandom::getrandom(&mut random)
-            .map_err(|_| io::Error::other("Random source unavailable"))?;
-        let token: String = random.iter().map(|v| format!("{v:02x}")).collect();
-        let invite = format!("pluriview://viewer?host={ip}&port={port}&token={token}");
-        let qr = qrcode::QrCode::new(invite.as_bytes())
-            .map_err(|_| io::Error::other("Pairing QR failed"))?;
+        let address = SocketAddrV4::new(ip, port);
+        let first_invite = Invite::new()?;
+        let (invite, qr) = invite_link(address, &first_invite.token)?;
         let shared = Arc::new(Shared {
             name: format!("Pluriview PC {}", &pairing::random_id()?[..6]),
             pairing: Mutex::new(pairing::Pairing::default()),
@@ -546,6 +636,7 @@ impl Host {
             video_frames: Mutex::new(VecDeque::with_capacity(6)),
             hardware: AtomicBool::new(false),
             pre_auth: Mutex::new(std::collections::HashMap::new()),
+            invite: Mutex::new(first_invite),
         });
         let (command_tx, commands) = mpsc::sync_channel(8);
         let (encoder, jobs) = mpsc::sync_channel::<CaptureJob>(1);
@@ -555,6 +646,7 @@ impl Host {
             shared: shared.clone(),
             commands,
             encoder,
+            address,
             invite,
             qr,
         };
@@ -714,7 +806,6 @@ impl Host {
             // otherwise Stop leaves accept() waiting until another client calls.
             listener.set_nonblocking(true)?;
             let state = shared.clone();
-            let token = token.clone();
             let commands = command_tx.clone();
             let ctx = ctx.clone();
             std::thread::Builder::new()
@@ -726,8 +817,7 @@ impl Host {
                                 // Over the limit: close at once instead of
                                 // spending a worker on reading its headers.
                                 if let Some(slot) = PreAuthSlot::acquire(&state, address.ip()) {
-                                    let _ =
-                                        serve(&mut stream, &state, slot, &token, &commands, &ctx);
+                                    let _ = serve(&mut stream, &state, slot, &commands, &ctx);
                                 }
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -874,7 +964,6 @@ fn serve(
     stream: &mut TcpStream,
     shared: &Shared,
     pre_auth: PreAuthSlot<'_>,
-    token: &str,
     commands: &mpsc::SyncSender<QueuedCamera>,
     ctx: &egui::Context,
 ) -> io::Result<()> {
@@ -895,12 +984,11 @@ fn serve(
     if shared.running.load(Ordering::Relaxed) && request.path.starts_with("/v3/") {
         return pairing::serve_pairing(stream, shared, &request, ctx);
     }
-    if request.authorization != format!("Bearer {token}")
-        && !shared
-            .pairing
-            .lock()
-            .authorized(&request.client, &request.authorization)
-    {
+    let authorized = auth::Credentials::parse(&request.authorization).is_some_and(|credentials| {
+        shared.pairing.lock().authorized(&request, &credentials)
+            || shared.invite.lock().authorized(&request, &credentials)
+    });
+    if !authorized {
         return respond(stream, 401, "", &[]);
     }
     if !shared.running.load(Ordering::Relaxed) {
@@ -1511,7 +1599,7 @@ mod tests {
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            write!(socket, "{method} {route} HTTP/1.1\r\nAuthorization: Bearer {}\r\nX-Pluriview-Client: 00000000000000000000000000000001\r\n{extra}\r\n{body}", values["token"]).unwrap();
+            write!(socket, "{method} {route} HTTP/1.1\r\nAuthorization: {}\r\nX-Pluriview-Client: 00000000000000000000000000000001\r\n{extra}\r\n{body}", auth::test_authorization(&values["token"], method, route, "00000000000000000000000000000001")).unwrap();
             let mut reply = String::new();
             socket.read_to_string(&mut reply).unwrap();
             reply
@@ -1606,7 +1694,12 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        write!(stream, "GET /v2/video HTTP/1.1\r\nAuthorization: Bearer {}\r\nX-Pluriview-Client: {client}\r\n\r\n", values["token"]).unwrap();
+        write!(
+            stream,
+            "GET /v2/video HTTP/1.1\r\nAuthorization: {}\r\nX-Pluriview-Client: {client}\r\n\r\n",
+            auth::test_authorization(&values["token"], "GET", "/v2/video", client)
+        )
+        .unwrap();
         let mut response = Vec::new();
         let mut byte = [0];
         while !response.ends_with(b"\r\n\r\n") {
@@ -1701,7 +1794,7 @@ mod tests {
                 feedback
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
-                write!(feedback, "POST /v2/feedback HTTP/1.1\r\nAuthorization: Bearer {}\r\nX-Pluriview-Client: {client}\r\nContent-Length: {}\r\n\r\n{body}", values["token"], body.len()).unwrap();
+                write!(feedback, "POST /v2/feedback HTTP/1.1\r\nAuthorization: {}\r\nX-Pluriview-Client: {client}\r\nContent-Length: {}\r\n\r\n{body}", auth::test_authorization(&values["token"], "POST", "/v2/feedback", client), body.len()).unwrap();
                 let mut reply = String::new();
                 feedback.read_to_string(&mut reply).unwrap();
                 assert!(reply.starts_with("HTTP/1.1 200"));
@@ -1792,7 +1885,12 @@ mod tests {
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            write!(socket, "GET {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nX-Pluriview-Client: {client}\r\n\r\n").unwrap();
+            write!(
+                socket,
+                "GET {path} HTTP/1.1\r\nAuthorization: {}\r\nX-Pluriview-Client: {client}\r\n\r\n",
+                auth::test_authorization(token, "GET", path, client)
+            )
+            .unwrap();
             let mut reply = String::new();
             socket.read_to_string(&mut reply).unwrap();
             reply
@@ -1804,12 +1902,69 @@ mod tests {
         assert!(request("/v1/delete", &values["token"], client).starts_with("HTTP/1.1 404"));
         assert!(request("/v1/frame", &values["token"], client).starts_with("HTTP/1.1 204"));
         assert!(host.shared.watching());
+        // The link is single-use: another phone cannot reuse it.
         assert!(request(
             "/v1/frame",
             &values["token"],
             "00000000000000000000000000000002"
         )
-        .starts_with("HTTP/1.1 409"));
+        .starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn pairing_link_secret_never_crosses_the_network_and_expires() {
+        let mut host = Host::start(Ipv4Addr::LOCALHOST, egui::Context::default()).unwrap();
+        let uri = url::Url::parse(&host.invite).unwrap();
+        let values: std::collections::HashMap<_, _> = uri.query_pairs().collect();
+        let port = values["port"].parse::<u16>().unwrap();
+        let client = "00000000000000000000000000000001";
+        let send = |authorization: &str| {
+            let mut socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            write!(socket, "GET /v1/frame HTTP/1.1\r\nAuthorization: {authorization}\r\nX-Pluriview-Client: {client}\r\n\r\n").unwrap();
+            let mut reply = String::new();
+            socket.read_to_string(&mut reply).unwrap();
+            reply
+        };
+        // The old bearer form is no longer accepted.
+        let reply = send(&format!("Bearer {}", values["token"]));
+        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
+        // A captured signed request cannot be replayed.
+        let signed = auth::test_authorization(&values["token"], "GET", "/v1/frame", client);
+        assert!(send(&signed).starts_with("HTTP/1.1 204"));
+        assert!(send(&signed).starts_with("HTTP/1.1 401"));
+
+        // An unused link expires; a new link replaces the old secret.
+        host.refresh_invite().unwrap();
+        host.shared.invite.lock().created -= INVITE_LIFETIME;
+        let fresh = url::Url::parse(&host.invite).unwrap();
+        let fresh: std::collections::HashMap<_, _> = fresh.query_pairs().collect();
+        assert!(send(&auth::test_authorization(
+            &fresh["token"],
+            "GET",
+            "/v1/frame",
+            client
+        ))
+        .starts_with("HTTP/1.1 401"));
+        host.refresh_invite().unwrap();
+        let fresh = url::Url::parse(&host.invite).unwrap();
+        let fresh: std::collections::HashMap<_, _> = fresh.query_pairs().collect();
+        assert!(send(&auth::test_authorization(
+            &values["token"],
+            "GET",
+            "/v1/frame",
+            client
+        ))
+        .starts_with("HTTP/1.1 401"));
+        assert!(send(&auth::test_authorization(
+            &fresh["token"],
+            "GET",
+            "/v1/frame",
+            client
+        ))
+        .starts_with("HTTP/1.1 204"));
     }
 
     #[test]
@@ -1824,7 +1979,7 @@ mod tests {
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            write!(socket, "GET /v2/video HTTP/1.1\r\nAuthorization: Bearer {}\r\nX-Pluriview-Client: 00000000000000000000000000000001\r\n\r\n", values["token"]).unwrap();
+            write!(socket, "GET /v2/video HTTP/1.1\r\nAuthorization: {}\r\nX-Pluriview-Client: 00000000000000000000000000000001\r\n\r\n", auth::test_authorization(&values["token"], "GET", "/v2/video", "00000000000000000000000000000001")).unwrap();
             let mut header = Vec::new();
             let mut byte = [0];
             while !header.ends_with(b"\r\n\r\n") {

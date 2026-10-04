@@ -19,7 +19,12 @@ fn connect(invite: &str, route: &str, client: &str, authorized: bool) -> (TcpStr
     } else {
         "invalid"
     };
-    write!(stream, "GET {route} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nX-Pluriview-Client: {client}\r\n\r\n").unwrap();
+    write!(
+        stream,
+        "GET {route} HTTP/1.1\r\nAuthorization: {}\r\nX-Pluriview-Client: {client}\r\n\r\n",
+        super::auth::test_authorization(token, "GET", route, client)
+    )
+    .unwrap();
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
         let mut byte = [0];
@@ -158,6 +163,7 @@ fn persistent_control_preserves_auth_bounds_pause_and_peer_lease() {
     assert!(connect(&host.invite, "/v2/control", CLIENT, true)
         .1
         .starts_with("HTTP/1.1 409"));
+    // The pairing link belongs to the first phone that used it.
     assert!(connect(
         &host.invite,
         "/v2/control",
@@ -165,7 +171,7 @@ fn persistent_control_preserves_auth_bounds_pause_and_peer_lease() {
         true
     )
     .1
-    .starts_with("HTTP/1.1 409"));
+    .starts_with("HTTP/1.1 401"));
     let seen = host.shared.peer.lock().as_ref().unwrap().seen;
     assert_eq!(send(&mut control, PING), 200);
     assert_eq!(

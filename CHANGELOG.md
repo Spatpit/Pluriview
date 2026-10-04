@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Phone Viewer requests are now signed with HMAC-SHA256 instead of sending the pairing token, and captured requests cannot be replayed. The QR/link works for one phone, expires after ten unused minutes, and can be replaced with **New pairing link**. Requires Android Viewer 0.3.12 together with this PC build.
 - Prepared local testing packages as v0.7.1.
 - Android audio can run alongside desktop Stream Audio Monitor. While monitoring is enabled, the phone captures Pluriview's application mix once, including the existing monitor output, without separately adding the original window sources or changing Discord/OBS routing. Switching monitoring modes reconnects phone audio automatically.
 - Image/GIF decoding and folder-playlist scans now run in the background with immediate placeholders. Workspace changes, source replacements and deletion discard stale completions; loading does not overwrite edited tile geometry or playlist controls.

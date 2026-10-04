@@ -39,7 +39,7 @@ public final class AudioPacketTest {
                     }
                     String text = new String(request.toByteArray(), StandardCharsets.US_ASCII);
                     check(text.startsWith("GET /v2/audio HTTP/1.1"), "Wrong audio route");
-                    check(text.contains("Authorization: Bearer test-only") && text.contains("X-Pluriview-Client: test-client"), "Missing authentication");
+                    check(text.contains("Authorization: Pluriview-HMAC ") && !text.contains("test-only") && text.contains("X-Pluriview-Client: test-client"), "Missing authentication");
                     OutputStream out = socket.getOutputStream();
                     out.write("HTTP/1.1 200 OK\r\nContent-Type: application/x-pluriview-aac\r\nConnection: close\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
                     out.write(header); out.write(packet, 0, 2); out.flush(); Thread.sleep(300);

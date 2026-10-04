@@ -430,7 +430,7 @@ public final class ViewerActivity extends Activity {
             HttpURLConnection c = (HttpURLConnection) new URL(base + path).openConnection(java.net.Proxy.NO_PROXY);
             c.setConnectTimeout(1500); c.setReadTimeout(2000); c.setInstanceFollowRedirects(false);
             c.setUseCaches(false); c.setRequestMethod(method);
-            c.setRequestProperty("Authorization", "Bearer " + token);
+            c.setRequestProperty("Authorization", Auth.header(token, method, path, client));
             c.setRequestProperty("X-Pluriview-Client", client);
             c.setRequestProperty("Connection", "close");
             return c;

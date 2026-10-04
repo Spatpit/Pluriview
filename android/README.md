@@ -153,11 +153,22 @@ action is exposed.
 
 The invitation is `pluriview://viewer?host=<private-ipv4>&port=<port>&token=<random-128-bit-token>`.
 The host binds only the selected local interface and chooses an available port.
-Authenticated viewing requests use `Authorization: Bearer <token>` and a
-32-character hex `X-Pluriview-Client` session identifier. Tokens never appear in HTTP paths.
-The first authenticated frame request claims a four-second renewable lease.
-Other phones receive 409 until that lease expires. Restart sharing to revoke
-the token immediately. The native client accepts only literal private/loopback
+Tokens never cross the network. Authenticated requests carry a 32-character
+hex `X-Pluriview-Client` session identifier and
+`Authorization: Pluriview-HMAC t=<ms>, n=<32-hex nonce>, m=<64-hex mac>`, where
+the MAC is HMAC-SHA256 keyed by the token over
+the newline-separated fields `pluriview-hmac-v1`, method, path, client, `t`
+and nonce. `t` is the phone's monotonic clock in milliseconds; the PC never
+compares it with its own clock, but rejects reused nonces and times more than
+60 seconds behind the newest it accepted for that token, so captured requests
+cannot be replayed. The QR/link token works for the first phone that uses it
+and expires after ten unused minutes; **New pairing link** on the PC replaces
+it immediately. The first authenticated frame request claims a four-second
+renewable lease. Other phones receive 409 until that lease expires. Stop
+sharing to revoke all tokens immediately. Pairing over plain HTTP still
+delivers an approved nearby grant token once in a response body, and video and
+audio are unencrypted; transport encryption remains deferred.
+The native client accepts only literal private/loopback
 IPv4 addresses, does not follow redirects, and bounds response size and decoded
 dimensions. The host rejects browser Origin headers and bounds request sizes,
 socket timeouts, connection workers, image jobs and pending commands.
@@ -166,8 +177,9 @@ Windows advertises `_pluriview._tcp.local` on the selected private interface
 only while sharing. It advertises a generated PC display name, address/port and
 protocol version, never a token or canvas content. Android uses `NsdManager`,
 bounds results and resolves one service at a time. Discovery and approval stop
-when the pairing screen leaves the foreground. Four fixed host workers
-accommodate video, control, optional audio and pairing.
+when the pairing screen leaves the foreground. Eight fixed host workers
+accommodate video, control, optional audio and pairing; each address may have
+at most two connections waiting to send their headers.
 Foreground discovery holds a Wi-Fi multicast lock for older Android support;
 it releases the lock on failure, backgrounding or connection, as described in
 [Android's NSD documentation](https://developer.android.com/reference/android/net/nsd/NsdManager#Wi-Fi-Multicast-Lock).

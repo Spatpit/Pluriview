@@ -23,7 +23,7 @@ final class VideoConnection implements AutoCloseable {
             reader = new ResumableInput(socket.getInputStream(), System::nanoTime, waiting, responseTimeout);
             input = new DataInputStream(new BufferedInputStream(reader, 32768));
             socket.getOutputStream().write(("GET " + path + " HTTP/1.1\r\nHost: " + url.getHost() + ":" + url.getPort()
-                + "\r\nAuthorization: Bearer " + token + "\r\nX-Pluriview-Client: " + client
+                + "\r\nAuthorization: " + Auth.header(token, "GET", path, client) + "\r\nX-Pluriview-Client: " + client
                 + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
             reader.begin(true);
             ByteArrayOutputStream header = new ByteArrayOutputStream();

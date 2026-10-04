@@ -37,7 +37,12 @@ fn sustained_video_uses_the_same_transport_after_qr_and_approval() {
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
-        write!(stream, "GET /v2/video HTTP/1.1\r\nAuthorization: Bearer {token}\r\nX-Pluriview-Client: {client}\r\n\r\n").unwrap();
+        write!(
+            stream,
+            "GET /v2/video HTTP/1.1\r\nAuthorization: {}\r\nX-Pluriview-Client: {client}\r\n\r\n",
+            super::auth::test_authorization(&token, "GET", "/v2/video", &client)
+        )
+        .unwrap();
         let mut header = Vec::new();
         while !header.ends_with(b"\r\n\r\n") {
             let mut b = [0];

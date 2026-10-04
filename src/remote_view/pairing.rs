@@ -41,6 +41,7 @@ struct Pending {
 struct Grant {
     client: String,
     token: String,
+    replay: super::auth::ReplayGuard,
 }
 
 #[derive(Default)]
@@ -75,10 +76,21 @@ impl Pairing {
             .is_some_and(|p| p.decision.is_none() && p.created.elapsed() < REQUEST_LIFETIME)
     }
 
-    pub(super) fn authorized(&self, client: &str, authorization: &str) -> bool {
-        self.grant
-            .as_ref()
-            .is_some_and(|g| g.client == client && authorization == format!("Bearer {}", g.token))
+    pub(super) fn authorized(
+        &mut self,
+        request: &Request,
+        credentials: &super::auth::Credentials,
+    ) -> bool {
+        self.grant.as_mut().is_some_and(|grant| {
+            grant.client == request.client
+                && credentials.signed_by(
+                    &grant.token,
+                    &request.method,
+                    &request.path,
+                    &request.client,
+                )
+                && grant.replay.accept(credentials)
+        })
     }
 
     pub(super) fn decide(&mut self, request: &str, allow: bool, busy: bool, now: Instant) {
@@ -94,6 +106,7 @@ impl Pairing {
                     self.grant = Some(Grant {
                         client: p.client.clone(),
                         token,
+                        replay: Default::default(),
                     });
                     p.decision = Some(true);
                 }
@@ -237,7 +250,7 @@ mod tests {
             .unwrap();
         let method = if body.is_some() { "POST" } else { "GET" };
         let body = body.unwrap_or("");
-        write!(stream, "{method} {route} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nX-Pluriview-Client: {client}\r\nContent-Length: {}\r\n{}\r\n{body}", body.len(), if origin { "Origin: http://untrusted.invalid\r\n" } else { "" }).unwrap();
+        write!(stream, "{method} {route} HTTP/1.1\r\nAuthorization: {}\r\nX-Pluriview-Client: {client}\r\nContent-Length: {}\r\n{}\r\n{body}", super::super::auth::test_authorization(token, method, route, client), body.len(), if origin { "Origin: http://untrusted.invalid\r\n" } else { "" }).unwrap();
         let mut header = Vec::new();
         while !header.ends_with(b"\r\n\r\n") {
             let mut byte = [0];
@@ -365,12 +378,30 @@ mod tests {
         let (status, body) = state.poll(input(&id), "phone", false, false, now);
         assert_eq!(status, 200);
         let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let bearer = format!("Bearer {}", response["token"].as_str().unwrap());
-        assert!(state.authorized("phone", &bearer));
-        assert!(!state.authorized("other", &bearer));
+        let token = response["token"].as_str().unwrap().to_owned();
+        let authorized = |state: &mut Pairing, client: &str| {
+            let request = Request {
+                method: "GET".into(),
+                path: "/v2/video".into(),
+                authorization: super::super::auth::test_authorization(
+                    &token,
+                    "GET",
+                    "/v2/video",
+                    client,
+                ),
+                client: client.into(),
+                last_frame: 0,
+                body: Vec::new(),
+            };
+            let credentials =
+                super::super::auth::Credentials::parse(&request.authorization).unwrap();
+            state.authorized(&request, &credentials)
+        };
+        assert!(authorized(&mut state, "phone"));
+        assert!(!authorized(&mut state, "other"));
         assert_ne!(state.poll(input(&id), "other", false, false, now).0, 200);
         assert_eq!(state.poll(input(&id), "phone", false, true, now).0, 200);
-        assert!(!state.authorized("phone", &bearer));
+        assert!(!authorized(&mut state, "phone"));
         assert_eq!(state.poll(input(&id), "phone", false, false, now).0, 403);
     }
     #[test]

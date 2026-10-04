@@ -18,7 +18,7 @@ final class ControlConnection implements AutoCloseable {
             socket.connect(new InetSocketAddress(url.getHost(), url.getPort()), 1000);
             input = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 1024));
             output = new DataOutputStream(socket.getOutputStream());
-            output.write(("GET /v2/control HTTP/1.1\r\nHost: " + url.getHost() + "\r\nAuthorization: Bearer " + token + "\r\nX-Pluriview-Client: " + client + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            output.write(("GET /v2/control HTTP/1.1\r\nHost: " + url.getHost() + "\r\nAuthorization: " + Auth.header(token, "GET", "/v2/control", client) + "\r\nX-Pluriview-Client: " + client + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
             ByteArrayOutputStream header = new ByteArrayOutputStream(); int ending = 0;
             byte[] delimiter = {13,10,13,10};
             while (ending != 4) {

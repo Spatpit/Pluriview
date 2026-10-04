@@ -39,6 +39,8 @@ Invoke-Checked javac (@('-encoding', 'UTF-8', '--release', '8', '-classpath', $a
 Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', $classes, '-d', $tests, "$source\tests\CameraTransformTest.java", "$source\tests\VideoPacketTest.java", "$source\tests\DisplayMappingTest.java", "$source\tests\DoubleTapTest.java", "$source\tests\StreamTimingTest.java", "$source\tests\DecoderLifecycleTest.java")
 Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', "$classes;$tests", '-d', $tests, "$source\tests\VideoConnectionTest.java")
 Invoke-Checked java @('-cp', "$classes;$tests", 'io.pluriview.viewer.VideoConnectionTest')
+Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', $classes, '-d', $tests, "$source\tests\AuthTest.java")
+Invoke-Checked java @('-cp', "$classes;$tests", 'io.pluriview.viewer.AuthTest')
 Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', $classes, '-d', $tests, "$source\tests\AudioPacketTest.java")
 Invoke-Checked java @('-cp', "$classes;$tests", 'io.pluriview.viewer.AudioPacketTest')
 # Isolate the simulated decoder from both the real classes and APK inputs.
