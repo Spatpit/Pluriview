@@ -1553,8 +1553,58 @@ fn installed_ubol_has_current_marker(extension_dir: &Path) -> bool {
     let Some(marker_path) = ubol_verification_marker_path(extension_dir) else {
         return false;
     };
-    fs::read_to_string(marker_path)
-        .is_ok_and(|fingerprint| fingerprint.trim() == UBOL_ARCHIVE_FINGERPRINT)
+    let Some(expected) = installed_ubol_marker(extension_dir) else {
+        return false;
+    };
+    fs::read_to_string(marker_path).is_ok_and(|marker| marker.trim() == expected)
+}
+
+/// The verified archive fingerprint plus a digest of every installed file's
+/// path, size and modification time. Startup skips re-hashing file contents
+/// only while nothing in the extension folder has been added, removed or
+/// rewritten since the last full verification. WebView2 itself writes
+/// generated rule indexes under `_metadata`, which is therefore excluded.
+fn installed_ubol_marker(extension_dir: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut files = Vec::new();
+    let mut pending = vec![extension_dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).ok()? {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                if entry.path() != extension_dir.join("_metadata") {
+                    pending.push(entry.path());
+                }
+            } else if file_type.is_file() {
+                let metadata = entry.metadata().ok()?;
+                let modified = metadata
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_nanos();
+                let relative = entry.path().strip_prefix(extension_dir).ok()?.to_owned();
+                files.push((relative, metadata.len(), modified));
+            } else {
+                return None;
+            }
+        }
+    }
+    files.sort();
+    let mut digest = Sha256::new();
+    for (path, length, modified) in files {
+        digest.update(path.to_string_lossy().as_bytes());
+        digest.update([0]);
+        digest.update(length.to_le_bytes());
+        digest.update(modified.to_le_bytes());
+    }
+    let digest: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(format!("{UBOL_ARCHIVE_FINGERPRINT} {digest}"))
 }
 
 fn installed_ubol_manifest_matches_embedded(extension_dir: &Path) -> bool {
@@ -1576,7 +1626,11 @@ fn write_ubol_verification_marker(extension_dir: &Path) {
         log::warn!("Could not determine the uBlock Origin Lite verification marker path");
         return;
     };
-    if let Err(error) = fs::write(marker_path, UBOL_ARCHIVE_FINGERPRINT) {
+    let Some(marker) = installed_ubol_marker(extension_dir) else {
+        log::warn!("Could not describe the verified uBlock Origin Lite files");
+        return;
+    };
+    if let Err(error) = fs::write(marker_path, marker) {
         // The verified extension is still safe to use. A missing marker only
         // means the next launch will repeat the full verification.
         log::warn!("Could not cache uBlock Origin Lite verification: {error}");
@@ -1675,6 +1729,11 @@ fn installed_ubol_matches_embedded_with_progress(
             };
             if file_type.is_symlink() {
                 return false;
+            }
+            // WebView2 writes generated rule indexes here; they are not part
+            // of the package and must not force a reinstall.
+            if file_type.is_dir() && path == extension_dir.join("_metadata") {
+                continue;
             }
             if file_type.is_dir() {
                 pending.push(path);
@@ -1907,6 +1966,28 @@ mod tests {
 
         write_ubol_verification_marker(&destination);
         assert!(installed_ubol_has_current_marker(&destination));
+
+        // Rule indexes WebView2 generates at runtime are not tampering.
+        let generated = destination
+            .join("_metadata")
+            .join("generated_indexed_rulesets");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(generated.join("_ruleset1"), b"index").unwrap();
+        assert!(installed_ubol_has_current_marker(&destination));
+        assert!(installed_ubol_matches_embedded(&destination));
+
+        // Rewriting any package file, not just the manifest, is detected.
+        let script = std::fs::read_dir(&destination)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file() && path.file_name().unwrap() != "manifest.json")
+            .unwrap();
+        let mut original = std::fs::read(&script).unwrap();
+        original.extend_from_slice(b"// tampered");
+        std::fs::write(&script, original).unwrap();
+        assert!(!installed_ubol_has_current_marker(&destination));
+        assert!(!installed_ubol_matches_embedded(&destination));
 
         std::fs::write(destination.join("manifest.json"), b"{}").unwrap();
         assert!(!installed_ubol_has_current_marker(&destination));
