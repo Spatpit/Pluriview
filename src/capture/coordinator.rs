@@ -14,11 +14,30 @@ use super::downsample::{fitted_capture_size, RgbaDownsampler};
 
 /// Frame data sent from capture threads
 pub(crate) struct CapturedFrame {
-    pub width: u32,
-    pub height: u32,
     pub source_width: u32,
     pub source_height: u32,
-    pub data: Vec<u8>,
+    /// Already converted to egui's premultiplied format on the capture
+    /// worker, so the UI thread only hands it to the texture upload.
+    pub image: eframe::egui::ColorImage,
+}
+
+impl CapturedFrame {
+    pub fn from_rgba(
+        width: u32,
+        height: u32,
+        source_width: u32,
+        source_height: u32,
+        rgba: &[u8],
+    ) -> Self {
+        Self {
+            source_width,
+            source_height,
+            image: eframe::egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                rgba,
+            ),
+        }
+    }
 }
 
 /// Shared controls and result slots passed to either capture worker type.
@@ -317,11 +336,9 @@ impl CaptureCoordinator {
                         crate::app::performance::counters::CAPTURE_CONSUMED,
                     );
                     preview.update_capture_frame(
-                        frame.width,
-                        frame.height,
                         frame.source_width,
                         frame.source_height,
-                        frame.data,
+                        frame.image,
                     );
                 } else if let Some(error) = failure {
                     preview.set_capture_error(error);
@@ -595,24 +612,18 @@ fn capture_window_loop(
                 crate::app::performance::counters::record(
                     crate::app::performance::counters::CAPTURE_GPU_RESIZED,
                 );
-                CapturedFrame {
-                    width: out_width,
-                    height: out_height,
-                    source_width: width,
-                    source_height: height,
-                    data,
-                }
+                CapturedFrame::from_rgba(out_width, out_height, width, height, &data)
             } else if out_width == width && out_height == height {
                 let buffer = frame.buffer()?;
-                CapturedFrame {
+                // Convert straight from the reused readback scratch: no
+                // intermediate byte copy, and no per-pixel work on the UI thread.
+                CapturedFrame::from_rgba(
                     width,
                     height,
-                    source_width: width,
-                    source_height: height,
-                    data: buffer
-                        .as_nopadding_buffer(&mut self.readback_scratch)
-                        .to_vec(),
-                }
+                    width,
+                    height,
+                    buffer.as_nopadding_buffer(&mut self.readback_scratch),
+                )
             } else {
                 let mut buffer = frame.buffer()?;
                 let stride = buffer.row_pitch();
@@ -627,13 +638,7 @@ fn capture_window_loop(
                 else {
                     return Err("Could not downscale the captured frame".into());
                 };
-                CapturedFrame {
-                    width: out_width,
-                    height: out_height,
-                    source_width: width,
-                    source_height: height,
-                    data,
-                }
+                CapturedFrame::from_rgba(out_width, out_height, width, height, &data)
             };
             *self.latest_frame.lock() = Some(captured_frame);
             #[cfg(pluriview_performance)]
@@ -901,13 +906,7 @@ mod tests {
         closed
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
-        *closed.latest_frame.lock() = Some(CapturedFrame {
-            width: 1,
-            height: 1,
-            source_width: 1,
-            source_height: 1,
-            data: vec![255; 4],
-        });
+        *closed.latest_frame.lock() = Some(CapturedFrame::from_rgba(1, 1, 1, 1, &[255; 4]));
         coordinator.sessions.insert(id, closed);
         coordinator.process_frames(&mut previews);
         let preview = previews.get_mut(id).unwrap();
@@ -993,24 +992,12 @@ mod tests {
     #[test]
     fn pending_frames_replace_stale_frames_per_preview() {
         let pending = Mutex::new(None);
-        *pending.lock() = Some(CapturedFrame {
-            width: 1,
-            height: 1,
-            source_width: 1,
-            source_height: 1,
-            data: vec![1; 4],
-        });
-        *pending.lock() = Some(CapturedFrame {
-            width: 2,
-            height: 2,
-            source_width: 2,
-            source_height: 2,
-            data: vec![2; 16],
-        });
+        *pending.lock() = Some(CapturedFrame::from_rgba(1, 1, 1, 1, &[1; 4]));
+        *pending.lock() = Some(CapturedFrame::from_rgba(2, 2, 2, 2, &[2; 16]));
 
         let latest = pending.lock().take().unwrap();
-        assert_eq!(latest.width, 2);
-        assert_eq!(latest.data, vec![2; 16]);
+        assert_eq!(latest.image.size[0], 2);
+        assert_eq!(latest.image.size, [2, 2]);
     }
 
     #[test]
@@ -1056,20 +1043,8 @@ mod tests {
         let stale_slot = Arc::new(Mutex::new(None));
         let current = session(30, true, false);
 
-        *stale_slot.lock() = Some(CapturedFrame {
-            width: 1,
-            height: 1,
-            source_width: 1,
-            source_height: 1,
-            data: vec![1; 4],
-        });
-        *current.latest_frame.lock() = Some(CapturedFrame {
-            width: 2,
-            height: 2,
-            source_width: 4,
-            source_height: 4,
-            data: vec![2; 16],
-        });
+        *stale_slot.lock() = Some(CapturedFrame::from_rgba(1, 1, 1, 1, &[1; 4]));
+        *current.latest_frame.lock() = Some(CapturedFrame::from_rgba(2, 2, 4, 4, &[2; 16]));
         let mut coordinator = CaptureCoordinator::new();
         coordinator.sessions.insert(preview_id, current);
         coordinator.process_frames(&mut previews);
@@ -1079,7 +1054,7 @@ mod tests {
             previews.get(preview_id).unwrap().source_frame_size,
             Some((4, 4))
         );
-        assert_eq!(stale_slot.lock().as_ref().unwrap().width, 1);
+        assert_eq!(stale_slot.lock().as_ref().unwrap().image.size[0], 1);
     }
 
     #[test]

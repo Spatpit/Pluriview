@@ -376,9 +376,7 @@ pub struct Preview {
 
 /// Raw frame data from capture
 struct FrameData {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
+    image: egui::ColorImage,
 }
 
 impl Preview {
@@ -534,9 +532,10 @@ impl Preview {
     pub fn update_seek_preview(&mut self, time: f64, width: u32, height: u32, data: Vec<u8>) {
         self.seek_preview_time = Some(time);
         self.seek_preview_frame = Some(FrameData {
-            width,
-            height,
-            data,
+            image: egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                &data,
+            ),
         });
     }
 
@@ -552,10 +551,7 @@ impl Preview {
 
     pub fn get_seek_preview_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         if let Some(frame) = self.seek_preview_frame.take() {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.data,
-            );
+            let image = frame.image;
             if let Some(texture) = self.seek_preview_texture.as_mut() {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
@@ -625,23 +621,26 @@ impl Preview {
 
     /// Update frame data from capture
     pub fn update_frame(&mut self, width: u32, height: u32, data: Vec<u8>) {
-        self.update_capture_frame(width, height, width, height, data);
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &data);
+        self.update_capture_frame(width, height, image);
     }
 
     /// Update a live-capture texture while retaining the source's native size.
+    /// The image arrives already premultiplied (capture workers convert it),
+    /// so this path does no per-pixel work beyond the browser startup check.
     pub fn update_capture_frame(
         &mut self,
-        width: u32,
-        height: u32,
         source_width: u32,
         source_height: u32,
-        data: Vec<u8>,
+        image: egui::ColorImage,
     ) {
+        let [width, height] = image.size.map(|value| value as u32);
         #[cfg(all(windows, pluriview_performance))]
         crate::app::performance::counters::capture_tile(self.id.0);
         self.clear_capture_error();
-        let transparent_browser_startup = self.browser_waiting_for_content
-            && !data.iter().skip(3).step_by(4).any(|alpha| *alpha != 0);
+        let transparent_browser_startup =
+            self.browser_waiting_for_content && !image.pixels.iter().any(|pixel| pixel.a() != 0);
         if self.browser_waiting_for_content && !transparent_browser_startup {
             self.browser_waiting_for_content = false;
         }
@@ -663,11 +662,7 @@ impl Preview {
             return;
         }
 
-        self.frame_buffer = Some(FrameData {
-            width,
-            height,
-            data,
-        });
+        self.frame_buffer = Some(FrameData { image });
     }
 
     /// Release a CPU-side frame that arrived just before a capture was
@@ -703,12 +698,7 @@ impl Preview {
         } else {
             None
         };
-        let capture_image = self.frame_buffer.take().map(|frame| {
-            egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.data,
-            )
-        });
+        let capture_image = self.frame_buffer.take().map(|frame| frame.image);
 
         if let Some(image) = media_image.or(capture_image) {
             #[cfg(all(windows, pluriview_performance))]

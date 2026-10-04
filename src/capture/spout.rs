@@ -248,13 +248,13 @@ impl SpoutGpuReceiver {
         }
         let data = data?;
 
-        Ok(Some(CapturedFrame {
-            width: out_width,
-            height: out_height,
-            source_width: self.width,
-            source_height: self.height,
-            data,
-        }))
+        Ok(Some(CapturedFrame::from_rgba(
+            out_width,
+            out_height,
+            self.width,
+            self.height,
+            &data,
+        )))
     }
 
     fn open_shared(&mut self, info: &spout::SpoutSender) -> Result<(), String> {
