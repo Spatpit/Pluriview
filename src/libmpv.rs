@@ -593,6 +593,10 @@ impl MpvCore {
             ("terminal", "no"),
             ("osc", "no"),
             ("input-default-bindings", "no"),
+            // Match the seek-preview core: no built-in or user scripts, and
+            // no yt-dlp lookup on PATH. Streams are resolved by Streamlink.
+            ("load-scripts", "no"),
+            ("ytdl", "no"),
             ("keep-open", "yes"),
             ("vo", "libmpv"),
             // ANGLE exposes the renderer as OpenGL ES. libmpv may otherwise
