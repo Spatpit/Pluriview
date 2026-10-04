@@ -1,0 +1,49 @@
+name: Windows checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "1.93.0"
+
+jobs:
+  check:
+    name: Format, test and lint
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup component add rustfmt clippy --toolchain $env:RUSTUP_TOOLCHAIN
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+      - name: Prepare pinned ANGLE runtime
+        shell: pwsh
+        run: .\scripts\prepare-angle.ps1
+      - name: Prepare pinned libmpv runtime
+        shell: pwsh
+        run: .\scripts\prepare-libmpv.ps1
+      - name: Run tests
+        run: cargo test --all-targets --locked
+      - name: Check correctness lints
+        # Existing style warnings remain visible while correctness is blocking.
+        run: cargo clippy --all-targets --locked -- -D clippy::correctness
