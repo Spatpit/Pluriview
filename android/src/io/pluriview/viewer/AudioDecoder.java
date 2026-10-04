@@ -12,6 +12,8 @@ import java.util.concurrent.TimeUnit;
 
 /** AAC decoding and bounded speaker writes never block the video/UI workers. */
 final class AudioDecoder implements AutoCloseable {
+    /** About 128 ms of 48 kHz stereo PCM: absorbs Wi-Fi scheduling jitter. */
+    static final int JITTER_BUFFER_BYTES = 6 * 4096;
     private final ArrayBlockingQueue<AudioPacket> packets = new ArrayBlockingQueue<>(6);
     private final AudioStartup startup = new AudioStartup();
     private final Thread worker;
@@ -22,20 +24,27 @@ final class AudioDecoder implements AutoCloseable {
         worker = new Thread(this::decode, "viewer-audio-decoder"); slot.start(worker);
     }
     void awaitReady() throws IOException { startup.await(); if (failure != null) throw failure; }
+    /** Live audio older than this is skipped rather than played late. */
+    static final long MAX_LATENCY_NANOS = 250_000_000L;
+    private volatile int dropped;
+    int dropped() { return dropped; }
     void queue(AudioPacket packet) throws IOException {
-        // TCP may deliver a short burst after Wi-Fi scheduling. Let the decoder
-        // consume the same bounded queue instead of reconnecting on one full
-        // offer. Packet age still bounds the total wait, including network time.
+        // After a Wi-Fi stall, TCP delivers the PC's backlog as one burst that
+        // the speaker can only play in real time. Let the decoder drain it,
+        // but once the oldest queued packet is too old, skip it to return to
+        // live sound. Ending the connection here made audio restart (seconds
+        // of silence) after every ordinary hiccup. A decoder that stops
+        // accepting input is still detected by its watchdog.
         while (!closed) {
             if (failure != null) throw failure;
-            long remaining = 250_000_000L - (System.nanoTime() - packet.received);
-            if (remaining <= 0) throw new IOException("Audio input queue stalled");
             try {
-                if (packets.offer(packet, Math.min(remaining, 10_000_000L), TimeUnit.NANOSECONDS)) return;
+                if (packets.offer(packet, 10_000_000L, TimeUnit.NANOSECONDS)) return;
             } catch (InterruptedException stopped) {
                 Thread.currentThread().interrupt();
                 throw new java.io.InterruptedIOException("Audio stopped");
             }
+            AudioPacket oldest = packets.peek();
+            if (oldest != null && System.nanoTime() - oldest.received > MAX_LATENCY_NANOS && packets.remove(oldest)) dropped++;
         }
         throw new IOException("Audio stopped");
     }
@@ -55,7 +64,7 @@ final class AudioDecoder implements AutoCloseable {
             output = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
                 .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(48000).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
-                .setBufferSizeInBytes(Math.max(minimum, 8192)).setTransferMode(AudioTrack.MODE_STREAM).build();
+                .setBufferSizeInBytes(Math.max(minimum, JITTER_BUFFER_BYTES)).setTransferMode(AudioTrack.MODE_STREAM).build();
             track = output;
             if (closed) return;
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
@@ -73,7 +82,6 @@ final class AudioDecoder implements AutoCloseable {
                 boolean worked = false;
                 AudioPacket packet = packets.peek();
                 if (packet != null) {
-                    if (System.nanoTime() - packet.received > 250_000_000L) throw new IOException("Audio input queue stalled");
                     int index = codec.dequeueInputBuffer(0);
                     if (index >= 0) {
                         packets.remove();

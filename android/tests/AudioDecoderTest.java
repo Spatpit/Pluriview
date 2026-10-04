@@ -49,13 +49,32 @@ public final class AudioDecoderTest {
             decoder.awaitReady();
             long start = System.nanoTime();
             try {
-                for (int i = 0; i < 8; i++) decoder.queue(packet());
+                // Late audio is skipped, so a stuck codec never builds a backlog;
+                // its watchdog still ends the stream within a bounded time.
+                while (System.nanoTime() - start < 3_000_000_000L) decoder.queue(packet());
                 throw new AssertionError("Stuck codec accepted unbounded audio");
             } catch (IOException expected) {
-                check("Audio input queue stalled".equals(expected.getMessage()), "Wrong codec-stall reason");
-                check(System.nanoTime() - start < 500_000_000L, "Input backlog was unbounded");
+                check("Audio decoder stalled".equals(expected.getMessage()), "Wrong codec-stall reason: " + expected.getMessage());
+                check(System.nanoTime() - start < 1_500_000_000L, "Codec stall was unbounded");
+                check(decoder.dropped() > 0, "Late audio was not skipped");
             }
         }
+        stopped(slot); MediaCodec.rejectInput = false;
+        // A Wi-Fi stall followed by a burst: audio that is already too late is
+        // skipped and playback continues, instead of ending the connection.
+        AudioTrack.pressureMillis = 120;
+        try (AudioDecoder decoder = new AudioDecoder(slot)) {
+            decoder.awaitReady();
+            AudioPacket[] burst = new AudioPacket[40];
+            for (int i = 0; i < burst.length; i++) burst[i] = packet();
+            Thread.sleep(200); // already late when they reach the phone
+            for (AudioPacket late : burst) decoder.queue(late);
+            long deadline = System.nanoTime() + 1_000_000_000L;
+            while (AudioTrack.latest.written == 0 && System.nanoTime() < deadline) Thread.sleep(2);
+            check(AudioTrack.latest.written > 0, "Playback did not resume after the burst");
+            check(decoder.dropped() > 0, "Stale burst audio was played late");
+        }
+        AudioTrack.pressureMillis = 0;
         stopped(slot); MediaCodec.rejectInput = false;
         System.out.println("Production audio pump: burst input, partial/zero output, playback start, bounded codec/speaker stalls and cleanup passed");
     }
