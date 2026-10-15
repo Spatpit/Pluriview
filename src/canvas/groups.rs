@@ -316,6 +316,27 @@ fn spotlight_rects(aspects: &[f32], bounds: Rect, large_count: usize) -> Vec<Rec
     rects
 }
 
+/// Lay a group out from its current outline while keeping its visible area.
+/// Fitting each preset inside the previous preset's outline loses the space
+/// the new shape cannot use, so switching layouts would shrink the group.
+fn spotlight_group_rects(current: &[Rect], large_count: usize) -> Vec<Rect> {
+    let Some(bounds) = bounds_of(current.iter().copied()) else {
+        return Vec::new();
+    };
+    let aspects: Vec<_> = current.iter().map(Rect::aspect_ratio).collect();
+    let rects = spotlight_rects(&aspects, bounds, large_count);
+    let area = current.iter().map(Rect::area).sum::<f32>();
+    let arranged = rects.iter().map(Rect::area).sum::<f32>();
+    if !(area > 0.0 && arranged > 0.0) {
+        return rects;
+    }
+    let scale = (area / arranged).sqrt();
+    rects
+        .into_iter()
+        .map(|r| Rect::from_min_size(bounds.min + (r.min - bounds.min) * scale, r.size() * scale))
+        .collect()
+}
+
 /// A layout change conserves visible content area. Fitting a column into the
 /// previous row's bounds (then vice versa) would otherwise collapse the group.
 #[cfg(test)]
@@ -1139,9 +1160,7 @@ impl CanvasState {
                     .unwrap_or_else(|| p.rect())
             })
             .collect();
-        let aspects: Vec<_> = current.iter().map(Rect::aspect_ratio).collect();
-        let available = bounds_of(current.into_iter()).unwrap();
-        let rects = spotlight_rects(&aspects, available, large_count);
+        let rects = spotlight_group_rects(&current, large_count);
         for (index, (id, rect)) in order.iter().zip(rects).enumerate() {
             if let Some(p) = previews.get_mut(*id) {
                 if p.viewport_pin.is_some() {
@@ -2079,6 +2098,37 @@ mod tests {
                 for (before, after) in rects.iter().zip(arranged_group_rects(&rects, layout, 1)) {
                     assert!(before.min.distance(after.min) < 0.02);
                     assert!((before.size() - after.size()).length() < 0.02);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switching_group_layouts_does_not_shrink_the_group() {
+        for pinned in [false, true] {
+            let (mut canvas, mut previews, ids, viewport) = fixture();
+            for (id, size) in ids.iter().zip([
+                Vec2::new(320.0, 180.0),
+                Vec2::new(120.0, 210.0),
+                Vec2::new(320.0, 180.0),
+                Vec2::splat(160.0),
+            ]) {
+                previews.get_mut(*id).unwrap().size = size;
+            }
+            if pinned {
+                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
+            }
+            let area = |canvas: &CanvasState, previews: &PreviewManager| {
+                ids.iter()
+                    .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport))
+                    .map(|r| r.area())
+                    .sum::<f32>()
+            };
+            let original = area(&canvas, &previews);
+            for _ in 0..10 {
+                for (count, _, _) in LAYOUTS {
+                    canvas.apply_spotlight_layout(count, Some(ids[1]), viewport, &mut previews);
+                    assert!((area(&canvas, &previews) / original - 1.0).abs() < 0.01);
                 }
             }
         }
