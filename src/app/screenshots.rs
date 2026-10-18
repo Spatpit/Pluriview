@@ -27,6 +27,7 @@ pub(super) struct ScreenshotState {
     pulse: Option<(Instant, egui::Rect)>,
     next_thumbnail: u64,
     pub(super) panel: super::screenshot_panel::PanelState,
+    pub(super) landings: Vec<super::screenshot_drop::Landing>,
 }
 
 struct SavingShot {

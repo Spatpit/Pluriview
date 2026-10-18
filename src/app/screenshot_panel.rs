@@ -18,6 +18,8 @@ const ROW_HEIGHT: f32 = 30.0;
 #[derive(Clone, Debug)]
 pub(super) struct ShotDrag {
     pub paths: Vec<PathBuf>,
+    /// A whole folder dragged by its header: it can only go to the canvas.
+    pub from_folder: bool,
 }
 
 #[derive(Default)]
@@ -37,6 +39,8 @@ pub(super) struct PanelState {
     /// Header of the folder new screenshots go to, while visible.
     pub(super) landing_rect: Option<egui::Rect>,
     fresh: Option<(PathBuf, Instant)>,
+    /// Where each visible card was drawn this frame, for fly-out animations.
+    card_rects: HashMap<PathBuf, egui::Rect>,
 }
 
 /// Selected screenshots plus the anchor that Shift+click extends from.
@@ -168,6 +172,8 @@ struct FolderEdit {
 }
 
 enum PanelAction {
+    /// Screenshots plus the rects they fly out from.
+    AddToCanvas(Vec<PathBuf>, Vec<egui::Rect>),
     SaveTo(Option<String>),
     NewFolder(Vec<PathBuf>),
     RenameFolder(String),
@@ -344,6 +350,22 @@ impl PanelState {
         None
     }
 
+    pub(super) fn texture_handle(&self, path: &Path) -> Option<egui::TextureHandle> {
+        match self.thumbnails.get(path) {
+            Some(Thumbnail::Ready { texture, .. }) => Some(texture.clone()),
+            _ => None,
+        }
+    }
+
+    /// Source rects for screenshots leaving the panel: their cards when
+    /// visible, else `fallback`.
+    fn source_rects(&self, paths: &[PathBuf], fallback: egui::Rect) -> Vec<egui::Rect> {
+        paths
+            .iter()
+            .map(|path| self.card_rects.get(path).copied().unwrap_or(fallback))
+            .collect()
+    }
+
     fn texture_for(&self, path: &Path) -> Option<(egui::TextureId, egui::Vec2)> {
         match self.thumbnails.get(path) {
             Some(Thumbnail::Ready { texture, .. }) => Some((texture.id(), texture.size_vec2())),
@@ -462,6 +484,7 @@ impl PluriviewApp {
             return;
         };
         self.screenshots.panel.upkeep(&root, ctx);
+        self.screenshots.panel.card_rects.clear();
         let save_folder = self.app_config.screenshot_folder.clone();
         let panel_shortcut = self
             .app_config
@@ -634,6 +657,19 @@ impl PluriviewApp {
                                 if folder.name == save_folder && ui.is_rect_visible(header.rect) {
                                     landing = Some(header.rect);
                                 }
+                                if header.drag_started() && !folder.shots.is_empty() {
+                                    egui::DragAndDrop::set_payload(
+                                        ui.ctx(),
+                                        ShotDrag {
+                                            paths: folder
+                                                .shots
+                                                .iter()
+                                                .map(|shot| shot.path.clone())
+                                                .collect(),
+                                            from_folder: true,
+                                        },
+                                    );
+                                }
                                 if header.clicked() && !state.collapsed.remove(&folder.name) {
                                     // Hidden shots leave the selection.
                                     state.collapsed.insert(folder.name.clone());
@@ -654,6 +690,20 @@ impl PluriviewApp {
                                             actions.push(PanelAction::RenameFolder(name.clone()));
                                             ui.close_menu();
                                         }
+                                    }
+                                    if !folder.shots.is_empty()
+                                        && ui.button("Add Folder to Canvas").clicked()
+                                    {
+                                        let paths: Vec<PathBuf> = folder
+                                            .shots
+                                            .iter()
+                                            .map(|shot| shot.path.clone())
+                                            .collect();
+                                        actions.push(PanelAction::AddToCanvas(
+                                            paths,
+                                            vec![header.rect],
+                                        ));
+                                        ui.close_menu();
                                     }
                                     if ui.button("Select All in Folder").clicked() {
                                         state.collapsed.remove(&folder.name);
@@ -680,7 +730,9 @@ impl PluriviewApp {
                                 egui::pos2(ui.min_rect().left(), section_top),
                                 egui::pos2(ui.min_rect().right(), ui.cursor().top()),
                             );
-                            if let Some(payload) = dragging.as_ref() {
+                            if let Some(payload) =
+                                dragging.as_ref().filter(|payload| !payload.from_folder)
+                            {
                                 if ui.rect_contains_pointer(section) {
                                     ui.painter().rect_stroke(
                                         section.shrink(1.0),
@@ -702,6 +754,21 @@ impl PluriviewApp {
 
         if let Some(payload) = egui::DragAndDrop::payload::<ShotDrag>(ctx) {
             drag_ghost(ctx, &self.screenshots.panel, &payload);
+            let over_canvas = ctx.pointer_latest_pos().filter(|pointer| {
+                self.canvas
+                    .last_screen_rect
+                    .is_some_and(|rect| rect.contains(*pointer))
+            });
+            if let Some(pointer) = over_canvas {
+                if ctx.input(|input| input.pointer.any_released()) {
+                    let sources: Vec<egui::Rect> = (0..payload.paths.len())
+                        .map(|index| ghost_rect(pointer, index))
+                        .collect();
+                    self.add_screenshots_to_canvas(&payload.paths, pointer, &sources, ctx);
+                } else {
+                    self.screenshot_drop_hint_ui(ctx, payload.paths.len());
+                }
+            }
         }
 
         if close {
@@ -713,14 +780,33 @@ impl PluriviewApp {
             EditOutcome::Submit => self.submit_folder_edit(&root),
         }
         for action in actions {
-            self.handle_screenshot_panel_action(action, &root);
+            self.handle_screenshot_panel_action(action, &root, ctx.clone());
         }
     }
 
-    fn handle_screenshot_panel_action(&mut self, action: PanelAction, root: &Path) {
+    fn handle_screenshot_panel_action(
+        &mut self,
+        action: PanelAction,
+        root: &Path,
+        panel_ctx: egui::Context,
+    ) {
         let mut notice = None;
         let panel = &mut self.screenshots.panel;
         match action {
+            PanelAction::AddToCanvas(paths, sources) => {
+                let Some(canvas_rect) = self.canvas.last_screen_rect else {
+                    return;
+                };
+                let fallback = sources.first().copied().unwrap_or_else(|| {
+                    egui::Rect::from_center_size(
+                        canvas_rect.right_center(),
+                        egui::Vec2::splat(40.0),
+                    )
+                });
+                let sources = panel.source_rects(&paths, fallback);
+                self.add_screenshots_to_canvas(&paths, canvas_rect.center(), &sources, &panel_ctx);
+                return;
+            }
             PanelAction::SaveTo(folder) => {
                 self.app_config.screenshot_folder = folder;
                 self.save_app_config();
@@ -920,6 +1006,13 @@ fn selection_bar(
                     {
                         actions.push(PanelAction::Delete(selected.to_vec()));
                     }
+                    if ui
+                        .add(icon(egui_phosphor::regular::SQUARES_FOUR))
+                        .on_hover_text("Add to canvas")
+                        .clicked()
+                    {
+                        actions.push(PanelAction::AddToCanvas(selected.to_vec(), Vec::new()));
+                    }
                     ui.menu_button(
                         egui::RichText::new(egui_phosphor::regular::FOLDER_SIMPLE_PLUS).size(14.0),
                         |ui| {
@@ -1050,7 +1143,7 @@ fn folder_header(
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW_HEIGHT),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
     let fill = if response.hovered() && !dragging {
         crate::ui_theme::HOVER
@@ -1165,6 +1258,7 @@ fn shot_grid(
                 if !ui.is_rect_visible(rect) {
                     continue;
                 }
+                state.card_rects.insert(shot.path.clone(), rect);
                 let selected = state.selection.contains(&shot.path);
                 let image_rect =
                     egui::Rect::from_min_size(rect.min, egui::vec2(card_width, image_height));
@@ -1256,6 +1350,7 @@ fn shot_grid(
                         ui.ctx(),
                         ShotDrag {
                             paths: state.selection.ordered(order),
+                            from_folder: false,
                         },
                     );
                 }
@@ -1273,6 +1368,17 @@ fn shot_grid(
                 let response = response.on_hover_text(&shot.name);
                 response.context_menu(|ui| {
                     crate::ui_theme::menu(ui);
+                    if crate::ui_theme::action(
+                        ui,
+                        egui_phosphor::regular::SQUARES_FOUR,
+                        "Add to Canvas",
+                    )
+                    .clicked()
+                    {
+                        actions.push(PanelAction::AddToCanvas(targets.clone(), Vec::new()));
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if targets.len() > 1 {
                         crate::ui_theme::section(ui, &shots_label(targets.len()).to_uppercase());
                     } else {
@@ -1301,6 +1407,14 @@ fn shot_grid(
     }
 }
 
+/// Where the drag ghost draws the `index`th screenshot: a small stack of up
+/// to three cards beside the pointer.
+fn ghost_rect(pointer: egui::Pos2, index: usize) -> egui::Rect {
+    let offset = egui::vec2(5.0, -5.0) * index.min(2) as f32;
+    egui::Rect::from_min_size(pointer + egui::vec2(12.0, 12.0), egui::vec2(112.0, 63.0))
+        .translate(offset)
+}
+
 /// Thumbnail following the pointer, stacked with a count for several shots.
 fn drag_ghost(ctx: &egui::Context, panel: &PanelState, payload: &ShotDrag) {
     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -1311,11 +1425,10 @@ fn drag_ghost(ctx: &egui::Context, panel: &PanelState, payload: &ShotDrag) {
         egui::Order::Tooltip,
         egui::Id::new("screenshot_drag_ghost"),
     ));
-    let rect = egui::Rect::from_min_size(pointer + egui::vec2(12.0, 12.0), egui::vec2(112.0, 63.0));
+    let rect = ghost_rect(pointer, 0);
     let stacked = payload.paths.len().min(3);
     for layer in (0..stacked).rev() {
-        let offset = egui::vec2(5.0, -5.0) * layer as f32;
-        let card = rect.translate(offset);
+        let card = ghost_rect(pointer, layer);
         painter.rect_filled(
             card.translate(egui::vec2(0.0, 3.0)),
             6.0,

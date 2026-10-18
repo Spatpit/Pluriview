@@ -444,6 +444,12 @@ Each new screenshot flies into the folder it is saved to.
 - Right-click a folder to rename it in place, select everything in it, save new
   screenshots there, or open it in Explorer. Click a folder's header to
   collapse or expand it.
+- Drag screenshots from the panel onto the canvas to add them as image tiles,
+  or drag a folder by its header to add all of its screenshots. They fly in
+  from the panel and are arranged in a grid around the drop point, then
+  selected so you can move them or press `Ctrl+G` to group them. **Add to
+  Canvas** in the right-click menus and the selection bar does the same at the
+  center of the view. One drop adds at most 48 screenshots.
 - Folders made in Explorer inside the `screenshots` folder appear in the panel
   too; folders inside folders are not shown. A frozen
 window or browser tile can be captured while it stays selected after freezing;

@@ -7,13 +7,23 @@ impl PluriviewApp {
         source: &std::path::Path,
         position: Pos2,
     ) -> Result<PreviewId, String> {
+        self.import_media_tile_sized(source, position, Vec2::new(640.0, 480.0))
+    }
+
+    /// Like `import_media_tile`, with a placeholder size; a size that already
+    /// matches the image's proportions stays put when decoding finishes.
+    pub(super) fn import_media_tile_sized(
+        &mut self,
+        source: &std::path::Path,
+        position: Pos2,
+        size: Vec2,
+    ) -> Result<PreviewId, String> {
         let path = original_image_path(source)?;
         let title = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("Image")
             .to_owned();
-        let size = Vec2::new(640.0, 480.0);
         let id = self
             .preview_manager
             .add_media(path.clone(), title, Vec::new(), position, size);

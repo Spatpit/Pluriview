@@ -58,6 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
 mod media_sources;
+mod screenshot_drop;
 mod screenshot_panel;
 mod screenshots;
 mod settings;
@@ -5916,6 +5917,7 @@ impl eframe::App for PluriviewApp {
         self.workspace_delete_confirmation_ui(ctx);
         self.canvas_view_undo_toast_ui(ctx);
         self.screenshot_animation_ui(ctx);
+        self.screenshot_landings_ui(ctx);
         self.canvas_notice_ui(ctx);
 
         if self.media_error.is_some() {
