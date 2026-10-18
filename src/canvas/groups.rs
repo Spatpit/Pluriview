@@ -375,15 +375,41 @@ fn keep_in_view(rects: Vec<Rect>, previous: Rect, viewport: Rect) -> Vec<Rect> {
     rects.into_iter().map(|r| r.translate(shift)).collect()
 }
 
+/// The shape a tile's picture needs to show without distortion. Window,
+/// screen, image and Spout frames are drawn across the whole tile, so a tile
+/// resized to another shape (or whose source window changed shape) stretches
+/// them. Browsers render at the tile's own size and videos are drawn by their
+/// player, so their tile shape is already right and they report `None`.
+fn content_aspect(p: &Preview) -> Option<f32> {
+    if p.is_browser() || p.is_video() || p.is_playlist() {
+        return None;
+    }
+    let (width, height) = p.source_frame_size.or(p.frame_size)?;
+    let (u0, v0, u1, v1) = p.crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
+    let aspect = ((u1 - u0) * width as f32) / ((v1 - v0) * height as f32);
+    (aspect.is_finite() && aspect > 0.0).then_some(aspect)
+}
+
+/// The largest rect of `aspect` centered inside `slot`.
+fn fit_aspect(slot: Rect, aspect: f32) -> Rect {
+    let size = if slot.aspect_ratio() > aspect {
+        Vec2::new(slot.height() * aspect, slot.height())
+    } else {
+        Vec2::new(slot.width(), slot.width() / aspect)
+    };
+    Rect::from_center_size(slot.center(), size)
+}
+
 /// Lay a group out from its current outline while keeping its visible area.
 /// Fitting each preset inside the previous preset's outline loses the space
 /// the new shape cannot use, so switching layouts would shrink the group.
-fn spotlight_group_rects(current: &[Rect], large_count: usize) -> Vec<Rect> {
+/// `aspects` are the shapes the tiles should take, which can differ from
+/// their current, stretched shapes.
+fn spotlight_group_rects(current: &[Rect], aspects: &[f32], large_count: usize) -> Vec<Rect> {
     let Some(bounds) = bounds_of(current.iter().copied()) else {
         return Vec::new();
     };
-    let aspects: Vec<_> = current.iter().map(Rect::aspect_ratio).collect();
-    let rects = spotlight_rects(&aspects, bounds, large_count);
+    let rects = spotlight_rects(aspects, bounds, large_count);
     let area = current.iter().map(Rect::area).sum::<f32>();
     let arranged = rects.iter().map(Rect::area).sum::<f32>();
     if !(area > 0.0 && arranged > 0.0) {
@@ -686,6 +712,14 @@ impl CanvasState {
                 p.position = destination.position;
                 p.size = destination.size;
                 p.viewport_pin = destination.pin;
+            }
+            // A slot shaped for the other tile would stretch this one's
+            // picture, so show it at its own proportions inside the slot.
+            if let Some((aspect, slot)) = previews
+                .get(id)
+                .and_then(|p| Some((content_aspect(p)?, self.target_screen_rect(p, viewport))))
+            {
+                self.set_group_screen_rect(id, fit_aspect(slot, aspect), viewport, previews);
             }
         }
         self.selection = vec![source];
@@ -1270,8 +1304,14 @@ impl CanvasState {
         let Some(previous) = bounds_of(current.iter().copied()) else {
             return;
         };
+        let aspects: Vec<_> = order
+            .iter()
+            .filter_map(|id| previews.get(*id))
+            .zip(&current)
+            .map(|(p, rect)| content_aspect(p).unwrap_or(rect.aspect_ratio()))
+            .collect();
         let rects = keep_in_view(
-            spotlight_group_rects(&current, large_count),
+            spotlight_group_rects(&current, &aspects, large_count),
             previous,
             viewport,
         );
@@ -2254,6 +2294,118 @@ mod tests {
                     assert!((area(&canvas, &previews) / original - 1.0).abs() < 0.01);
                 }
             }
+        }
+    }
+
+    /// Tiles squashed into the same 300×180 shape, showing sources of very
+    /// different shapes: a phone-shaped window, a wide window, a square crop
+    /// of a 4:3 capture and a landscape image.
+    fn stretched_fixture() -> (CanvasState, PreviewManager, Vec<PreviewId>, Rect, [f32; 4]) {
+        let (canvas, mut previews, ids, viewport) = fixture();
+        let sources = [
+            (Some((540, 1170)), None, None),
+            (Some((2560, 1080)), None, None),
+            (Some((1600, 1200)), None, Some((0.125, 0.0, 0.875, 1.0))),
+            (None, Some((1200, 800)), None),
+        ];
+        for (id, (source, frame, crop)) in ids.iter().zip(sources) {
+            let p = previews.get_mut(*id).unwrap();
+            p.source_frame_size = source;
+            p.frame_size = frame;
+            p.crop_uv = crop;
+        }
+        let aspects = [540.0 / 1170.0, 2560.0 / 1080.0, 1.0, 1.5];
+        (canvas, previews, ids, viewport, aspects)
+    }
+
+    #[test]
+    fn content_aspect_follows_the_source_frame_and_crop() {
+        let (_, mut previews, ids, _, aspects) = stretched_fixture();
+        for (id, aspect) in ids.iter().zip(aspects) {
+            let found = content_aspect(previews.get(*id).unwrap()).unwrap();
+            assert!((found - aspect).abs() < 0.001, "{found} vs {aspect}");
+        }
+        let p = previews.get_mut(ids[0]).unwrap();
+        p.browser_url = Some("https://example.com".into());
+        assert_eq!(content_aspect(p), None);
+        let p = previews.get_mut(ids[1]).unwrap();
+        p.source_frame_size = None;
+        assert_eq!(content_aspect(p), None);
+    }
+
+    #[test]
+    fn group_layouts_undo_stretched_tiles_without_overlap_or_shrinking() {
+        for pinned in [false, true] {
+            let (mut canvas, mut previews, ids, viewport, aspects) = stretched_fixture();
+            if pinned {
+                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
+            }
+            let rects = |canvas: &CanvasState, previews: &PreviewManager| -> Vec<Rect> {
+                ids.iter()
+                    .map(|id| canvas.target_screen_rect(previews.get(*id).unwrap(), viewport))
+                    .collect()
+            };
+            let original: f32 = rects(&canvas, &previews).iter().map(Rect::area).sum();
+            for _ in 0..3 {
+                for (count, _, _) in LAYOUTS {
+                    for selected in [ids[0], ids[1]] {
+                        canvas.apply_spotlight_layout(
+                            count,
+                            Some(selected),
+                            viewport,
+                            &mut previews,
+                        );
+                        let rects = rects(&canvas, &previews);
+                        for (index, (rect, aspect)) in rects.iter().zip(aspects).enumerate() {
+                            assert!(
+                                (rect.aspect_ratio() / aspect - 1.0).abs() < 0.001,
+                                "tile {index}: {} vs {aspect}",
+                                rect.aspect_ratio()
+                            );
+                            for other in &rects[..index] {
+                                assert!(!rect.shrink(0.01).intersects(*other));
+                            }
+                        }
+                        let area: f32 = rects.iter().map(Rect::area).sum();
+                        assert!((area / original - 1.0).abs() < 0.01);
+                        // The selected tile is the main tile, at its own shape.
+                        // (Two or three large tiles share a height instead.)
+                        if count == 1 || count == usize::MAX {
+                            let largest = rects.iter().map(Rect::area).fold(0.0, f32::max);
+                            let index = ids.iter().position(|id| *id == selected).unwrap();
+                            assert!((rects[index].area() / largest - 1.0).abs() < 0.001);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spotlight_swaps_fit_each_picture_inside_its_new_slot() {
+        let (mut canvas, mut previews, ids, viewport, aspects) = stretched_fixture();
+        canvas.toggle_spotlight(ids[0], viewport, &mut previews);
+        let slots: Vec<_> = ids
+            .iter()
+            .map(|id| canvas.target_screen_rect(previews.get(*id).unwrap(), viewport))
+            .collect();
+        canvas.swap_spotlight_tiles(ids[0], ids[1], viewport, &mut previews);
+        for (id, slot, aspect) in [
+            (ids[0], slots[1], aspects[0]),
+            (ids[1], slots[0], aspects[1]),
+        ] {
+            let rect = canvas.target_screen_rect(previews.get(id).unwrap(), viewport);
+            assert!((rect.aspect_ratio() / aspect - 1.0).abs() < 0.001);
+            assert!(slot.expand(0.01).contains_rect(rect));
+            assert!((rect.center() - slot.center()).length() < 0.01);
+            assert!(
+                (rect.width() - slot.width()).abs() < 0.01
+                    || (rect.height() - slot.height()).abs() < 0.01
+            );
+        }
+        for index in [2, 3] {
+            let rect = canvas.target_screen_rect(previews.get(ids[index]).unwrap(), viewport);
+            assert_eq!(rect, slots[index]);
         }
     }
 
