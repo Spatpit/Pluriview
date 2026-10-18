@@ -61,6 +61,11 @@ impl Storage {
         })
     }
 
+    /// Saved tile screenshots, beside the rest of Pluriview's data.
+    pub fn screenshots_dir(&self) -> PathBuf {
+        self.data_dir.join("screenshots")
+    }
+
     /// Get auto-save path
     pub fn autosave_path(&self) -> PathBuf {
         self.data_dir.join("autosave.json")

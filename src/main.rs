@@ -17,6 +17,7 @@ mod playlist;
 mod preview;
 mod privacy;
 mod remote_view;
+mod screenshot;
 #[cfg(windows)]
 mod source_dialog;
 mod spout;

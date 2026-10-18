@@ -4,7 +4,10 @@ use super::wallpaper::CanvasWallpaper;
 mod groups;
 #[path = "navigation.rs"]
 mod navigation;
-use crate::capture::{capture_lod_factor, window_capture_target, CaptureCoordinator};
+use crate::capture::{
+    capture_lod_factor, window_capture_target, CaptureCoordinator, MAX_CAPTURE_HEIGHT,
+    MAX_CAPTURE_WIDTH,
+};
 use crate::hotkeys::{HotkeyBindings, HotkeySlot};
 use crate::preview::{
     compact_title, BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager,
@@ -1567,13 +1570,19 @@ impl CanvasState {
             if !preview.is_live_capture() || preview.manually_frozen {
                 continue;
             }
-            let display_size = live_capture_display_size(preview, lod);
-            let (width, height) = window_capture_target(
-                display_size.x,
-                display_size.y,
-                pixels_per_point,
-                preview.crop_uv,
-            );
+            // A pending screenshot briefly asks for the full source size so a
+            // small tile still saves a sharp image.
+            let (width, height) = if preview.screenshot_wants_native_frame {
+                (MAX_CAPTURE_WIDTH, MAX_CAPTURE_HEIGHT)
+            } else {
+                let display_size = live_capture_display_size(preview, lod);
+                window_capture_target(
+                    display_size.x,
+                    display_size.y,
+                    pixels_per_point,
+                    preview.crop_uv,
+                )
+            };
             capture_coordinator.set_target_size(preview.id, width, height);
         }
     }

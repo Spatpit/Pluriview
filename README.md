@@ -413,6 +413,20 @@ a transition.
 Use `Ctrl+1` through `Ctrl+9` to open a viewpoint directly, or
 `Ctrl+Page Up` / `Ctrl+Page Down` to cycle between them.
 
+### Screenshots
+
+Select a tile, or focus it with `F`, then click the camera in the top bar's
+**Capture** section or press `Shift+S`. With several tiles selected, each one
+is saved as its own PNG. The screenshot keeps the tile's crop and is taken from
+the source rather than the screen: window tiles briefly capture at their full
+size (up to 4K), images and GIFs use their original pixels, and videos use the
+frame as currently rendered, so focusing a video first gives a sharper shot.
+
+Screenshots are saved in the `screenshots` folder inside Pluriview's data
+folder. Choose **Capture → Open Screenshots Folder** to see them. A frozen
+window or browser tile can be captured while it stays selected after freezing;
+otherwise resume it first. Playlist tiles cannot be captured.
+
 ## Sharing audio with Discord or OBS
 
 Browser audio plays normally while you use Pluriview. However, that sound
@@ -456,6 +470,7 @@ your installation still uses `Numpad 2`.
 | Delete selected tiles | `Delete` |
 | Undo the latest tile deletion | `Ctrl+Z` |
 | Focus current tile | `F` |
+| Screenshot selected or focused tile | `Shift+S` |
 | Group / ungroup selected tiles | `Ctrl+G` / `Ctrl+U` |
 | One / two / three large tiles / equal tiles | `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
 | Medium / large selection size | `Alt+6` / `Alt+7` |

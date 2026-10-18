@@ -74,6 +74,7 @@ pub enum HotkeySlot {
     NextSpotlight,
     SizeMedium,
     SizeLarge,
+    ScreenshotTile,
 }
 
 impl HotkeySlot {
@@ -89,7 +90,7 @@ impl HotkeySlot {
         Self::CanvasView9,
     ];
 
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
@@ -123,6 +124,7 @@ impl HotkeySlot {
         Self::NextSpotlight,
         Self::SizeMedium,
         Self::SizeLarge,
+        Self::ScreenshotTile,
     ];
 
     pub fn label(self) -> &'static str {
@@ -160,6 +162,7 @@ impl HotkeySlot {
             Self::NextSpotlight => "Next Spotlight tile",
             Self::SizeMedium => "Medium group size",
             Self::SizeLarge => "Large group size",
+            Self::ScreenshotTile => "Screenshot selected tile",
         }
     }
 }
@@ -200,6 +203,7 @@ pub struct HotkeyBindings {
     pub next_spotlight: Hotkey,
     pub size_medium: Hotkey,
     pub size_large: Hotkey,
+    pub screenshot_tile: Hotkey,
 }
 
 impl Default for HotkeyBindings {
@@ -238,6 +242,7 @@ impl Default for HotkeyBindings {
             next_spotlight: Hotkey::pair(0x10, 0x27),
             size_medium: Hotkey::pair(0x12, 0x36),
             size_large: Hotkey::pair(0x12, 0x37),
+            screenshot_tile: Hotkey::pair(0x10, 0x53), // Shift+S
         }
     }
 }
@@ -278,6 +283,7 @@ impl HotkeyBindings {
             HotkeySlot::NextSpotlight => self.next_spotlight,
             HotkeySlot::SizeMedium => self.size_medium,
             HotkeySlot::SizeLarge => self.size_large,
+            HotkeySlot::ScreenshotTile => self.screenshot_tile,
         }
     }
 
@@ -316,6 +322,7 @@ impl HotkeyBindings {
             HotkeySlot::NextSpotlight => self.next_spotlight = hotkey,
             HotkeySlot::SizeMedium => self.size_medium = hotkey,
             HotkeySlot::SizeLarge => self.size_large = hotkey,
+            HotkeySlot::ScreenshotTile => self.screenshot_tile = hotkey,
         }
     }
 
@@ -746,6 +753,20 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_shortcut_defaults_to_shift_s_for_older_settings() {
+        let old = serde_json::json!({"select_all": {"first_key": 17, "second_key": 65}});
+        let restored: HotkeyBindings = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.get(HotkeySlot::ScreenshotTile).display(),
+            "Shift+S"
+        );
+        assert_eq!(
+            restored.conflict(HotkeySlot::ScreenshotTile, restored.screenshot_tile),
+            None
+        );
+    }
+
+    #[test]
     fn focus_defaults_to_f_when_missing_from_saved_settings() {
         let mut value = serde_json::to_value(HotkeyBindings::default()).unwrap();
         value.as_object_mut().unwrap().remove("focus_current_tile");
@@ -846,13 +867,14 @@ mod tests {
         let configured = shortcuts.configured_keys();
         assert_eq!(
             configured.into_iter().filter(|enabled| *enabled).count(),
-            28
+            29
         );
         assert!(configured[0x11]); // Ctrl
         assert!(configured[0x31]); // 1
         assert!(configured[0x39]); // 9
         assert!(configured[0x47]); // G
         assert!(configured[0x57]); // W
+        assert!(configured[0x53]); // S
         assert!(!configured[0x51]); // Q
     }
 

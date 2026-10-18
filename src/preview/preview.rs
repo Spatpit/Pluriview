@@ -1,6 +1,7 @@
 use eframe::egui::{self, Pos2, Rect, TextureHandle, Vec2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::VideoPlaybackPreferences;
@@ -300,6 +301,19 @@ pub struct Preview {
     /// Frame data buffer (BGRA)
     frame_buffer: Option<FrameData>,
 
+    /// Last uploaded capture frame, shared with the texture upload rather
+    /// than copied. Runtime-only and kept only for selected tiles (and frozen
+    /// tiles that were selected when frozen), so a screenshot can save the
+    /// exact visible moment without holding a CPU copy of every tile.
+    retain_frame: bool,
+    retained_frame: Option<Arc<egui::ColorImage>>,
+
+    /// Runtime screenshot request for a live capture: the next frame at the
+    /// source's full capture size (any next frame for a browser) is kept here
+    /// for the screenshot.
+    pub screenshot_wants_native_frame: bool,
+    screenshot_native_frame: Option<Arc<egui::ColorImage>>,
+
     /// Current URL when this preview is a browser tile, None otherwise.
     /// Kept up to date as the page navigates so layouts save where the
     /// user actually is, not where the tile started.
@@ -376,7 +390,7 @@ pub struct Preview {
 
 /// Raw frame data from capture
 struct FrameData {
-    image: egui::ColorImage,
+    image: Arc<egui::ColorImage>,
 }
 
 impl Preview {
@@ -408,6 +422,10 @@ impl Preview {
             source_frame_size: None,
             texture: None,
             frame_buffer: None,
+            retain_frame: false,
+            retained_frame: None,
+            screenshot_wants_native_frame: false,
+            screenshot_native_frame: None,
             browser_url: None,
             browser_muted: false,
             stream_audio: false,
@@ -497,6 +515,8 @@ impl Preview {
         self.capture_hibernated = false;
         self.capture_offscreen_since = None;
         self.frame_buffer = None;
+        self.retained_frame = None;
+        self.cancel_screenshot_native_frame();
         self.texture = None;
         self.clear_capture_error();
     }
@@ -532,10 +552,10 @@ impl Preview {
     pub fn update_seek_preview(&mut self, time: f64, width: u32, height: u32, data: Vec<u8>) {
         self.seek_preview_time = Some(time);
         self.seek_preview_frame = Some(FrameData {
-            image: egui::ColorImage::from_rgba_unmultiplied(
+            image: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
                 [width as usize, height as usize],
                 &data,
-            ),
+            )),
         });
     }
 
@@ -662,6 +682,16 @@ impl Preview {
             return;
         }
 
+        let image = Arc::new(image);
+        // Browser captures are not resized for screenshots; take their next frame.
+        if self.screenshot_wants_native_frame
+            && (self.is_browser()
+                || (width, height)
+                    == crate::capture::screenshot_capture_size(source_width, source_height))
+        {
+            self.screenshot_wants_native_frame = false;
+            self.screenshot_native_frame = Some(Arc::clone(&image));
+        }
         self.frame_buffer = Some(FrameData { image });
     }
 
@@ -670,6 +700,39 @@ impl Preview {
     /// visual snapshot.
     pub fn discard_pending_capture_frame(&mut self) {
         self.frame_buffer = None;
+    }
+
+    /// Keep (or release) a shared reference to each uploaded capture frame.
+    /// A frozen tile keeps the frame it already holds, because no new frame
+    /// will arrive to replace it once it is selected again.
+    pub fn set_retain_frame(&mut self, retain: bool) {
+        self.retain_frame = retain;
+        if !retain && !self.manually_frozen {
+            self.retained_frame = None;
+        }
+    }
+
+    /// Newest capture frame this tile can hand to a screenshot without a GPU
+    /// readback: a frame waiting for upload, else the retained upload.
+    pub fn latest_capture_frame(&self) -> Option<Arc<egui::ColorImage>> {
+        self.frame_buffer
+            .as_ref()
+            .map(|frame| Arc::clone(&frame.image))
+            .or_else(|| self.retained_frame.clone())
+    }
+
+    pub fn take_screenshot_native_frame(&mut self) -> Option<Arc<egui::ColorImage>> {
+        self.screenshot_native_frame.take()
+    }
+
+    pub fn cancel_screenshot_native_frame(&mut self) {
+        self.screenshot_wants_native_frame = false;
+        self.screenshot_native_frame = None;
+    }
+
+    /// Current decoded image/GIF frame as straight-alpha RGBA.
+    pub fn current_media_frame(&self) -> Option<&MediaFrame> {
+        self.media_frames.get(self.media_frame_index)
     }
 
     /// Get UV coordinates for rendering (either crop region or full frame)
@@ -698,9 +761,14 @@ impl Preview {
         } else {
             None
         };
-        let capture_image = self.frame_buffer.take().map(|frame| frame.image);
+        let capture_image = self.frame_buffer.take().map(|frame| {
+            if self.retain_frame {
+                self.retained_frame = Some(Arc::clone(&frame.image));
+            }
+            egui::ImageData::from(frame.image)
+        });
 
-        if let Some(image) = media_image.or(capture_image) {
+        if let Some(image) = media_image.map(egui::ImageData::from).or(capture_image) {
             #[cfg(all(windows, pluriview_performance))]
             crate::app::performance::counters::record(
                 crate::app::performance::counters::TEXTURE_UPLOAD,

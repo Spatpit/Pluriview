@@ -58,6 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
 mod media_sources;
+mod screenshots;
 mod settings;
 mod source_loading;
 mod workspaces;
@@ -1006,6 +1007,8 @@ pub struct PluriviewApp {
     media_error: Option<String>,
     /// Short-lived message shown at the top of the canvas.
     canvas_notice: Option<(String, Instant)>,
+    /// Pending tile screenshots, saves and their capture animations.
+    screenshots: screenshots::ScreenshotState,
     source_loads: SourceLoads,
 
     /// Missing optional tools encountered by a video creation action.
@@ -1210,6 +1213,7 @@ impl PluriviewApp {
             quick_add: None,
             media_error: None,
             canvas_notice: None,
+            screenshots: Default::default(),
             source_loads: SourceLoads::new(_cc.egui_ctx.clone()),
             external_tool_error: None,
             video_action_error: None,
@@ -3553,6 +3557,8 @@ impl PluriviewApp {
                         ui.add_space(16.0);
                         // File / View / Help, inline next to the app name.
                         self.menu_bar(ui, ctx);
+                        ui.add_space(6.0);
+                        self.capture_section_ui(ui, ctx);
                     });
                 });
 
@@ -5511,6 +5517,9 @@ impl eframe::App for PluriviewApp {
         if shortcut_presses.pressed(HotkeySlot::ShowShortcutHelp) {
             self.show_shortcuts = true;
         }
+        if shortcut_presses.pressed(HotkeySlot::ScreenshotTile) {
+            self.request_tile_screenshots(ctx);
+        }
         let numbered_canvas_view = HotkeySlot::CANVAS_VIEWS
             .iter()
             .position(|slot| shortcut_presses.pressed(*slot));
@@ -5585,6 +5594,7 @@ impl eframe::App for PluriviewApp {
 
         // Custom title bar + manual resize border (decorations are off)
         self.handle_frameless_resize(ctx);
+        self.screenshots.button_rect = None;
         if !self.canvas_only {
             self.title_bar_ui(ctx);
         }
@@ -5600,6 +5610,8 @@ impl eframe::App for PluriviewApp {
             .process_frames(&mut self.preview_manager);
         #[cfg(windows)]
         self.browser_capture_frame_rate_upkeep();
+        self.sync_screenshot_frame_retention();
+        self.screenshot_upkeep(ctx);
 
         // Menu bar (File / View / Help) now lives inline in the custom
         // title bar; see `title_bar_ui` / `menu_bar`.
@@ -5889,6 +5901,7 @@ impl eframe::App for PluriviewApp {
         self.workspace_dialog_ui(ctx);
         self.workspace_delete_confirmation_ui(ctx);
         self.canvas_view_undo_toast_ui(ctx);
+        self.screenshot_animation_ui(ctx);
         self.canvas_notice_ui(ctx);
 
         if self.media_error.is_some() {
@@ -6149,6 +6162,18 @@ impl eframe::App for PluriviewApp {
                                     self.app_config
                                         .keyboard_shortcuts
                                         .get(HotkeySlot::DeleteSelected)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
+                            ui.end_row();
+
+                            ui.label("Screenshot selected tile");
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::ScreenshotTile)
                                         .display(),
                                 )
                                 .weak(),

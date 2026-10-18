@@ -259,6 +259,21 @@ impl CanvasState {
         Rect::from_min_max(min, max)
     }
 
+    /// Where a tile was last shown on screen, for overlays drawn by the app.
+    pub fn tile_screen_rect(&self, id: PreviewId, previews: &PreviewManager) -> Option<Rect> {
+        let canvas_rect = self.last_screen_rect?;
+        let preview = previews.get(id)?;
+        Some(self.preview_screen_rect(preview, canvas_rect))
+    }
+
+    /// Tiles a capture action applies to: the focused tile, else the selection.
+    pub fn capture_targets(&self) -> Vec<PreviewId> {
+        match &self.focus {
+            Some(focus) => vec![focus.id],
+            None => self.selection.clone(),
+        }
+    }
+
     pub(super) fn preview_screen_rect(&self, preview: &Preview, canvas_rect: Rect) -> Rect {
         let target = preview
             .viewport_pin
