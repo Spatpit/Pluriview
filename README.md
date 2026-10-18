@@ -82,7 +82,7 @@ is remembered, and gestures remain mapped to the shared PC camera in either mode
 
 1. Build/install the test APK using [the Android build instructions](android/README.md).
 2. Connect the PC and phone to the same trusted private Wi-Fi.
-3. In Pluriview, choose **View → Phone Viewer...**, check the PC's Wi-Fi IPv4
+3. In Pluriview, choose **Tools → Phone Viewer...**, check the PC's Wi-Fi IPv4
    address, and choose **Start sharing**.
 4. Open Pluriview Viewer and tap **Request connection** on the nearby PC
    matching the name shown in the PC's Phone Viewer dialog.
@@ -293,7 +293,7 @@ from your regular browser profile:
 - All Pluriview browser tiles share cookies and login sessions, including across workspaces.
 - Signing into a website in one tile can also sign you into that website in other tiles.
 - Login sessions can remain available when you close and reopen Pluriview.
-- **View → Clear Browser Data...** signs you out of every site and erases the
+- **Tools → Clear Browser Data...** signs you out of every site and erases the
   shared profile's cookies, site data, history and cache. uBlock Origin Lite
   stays installed. It is available while at least one browser tile is open.
 
@@ -304,7 +304,7 @@ normally would when you visit them.
 
 The WebView2 Runtime updates itself with Microsoft Edge. Running tiles keep the
 engine version they started with, so when an update is installed while
-Pluriview is open, a notice appears and the View menu shows **Restart Browser
+Pluriview is open, a notice appears and the Tools menu shows **Restart Browser
 Tiles (update ready)**. Choosing it restarts every browser tile on the new
 engine, keeping each tile's address, mute state and position. Restarting
 Pluriview also applies it.
@@ -321,7 +321,7 @@ browser engine stops, every browser tile restarts once on its own.
 
 **uBlock Origin Lite** is included and enabled by default for browser tiles.
 
-Toggle it under **View → Block Ads & Trackers (uBOL)**. The setting applies to
+Toggle it under **Tools → Block Ads & Trackers (uBOL)**. The setting applies to
 all browser tiles. If blocking interferes with a page, you can turn it off from
 this menu.
 
@@ -499,7 +499,7 @@ audio out.
 **Stream Audio Monitor** lets Pluriview replay a copy of the audio through its
 own process so window sharing can capture it.
 
-1. Open **View → Stream Audio Monitor**.
+1. Open **Tools → Stream Audio Monitor**.
 2. Choose an output you do not listen to, such as a virtual audio cable or an unused audio output.
 3. Share the Pluriview window in your streaming or calling application.
 
@@ -511,7 +511,7 @@ This feature is off by default.
 
 ## Controls and shortcuts
 
-Keyboard shortcuts can be changed under **View → Settings → Keyboard
+Keyboard shortcuts can be changed under **Tools → Settings → Keyboard
 shortcuts**. Mouse controls are fixed.
 
 Starting with v0.6.9, **Focus current tile** defaults to `F`. Existing saved

@@ -3679,7 +3679,7 @@ impl PluriviewApp {
         self.title_bar_menu_open = want_visible && ctx.memory(|m| m.any_popup_open());
     }
 
-    /// The File / View / Help menus. Rendered inline in the title bar next
+    /// The File / Workspace / View / Tools / Help menus. Rendered inline in the title bar next
     /// to the app name (Minimal Void: one unified dark strip, no separate
     /// menu-bar row).
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -3839,11 +3839,7 @@ impl PluriviewApp {
 
             ui.menu_button("View", |ui| {
                 crate::ui_theme::menu(ui);
-                if ui.button("Phone Viewer...").clicked() {
-                    self.remote_view.show_dialog = true;
-                    ui.close_menu();
-                }
-                crate::ui_theme::section(ui, "APPEARANCE");
+                crate::ui_theme::section(ui, "PANELS");
                 if crate::ui_theme::shortcut_toggle(ui, &mut self.picker_open, "Window Picker",
                     self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleWindowPicker)).clicked()
                 {
@@ -3854,6 +3850,36 @@ impl PluriviewApp {
                     self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleScreenshotsPanel)).clicked()
                 {
                     self.set_screenshots_panel_open(screenshots_open);
+                    ui.close_menu();
+                }
+                if ui
+                    .checkbox(
+                        &mut self.app_config.always_show_title_bar,
+                        "Always Show Top Bar",
+                    )
+                    .on_hover_text(
+                        "When off, the top bar hides until you move the mouse to the top of the window.",
+                    )
+                    .clicked()
+                {
+                    self.save_app_config();
+                    ui.close_menu();
+                }
+                ui.separator();
+                crate::ui_theme::section(ui, "CANVAS");
+                ui.menu_button("Saved Viewpoints", |ui| {
+                    crate::ui_theme::menu(ui);
+                    canvas_view_action = canvas_views_menu_contents(
+                        ui,
+                        &canvas_views,
+                        active_canvas_view,
+                        active_canvas_view_modified,
+                        &self.app_config.keyboard_shortcuts,
+                    );
+                });
+                if ui.button("Reset View").clicked() {
+                    self.canvas.exit_spotlight(&mut self.preview_manager);
+                    self.canvas.reset();
                     ui.close_menu();
                 }
                 if crate::ui_theme::shortcut_toggle(ui, &mut self.canvas.show_grid, "Show Grid",
@@ -3871,19 +3897,6 @@ impl PluriviewApp {
                     self.save_app_config();
                     ui.close_menu();
                 }
-                if ui
-                    .checkbox(
-                        &mut self.app_config.always_show_title_bar,
-                        "Always Show Top Bar",
-                    )
-                    .on_hover_text(
-                        "When off, the top bar hides until you move the mouse to the top of the window.",
-                    )
-                    .clicked()
-                {
-                    self.save_app_config();
-                    ui.close_menu();
-                }
                 if ui.button("Set Wallpaper...").clicked() {
                     self.canvas.pending_wallpaper_pick = true;
                     ui.close_menu();
@@ -3892,26 +3905,21 @@ impl PluriviewApp {
                     self.canvas.pending_wallpaper_clear = true;
                     ui.close_menu();
                 }
-                ui.separator();
-                ui.menu_button("Saved Viewpoints", |ui| {
-                    crate::ui_theme::menu(ui);
-                    canvas_view_action = canvas_views_menu_contents(
-                        ui,
-                        &canvas_views,
-                        active_canvas_view,
-                        active_canvas_view_modified,
-                        &self.app_config.keyboard_shortcuts,
-                    );
-                });
-                ui.separator();
-                if ui.button("Reset View").clicked() {
-                    self.canvas.exit_spotlight(&mut self.preview_manager);
-                    self.canvas.reset();
+            });
+
+            ui.menu_button("Tools", |ui| {
+                crate::ui_theme::menu(ui);
+                crate::ui_theme::section(ui, "SHARING");
+                if ui.button("Phone Viewer...").clicked() {
+                    self.remote_view.show_dialog = true;
                     ui.close_menu();
                 }
                 #[cfg(windows)]
+                self.stream_audio_menu(ui);
+                #[cfg(windows)]
                 {
                     ui.separator();
+                    crate::ui_theme::section(ui, "BROWSER TILES");
                     let mut enabled = self.browser.adblock_enabled();
                     let response = ui
                         .checkbox(&mut enabled, "Block Ads & Trackers (uBOL)")
@@ -3935,11 +3943,11 @@ impl PluriviewApp {
                             .weak(),
                     );
                     self.browser_maintenance_menu(ui);
-                    ui.separator();
-                    self.stream_audio_menu(ui);
                 }
                 ui.separator();
-                if crate::ui_theme::action(ui, egui_phosphor::regular::GEAR, "Settings...").clicked() {
+                if crate::ui_theme::action(ui, egui_phosphor::regular::GEAR, "Settings...")
+                    .clicked()
+                {
                     self.show_settings = true;
                     ui.close_menu();
                 }

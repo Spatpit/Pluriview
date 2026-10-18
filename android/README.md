@@ -1,7 +1,7 @@
 # Pluriview Viewer for Android
 
 Development preview of a **shared PC canvas camera**. Requires Android 8.0+
-and a running Windows Pluriview build with View → Phone Viewer. There is no
+and a running Windows Pluriview build with Tools → Phone Viewer. There is no
 cloud service or account. Use only trusted private Wi-Fi: the LAN transport is
 unencrypted. Version 0.3.11 fixes audio queue-full reconnects and retains
 the optional tile audio introduced in 0.3.9. Use the updated Windows 0.7.1 build

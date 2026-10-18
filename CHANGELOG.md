@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Reorganized the top bar. **View** now holds only panels and canvas display (Window Picker, Screenshots Panel, Always Show Top Bar, Saved Viewpoints, Reset View, Show Grid, Show Sound Badges, wallpaper), grouped under headings. A new **Tools** menu holds Phone Viewer, Stream Audio Monitor, the browser tile options (ad blocking, Restart Browser Tiles, Clear Browser Data) and Settings. Keyboard shortcuts are unchanged.
 - Phone Viewer requests are now signed with HMAC-SHA256 instead of sending the pairing token, and captured requests cannot be replayed. The QR/link works for one phone, expires after ten unused minutes, and can be replaced with **New pairing link**. Requires Android Viewer 0.3.12 together with this PC build.
 - Prepared local testing packages as v0.7.1.
 - Android audio can run alongside desktop Stream Audio Monitor. While monitoring is enabled, the phone captures Pluriview's application mix once, including the existing monitor output, without separately adding the original window sources or changing Discord/OBS routing. Switching monitoring modes reconnects phone audio automatically.
@@ -26,10 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Experimental Android companion viewer with opt-in LAN sharing, QR/link pairing, fullscreen viewing, and shared PC canvas pan/pinch-zoom. Phone commands cannot edit or interact with tiles. Fullscreen Fill/Fit preserves proportions and gesture mapping, with auto-hiding controls and cutout support. Continuous H.264 video uses a fixed 720p profile (1280×720 cap, 30 FPS / 4 Mbps targets), prefers PC hardware encoding, and retains software/JPEG fallbacks. Native Android decoding uses bounded buffering and fresh-stream recovery. Sharing is unencrypted and pauses for desktop dialogs or interactive browser mode; companion 0.3.9 adds optional tile audio.
 
 ### Fixed
-- Browser tiles now pick up WebView2 security updates without quitting Pluriview: when an update is installed, a notice appears and **View → Restart Browser Tiles** restarts every browser tile on the new engine, keeping addresses, mute state and positions.
+- Browser tiles now pick up WebView2 security updates without quitting Pluriview: when an update is installed, a notice appears and **Tools → Restart Browser Tiles** restarts every browser tile on the new engine, keeping addresses, mute state and positions.
 - Microsoft Defender SmartScreen phishing and malware warnings are back on in browser tiles (wry's default WebView2 arguments had turned them off).
 - A browser tile whose page crashes reloads it automatically, and every browser tile restarts once if the shared browser engine stops, instead of staying frozen.
-- Added **View → Clear Browser Data...** to sign out of every site and erase the shared browser profile's cookies, site data, history and cache.
+- Added **Tools → Clear Browser Data...** to sign out of every site and erase the shared browser profile's cookies, site data, history and cache.
 - Switching a tile group between layouts no longer shrinks it a little each time until the tiles become tiny.
 - Phone tile audio no longer cycles through "reconnecting" on ordinary Wi-Fi hiccups. The PC keeps the audio stream through video restarts and brief PC delays, and Android Viewer 0.3.13 skips audio that arrives too late instead of restarting, keeps audio playing while video briefly recovers, and uses a slightly larger jitter buffer. Pauses, source changes and disconnects still stop audio.
 - Android Viewer 0.3.11 fixes immediate audio queue-full reconnects on short packet bursts and prevents speaker writes from monopolizing the decoder loop. Retains bounded queues and deadlines, starts streaming playback without a fixed prefill count, and distinguishes stuck decoder input from speaker output. Added production audio-pump regression tests; the PC 0.7.1 build and Discord/OBS routing are unchanged.
