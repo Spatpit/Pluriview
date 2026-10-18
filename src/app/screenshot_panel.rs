@@ -8,7 +8,8 @@ use std::time::SystemTime;
 const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 const THUMBNAIL_DECODE_SIDE: u32 = 320;
 const MAX_THUMBNAILS_IN_FLIGHT: usize = 4;
-const MAX_CACHED_THUMBNAILS: usize = 240;
+/// Thumbnails kept while the panel is open (about 230 KB of GPU memory each).
+const MAX_CACHED_THUMBNAILS: usize = 120;
 const FRESH_SECS: f32 = 1.4;
 const CARD_GAP: f32 = 8.0;
 const ROW_HEIGHT: f32 = 30.0;
@@ -373,6 +374,24 @@ impl PanelState {
         }
     }
 
+    /// Free everything the panel holds while it is hidden: thumbnail
+    /// textures, the folder listing, and the decode worker thread. Reopening
+    /// rescans and decodes only the cards in view.
+    fn release(&mut self) {
+        if self.folders.is_empty()
+            && self.thumbnails.is_empty()
+            && self.worker.is_none()
+            && self.scan.is_none()
+        {
+            return;
+        }
+        let collapsed = std::mem::take(&mut self.collapsed);
+        *self = Self {
+            collapsed,
+            ..Self::default()
+        };
+    }
+
     fn start_edit(&mut self, rename: Option<String>, then_move: Vec<PathBuf>) {
         if let Some(name) = &rename {
             self.collapsed.remove(&Some(name.clone()));
@@ -478,6 +497,7 @@ impl PluriviewApp {
     pub(super) fn screenshots_panel_ui(&mut self, ctx: &egui::Context) {
         self.screenshots.panel.landing_rect = None;
         if !self.app_config.screenshots_panel_open || self.canvas_only {
+            self.screenshots.panel.release();
             return;
         }
         let Some(root) = self.screenshots_dir() else {
@@ -1466,6 +1486,27 @@ fn drag_ghost(ctx: &egui::Context, panel: &PanelState, payload: &ShotDrag) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hiding_the_panel_releases_its_caches_but_keeps_collapsed_folders() {
+        let mut panel = PanelState::default();
+        panel.folders.push(ScreenshotFolder {
+            name: None,
+            shots: Vec::new(),
+        });
+        panel
+            .thumbnails
+            .insert(PathBuf::from("a.png"), Thumbnail::Loading);
+        panel.in_flight = 1;
+        panel.collapsed.insert(Some("Trips".to_owned()));
+        panel.selection.paths.insert(PathBuf::from("a.png"));
+        panel.release();
+        assert!(panel.folders.is_empty());
+        assert!(panel.thumbnails.is_empty());
+        assert_eq!(panel.in_flight, 0);
+        assert!(panel.selection.paths.is_empty());
+        assert!(panel.collapsed.contains(&Some("Trips".to_owned())));
+    }
 
     fn paths() -> Vec<PathBuf> {
         ["a", "b", "c", "d", "e"]

@@ -267,12 +267,16 @@ impl PluriviewApp {
         }
 
         let panel = &mut self.screenshots.panel;
+        // A hidden panel caches nothing; it rescans when it opens.
+        let panel_shown = self.app_config.screenshots_panel_open && !self.canvas_only;
         self.screenshots
             .saving
             .retain(|shot| match shot.receiver.try_recv() {
                 Ok(Ok(path)) => {
                     log::info!("Saved a tile screenshot");
-                    panel.add_saved_shot(path, shot.thumbnail.clone());
+                    if panel_shown {
+                        panel.add_saved_shot(path, shot.thumbnail.clone());
+                    }
                     false
                 }
                 Ok(Err(error)) => {
