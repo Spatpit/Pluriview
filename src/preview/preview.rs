@@ -375,6 +375,9 @@ pub struct Preview {
 
     /// Decoded frames for a managed image. A single frame is a static image.
     media_frames: Vec<MediaFrame>,
+    /// A still image drops its decoded pixels once they are on the GPU; the
+    /// texture is what the tile shows, and the file is reread when needed.
+    media_pixels_released: bool,
     media_frame_index: usize,
     media_frame_dirty: bool,
     media_frame_started: Instant,
@@ -448,6 +451,7 @@ impl Preview {
             seek_preview_texture: None,
             seek_preview_frame: None,
             media_frames: Vec::new(),
+            media_pixels_released: false,
             media_frame_index: 0,
             media_frame_dirty: false,
             media_frame_started: Instant::now(),
@@ -593,6 +597,7 @@ impl Preview {
         self.clear_capture_error();
         self.media_path = Some(path);
         self.media_frames = frames;
+        self.media_pixels_released = false;
         self.media_frame_index = 0;
         self.media_frame_dirty = true;
         self.media_frame_started = Instant::now();
@@ -730,9 +735,17 @@ impl Preview {
         self.screenshot_native_frame = None;
     }
 
-    /// Current decoded image/GIF frame as straight-alpha RGBA.
+    /// Current decoded image/GIF frame as straight-alpha RGBA. `None` for a
+    /// still image whose pixels were released after upload; see
+    /// `media_pixels_released`.
     pub fn current_media_frame(&self) -> Option<&MediaFrame> {
         self.media_frames.get(self.media_frame_index)
+    }
+
+    /// The still image is shown from its GPU texture only; read the file to
+    /// get its pixels again.
+    pub fn media_pixels_released(&self) -> bool {
+        self.media_pixels_released
     }
 
     /// Get UV coordinates for rendering (either crop region or full frame)
@@ -752,12 +765,19 @@ impl Preview {
         // image directly from that slice instead of cloning a second buffer.
         let media_image = if self.media_frame_dirty {
             self.media_frame_dirty = false;
-            self.media_frames.get(self.media_frame_index).map(|frame| {
+            let image = self.media_frames.get(self.media_frame_index).map(|frame| {
                 egui::ColorImage::from_rgba_unmultiplied(
                     [frame.width as usize, frame.height as usize],
                     &frame.rgba,
                 )
-            })
+            });
+            // A still image never uploads again, so its decoded copy would
+            // only double its memory. GIF frames stay for animation.
+            if image.is_some() && self.media_frames.len() == 1 {
+                self.media_frames = Vec::new();
+                self.media_pixels_released = true;
+            }
+            image
         } else {
             None
         };
@@ -1217,6 +1237,47 @@ mod tests {
         assert!(preview.get_texture(&context).is_some());
         assert!(!preview.media_frame_dirty);
         assert!(preview.frame_buffer.is_none());
+    }
+
+    #[test]
+    fn still_images_release_decoded_pixels_after_upload_but_gifs_keep_them() {
+        let ctx = eframe::egui::Context::default();
+        let frame = |duration_ms| MediaFrame {
+            width: 2,
+            height: 1,
+            rgba: vec![255; 8],
+            duration: std::time::Duration::from_millis(duration_ms),
+        };
+        let mut still = Preview::new(
+            PreviewId(1),
+            "still".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(10.0),
+        );
+        still.set_media(PathBuf::from("still.png"), vec![frame(0)]);
+        assert!(still.current_media_frame().is_some());
+        assert!(still.get_texture(&ctx).is_some());
+        assert!(still.current_media_frame().is_none());
+        assert!(still.media_pixels_released());
+        assert_eq!(still.frame_size, Some((2, 1)));
+        // The texture remains after the pixels are gone.
+        assert!(still.get_texture(&ctx).is_some());
+
+        let mut gif = Preview::new(
+            PreviewId(2),
+            "gif".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(10.0),
+        );
+        gif.set_media(PathBuf::from("anim.gif"), vec![frame(100), frame(100)]);
+        assert!(gif.get_texture(&ctx).is_some());
+        assert!(gif.current_media_frame().is_some());
+        assert!(!gif.media_pixels_released());
+
+        // Replacing the source decodes again and starts with pixels.
+        still.set_media(PathBuf::from("other.png"), vec![frame(0)]);
+        assert!(!still.media_pixels_released());
+        assert!(still.current_media_frame().is_some());
     }
 
     #[test]

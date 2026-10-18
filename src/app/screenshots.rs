@@ -45,6 +45,8 @@ struct PendingShot {
 }
 
 enum PendingSource {
+    /// Rereading a still image whose decoded pixels were released.
+    ImageFile(mpsc::Receiver<Option<ScreenshotImage>>),
     /// Waiting for a live capture to deliver one frame at its full size.
     NativeFrame {
         fallback: Option<Arc<egui::ColorImage>>,
@@ -63,6 +65,21 @@ enum ShotStart {
     Ready(CapturedPixels),
     Pending(PendingSource),
     Unavailable(&'static str),
+}
+
+/// Decode a still image's file again on a worker thread.
+fn reread_image(path: PathBuf) -> mpsc::Receiver<Option<ScreenshotImage>> {
+    let (sender, receiver) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("pluriview-screenshot-reread".to_owned())
+        .spawn(move || {
+            let image = crate::media::load(&path).ok().and_then(|asset| {
+                let frame = asset.frames.into_iter().next()?;
+                ScreenshotImage::from_straight_rgba(frame.width, frame.height, frame.rgba)
+            });
+            let _ = sender.send(image);
+        });
+    receiver
 }
 
 fn ease_in_out_cubic(t: f32) -> f32 {
@@ -158,11 +175,16 @@ impl PluriviewApp {
             return ShotStart::Unavailable("Playlist tiles can't be captured.");
         }
         if preview.is_media() {
-            return match preview.current_media_frame().and_then(|frame| {
+            if let Some(image) = preview.current_media_frame().and_then(|frame| {
                 ScreenshotImage::from_straight_rgba(frame.width, frame.height, frame.rgba.clone())
             }) {
-                Some(image) => ShotStart::Ready(CapturedPixels::Straight(image)),
-                None => ShotStart::Unavailable("This image is still loading."),
+                return ShotStart::Ready(CapturedPixels::Straight(image));
+            }
+            return match preview.media_path.clone() {
+                Some(path) if preview.media_pixels_released() => {
+                    ShotStart::Pending(PendingSource::ImageFile(reread_image(path)))
+                }
+                _ => ShotStart::Unavailable("This image is still loading."),
             };
         }
         if preview.is_inactive_window() {
@@ -216,6 +238,11 @@ impl PluriviewApp {
             let preview = self.preview_manager.get_mut(shot.id);
             let outcome: Option<Option<CapturedPixels>> = match (&mut shot.source, preview) {
                 (_, None) => Some(None),
+                (PendingSource::ImageFile(receiver), Some(_)) => match receiver.try_recv() {
+                    Ok(image) => Some(image.map(CapturedPixels::Straight)),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                },
                 (PendingSource::NativeFrame { fallback }, Some(preview)) => {
                     if let Some(frame) = preview.take_screenshot_native_frame() {
                         Some(Some(CapturedPixels::Premultiplied(frame)))
