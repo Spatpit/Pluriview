@@ -429,13 +429,21 @@ The **Screenshots panel** on the right lists them newest first. Open it with
 the gallery button next to the camera, **View → Screenshots Panel**, or `S`.
 Each new screenshot flies into the folder it is saved to.
 
-- Use the folder button at the top of the panel to create a folder. New
+- Use the folder button at the top of the panel to create a folder; type its
+  name in the row that appears and press `Enter` (`Esc` cancels). New
   screenshots go to the folder chosen under **Save new shots to**; creating a
   folder selects it.
-- Drag a screenshot onto another folder to move it, or right-click it for
+- Click a screenshot to select it, `Ctrl`+click to add or remove one, and
+  `Shift`+click to select a range. Selected screenshots get a gold outline and
+  check mark, and a bar above the list shows how many are selected, with
+  buttons to move them to a folder, move them to the Recycle Bin, or clear the
+  selection. Clicking empty space in the panel also clears it.
+- Drag screenshots onto another folder to move them, or right-click for
   **Move to**, **Open**, **Show in Explorer**, and **Move to Recycle Bin**.
-- Right-click a folder to rename it, save new screenshots there, or open it in
-  Explorer. Click a folder's header to collapse or expand it.
+  Double-click opens a screenshot.
+- Right-click a folder to rename it in place, select everything in it, save new
+  screenshots there, or open it in Explorer. Click a folder's header to
+  collapse or expand it.
 - Folders made in Explorer inside the `screenshots` folder appear in the panel
   too; folders inside folders are not shown. A frozen
 window or browser tile can be captured while it stays selected after freezing;
