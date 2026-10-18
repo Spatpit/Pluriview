@@ -58,6 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
 mod media_sources;
+mod screenshot_panel;
 mod screenshots;
 mod settings;
 mod source_loading;
@@ -3795,6 +3796,13 @@ impl PluriviewApp {
                 {
                     ui.close_menu();
                 }
+                let mut screenshots_open = self.app_config.screenshots_panel_open;
+                if crate::ui_theme::shortcut_toggle(ui, &mut screenshots_open, "Screenshots Panel",
+                    self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleScreenshotsPanel)).clicked()
+                {
+                    self.set_screenshots_panel_open(screenshots_open);
+                    ui.close_menu();
+                }
                 if crate::ui_theme::shortcut_toggle(ui, &mut self.canvas.show_grid, "Show Grid",
                     self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleGrid)).clicked()
                 {
@@ -5520,6 +5528,9 @@ impl eframe::App for PluriviewApp {
         if shortcut_presses.pressed(HotkeySlot::ScreenshotTile) {
             self.request_tile_screenshots(ctx);
         }
+        if shortcut_presses.pressed(HotkeySlot::ToggleScreenshotsPanel) {
+            self.set_screenshots_panel_open(!self.app_config.screenshots_panel_open);
+        }
         let numbered_canvas_view = HotkeySlot::CANVAS_VIEWS
             .iter()
             .position(|slot| shortcut_presses.pressed(*slot));
@@ -5636,6 +5647,9 @@ impl eframe::App for PluriviewApp {
                     );
                 });
         }
+
+        // Right-side panel: before the central canvas claims the remaining space.
+        self.screenshots_panel_ui(ctx);
 
         // Minimal Void: No status bar - floating indicator is drawn in the canvas
 
@@ -6174,6 +6188,18 @@ impl eframe::App for PluriviewApp {
                                     self.app_config
                                         .keyboard_shortcuts
                                         .get(HotkeySlot::ScreenshotTile)
+                                        .display(),
+                                )
+                                .weak(),
+                            );
+                            ui.end_row();
+
+                            ui.label("Toggle Screenshots panel");
+                            ui.label(
+                                egui::RichText::new(
+                                    self.app_config
+                                        .keyboard_shortcuts
+                                        .get(HotkeySlot::ToggleScreenshotsPanel)
                                         .display(),
                                 )
                                 .weak(),

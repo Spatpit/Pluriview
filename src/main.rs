@@ -18,6 +18,7 @@ mod preview;
 mod privacy;
 mod remote_view;
 mod screenshot;
+mod screenshot_library;
 #[cfg(windows)]
 mod source_dialog;
 mod spout;

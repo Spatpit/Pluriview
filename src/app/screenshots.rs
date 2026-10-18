@@ -18,13 +18,21 @@ const LANDED_SIDE: f32 = 26.0;
 #[derive(Default)]
 pub(super) struct ScreenshotState {
     pending: Vec<PendingShot>,
-    saving: Vec<mpsc::Receiver<Result<PathBuf, String>>>,
+    saving: Vec<SavingShot>,
     flashes: Vec<(egui::Rect, Instant)>,
     flights: Vec<Flight>,
     /// Where the Capture button was drawn this frame; flights land there.
     pub(super) button_rect: Option<egui::Rect>,
-    pulse: Option<Instant>,
+    /// Where the last flight landed, pulsing briefly.
+    pulse: Option<(Instant, egui::Rect)>,
     next_thumbnail: u64,
+    pub(super) panel: super::screenshot_panel::PanelState,
+}
+
+struct SavingShot {
+    receiver: mpsc::Receiver<Result<PathBuf, String>>,
+    /// Reused as the panel thumbnail once the file exists.
+    thumbnail: Option<egui::TextureHandle>,
 }
 
 struct PendingShot {
@@ -257,11 +265,13 @@ impl PluriviewApp {
             }
         }
 
+        let panel = &mut self.screenshots.panel;
         self.screenshots
             .saving
-            .retain(|receiver| match receiver.try_recv() {
-                Ok(Ok(_)) => {
+            .retain(|shot| match shot.receiver.try_recv() {
+                Ok(Ok(path)) => {
                     log::info!("Saved a tile screenshot");
+                    panel.add_saved_shot(path, shot.thumbnail.clone());
                     false
                 }
                 Ok(Err(error)) => {
@@ -286,10 +296,11 @@ impl PluriviewApp {
         pixels: CapturedPixels,
         ctx: &egui::Context,
     ) {
-        let Some(directory) = self.screenshots_dir() else {
+        let Some(directory) = self.screenshot_save_dir() else {
             return;
         };
         let thumbnail = pixels.thumbnail(crop_uv, THUMBNAIL_SIDE);
+        let mut saved_thumbnail = None;
         let from = self.canvas.tile_screen_rect(id, &self.preview_manager);
         if let (Some(thumbnail), Some(from)) = (thumbnail, from) {
             self.screenshots.next_thumbnail += 1;
@@ -302,15 +313,17 @@ impl PluriviewApp {
             let [width, height] = texture.size().map(|value| value as f32);
             let fit = (from.width() / width).min(from.height() / height);
             let from = egui::Rect::from_center_size(from.center(), egui::vec2(width, height) * fit);
+            saved_thumbnail = Some(texture.clone());
             self.screenshots.flights.push(Flight {
                 from,
                 texture,
                 started: Instant::now(),
             });
         }
-        self.screenshots
-            .saving
-            .push(screenshot::spawn_save(directory, stem, pixels, crop_uv));
+        self.screenshots.saving.push(SavingShot {
+            receiver: screenshot::spawn_save(directory, stem, pixels, crop_uv),
+            thumbnail: saved_thumbnail,
+        });
         ctx.request_repaint();
     }
 
@@ -342,6 +355,29 @@ impl PluriviewApp {
         if camera.clicked() {
             self.request_tile_screenshots(ctx);
         }
+        let panel_shortcut = self
+            .app_config
+            .keyboard_shortcuts
+            .get(HotkeySlot::ToggleScreenshotsPanel);
+        let panel_open = self.app_config.screenshots_panel_open;
+        let gallery = ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new(egui_phosphor::regular::IMAGES)
+                        .size(16.0)
+                        .color(if panel_open {
+                            crate::ui_theme::GOLD
+                        } else {
+                            crate::ui_theme::TEXT
+                        }),
+                )
+                .frame(false)
+                .min_size(egui::vec2(30.0, 26.0)),
+            )
+            .on_hover_text(format!("Screenshots panel ({})", panel_shortcut.display()));
+        if gallery.clicked() {
+            self.set_screenshots_panel_open(!panel_open);
+        }
         ui.menu_button("Capture", |ui| {
             crate::ui_theme::menu(ui);
             crate::ui_theme::section(ui, "SCREENSHOTS");
@@ -356,6 +392,18 @@ impl PluriviewApp {
                 .clicked()
             {
                 self.request_tile_screenshots(ctx);
+                ui.close_menu();
+            }
+            let mut panel_open = self.app_config.screenshots_panel_open;
+            if crate::ui_theme::shortcut_toggle(
+                ui,
+                &mut panel_open,
+                "Screenshots Panel",
+                panel_shortcut,
+            )
+            .clicked()
+            {
+                self.set_screenshots_panel_open(panel_open);
                 ui.close_menu();
             }
             if crate::ui_theme::action(
@@ -396,8 +444,8 @@ impl PluriviewApp {
         }
     }
 
-    /// Camera flash on the tile, then a thumbnail that arcs into the
-    /// Capture button, which pulses as it lands.
+    /// Camera flash on the tile, then a thumbnail that arcs into its folder in
+    /// the Screenshots panel (or the camera button), which pulses as it lands.
     pub(super) fn screenshot_animation_ui(&mut self, ctx: &egui::Context) {
         let state = &mut self.screenshots;
         state
@@ -418,8 +466,9 @@ impl PluriviewApp {
         }
 
         let screen = ctx.screen_rect();
-        let target = state
-            .button_rect
+        // The open panel's save folder first, else the camera button.
+        let landing = state.panel.landing_rect.or(state.button_rect);
+        let target = landing
             .map(|rect| rect.center())
             .unwrap_or_else(|| egui::pos2(screen.center().x, screen.top() + 12.0));
         let mut landed = false;
@@ -452,21 +501,30 @@ impl PluriviewApp {
             );
             true
         });
-        if landed {
-            state.pulse = Some(Instant::now());
+        if let (true, Some(rect)) = (landed, landing) {
+            state.pulse = Some((Instant::now(), rect));
         }
 
-        if let Some(started) = state.pulse {
+        if let Some((started, rect)) = state.pulse {
             let t = started.elapsed().as_secs_f32() / PULSE_SECS;
             if t >= 1.0 {
                 state.pulse = None;
-            } else if let Some(rect) = state.button_rect {
+            } else {
                 let alpha = (1.0 - t).powi(2);
-                painter.circle_stroke(
-                    rect.center(),
-                    10.0 + 10.0 * t,
-                    egui::Stroke::new(2.0, crate::ui_theme::GOLD.gamma_multiply(alpha)),
-                );
+                // A ring for the small camera button, a glow for a folder row.
+                if rect.width() > 60.0 {
+                    painter.rect_stroke(
+                        rect.expand(3.0 * t),
+                        8.0,
+                        egui::Stroke::new(2.0, crate::ui_theme::GOLD.gamma_multiply(alpha)),
+                    );
+                } else {
+                    painter.circle_stroke(
+                        rect.center(),
+                        10.0 + 10.0 * t,
+                        egui::Stroke::new(2.0, crate::ui_theme::GOLD.gamma_multiply(alpha)),
+                    );
+                }
             }
         }
         ctx.request_repaint();

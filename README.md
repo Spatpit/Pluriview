@@ -423,7 +423,21 @@ size (up to 4K), images and GIFs use their original pixels, and videos use the
 frame as currently rendered, so focusing a video first gives a sharper shot.
 
 Screenshots are saved in the `screenshots` folder inside Pluriview's data
-folder. Choose **Capture → Open Screenshots Folder** to see them. A frozen
+folder. Choose **Capture → Open Screenshots Folder** to see them in Explorer.
+
+The **Screenshots panel** on the right lists them newest first. Open it with
+the gallery button next to the camera, **View → Screenshots Panel**, or `S`.
+Each new screenshot flies into the folder it is saved to.
+
+- Use the folder button at the top of the panel to create a folder. New
+  screenshots go to the folder chosen under **Save new shots to**; creating a
+  folder selects it.
+- Drag a screenshot onto another folder to move it, or right-click it for
+  **Move to**, **Open**, **Show in Explorer**, and **Move to Recycle Bin**.
+- Right-click a folder to rename it, save new screenshots there, or open it in
+  Explorer. Click a folder's header to collapse or expand it.
+- Folders made in Explorer inside the `screenshots` folder appear in the panel
+  too; folders inside folders are not shown. A frozen
 window or browser tile can be captured while it stays selected after freezing;
 otherwise resume it first. Playlist tiles cannot be captured.
 
@@ -471,6 +485,7 @@ your installation still uses `Numpad 2`.
 | Undo the latest tile deletion | `Ctrl+Z` |
 | Focus current tile | `F` |
 | Screenshot selected or focused tile | `Shift+S` |
+| Show/hide Screenshots panel | `S` |
 | Group / ungroup selected tiles | `Ctrl+G` / `Ctrl+U` |
 | One / two / three large tiles / equal tiles | `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
 | Medium / large selection size | `Alt+6` / `Alt+7` |

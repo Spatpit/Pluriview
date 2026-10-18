@@ -75,6 +75,7 @@ pub enum HotkeySlot {
     SizeMedium,
     SizeLarge,
     ScreenshotTile,
+    ToggleScreenshotsPanel,
 }
 
 impl HotkeySlot {
@@ -90,7 +91,7 @@ impl HotkeySlot {
         Self::CanvasView9,
     ];
 
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
@@ -125,6 +126,7 @@ impl HotkeySlot {
         Self::SizeMedium,
         Self::SizeLarge,
         Self::ScreenshotTile,
+        Self::ToggleScreenshotsPanel,
     ];
 
     pub fn label(self) -> &'static str {
@@ -163,6 +165,7 @@ impl HotkeySlot {
             Self::SizeMedium => "Medium group size",
             Self::SizeLarge => "Large group size",
             Self::ScreenshotTile => "Screenshot selected tile",
+            Self::ToggleScreenshotsPanel => "Toggle Screenshots panel",
         }
     }
 }
@@ -204,6 +207,7 @@ pub struct HotkeyBindings {
     pub size_medium: Hotkey,
     pub size_large: Hotkey,
     pub screenshot_tile: Hotkey,
+    pub toggle_screenshots_panel: Hotkey,
 }
 
 impl Default for HotkeyBindings {
@@ -243,6 +247,7 @@ impl Default for HotkeyBindings {
             size_medium: Hotkey::pair(0x12, 0x36),
             size_large: Hotkey::pair(0x12, 0x37),
             screenshot_tile: Hotkey::pair(0x10, 0x53), // Shift+S
+            toggle_screenshots_panel: Hotkey::key(0x53), // S
         }
     }
 }
@@ -284,6 +289,7 @@ impl HotkeyBindings {
             HotkeySlot::SizeMedium => self.size_medium,
             HotkeySlot::SizeLarge => self.size_large,
             HotkeySlot::ScreenshotTile => self.screenshot_tile,
+            HotkeySlot::ToggleScreenshotsPanel => self.toggle_screenshots_panel,
         }
     }
 
@@ -323,6 +329,7 @@ impl HotkeyBindings {
             HotkeySlot::SizeMedium => self.size_medium = hotkey,
             HotkeySlot::SizeLarge => self.size_large = hotkey,
             HotkeySlot::ScreenshotTile => self.screenshot_tile = hotkey,
+            HotkeySlot::ToggleScreenshotsPanel => self.toggle_screenshots_panel = hotkey,
         }
     }
 
@@ -759,6 +766,10 @@ mod tests {
         assert_eq!(
             restored.get(HotkeySlot::ScreenshotTile).display(),
             "Shift+S"
+        );
+        assert_eq!(
+            restored.get(HotkeySlot::ToggleScreenshotsPanel).display(),
+            "S"
         );
         assert_eq!(
             restored.conflict(HotkeySlot::ScreenshotTile, restored.screenshot_tile),

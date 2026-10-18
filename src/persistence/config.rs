@@ -18,6 +18,11 @@ pub struct AppConfig {
     pub always_on_top: bool,
     /// App-global, user-editable keyboard bindings. Mouse gestures are fixed.
     pub keyboard_shortcuts: HotkeyBindings,
+    /// The right-side Screenshots panel is shown.
+    pub screenshots_panel_open: bool,
+    /// Folder inside the screenshots data folder that receives new
+    /// screenshots; `None` saves them at its top level. Validated on use.
+    pub screenshot_folder: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -28,6 +33,8 @@ impl Default for AppConfig {
             always_show_title_bar: true,
             always_on_top: false,
             keyboard_shortcuts: HotkeyBindings::default(),
+            screenshots_panel_open: false,
+            screenshot_folder: None,
         }
     }
 }
@@ -53,6 +60,8 @@ mod tests {
         assert!(!config.always_on_top);
         assert!(config.external_tools.streamlink_path.is_none());
         assert_eq!(config.keyboard_shortcuts, HotkeyBindings::default());
+        assert!(!config.screenshots_panel_open);
+        assert!(config.screenshot_folder.is_none());
     }
 
     #[test]
