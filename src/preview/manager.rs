@@ -32,6 +32,7 @@ pub struct RemovedPreviewInfo {
     pub browser_url: Option<String>,
     /// Reapplied when undo recreates the browser tile.
     pub browser_muted: bool,
+    pub browser_page_zoom: f32,
     /// Reapplied when undo recreates a window-capture tile.
     pub stream_audio: bool,
     /// Set when this tile receives a Spout2 sender.
@@ -298,6 +299,7 @@ impl PreviewManager {
                         crop_uv: preview.crop_uv,
                         browser_url: preview.browser_url,
                         browser_muted: preview.browser_muted,
+                        browser_page_zoom: preview.browser_page_zoom,
                         stream_audio: preview.stream_audio,
                         spout_sender: preview.spout_sender,
                         viewport_pin: preview.viewport_pin,

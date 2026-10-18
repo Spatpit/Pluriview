@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, TryRecvError},
         Arc, OnceLock,
     },
@@ -17,23 +17,31 @@ use std::{
 use eframe::egui;
 use parking_lot::Mutex;
 use webview2_com::{
-    take_pwstr, BrowserExtensionEnableCompletedHandler,
+    take_pwstr, BrowserExtensionEnableCompletedHandler, ClearBrowsingDataCompletedHandler,
+    IsDocumentPlayingAudioChangedEventHandler,
     Microsoft::Web::WebView2::Win32::{
         ICoreWebView2BrowserExtension, ICoreWebView2PermissionRequestedEventArgs3,
-        ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_3, ICoreWebView2_8,
-        COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
-        COREWEBVIEW2_PERMISSION_STATE_DENY,
+        ICoreWebView2Profile2, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_3,
+        ICoreWebView2_8, COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
+        COREWEBVIEW2_PERMISSION_STATE_DENY, COREWEBVIEW2_PROCESS_FAILED_KIND,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE,
     },
-    PermissionRequestedEventHandler, ProfileAddBrowserExtensionCompletedHandler,
+    NewBrowserVersionAvailableEventHandler, PermissionRequestedEventHandler,
+    ProcessFailedEventHandler, ProfileAddBrowserExtensionCompletedHandler,
     ProfileGetBrowserExtensionsCompletedHandler, TrySuspendCompletedHandler,
 };
 use webview2_core::{Interface, HSTRING as WebViewHString, PWSTR as WebViewPWSTR};
 use windows::{
     core::w,
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WPARAM},
         Graphics::Gdi::ClientToScreen,
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+        },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindowLongW,
             IsChild, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, GWL_EXSTYLE,
@@ -73,6 +81,95 @@ const MAX_CAPTURE_HEIGHT: i32 = 2160;
 /// Give WebView2's compositor time to apply a new viewport and zoom before
 /// the native host replaces the frozen captured preview onscreen.
 const INTERACTION_PREP_DELAY: Duration = Duration::from_millis(80);
+
+/// wry's default WebView2 arguments also disable `msSmartScreenProtection`,
+/// which turns off Microsoft Defender SmartScreen's phishing and malware site
+/// warnings. Browser tiles open arbitrary websites, so keep only wry's other
+/// two (Edge's text-selection mini menu and PDF mini menu). All tiles share
+/// one WebView2 environment, so every builder must pass this same string.
+const BROWSER_ARGUMENTS: &str = "--disable-features=msWebOOUI,msPdfOOUI";
+
+/// Page zoom limits offered per tile, before the tile-size zoom is applied.
+pub const MIN_PAGE_ZOOM: f32 = 0.5;
+pub const MAX_PAGE_ZOOM: f32 = 3.0;
+/// The zoom steps browsers use, so - and + feel familiar.
+const PAGE_ZOOM_STEPS: [f32; 13] = [
+    0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
+];
+
+/// The next page zoom step above (`zoom_in`) or below the current zoom.
+pub fn step_page_zoom(current: f32, zoom_in: bool) -> f32 {
+    const EPSILON: f32 = 0.005;
+    if zoom_in {
+        PAGE_ZOOM_STEPS
+            .into_iter()
+            .find(|step| *step > current + EPSILON)
+            .unwrap_or(MAX_PAGE_ZOOM)
+    } else {
+        PAGE_ZOOM_STEPS
+            .into_iter()
+            .rev()
+            .find(|step| *step < current - EPSILON)
+            .unwrap_or(MIN_PAGE_ZOOM)
+    }
+}
+
+/// Scroll the innermost scrollable element under a normalized page point,
+/// falling back to the page itself, as a mouse wheel over that point would.
+/// Arguments: horizontal and vertical position (0..1) and CSS pixels.
+const SCROLL_PAGE_SCRIPT: &str = r#"
+((u, v, dy) => {
+    let element = document.elementFromPoint(u * innerWidth, v * innerHeight);
+    while (element && element !== document.body && element !== document.documentElement) {
+        const overflow = getComputedStyle(element).overflowY;
+        if (/(auto|scroll|overlay)/.test(overflow) && element.scrollHeight > element.clientHeight + 1) {
+            const before = element.scrollTop;
+            element.scrollBy({ top: dy, behavior: "instant" });
+            if (element.scrollTop !== before) return;
+        }
+        element = element.parentElement;
+    }
+    window.scrollBy({ top: dy, behavior: "instant" });
+})"#;
+
+/// The largest visible video's picture as normalized viewport coordinates
+/// `[left, top, right, bottom]`, excluding the letterbox bars a video element
+/// adds by default, or null when no video covers at least 1% of the page.
+const FIND_VIDEO_SCRIPT: &str = r#"
+(() => {
+    const width = innerWidth, height = innerHeight;
+    let best = null, bestArea = 0;
+    for (const video of document.querySelectorAll("video")) {
+        const box = video.getBoundingClientRect();
+        if (box.width < 2 || box.height < 2) continue;
+        let left = box.left, top = box.top, w = box.width, h = box.height;
+        const fit = getComputedStyle(video).objectFit;
+        if (video.videoWidth && video.videoHeight && fit !== "fill" && fit !== "cover") {
+            const scale = Math.min(w / video.videoWidth, h / video.videoHeight);
+            const pictureWidth = video.videoWidth * scale, pictureHeight = video.videoHeight * scale;
+            left += (w - pictureWidth) / 2;
+            top += (h - pictureHeight) / 2;
+            w = pictureWidth;
+            h = pictureHeight;
+        }
+        const l = Math.max(0, left), t = Math.max(0, top);
+        const r = Math.min(width, left + w), b = Math.min(height, top + h);
+        const area = Math.max(0, r - l) * Math.max(0, b - t);
+        if (area > bestArea) {
+            bestArea = area;
+            best = [l / width, t / height, r / width, b / height];
+        }
+    }
+    return bestArea >= width * height * 0.01 ? best : null;
+})()
+"#;
+
+/// A page that crashes again this soon after being reloaded is left alone
+/// rather than reloaded in a loop; the tile menu's Reload still works.
+const CRASH_RELOAD_COOLDOWN: Duration = Duration::from_secs(60);
+/// Upper bound on waiting for the old WebView2 browser process to exit
+/// before restarted tiles create a new one.
+const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const UBOL_VERSION: &str = "2026.714.1952";
 const UBOL_ARCHIVE: &[u8] =
@@ -315,7 +412,157 @@ struct SharedState {
     pending_navigation: Option<String>,
     /// A download was refused since the last poll.
     download_blocked: bool,
+    /// The page's renderer process exited or stopped responding.
+    page_crashed: bool,
+    /// Whether the page is producing sound, reported by WebView2.
+    playing_audio: bool,
+    /// A finished Fit to Video lookup (see [`FIND_VIDEO_SCRIPT`]).
+    video_rect: Option<Option<(f32, f32, f32, f32)>>,
     dirty: bool,
+}
+
+fn parse_video_rect(json: &str) -> Option<(f32, f32, f32, f32)> {
+    let [left, top, right, bottom] = serde_json::from_str::<Option<[f32; 4]>>(json).ok()??;
+    let valid = [left, top, right, bottom]
+        .iter()
+        .all(|value| (0.0..=1.0).contains(value))
+        && right - left > 0.01
+        && bottom - top > 0.01;
+    valid.then_some((left, top, right, bottom))
+}
+
+fn register_audio_handler(
+    webview: &WebView,
+    shared: Arc<Mutex<SharedState>>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let core8: ICoreWebView2_8 = core.cast().map_err(|e| e.to_string())?;
+    let handler = IsDocumentPlayingAudioChangedEventHandler::create(Box::new(move |sender, _| {
+        let Some(sender) = sender else {
+            return Ok(());
+        };
+        let mut playing = Default::default();
+        unsafe {
+            sender
+                .cast::<ICoreWebView2_8>()?
+                .IsDocumentPlayingAudio(&mut playing)?
+        };
+        let mut state = shared.lock();
+        state.playing_audio = playing.as_bool();
+        state.dirty = true;
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe { core8.add_IsDocumentPlayingAudioChanged(&handler, &mut token) }
+        .map_err(|e| e.to_string())
+}
+
+/// Engine-wide WebView2 events, shared by every host's handlers.
+#[derive(Clone, Default)]
+struct EngineSignals {
+    /// A newer WebView2 Runtime (usually a security update) was installed.
+    /// Running tiles keep the old engine until every WebView is released.
+    update_ready: Arc<AtomicBool>,
+    /// The shared browser process exited, taking every tile's page with it.
+    lost: Arc<AtomicBool>,
+}
+
+/// Unread state a page advertises in its title, as Discord, YouTube, Gmail
+/// and most chat sites do ("(3) Discord", "• Discord", "Inbox (12) - ...").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnreadIndicator {
+    Count(u32),
+    /// Something is unread, without a number.
+    Dot,
+}
+
+pub fn unread_indicator(title: &str) -> Option<UnreadIndicator> {
+    let title = title.trim_start();
+    if let Some(count) = title.strip_prefix('(').and_then(parenthesized_count) {
+        return Some(UnreadIndicator::Count(count));
+    }
+    if title.starts_with('\u{2022}') || title.starts_with('\u{25CF}') {
+        return Some(UnreadIndicator::Dot);
+    }
+    let inbox = title.find("Inbox (")?;
+    parenthesized_count(&title[inbox + "Inbox (".len()..]).map(UnreadIndicator::Count)
+}
+
+/// The positive count in `12)`, `99+)` or `1,234)`.
+fn parenthesized_count(text: &str) -> Option<u32> {
+    let inner = &text[..text.find(')')?];
+    let digits: String = inner
+        .trim()
+        .trim_end_matches('+')
+        .chars()
+        .filter(|character| *character != ',')
+        .collect();
+    if digits.is_empty() || !digits.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|count| *count > 0)
+}
+
+/// How a tile handled its page crashing since the last poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageCrash {
+    Reloaded,
+    /// It crashed again within [`CRASH_RELOAD_COOLDOWN`] and was left as is.
+    Repeated,
+}
+
+fn crash_response(last_reload: Option<Instant>, now: Instant) -> PageCrash {
+    if last_reload.is_some_and(|at| now.duration_since(at) < CRASH_RELOAD_COOLDOWN) {
+        PageCrash::Repeated
+    } else {
+        PageCrash::Reloaded
+    }
+}
+
+/// Chromium restarts its GPU and utility processes by itself, and a crashed
+/// iframe only replaces that frame. These are the failures a tile must act on.
+fn register_process_failure_handler(
+    webview: &WebView,
+    shared: Arc<Mutex<SharedState>>,
+    engine_lost: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let handler = ProcessFailedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+        unsafe { args.ProcessFailedKind(&mut kind)? };
+        if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
+            engine_lost.store(true, Ordering::Release);
+        } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
+            || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE
+        {
+            let mut state = shared.lock();
+            state.page_crashed = true;
+            state.dirty = true;
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe { core.add_ProcessFailed(&handler, &mut token) }.map_err(|e| e.to_string())
+}
+
+fn register_engine_update_handler(
+    webview: &WebView,
+    update_ready: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let handler = NewBrowserVersionAvailableEventHandler::create(Box::new(move |_, _| {
+        update_ready.store(true, Ordering::Release);
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe {
+        webview
+            .environment()
+            .add_NewBrowserVersionAvailable(&handler, &mut token)
+    }
+    .map_err(|e| e.to_string())
 }
 
 /// Title/URL changes since the last poll, for the app to mirror onto the tile.
@@ -325,6 +572,11 @@ pub struct BrowserUpdate {
     pub url: Option<String>,
     /// The page tried to download a file, which browser tiles do not allow.
     pub download_blocked: bool,
+    pub page_crash: Option<PageCrash>,
+    pub playing_audio: bool,
+    /// A Fit to Video request finished: the video's crop, or None if the
+    /// page has no visible video.
+    pub video_rect: Option<Option<(f32, f32, f32, f32)>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -399,6 +651,12 @@ pub struct BrowserHost {
     /// Ad-block activation may request navigation while a tile sleeps. Keep
     /// it deferred because WebView2 navigation would otherwise auto-resume it.
     after_resume: Option<AfterResume>,
+    /// When this tile last reloaded itself after its page crashed.
+    last_crash_reload: Option<Instant>,
+    /// A repeated crash was already reported for the current cooldown.
+    crash_reported: bool,
+    /// The tile's own page zoom, multiplied into every zoom this host sets.
+    page_zoom: f64,
 }
 
 enum AfterResume {
@@ -407,7 +665,7 @@ enum AfterResume {
 }
 
 impl BrowserHost {
-    pub fn new(context: &mut WebContext, url: &str) -> Result<Self, String> {
+    fn new(context: &mut WebContext, url: &str, signals: &EngineSignals) -> Result<Self, String> {
         static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
         REGISTERED.get_or_init(register_window_class).clone()?;
 
@@ -450,6 +708,7 @@ impl BrowserHost {
             // be identical on every builder. Runtime 120+ supports the flag;
             // uBOL itself requires Chromium/WebView2 122+.
             .with_browser_extensions_enabled(true)
+            .with_additional_browser_args(BROWSER_ARGUMENTS)
             // Preserve transparent page backgrounds for overlay widgets.
             .with_transparent(true)
             // Captured hosts start parked; focus belongs to the canvas until
@@ -503,6 +762,17 @@ impl BrowserHost {
         if let Err(error) = register_permission_policy(&webview, interactive.clone()) {
             log::warn!("Browser permission requests use WebView2 defaults: {error}");
         }
+        if let Err(error) =
+            register_process_failure_handler(&webview, shared.clone(), signals.lost.clone())
+        {
+            log::warn!("Browser tiles cannot detect crashed pages: {error}");
+        }
+        if let Err(error) = register_audio_handler(&webview, shared.clone()) {
+            log::warn!("Browser tiles cannot report playing audio: {error}");
+        }
+        if let Err(error) = register_engine_update_handler(&webview, signals.update_ready.clone()) {
+            log::warn!("Browser tiles cannot detect WebView2 updates: {error}");
+        }
 
         Ok(Self {
             webview: Some(webview),
@@ -517,6 +787,9 @@ impl BrowserHost {
             shared,
             suspended: false,
             after_resume: None,
+            last_crash_reload: None,
+            crash_reported: false,
+            page_zoom: 1.0,
         })
     }
 
@@ -564,7 +837,69 @@ impl BrowserHost {
                 position: PhysicalPosition::new(0, 0).into(),
                 size: PhysicalSize::new(size.0, size.1).into(),
             });
-            let _ = webview.zoom((size.0 as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
+            let _ = webview.zoom(self.zoom_for_width(size.0));
+        }
+    }
+
+    /// WebView2 zoom for a page `width` physical pixels wide: the tile-size
+    /// zoom that keeps the layout at WIDTH CSS pixels, times the tile's own
+    /// page zoom.
+    fn zoom_for_width(&self, width: i32) -> f64 {
+        (width as f64 / WIDTH as f64 * self.page_zoom).clamp(MIN_ZOOM, MAX_ZOOM)
+    }
+
+    /// Apply the tile's page zoom (1.0 = the page's normal size).
+    pub fn set_page_zoom(&mut self, zoom: f32) {
+        let zoom = f64::from(zoom.clamp(MIN_PAGE_ZOOM, MAX_PAGE_ZOOM));
+        if (self.page_zoom - zoom).abs() < 1e-4 || self.suspended {
+            return;
+        }
+        self.page_zoom = zoom;
+        let width = match (self.active, self.last_geometry) {
+            (true, Some(geometry)) => geometry.page_width,
+            _ => self.capture_size.0,
+        };
+        if let Some(webview) = self.webview.as_ref() {
+            let _ = webview.zoom(self.zoom_for_width(width));
+        }
+    }
+
+    /// Scroll the page under a normalized point by `delta` CSS pixels
+    /// (positive scrolls down), without entering interaction mode.
+    pub fn scroll_page(&self, u: f32, v: f32, delta: f32) {
+        if self.suspended || !u.is_finite() || !v.is_finite() || !delta.is_finite() {
+            return;
+        }
+        if let Some(webview) = self.webview.as_ref() {
+            let script = format!(
+                "{SCROLL_PAGE_SCRIPT}({}, {}, {});",
+                u.clamp(0.0, 1.0),
+                v.clamp(0.0, 1.0),
+                delta
+            );
+            let _ = webview.evaluate_script(&script);
+        }
+    }
+
+    /// Look for the page's main video. The answer arrives through
+    /// [`BrowserUpdate::video_rect`].
+    pub fn request_video_rect(&self) {
+        if self.suspended {
+            return;
+        }
+        let Some(webview) = self.webview.as_ref() else {
+            return;
+        };
+        let shared = self.shared.clone();
+        let requested = webview.evaluate_script_with_callback(FIND_VIDEO_SCRIPT, move |json| {
+            let mut state = shared.lock();
+            state.video_rect = Some(parse_video_rect(&json));
+            state.dirty = true;
+        });
+        if requested.is_err() {
+            let mut state = self.shared.lock();
+            state.video_rect = Some(None);
+            state.dirty = true;
         }
     }
 
@@ -608,7 +943,7 @@ impl BrowserHost {
             return BrowserUpdate::default();
         }
         self.refresh_live_url();
-        let (update, navigate) = {
+        let (mut update, navigate, crashed) = {
             let mut state = self.shared.lock();
             let navigate = state.pending_navigation.take();
             if !state.dirty && navigate.is_none() {
@@ -620,14 +955,40 @@ impl BrowserHost {
                     title: state.current_title.clone(),
                     url: Some(state.current_url.clone()),
                     download_blocked: std::mem::take(&mut state.download_blocked),
+                    page_crash: None,
+                    playing_audio: state.playing_audio,
+                    video_rect: state.video_rect.take(),
                 },
                 navigate,
+                std::mem::take(&mut state.page_crashed),
             )
         };
         if let Some(url) = navigate {
             self.load(&url);
         }
+        if crashed {
+            update.page_crash = self.recover_crashed_page();
+        }
         update
+    }
+
+    /// Reload a crashed page, unless it already crashed shortly after the
+    /// last reload. Returns what to tell the user, if anything.
+    fn recover_crashed_page(&mut self) -> Option<PageCrash> {
+        let now = Instant::now();
+        match crash_response(self.last_crash_reload, now) {
+            PageCrash::Reloaded => {
+                self.last_crash_reload = Some(now);
+                self.crash_reported = false;
+                self.reload();
+                Some(PageCrash::Reloaded)
+            }
+            PageCrash::Repeated if self.crash_reported => None,
+            PageCrash::Repeated => {
+                self.crash_reported = true;
+                Some(PageCrash::Repeated)
+            }
+        }
     }
 
     /// Position the host over the visible part of `page_rect` inside
@@ -680,6 +1041,7 @@ impl BrowserHost {
             return;
         }
 
+        let zoom = self.zoom_for_width(geometry.page_width);
         let resize_webview = |webview: &WebView| {
             let _ = webview.set_bounds(Rect {
                 position: PhysicalPosition::new(geometry.page_x, geometry.page_y).into(),
@@ -687,8 +1049,7 @@ impl BrowserHost {
             });
             // Keep the page's apparent scale identical to the captured
             // texture: layout width stays WIDTH/dpi CSS px in both modes.
-            let _ =
-                webview.zoom((geometry.page_width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
+            let _ = webview.zoom(zoom);
         };
 
         if take_focus {
@@ -1058,6 +1419,40 @@ pub struct BrowserManager {
     adblock_settle_until: Option<Instant>,
     /// Tiles parked on `about:blank` until that moment, and where they go.
     deferred_loads: HashMap<PreviewId, String>,
+    signals: EngineSignals,
+    /// Set after [`Self::shut_down_engine`] until the old browser process
+    /// has exited, so new tiles start on a fresh (possibly updated) engine.
+    engine_shutdown: Option<EngineShutdown>,
+    /// Result slot of a Clear Browser Data request still in progress.
+    clearing_data: Option<ClearDataSlot>,
+}
+
+/// Filled by WebView2's completion callback for Clear Browser Data.
+type ClearDataSlot = Arc<Mutex<Option<Result<(), String>>>>;
+
+/// The old WebView2 browser process, while it shuts down.
+struct EngineShutdown {
+    process: Option<HANDLE>,
+    deadline: Instant,
+}
+
+impl EngineShutdown {
+    fn finished(&self) -> bool {
+        Instant::now() >= self.deadline
+            || self
+                .process
+                .is_none_or(|process| unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0)
+    }
+}
+
+impl Drop for EngineShutdown {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            unsafe {
+                let _ = CloseHandle(process);
+            }
+        }
+    }
 }
 
 impl BrowserManager {
@@ -1084,6 +1479,9 @@ impl BrowserManager {
             adblock_error: None,
             adblock_settle_until: None,
             deferred_loads: HashMap::new(),
+            signals: EngineSignals::default(),
+            engine_shutdown: None,
+            clearing_data: None,
         }
     }
 
@@ -1105,7 +1503,7 @@ impl BrowserManager {
         }
         let hold_navigation = initialize_extension || self.adblock_settling();
         let initial_url = if hold_navigation { "about:blank" } else { url };
-        let host = BrowserHost::new(&mut self.context, initial_url)?;
+        let host = BrowserHost::new(&mut self.context, initial_url, &self.signals)?;
 
         if initialize_extension {
             self.extension_initialized = true;
@@ -1392,6 +1790,112 @@ impl BrowserManager {
     pub fn clear(&mut self) {
         self.hosts.clear();
         self.deferred_loads.clear();
+    }
+
+    /// A newer WebView2 Runtime is installed and running tiles still use the
+    /// old one. Restarting every browser tile applies it.
+    pub fn engine_update_ready(&self) -> bool {
+        self.signals.update_ready.load(Ordering::Acquire)
+    }
+
+    /// True once after the shared browser process exits unexpectedly.
+    pub fn take_engine_lost(&self) -> bool {
+        self.signals.lost.swap(false, Ordering::AcqRel)
+    }
+
+    /// Close every host and release the extension so WebView2 can shut its
+    /// browser process down. Returns each closed tile and the address it was
+    /// showing; the caller recreates them once [`Self::engine_restarting`]
+    /// turns false.
+    pub fn shut_down_engine(&mut self) -> Vec<(PreviewId, String)> {
+        let process = self
+            .browser_process_id()
+            .and_then(|pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.ok());
+        let tiles = self
+            .hosts
+            .iter()
+            .map(|(id, host)| (*id, host.current_url()))
+            .collect();
+        self.hosts.clear();
+        self.deferred_loads.clear();
+        self.extension = None;
+        self.extension_initialized = false;
+        self.adblock_settle_until = None;
+        self.clearing_data = None;
+        self.engine_shutdown = Some(EngineShutdown {
+            process,
+            deadline: Instant::now() + ENGINE_SHUTDOWN_TIMEOUT,
+        });
+        tiles
+    }
+
+    /// True while the previous browser process is still exiting. New hosts
+    /// must not be created until this returns false. Call once per frame.
+    pub fn engine_restarting(&mut self) -> bool {
+        let Some(shutdown) = &self.engine_shutdown else {
+            return false;
+        };
+        if !shutdown.finished() {
+            return true;
+        }
+        self.engine_shutdown = None;
+        // The next environment loads the newest installed runtime, and any
+        // failure reported while the old engine closed is no longer relevant.
+        self.signals.update_ready.store(false, Ordering::Release);
+        self.signals.lost.store(false, Ordering::Release);
+        false
+    }
+
+    /// Erase cookies, logins, site storage, cache, history and saved form
+    /// data from the shared profile. Installed extensions stay. Finishes
+    /// asynchronously; see [`Self::poll_clear_browsing_data`].
+    pub fn clear_browsing_data(&mut self) -> Result<(), String> {
+        if self.clearing_data.is_some() {
+            return Ok(());
+        }
+        let host = self
+            .hosts
+            .values()
+            .next()
+            .ok_or("Open a browser tile first")?;
+        let slot = Arc::new(Mutex::new(None));
+        let completed = slot.clone();
+        host.with_core(|core| {
+            let profile: ICoreWebView2Profile2 = unsafe {
+                core.cast::<ICoreWebView2_13>()
+                    .and_then(|core13| core13.Profile())
+                    .and_then(|profile| profile.cast())
+            }
+            .map_err(|error| format!("This WebView2 Runtime cannot clear browser data: {error}"))?;
+            let handler = ClearBrowsingDataCompletedHandler::create(Box::new(move |result| {
+                *completed.lock() = Some(result.map_err(|error| error.to_string()));
+                Ok(())
+            }));
+            unsafe { profile.ClearBrowsingDataAll(&handler) }.map_err(|e| e.to_string())
+        })?;
+        self.clearing_data = Some(slot);
+        Ok(())
+    }
+
+    pub fn clearing_browsing_data(&self) -> bool {
+        self.clearing_data.is_some()
+    }
+
+    /// The finished Clear Browser Data result, once. On success every tile
+    /// reloads so pages drop the signed-in state they still hold in memory.
+    pub fn poll_clear_browsing_data(&mut self) -> Option<Result<(), String>> {
+        let result = self.clearing_data.as_ref()?.lock().take()?;
+        self.clearing_data = None;
+        if result.is_ok() {
+            for host in self.hosts.values_mut() {
+                if host.suspended {
+                    host.after_resume.get_or_insert(AfterResume::Reload);
+                } else {
+                    host.reload();
+                }
+            }
+        }
+        Some(result)
     }
 }
 
@@ -1899,6 +2403,70 @@ mod tests {
         assert!(!super::opens_as_popup(true, false));
         assert!(!super::opens_as_popup(false, true));
         assert!(!super::opens_as_popup(false, false));
+    }
+
+    #[test]
+    fn page_titles_report_unread_counts() {
+        use super::{unread_indicator, UnreadIndicator::*};
+        assert_eq!(unread_indicator("(3) Discord | #general"), Some(Count(3)));
+        assert_eq!(unread_indicator("(99+) YouTube"), Some(Count(99)));
+        assert_eq!(
+            unread_indicator("Inbox (1,204) - me@example.com - Gmail"),
+            Some(Count(1204))
+        );
+        assert_eq!(unread_indicator("\u{2022} Discord | #general"), Some(Dot));
+        assert_eq!(unread_indicator("Discord | #general"), None);
+        assert_eq!(unread_indicator("(0) Feed"), None);
+        assert_eq!(unread_indicator("(Live) Concert"), None);
+        assert_eq!(unread_indicator("Song (2024 Remaster) - YouTube"), None);
+    }
+
+    #[test]
+    fn page_zoom_steps_like_a_browser() {
+        use super::{step_page_zoom, MAX_PAGE_ZOOM, MIN_PAGE_ZOOM};
+        assert_eq!(step_page_zoom(1.0, true), 1.1);
+        assert_eq!(step_page_zoom(1.0, false), 0.9);
+        assert_eq!(step_page_zoom(1.17, true), 1.25);
+        assert_eq!(step_page_zoom(1.17, false), 1.1);
+        assert_eq!(step_page_zoom(MAX_PAGE_ZOOM, true), MAX_PAGE_ZOOM);
+        assert_eq!(step_page_zoom(MIN_PAGE_ZOOM, false), MIN_PAGE_ZOOM);
+    }
+
+    #[test]
+    fn video_rect_results_are_validated() {
+        use super::parse_video_rect;
+        assert_eq!(
+            parse_video_rect("[0.1,0.2,0.9,0.8]"),
+            Some((0.1, 0.2, 0.9, 0.8))
+        );
+        assert_eq!(parse_video_rect("null"), None);
+        assert_eq!(parse_video_rect("[0.5,0.5,0.5,0.9]"), None);
+        assert_eq!(parse_video_rect("[-0.1,0,1,1]"), None);
+        assert_eq!(parse_video_rect("oops"), None);
+    }
+
+    #[test]
+    fn browser_arguments_keep_smartscreen_enabled() {
+        assert!(!super::BROWSER_ARGUMENTS.contains("SmartScreen"));
+        // Keep the mini menus wry removes by default turned off.
+        assert!(super::BROWSER_ARGUMENTS.contains("msWebOOUI"));
+        assert!(super::BROWSER_ARGUMENTS.contains("msPdfOOUI"));
+    }
+
+    #[test]
+    fn crashed_pages_reload_unless_they_crash_again_soon() {
+        use super::{crash_response, PageCrash, CRASH_RELOAD_COOLDOWN};
+        use std::time::{Duration, Instant};
+        let now = Instant::now() + CRASH_RELOAD_COOLDOWN * 2;
+        assert_eq!(crash_response(None, now), PageCrash::Reloaded);
+        assert_eq!(
+            crash_response(Some(now - Duration::from_secs(5)), now),
+            PageCrash::Repeated
+        );
+        assert_eq!(
+            crash_response(Some(now - CRASH_RELOAD_COOLDOWN), now),
+            PageCrash::Reloaded
+        );
     }
 
     #[test]

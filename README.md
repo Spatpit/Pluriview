@@ -265,6 +265,21 @@ Hover over the tile for **back, forward, reload, and mute**. Each tile has its
 own page and mute control. One browser tile can receive direct interaction at
 a time.
 
+- **Scroll without interacting:** hold `Shift` and scroll over a browser tile to
+  scroll the page (or the chat or list under the pointer) while the canvas stays
+  put.
+- **Unread badges and sound:** a red badge shows the unread count a site puts in
+  its title, such as "(3) Discord" or Gmail's "Inbox (12)", and a speaker badge
+  marks tiles that are playing sound once you turn on **View → Show Sound
+  Badges** (off by default). Hover the tile to mute it.
+- **Page Zoom:** right-click → **Page Zoom** `−` / `+` makes a page's text and
+  layout larger or smaller without resizing the tile. Click the percentage to
+  return to 100%. Each tile remembers its zoom.
+- **Fit to Video:** right-click → **Fit to Video** crops the tile to the page's
+  video player, such as a YouTube, Twitch or Netflix video. **Crop → Clear Crop**
+  shows the whole page again. Videos inside embedded players from another site
+  cannot be found.
+
 #### How browser tiles work
 
 Pluriview uses **Microsoft WebView2** to run web pages inside browser instances
@@ -278,9 +293,29 @@ from your regular browser profile:
 - All Pluriview browser tiles share cookies and login sessions, including across workspaces.
 - Signing into a website in one tile can also sign you into that website in other tiles.
 - Login sessions can remain available when you close and reopen Pluriview.
+- **View → Clear Browser Data...** signs you out of every site and erases the
+  shared profile's cookies, site data, history and cache. uBlock Origin Lite
+  stays installed. It is available while at least one browser tile is open.
 
 Websites connect to their own services and handle account information as they
 normally would when you visit them.
+
+#### Security updates and crashed pages
+
+The WebView2 Runtime updates itself with Microsoft Edge. Running tiles keep the
+engine version they started with, so when an update is installed while
+Pluriview is open, a notice appears and the View menu shows **Restart Browser
+Tiles (update ready)**. Choosing it restarts every browser tile on the new
+engine, keeping each tile's address, mute state and position. Restarting
+Pluriview also applies it.
+
+Microsoft Defender SmartScreen is on in browser tiles, as in Edge, and warns
+before known phishing or malware sites open. Like in Edge, SmartScreen checks
+addresses you visit with Microsoft.
+
+If a page crashes, its tile reloads it automatically. A page that crashes again
+within a minute is left alone; reload it from the tile menu. If the shared
+browser engine stops, every browser tile restarts once on its own.
 
 #### Ad and tracker blocking
 

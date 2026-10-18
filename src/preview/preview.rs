@@ -322,6 +322,13 @@ pub struct Preview {
     /// Is this browser tile's audio muted? (Only meaningful for browsers.)
     pub browser_muted: bool,
 
+    /// Page zoom chosen for this browser tile, on top of the zoom that keeps
+    /// the page layout independent of the tile size. 1.0 is the page's own size.
+    pub browser_page_zoom: f32,
+
+    /// The browser tile's page is playing sound (runtime only).
+    pub browser_playing_audio: bool,
+
     /// Replay this window-capture tile's process audio through the stream
     /// audio monitor (Discord/OBS). Ignored for browser, video, and image tiles.
     pub stream_audio: bool,
@@ -431,6 +438,8 @@ impl Preview {
             screenshot_native_frame: None,
             browser_url: None,
             browser_muted: false,
+            browser_page_zoom: 1.0,
+            browser_playing_audio: false,
             stream_audio: false,
             capture_error: None,
             browser_status: BrowserTileStatus::Ready,
@@ -903,6 +912,9 @@ pub struct PreviewLayout {
     /// WebView2 mute is per-session, so remember it and reapply on restore.
     #[serde(default)]
     pub browser_muted: bool,
+    /// Per-tile page zoom for browser tiles.
+    #[serde(default = "default_browser_page_zoom")]
+    pub browser_page_zoom: f32,
     /// Replay this captured window's audio through the stream monitor.
     #[serde(default)]
     pub stream_audio: bool,
@@ -951,6 +963,7 @@ impl From<&Preview> for PreviewLayout {
             crop_uv: preview.crop_uv,
             browser_url: preview.browser_url.clone(),
             browser_muted: preview.browser_muted,
+            browser_page_zoom: preview.browser_page_zoom,
             stream_audio: preview.stream_audio,
             media_path: preview.media_path.clone(),
             video_source: preview.video_source.as_ref().map(scrub_video_source),
@@ -962,6 +975,10 @@ impl From<&Preview> for PreviewLayout {
             left_click_disabled: preview.left_click_disabled,
         }
     }
+}
+
+fn default_browser_page_zoom() -> f32 {
+    1.0
 }
 
 fn scrub_video_source(source: &VideoSource) -> VideoSource {
@@ -1193,6 +1210,28 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("video_preferences");
         let saved: PreviewLayout = serde_json::from_value(legacy).unwrap();
         assert_eq!(saved.video_preferences, VideoPlaybackPreferences::default());
+    }
+
+    #[test]
+    fn browser_page_zoom_round_trips_and_defaults_to_full_size() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "page".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        preview.browser_url = Some("https://example.com".to_owned());
+        preview.browser_page_zoom = 1.25;
+        preview.browser_playing_audio = true;
+        let json = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert!(json.get("browser_playing_audio").is_none());
+        let saved: PreviewLayout = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(saved.browser_page_zoom, 1.25);
+
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("browser_page_zoom");
+        let saved: PreviewLayout = serde_json::from_value(legacy).unwrap();
+        assert_eq!(saved.browser_page_zoom, 1.0);
     }
 
     #[test]

@@ -57,6 +57,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
+#[cfg(windows)]
+mod browser_maintenance;
 mod media_sources;
 mod screenshot_drop;
 mod screenshot_panel;
@@ -267,6 +269,7 @@ fn restore_layout_tile_state(preview: &mut Preview, saved: &PreviewLayout) {
     preview.tile_group = saved.tile_group.clone();
     preview.lock_aspect_ratio = saved.lock_aspect_ratio;
     preview.crop_uv = saved.crop_uv;
+    preview.browser_page_zoom = saved.browser_page_zoom;
     preview.stream_audio = saved.stream_audio;
     preview.playlist_group = saved.playlist_group;
     preview.viewport_pin = saved.viewport_pin;
@@ -289,6 +292,7 @@ fn restore_removed_tile_state(preview: &mut Preview, removed: &RemovedPreviewInf
     preview.tile_group = removed.tile_group.clone();
     preview.set_fps_preset(removed.fps_preset);
     preview.crop_uv = removed.crop_uv;
+    preview.browser_page_zoom = removed.browser_page_zoom;
     preview.stream_audio = removed.stream_audio;
     preview.viewport_pin = removed.viewport_pin;
     preview.left_click_disabled = removed.left_click_disabled;
@@ -1036,6 +1040,8 @@ pub struct PluriviewApp {
     #[cfg(windows)]
     browser: BrowserManager,
     #[cfg(windows)]
+    browser_maintenance: browser_maintenance::BrowserMaintenance,
+    #[cfg(windows)]
     pending_browser_tiles: HashMap<PreviewId, PendingBrowserTile>,
     /// Last restored WebView startup, used to keep heavyweight pages staggered.
     #[cfg(windows)]
@@ -1089,7 +1095,8 @@ impl PluriviewApp {
         let blocked = blocked
             || self.browser.active_id().is_some()
             || self.add_browser.is_some()
-            || self.add_stream.is_some();
+            || self.add_stream.is_some()
+            || self.browser_maintenance.confirm_clear;
         blocked
     }
 
@@ -1225,6 +1232,8 @@ impl PluriviewApp {
             recent_urls: Vec::new(),
             #[cfg(windows)]
             browser: BrowserManager::new(),
+            #[cfg(windows)]
+            browser_maintenance: Default::default(),
             #[cfg(windows)]
             pending_browser_tiles: HashMap::new(),
             #[cfg(windows)]
@@ -2519,10 +2528,12 @@ impl PluriviewApp {
             ExtensionPreparationStatus::Idle | ExtensionPreparationStatus::Failed(_) => 0.0,
         };
 
-        let can_create = self.browser.can_create_browser();
+        // Restarted tiles wait for the old browser engine to exit first.
+        let engine_restarting = self.browser_maintenance_upkeep(ctx);
+        let can_create = self.browser.can_create_browser() && !engine_restarting;
         for id in self.pending_browser_tiles.keys().copied() {
             if let Some(preview) = self.preview_manager.get_mut(id) {
-                preview.browser_status = if can_create {
+                preview.browser_status = if can_create || engine_restarting {
                     BrowserTileStatus::Starting
                 } else {
                     match &status {
@@ -2984,6 +2995,15 @@ impl PluriviewApp {
                     }
                 }
             }
+            BrowserAction::FitToVideo => match self.browser.get(id) {
+                Some(host) => host.request_video_rect(),
+                None => {
+                    self.canvas_notice = Some((
+                        "This browser tile is still starting.".to_owned(),
+                        Instant::now(),
+                    ));
+                }
+            },
             BrowserAction::EditUrl => {
                 let current = self
                     .browser
@@ -3287,11 +3307,13 @@ impl PluriviewApp {
         // overlay shows "lofi hip hop radio..." instead of the raw URL and
         // layouts save where the user actually navigated.
         let mut updates = Vec::new();
+        let mut page_crash = None;
         for (id, host) in self.browser.iter_mut() {
             if frozen.contains(id) {
                 continue;
             }
             let update = host.poll();
+            page_crash = update.page_crash.or(page_crash);
             if update.download_blocked {
                 self.canvas_notice = Some((
                     "Downloads are not available in browser tiles.".to_owned(),
@@ -3302,8 +3324,13 @@ impl PluriviewApp {
                 updates.push((*id, update));
             }
         }
+        let mut video_fits = Vec::new();
         for (id, update) in updates {
+            if let Some(found) = update.video_rect {
+                video_fits.push((id, found));
+            }
             if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.browser_playing_audio = update.playing_audio;
                 if let Some(title) = update.title {
                     if !title.is_empty() {
                         preview.title = title;
@@ -3311,6 +3338,29 @@ impl PluriviewApp {
                 }
                 if let Some(url) = update.url {
                     preview.browser_url = Some(url);
+                }
+            }
+        }
+        if let Some(crash) = page_crash {
+            self.note_browser_page_crash(crash);
+        }
+        for (id, found) in video_fits {
+            match (found, self.canvas.last_screen_rect) {
+                (Some(crop), Some(canvas_rect)) => {
+                    self.canvas.set_preview_crop(
+                        id,
+                        Some(crop),
+                        canvas_rect,
+                        &mut self.preview_manager,
+                    );
+                }
+                (Some(_), None) => {}
+                (None, _) => {
+                    self.canvas_notice = Some((
+                        "No video found on this page. Videos inside embedded players cannot be fitted."
+                            .to_owned(),
+                        Instant::now(),
+                    ));
                 }
             }
         }
@@ -3328,6 +3378,7 @@ impl PluriviewApp {
             let Some(preview) = self.preview_manager.get(id) else {
                 continue;
             };
+            let page_zoom = preview.browser_page_zoom;
             let display_size = browser_capture_display_size(preview);
             let physical_size = display_size * pixels_per_point;
             let capture_size = browser::capture_size_for_tile(
@@ -3336,6 +3387,7 @@ impl PluriviewApp {
             );
             if let Some(host) = self.browser.get_mut(id) {
                 host.sync_capture_size(capture_size.0, capture_size.1);
+                host.set_page_zoom(page_zoom);
             }
         }
 
@@ -3809,6 +3861,16 @@ impl PluriviewApp {
                 {
                     ui.close_menu();
                 }
+                #[cfg(windows)]
+                if ui
+                    .checkbox(&mut self.app_config.show_sound_badges, "Show Sound Badges")
+                    .on_hover_text("Mark browser tiles that are playing sound with a speaker badge.")
+                    .clicked()
+                {
+                    self.canvas.show_sound_badges = self.app_config.show_sound_badges;
+                    self.save_app_config();
+                    ui.close_menu();
+                }
                 if ui
                     .checkbox(
                         &mut self.app_config.always_show_title_bar,
@@ -3872,6 +3934,7 @@ impl PluriviewApp {
                             .small()
                             .weak(),
                     );
+                    self.browser_maintenance_menu(ui);
                     ui.separator();
                     self.stream_audio_menu(ui);
                 }
@@ -5494,8 +5557,10 @@ impl eframe::App for PluriviewApp {
         // Dialog controls retain keyboard ownership even when the URL field
         // loses focus to a recent website or quality choice.
         #[cfg(windows)]
-        let shortcut_listening =
-            shortcut_listening && self.add_browser.is_none() && self.add_stream.is_none();
+        let shortcut_listening = shortcut_listening
+            && self.add_browser.is_none()
+            && self.add_stream.is_none()
+            && !self.browser_maintenance.confirm_clear;
         #[cfg(windows)]
         let webview_active = self.browser.active_id().is_some();
         #[cfg(not(windows))]
@@ -5879,6 +5944,11 @@ impl eframe::App for PluriviewApp {
             for (id, action) in std::mem::take(&mut self.canvas.pending_browser_actions) {
                 self.handle_browser_action(ctx, id, action);
             }
+            for (id, u, v, delta) in std::mem::take(&mut self.canvas.pending_browser_scrolls) {
+                if let Some(host) = self.browser.get(id) {
+                    host.scroll_page(u, v, delta);
+                }
+            }
 
             for (id, action) in std::mem::take(&mut self.canvas.pending_video_actions) {
                 self.handle_video_action(ctx, id, action);
@@ -5915,6 +5985,8 @@ impl eframe::App for PluriviewApp {
         self.canvas_view_dialog_ui(ctx);
         self.workspace_dialog_ui(ctx);
         self.workspace_delete_confirmation_ui(ctx);
+        #[cfg(windows)]
+        self.browser_data_confirmation_ui(ctx);
         self.canvas_view_undo_toast_ui(ctx);
         self.screenshot_animation_ui(ctx);
         self.screenshot_landings_ui(ctx);

@@ -620,6 +620,35 @@ impl CanvasState {
             .map(|preview| preview.id)
     }
 
+    /// The browser tile under `screen_pos` and that point in normalized page
+    /// coordinates, through the tile's crop. None for other tiles and for
+    /// browser tiles that are frozen or not running yet.
+    pub(super) fn browser_page_point_at(
+        &self,
+        screen_pos: Pos2,
+        canvas_rect: Rect,
+        preview_manager: &PreviewManager,
+    ) -> Option<(PreviewId, Vec2)> {
+        let id = self.left_click_preview_at_screen(screen_pos, canvas_rect, preview_manager)?;
+        let preview = preview_manager.get(id)?;
+        if !preview.is_browser()
+            || preview.manually_frozen
+            || preview.browser_status != BrowserTileStatus::Ready
+        {
+            return None;
+        }
+        let rect = self.preview_screen_rect(preview, canvas_rect);
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return None;
+        }
+        let (min_u, min_v, max_u, max_v) = preview.crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
+        let t = (screen_pos - rect.min) / rect.size();
+        Some((
+            id,
+            Vec2::new(min_u + t.x * (max_u - min_u), min_v + t.y * (max_v - min_v)),
+        ))
+    }
+
     pub(super) fn left_click_preview_at_screen(
         &self,
         screen_pos: Pos2,

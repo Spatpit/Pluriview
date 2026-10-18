@@ -23,6 +23,8 @@ pub struct AppConfig {
     /// Folder inside the screenshots data folder that receives new
     /// screenshots; `None` saves them at its top level. Validated on use.
     pub screenshot_folder: Option<String>,
+    /// Show a speaker badge on browser tiles that are playing sound.
+    pub show_sound_badges: bool,
 }
 
 impl Default for AppConfig {
@@ -35,6 +37,7 @@ impl Default for AppConfig {
             keyboard_shortcuts: HotkeyBindings::default(),
             screenshots_panel_open: false,
             screenshot_folder: None,
+            show_sound_badges: false,
         }
     }
 }
@@ -62,6 +65,7 @@ mod tests {
         assert_eq!(config.keyboard_shortcuts, HotkeyBindings::default());
         assert!(!config.screenshots_panel_open);
         assert!(config.screenshot_folder.is_none());
+        assert!(!config.show_sound_badges);
     }
 
     #[test]

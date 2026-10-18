@@ -2350,3 +2350,68 @@ fn removing_focused_tile_exits_focus_without_restoring_deleted_selection() {
     assert_eq!(canvas.selection, vec![PreviewId(99)]);
     assert!(!canvas.exit_focus());
 }
+
+#[test]
+fn shift_wheel_over_a_browser_tile_scrolls_its_page_instead_of_zooming() {
+    let context = Context::default();
+    let mut canvas = CanvasState::default();
+    let mut previews = PreviewManager::new();
+    let id = previews.add_browser_placeholder(
+        "https://example.com".to_owned(),
+        Pos2::new(100.0, 100.0),
+        Vec2::new(200.0, 100.0),
+        FpsPreset::Medium,
+    );
+    let preview = previews.get_mut(id).unwrap();
+    preview.browser_status = crate::preview::BrowserTileStatus::Ready;
+    preview.crop_uv = Some((0.5, 0.0, 1.0, 1.0));
+    let mut captures = CaptureCoordinator::new();
+    let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 500.0));
+    let tile = canvas.canvas_rect_to_screen(previews.get(id).unwrap().rect(), screen_rect);
+    let pointer = tile.center();
+    let wheel = |canvas: &mut CanvasState,
+                 previews: &mut PreviewManager,
+                 captures: &mut CaptureCoordinator,
+                 modifiers: Modifiers| {
+        let _ = context.run(
+            RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    Event::PointerMoved(pointer),
+                    Event::MouseWheel {
+                        unit: MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, -50.0),
+                        modifiers,
+                    },
+                ],
+                modifiers,
+                ..Default::default()
+            },
+            |context| {
+                CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(context, |ui| {
+                        canvas.ui(ui, previews, captures, context, true);
+                    });
+            },
+        );
+    };
+
+    let zoom = canvas.zoom;
+    wheel(&mut canvas, &mut previews, &mut captures, Modifiers::SHIFT);
+    assert_eq!(canvas.zoom, zoom);
+    let scrolls = std::mem::take(&mut canvas.pending_browser_scrolls);
+    assert_eq!(scrolls.len(), 1);
+    let (scrolled, u, v, delta) = scrolls[0];
+    assert_eq!(scrolled, id);
+    // The tile shows the right half of the page, so its centre is at 75%.
+    assert!((u - 0.75).abs() < 0.01 && (v - 0.5).abs() < 0.01);
+    assert!(
+        delta > 0.0,
+        "scrolling the wheel down scrolls the page down"
+    );
+
+    wheel(&mut canvas, &mut previews, &mut captures, Modifiers::NONE);
+    assert!(canvas.pending_browser_scrolls.is_empty());
+    assert_ne!(canvas.zoom, zoom);
+}

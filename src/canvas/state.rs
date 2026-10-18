@@ -126,6 +126,62 @@ pub enum BrowserAction {
     OpenExternal,
     CopyUrl,
     EditUrl,
+    /// Crop the tile to the page's main video.
+    FitToVideo,
+}
+
+/// CSS pixels a browser page scrolls per egui point of Shift+wheel, so one
+/// wheel notch scrolls about as far as it does in a browser.
+const PAGE_SCROLL_CSS_PER_POINT: f32 = 2.0;
+
+/// Unread count and sound badges in a browser tile's top-right corner,
+/// readable without hovering.
+fn paint_browser_status_badges(
+    painter: &egui::Painter,
+    rect: Rect,
+    unread: Option<crate::browser::UnreadIndicator>,
+    playing_audio: bool,
+    muted: bool,
+) {
+    let mut right = rect.right() - 8.0;
+    let center_y = rect.top() + 18.0;
+    if playing_audio {
+        let center = Pos2::new(right - 11.0, center_y);
+        painter.circle_filled(center, 11.0, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            if muted {
+                egui_phosphor::regular::SPEAKER_SLASH
+            } else {
+                egui_phosphor::regular::SPEAKER_HIGH
+            },
+            egui::FontId::proportional(12.0),
+            if muted {
+                Color32::from_rgb(255, 150, 100)
+            } else {
+                crate::ui_theme::GOLD
+            },
+        );
+        right -= 26.0;
+    }
+    let Some(unread) = unread else {
+        return;
+    };
+    let label = match unread {
+        crate::browser::UnreadIndicator::Count(count) if count > 99 => "99+".to_owned(),
+        crate::browser::UnreadIndicator::Count(count) => count.to_string(),
+        crate::browser::UnreadIndicator::Dot => String::new(),
+    };
+    let galley = painter.layout_no_wrap(label, egui::FontId::proportional(11.0), Color32::WHITE);
+    let size = if galley.size().x > 0.0 {
+        Vec2::new((galley.size().x + 12.0).max(20.0), 20.0)
+    } else {
+        Vec2::splat(12.0)
+    };
+    let badge = Rect::from_center_size(Pos2::new(right - size.x / 2.0, center_y), size);
+    painter.rect_filled(badge, size.y / 2.0, Color32::from_rgb(229, 72, 77));
+    painter.galley(badge.center() - galley.size() / 2.0, galley, Color32::WHITE);
 }
 
 fn show_context_menu_if(
@@ -379,9 +435,11 @@ struct FrameInput {
     hover_pos: Option<Pos2>,
     interact_pos: Option<Pos2>,
     pointer_delta: Vec2,
+    scroll_x: f32,
     scroll_y: f32,
     alt: bool,
     ctrl: bool,
+    shift: bool,
     middle_down: bool,
     primary_down: bool,
     primary_pressed: bool,
@@ -468,6 +526,7 @@ struct TileInfo {
     lock_aspect_ratio: bool,
     left_click_disabled: bool,
     muted: bool,
+    playing_audio: bool,
     stream_audio: bool,
     capture_failed: bool,
     browser_status: BrowserTileStatus,
@@ -505,6 +564,7 @@ impl TileInfo {
             lock_aspect_ratio: preview.lock_aspect_ratio,
             left_click_disabled: preview.left_click_disabled,
             muted: preview.browser_muted,
+            playing_audio: preview.browser_playing_audio,
             stream_audio: preview.stream_audio,
             capture_failed: preview.capture_error.is_some(),
             browser_status: preview.browser_status.clone(),
@@ -541,6 +601,7 @@ impl TileInfo {
         self.lock_aspect_ratio = preview.lock_aspect_ratio;
         self.left_click_disabled = preview.left_click_disabled;
         self.muted = preview.browser_muted;
+        self.playing_audio = preview.browser_playing_audio;
         self.stream_audio = preview.stream_audio;
         self.capture_failed = preview.capture_error.is_some();
         self.browser_status.clone_from(&preview.browser_status);
@@ -743,7 +804,7 @@ fn stream_audio_badge_rect(screen_rect: Rect, enabled: bool, beside_fps: bool) -
 fn stream_audio_tooltip(enabled: bool, monitor_ready: bool) -> &'static str {
     match (enabled, monitor_ready) {
         (true, true) => "Streaming audio — click to stop",
-        (true, false) => "Stream Audio is on — pick a device under View → Stream Audio Monitor",
+        (true, false) => "Stream Audio is on — pick a device under Tools → Stream Audio Monitor",
         (false, true) => "Stream audio to Discord/OBS",
         (false, false) => "Pick a Stream Audio Monitor device in View first",
     }
@@ -1099,6 +1160,9 @@ pub struct CanvasState {
     /// Grid visibility
     pub show_grid: bool,
 
+    /// Show the speaker badge on browser tiles playing sound (AppConfig).
+    pub show_sound_badges: bool,
+
     /// Grid size in canvas units
     pub grid_size: f32,
 
@@ -1173,6 +1237,9 @@ pub struct CanvasState {
     /// consumed by the app.
     pub pending_browser_actions: Vec<(PreviewId, BrowserAction)>,
 
+    /// Shift+wheel page scrolls: tile, normalized page point and CSS pixels.
+    pub pending_browser_scrolls: Vec<(PreviewId, f32, f32, f32)>,
+
     /// Video tile actions queued by hover controls / context menus.
     pub pending_video_actions: Vec<(PreviewId, VideoAction)>,
 
@@ -1198,7 +1265,7 @@ pub struct CanvasState {
     pub always_on_top: bool,
     pub pending_always_on_top: Option<bool>,
 
-    /// True when View → Stream Audio Monitor has a target device.
+    /// True when Tools → Stream Audio Monitor has a target device.
     pub stream_monitor_ready: bool,
 
     /// Last canvas rectangle in egui screen coordinates.
@@ -1228,6 +1295,7 @@ impl Default for CanvasState {
             selection: Vec::new(),
             drag_state: None,
             show_grid: true,
+            show_sound_badges: false,
             grid_size: 50.0,
             wallpaper: None,
             pending_wallpaper_pick: false,
@@ -1251,6 +1319,7 @@ impl Default for CanvasState {
             pending_video_add: None,
             pending_stream_add: None,
             pending_browser_actions: Vec::new(),
+            pending_browser_scrolls: Vec::new(),
             pending_video_actions: Vec::new(),
             video_volume_hover: None,
             pending_tile_activity_actions: Vec::new(),
@@ -1329,9 +1398,11 @@ impl CanvasState {
             hover_pos: i.pointer.hover_pos(),
             interact_pos: i.pointer.interact_pos(),
             pointer_delta: i.pointer.delta(),
+            scroll_x: i.raw_scroll_delta.x,
             scroll_y: i.raw_scroll_delta.y,
             alt: i.modifiers.alt,
             ctrl: i.modifiers.ctrl,
+            shift: i.modifiers.shift,
             middle_down: i.pointer.middle_down(),
             primary_down: i.pointer.primary_down(),
             primary_pressed: i.pointer.primary_pressed(),
@@ -1889,7 +1960,32 @@ impl CanvasState {
         if !handle_drag_active && !input.pointer_blocked {
             if let Some(mouse_pos) = input.hover_pos {
                 if canvas_rect.contains(mouse_pos) {
-                    let scroll_delta = input.scroll_y;
+                    // Shift+wheel over a browser tile scrolls its page instead
+                    // of zooming the canvas. Windows reports Shift+wheel as a
+                    // horizontal scroll, so accept either axis.
+                    let page_scroll = if input.shift {
+                        input.scroll_y + input.scroll_x
+                    } else {
+                        0.0
+                    };
+                    let page_target = (page_scroll != 0.0)
+                        .then(|| {
+                            self.browser_page_point_at(mouse_pos, canvas_rect, preview_manager)
+                        })
+                        .flatten();
+                    if let Some((id, point)) = page_target {
+                        self.pending_browser_scrolls.push((
+                            id,
+                            point.x,
+                            point.y,
+                            -page_scroll * PAGE_SCROLL_CSS_PER_POINT,
+                        ));
+                    }
+                    let scroll_delta = if page_target.is_some() {
+                        0.0
+                    } else {
+                        input.scroll_y
+                    };
                     if scroll_delta != 0.0 {
                         let canvas_pos = self.screen_to_canvas(mouse_pos, canvas_rect);
                         let playlist_id = preview_manager.get_preview_at(canvas_pos).filter(|id| {
@@ -2209,6 +2305,7 @@ impl CanvasState {
             let viewport_pin = info.viewport_pin;
             let lock_aspect_ratio = info.lock_aspect_ratio;
             let left_click_disabled = info.left_click_disabled;
+            let playing_audio = info.playing_audio;
             let muted = if is_video {
                 info.video_playback.muted
             } else {
@@ -2446,6 +2543,20 @@ impl CanvasState {
                             preview_manager,
                         ) == Some(id)
                 });
+            if is_browser
+                && !manually_frozen
+                && !(show_overlays && pointer_over_tile)
+                && screen_rect.width() >= 90.0
+                && screen_rect.height() >= 60.0
+            {
+                paint_browser_status_badges(
+                    &painter,
+                    screen_rect,
+                    crate::browser::unread_indicator(title),
+                    playing_audio && self.show_sound_badges,
+                    muted,
+                );
+            }
             if show_overlays && pointer_over_tile {
                 // Playlist tiles already have a designed header; a second title
                 // bar would cover the folder name and transport controls.
@@ -3460,6 +3571,57 @@ impl CanvasState {
                         self.pending_browser_actions
                             .push((id, BrowserAction::Reload));
                         ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(browser_ready, egui::Button::new("Fit to Video"))
+                        .on_hover_text("Crop the tile to the page's video player")
+                        .clicked()
+                    {
+                        self.pending_browser_actions
+                            .push((id, BrowserAction::FitToVideo));
+                        ui.close_menu();
+                    }
+                    let page_zoom = preview_manager
+                        .get(id)
+                        .map_or(1.0, |preview| preview.browser_page_zoom);
+                    let mut new_page_zoom = None;
+                    ui.horizontal(|ui| {
+                        ui.label("Page Zoom");
+                        if ui
+                            .add_enabled(
+                                browser_ready && page_zoom > crate::browser::MIN_PAGE_ZOOM + 0.005,
+                                egui::Button::new(egui_phosphor::regular::MINUS),
+                            )
+                            .on_hover_text("Zoom out")
+                            .clicked()
+                        {
+                            new_page_zoom = Some(crate::browser::step_page_zoom(page_zoom, false));
+                        }
+                        if ui
+                            .add_enabled(
+                                browser_ready,
+                                egui::Button::new(format!("{:.0}%", page_zoom * 100.0)),
+                            )
+                            .on_hover_text("Reset to 100%")
+                            .clicked()
+                        {
+                            new_page_zoom = Some(1.0);
+                        }
+                        if ui
+                            .add_enabled(
+                                browser_ready && page_zoom < crate::browser::MAX_PAGE_ZOOM - 0.005,
+                                egui::Button::new(egui_phosphor::regular::PLUS),
+                            )
+                            .on_hover_text("Zoom in")
+                            .clicked()
+                        {
+                            new_page_zoom = Some(crate::browser::step_page_zoom(page_zoom, true));
+                        }
+                    });
+                    if let Some(zoom) = new_page_zoom {
+                        if let Some(preview) = preview_manager.get_mut(id) {
+                            preview.browser_page_zoom = zoom;
+                        }
                     }
                     if ui
                         .add_enabled(browser_ready, egui::Button::new("Change URL..."))
