@@ -557,7 +557,8 @@ The download includes the ANGLE rendering runtime in the `lib` folder:
 - `libGLESv2.dll`
 
 The **Full** download also includes `libmpv-2.dll` for video tiles, folder
-playlists, and video wallpapers.
+playlists, and video wallpapers, and `uBOLite_2026.714.1952.edge.zip`, the
+uBlock Origin Lite package used for ad and tracker blocking in browser tiles.
 
 **WebView2** is required for browser tiles. **Streamlink** is an optional
 separate installation for supported stream URLs opened in video tiles.

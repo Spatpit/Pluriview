@@ -172,8 +172,10 @@ const CRASH_RELOAD_COOLDOWN: Duration = Duration::from_secs(60);
 const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const UBOL_VERSION: &str = "2026.714.1952";
-const UBOL_ARCHIVE: &[u8] =
-    include_bytes!("../assets/third_party/ubol/uBOLite_2026.714.1952.edge.zip");
+/// Shipped in the `lib` folder beside the executable instead of embedded,
+/// which keeps ~10 MB out of pluriview.exe. The build still pins its SHA-256,
+/// and only a package matching that fingerprint is ever extracted.
+const UBOL_ARCHIVE_NAME: &str = "uBOLite_2026.714.1952.edge.zip";
 const UBOL_ARCHIVE_FINGERPRINT: &str = env!("PLURIVIEW_UBOL_SHA256");
 const PREPARATION_PROGRESS_SCALE: u32 = 10_000;
 
@@ -2026,7 +2028,8 @@ fn prepare_ubol_with_progress(extension_dir: &Path, progress: &AtomicU32) -> Res
         return Ok(());
     }
 
-    if installed_ubol_matches_embedded_with_progress(extension_dir, progress, 0.03, 0.38) {
+    let archive = load_ubol_archive()?;
+    if installed_ubol_matches_package_with_progress(extension_dir, &archive, progress, 0.03, 0.38) {
         write_ubol_verification_marker(extension_dir);
         set_preparation_progress(progress, 1.0);
         return Ok(());
@@ -2046,12 +2049,13 @@ fn prepare_ubol_with_progress(extension_dir: &Path, progress: &AtomicU32) -> Res
         .map_err(|error| format!("Create extension staging directory: {error}"))?;
 
     set_preparation_progress(progress, 0.4);
-    let extract_result = extract_ubol_archive_with_progress(&staging, progress, 0.4, 0.74);
+    let extract_result =
+        extract_ubol_archive_with_progress(&staging, &archive, progress, 0.4, 0.74);
     if let Err(error) = extract_result {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
-    if !installed_ubol_matches_embedded_with_progress(&staging, progress, 0.75, 0.98) {
+    if !installed_ubol_matches_package_with_progress(&staging, &archive, progress, 0.75, 0.98) {
         let _ = fs::remove_dir_all(&staging);
         return Err("Extracted uBlock Origin Lite package failed its integrity check".to_owned());
     }
@@ -2077,7 +2081,7 @@ fn ubol_verification_marker_path(extension_dir: &Path) -> Option<PathBuf> {
 }
 
 fn installed_ubol_has_current_marker(extension_dir: &Path) -> bool {
-    if !extension_dir.is_dir() || !installed_ubol_manifest_matches_embedded(extension_dir) {
+    if !extension_dir.is_dir() || !installed_ubol_manifest_is_pinned_version(extension_dir) {
         return false;
     }
     let Some(marker_path) = ubol_verification_marker_path(extension_dir) else {
@@ -2137,18 +2141,72 @@ fn installed_ubol_marker(extension_dir: &Path) -> Option<String> {
     Some(format!("{UBOL_ARCHIVE_FINGERPRINT} {digest}"))
 }
 
-fn installed_ubol_manifest_matches_embedded(extension_dir: &Path) -> bool {
-    let Ok(installed_manifest) = fs::read(extension_dir.join("manifest.json")) else {
+/// Cheap launch check that needs no package read; the verification marker
+/// already ties the installed files to the pinned archive fingerprint.
+fn installed_ubol_manifest_is_pinned_version(extension_dir: &Path) -> bool {
+    let Ok(manifest) = fs::read(extension_dir.join("manifest.json")) else {
         return false;
     };
-    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(UBOL_ARCHIVE)) else {
-        return false;
+    serde_json::from_slice::<serde_json::Value>(&manifest)
+        .is_ok_and(|manifest| manifest["version"] == UBOL_VERSION)
+}
+
+/// Where the pinned package may live: the `lib` folder beside the
+/// executable, or the source tree's copy when running a cargo build.
+fn ubol_archive_candidates(executable: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let Some(directory) = executable.and_then(Path::parent) else {
+        return candidates;
     };
-    let Ok(mut embedded_manifest) = archive.by_name("manifest.json") else {
-        return false;
-    };
-    let mut expected = Vec::with_capacity(embedded_manifest.size() as usize);
-    embedded_manifest.read_to_end(&mut expected).is_ok() && installed_manifest == expected
+    candidates.push(directory.join("lib").join(UBOL_ARCHIVE_NAME));
+
+    let is_build_profile = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "debug" | "release"));
+    let target_directory = directory.parent();
+    let is_target_directory = target_directory
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("target");
+    if is_build_profile && is_target_directory {
+        if let Some(workspace) = target_directory.and_then(Path::parent) {
+            candidates.push(
+                workspace
+                    .join("assets")
+                    .join("third_party")
+                    .join("ubol")
+                    .join(UBOL_ARCHIVE_NAME),
+            );
+        }
+    }
+    candidates
+}
+
+fn load_ubol_archive() -> Result<Vec<u8>, String> {
+    let executable = std::env::current_exe().ok();
+    let path = ubol_archive_candidates(executable.as_deref())
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| format!("{UBOL_ARCHIVE_NAME} is missing from the lib folder"))?;
+    let archive = fs::read(&path).map_err(|error| format!("Read {UBOL_ARCHIVE_NAME}: {error}"))?;
+    verify_ubol_archive(archive)
+}
+
+/// Only the exact package this build was pinned to is ever extracted.
+fn verify_ubol_archive(archive: Vec<u8>) -> Result<Vec<u8>, String> {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(&archive)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if digest == UBOL_ARCHIVE_FINGERPRINT {
+        Ok(archive)
+    } else {
+        Err(format!(
+            "{UBOL_ARCHIVE_NAME} in the lib folder doesn't match this version of Pluriview"
+        ))
+    }
 }
 
 fn write_ubol_verification_marker(extension_dir: &Path) {
@@ -2169,13 +2227,13 @@ fn write_ubol_verification_marker(extension_dir: &Path) {
 
 fn extract_ubol_archive_with_progress(
     destination: &Path,
+    archive: &[u8],
     progress: &AtomicU32,
     start: f32,
     end: f32,
 ) -> Result<(), String> {
-    let reader = Cursor::new(UBOL_ARCHIVE);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|error| format!("Open embedded uBlock Origin Lite package: {error}"))?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(archive))
+        .map_err(|error| format!("Open uBlock Origin Lite package: {error}"))?;
 
     let entry_count = archive.len().max(1);
     for index in 0..archive.len() {
@@ -2208,19 +2266,19 @@ fn extract_ubol_archive_with_progress(
 }
 
 #[cfg(test)]
-fn installed_ubol_matches_embedded(extension_dir: &Path) -> bool {
+fn installed_ubol_matches_package(extension_dir: &Path, archive: &[u8]) -> bool {
     let progress = AtomicU32::new(0);
-    installed_ubol_matches_embedded_with_progress(extension_dir, &progress, 0.0, 1.0)
+    installed_ubol_matches_package_with_progress(extension_dir, archive, &progress, 0.0, 1.0)
 }
 
-fn installed_ubol_matches_embedded_with_progress(
+fn installed_ubol_matches_package_with_progress(
     extension_dir: &Path,
+    archive: &[u8],
     progress: &AtomicU32,
     start: f32,
     end: f32,
 ) -> bool {
-    let reader = Cursor::new(UBOL_ARCHIVE);
-    let Ok(mut archive) = zip::ZipArchive::new(reader) else {
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(archive)) else {
         return false;
     };
     let mut expected_files = HashSet::new();
@@ -2313,11 +2371,11 @@ unsafe extern "system" fn browser_window_proc(
 mod tests {
     use super::{
         browser_geometry, capture_size_for_tile, extract_ubol_archive_with_progress,
-        installed_ubol_has_current_marker, installed_ubol_matches_embedded, is_allowed_navigation,
+        installed_ubol_has_current_marker, installed_ubol_matches_package, is_allowed_navigation,
         normalize_url, parked_bounds, profile_install_marker_path, read_profile_install_marker,
-        scrub_url_for_storage, ubol_verification_marker_path, write_profile_install_marker,
-        write_ubol_verification_marker, NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE,
-        UBOL_VERSION,
+        scrub_url_for_storage, ubol_archive_candidates, ubol_verification_marker_path,
+        verify_ubol_archive, write_profile_install_marker, write_ubol_verification_marker,
+        NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE_NAME, UBOL_VERSION,
     };
     use eframe::egui;
     use std::io::{Cursor, Read};
@@ -2513,9 +2571,19 @@ mod tests {
         );
     }
 
+    fn source_ubol_archive() -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("third_party")
+            .join("ubol")
+            .join(UBOL_ARCHIVE_NAME);
+        verify_ubol_archive(std::fs::read(path).unwrap()).unwrap()
+    }
+
     #[test]
-    fn embedded_ubol_package_matches_pinned_version() {
-        let mut archive = zip::ZipArchive::new(Cursor::new(UBOL_ARCHIVE)).unwrap();
+    fn packaged_ubol_matches_pinned_version() {
+        let archive = source_ubol_archive();
+        let mut archive = zip::ZipArchive::new(Cursor::new(archive)).unwrap();
         let mut manifest = String::new();
         archive
             .by_name("manifest.json")
@@ -2560,10 +2628,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&destination);
         let _ = std::fs::remove_file(&marker);
         std::fs::create_dir(&destination).unwrap();
+        let archive = source_ubol_archive();
         let progress = AtomicU32::new(0);
-        extract_ubol_archive_with_progress(&destination, &progress, 0.0, 1.0).unwrap();
+        extract_ubol_archive_with_progress(&destination, &archive, &progress, 0.0, 1.0).unwrap();
         assert_eq!(progress.load(Ordering::Relaxed), PREPARATION_PROGRESS_SCALE);
-        assert!(installed_ubol_matches_embedded(&destination));
+        assert!(installed_ubol_matches_package(&destination, &archive));
         assert!(!installed_ubol_has_current_marker(&destination));
 
         write_ubol_verification_marker(&destination);
@@ -2576,7 +2645,7 @@ mod tests {
         std::fs::create_dir_all(&generated).unwrap();
         std::fs::write(generated.join("_ruleset1"), b"index").unwrap();
         assert!(installed_ubol_has_current_marker(&destination));
-        assert!(installed_ubol_matches_embedded(&destination));
+        assert!(installed_ubol_matches_package(&destination, &archive));
 
         // Rewriting any package file, not just the manifest, is detected.
         let script = std::fs::read_dir(&destination)
@@ -2589,12 +2658,41 @@ mod tests {
         original.extend_from_slice(b"// tampered");
         std::fs::write(&script, original).unwrap();
         assert!(!installed_ubol_has_current_marker(&destination));
-        assert!(!installed_ubol_matches_embedded(&destination));
+        assert!(!installed_ubol_matches_package(&destination, &archive));
 
         std::fs::write(destination.join("manifest.json"), b"{}").unwrap();
         assert!(!installed_ubol_has_current_marker(&destination));
-        assert!(!installed_ubol_matches_embedded(&destination));
+        assert!(!installed_ubol_matches_package(&destination, &archive));
         std::fs::remove_dir_all(&destination).unwrap();
         std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn ubol_package_with_wrong_fingerprint_is_rejected() {
+        let mut archive = source_ubol_archive();
+        archive.push(0);
+        assert!(verify_ubol_archive(archive).is_err());
+    }
+
+    #[test]
+    fn ubol_package_is_looked_up_in_lib_then_source_tree() {
+        let workspace = std::path::Path::new(r"C:\work\pluriview");
+        let built = workspace.join(r"target\release\pluriview.exe");
+        assert_eq!(
+            ubol_archive_candidates(Some(&built)),
+            vec![
+                workspace
+                    .join(r"target\release\lib")
+                    .join(UBOL_ARCHIVE_NAME),
+                workspace
+                    .join(r"assets\third_party\ubol")
+                    .join(UBOL_ARCHIVE_NAME),
+            ]
+        );
+        let installed = std::path::Path::new(r"D:\Apps\Pluriview\pluriview.exe");
+        assert_eq!(
+            ubol_archive_candidates(Some(installed)),
+            vec![std::path::Path::new(r"D:\Apps\Pluriview\lib").join(UBOL_ARCHIVE_NAME)]
+        );
     }
 }
