@@ -314,6 +314,10 @@ pub struct Preview {
     pub screenshot_wants_native_frame: bool,
     screenshot_native_frame: Option<Arc<egui::ColorImage>>,
 
+    /// Runtime-only: this tile is being recorded, so it keeps capturing at
+    /// full size and stays live while off screen.
+    pub recording: bool,
+
     /// Current URL when this preview is a browser tile, None otherwise.
     /// Kept up to date as the page navigates so layouts save where the
     /// user actually is, not where the tile started.
@@ -436,6 +440,7 @@ impl Preview {
             retained_frame: None,
             screenshot_wants_native_frame: false,
             screenshot_native_frame: None,
+            recording: false,
             browser_url: None,
             browser_muted: false,
             browser_page_zoom: 1.0,

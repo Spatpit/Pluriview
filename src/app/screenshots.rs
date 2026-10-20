@@ -112,8 +112,10 @@ impl PluriviewApp {
     /// uploaded frame, so a screenshot saves exactly what is on screen.
     pub(super) fn sync_screenshot_frame_retention(&mut self) {
         let targets = self.canvas.capture_targets();
+        let recording = self.recording_tile();
         for preview in self.preview_manager.all_mut() {
-            preview.set_retain_frame(targets.contains(&preview.id));
+            preview
+                .set_retain_frame(targets.contains(&preview.id) || recording == Some(preview.id));
         }
     }
 
@@ -359,8 +361,8 @@ impl PluriviewApp {
         ctx.request_repaint();
     }
 
-    /// Top-bar section for things Pluriview captures itself. A one-click
-    /// camera plus a small menu; recording can join it later.
+    /// Top-bar section for things Pluriview captures itself: one-click
+    /// camera and record buttons plus a small menu.
     pub(super) fn capture_section_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let (divider, _) = ui.allocate_exact_size(egui::vec2(1.0, 18.0), egui::Sense::hover());
         ui.painter().vline(
@@ -387,6 +389,7 @@ impl PluriviewApp {
         if camera.clicked() {
             self.request_tile_screenshots(ctx);
         }
+        self.record_button_ui(ui);
         let panel_shortcut = self
             .app_config
             .keyboard_shortcuts
@@ -448,6 +451,7 @@ impl PluriviewApp {
                 self.open_screenshots_folder();
                 ui.close_menu();
             }
+            self.recording_menu_ui(ui);
         });
     }
 

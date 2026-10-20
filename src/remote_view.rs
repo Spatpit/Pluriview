@@ -25,7 +25,7 @@ mod soak_tests;
 #[cfg(test)]
 mod transport_tests;
 #[cfg(windows)]
-mod video;
+pub(crate) mod video;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const VIDEO_SIZE: [usize; 2] = [1280, 720];

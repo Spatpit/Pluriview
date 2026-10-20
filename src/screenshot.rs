@@ -133,7 +133,7 @@ impl CapturedPixels {
 
 /// Pixel rectangle `(left, top, right, bottom)` covered by a normalized crop.
 /// Invalid crops fall back to the full frame; valid ones keep at least 1 px.
-fn crop_pixel_bounds(
+pub(crate) fn crop_pixel_bounds(
     width: u32,
     height: u32,
     crop_uv: Option<(f32, f32, f32, f32)>,

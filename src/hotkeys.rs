@@ -76,6 +76,8 @@ pub enum HotkeySlot {
     SizeLarge,
     ScreenshotTile,
     ToggleScreenshotsPanel,
+    RecordTile,
+    PauseRecording,
 }
 
 impl HotkeySlot {
@@ -91,7 +93,7 @@ impl HotkeySlot {
         Self::CanvasView9,
     ];
 
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 37] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
@@ -127,6 +129,8 @@ impl HotkeySlot {
         Self::SizeLarge,
         Self::ScreenshotTile,
         Self::ToggleScreenshotsPanel,
+        Self::RecordTile,
+        Self::PauseRecording,
     ];
 
     pub fn label(self) -> &'static str {
@@ -166,6 +170,8 @@ impl HotkeySlot {
             Self::SizeLarge => "Large group size",
             Self::ScreenshotTile => "Screenshot selected tile",
             Self::ToggleScreenshotsPanel => "Toggle Screenshots panel",
+            Self::RecordTile => "Start/stop recording selected tile",
+            Self::PauseRecording => "Pause/resume recording",
         }
     }
 }
@@ -208,6 +214,8 @@ pub struct HotkeyBindings {
     pub size_large: Hotkey,
     pub screenshot_tile: Hotkey,
     pub toggle_screenshots_panel: Hotkey,
+    pub record_tile: Hotkey,
+    pub pause_recording: Hotkey,
 }
 
 impl Default for HotkeyBindings {
@@ -248,6 +256,8 @@ impl Default for HotkeyBindings {
             size_large: Hotkey::pair(0x12, 0x37),
             screenshot_tile: Hotkey::pair(0x10, 0x53), // Shift+S
             toggle_screenshots_panel: Hotkey::key(0x53), // S
+            record_tile: Hotkey::pair(0x10, 0x52),     // Shift+R
+            pause_recording: Hotkey::key(0x50),        // P
         }
     }
 }
@@ -290,6 +300,8 @@ impl HotkeyBindings {
             HotkeySlot::SizeLarge => self.size_large,
             HotkeySlot::ScreenshotTile => self.screenshot_tile,
             HotkeySlot::ToggleScreenshotsPanel => self.toggle_screenshots_panel,
+            HotkeySlot::RecordTile => self.record_tile,
+            HotkeySlot::PauseRecording => self.pause_recording,
         }
     }
 
@@ -330,6 +342,8 @@ impl HotkeyBindings {
             HotkeySlot::SizeLarge => self.size_large = hotkey,
             HotkeySlot::ScreenshotTile => self.screenshot_tile = hotkey,
             HotkeySlot::ToggleScreenshotsPanel => self.toggle_screenshots_panel = hotkey,
+            HotkeySlot::RecordTile => self.record_tile = hotkey,
+            HotkeySlot::PauseRecording => self.pause_recording = hotkey,
         }
     }
 
@@ -775,6 +789,8 @@ mod tests {
             restored.conflict(HotkeySlot::ScreenshotTile, restored.screenshot_tile),
             None
         );
+        assert_eq!(restored.get(HotkeySlot::RecordTile).display(), "Shift+R");
+        assert_eq!(restored.get(HotkeySlot::PauseRecording).display(), "P");
     }
 
     #[test]
@@ -878,7 +894,7 @@ mod tests {
         let configured = shortcuts.configured_keys();
         assert_eq!(
             configured.into_iter().filter(|enabled| *enabled).count(),
-            29
+            31
         );
         assert!(configured[0x11]); // Ctrl
         assert!(configured[0x31]); // 1

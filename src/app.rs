@@ -60,6 +60,7 @@ use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 #[cfg(windows)]
 mod browser_maintenance;
 mod media_sources;
+mod recording;
 mod screenshot_drop;
 mod screenshot_panel;
 mod screenshots;
@@ -1015,6 +1016,7 @@ pub struct PluriviewApp {
     canvas_notice: Option<(String, Instant)>,
     /// Pending tile screenshots, saves and their capture animations.
     screenshots: screenshots::ScreenshotState,
+    recording: recording::RecordingState,
     source_loads: SourceLoads,
 
     /// Missing optional tools encountered by a video creation action.
@@ -1223,6 +1225,7 @@ impl PluriviewApp {
             media_error: None,
             canvas_notice: None,
             screenshots: Default::default(),
+            recording: Default::default(),
             source_loads: SourceLoads::new(_cc.egui_ctx.clone()),
             external_tool_error: None,
             video_action_error: None,
@@ -5605,6 +5608,13 @@ impl eframe::App for PluriviewApp {
         if shortcut_presses.pressed(HotkeySlot::ToggleScreenshotsPanel) {
             self.set_screenshots_panel_open(!self.app_config.screenshots_panel_open);
         }
+        if shortcut_presses.pressed(HotkeySlot::RecordTile) {
+            self.toggle_recording();
+        }
+        // P does nothing unless a recording is running.
+        if shortcut_presses.pressed(HotkeySlot::PauseRecording) {
+            self.toggle_recording_pause();
+        }
         let numbered_canvas_view = HotkeySlot::CANVAS_VIEWS
             .iter()
             .position(|slot| shortcut_presses.pressed(*slot));
@@ -5697,6 +5707,7 @@ impl eframe::App for PluriviewApp {
         self.browser_capture_frame_rate_upkeep();
         self.sync_screenshot_frame_retention();
         self.screenshot_upkeep(ctx);
+        self.recording_upkeep(ctx);
 
         // Menu bar (File / View / Help) now lives inline in the custom
         // title bar; see `title_bar_ui` / `menu_bar`.
@@ -6287,6 +6298,20 @@ impl eframe::App for PluriviewApp {
                                 .weak(),
                             );
                             ui.end_row();
+
+                            for (label, slot) in [
+                                ("Start/stop recording", HotkeySlot::RecordTile),
+                                ("Pause/resume recording", HotkeySlot::PauseRecording),
+                            ] {
+                                ui.label(label);
+                                ui.label(
+                                    egui::RichText::new(
+                                        self.app_config.keyboard_shortcuts.get(slot).display(),
+                                    )
+                                    .weak(),
+                                );
+                                ui.end_row();
+                            }
 
                             ui.add_space(10.0);
                             ui.end_row();

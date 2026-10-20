@@ -16,6 +16,7 @@ mod persistence;
 mod playlist;
 mod preview;
 mod privacy;
+mod recording;
 mod remote_view;
 mod screenshot;
 mod screenshot_library;

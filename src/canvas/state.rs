@@ -1643,7 +1643,7 @@ impl CanvasState {
             }
             // A pending screenshot briefly asks for the full source size so a
             // small tile still saves a sharp image.
-            let (width, height) = if preview.screenshot_wants_native_frame {
+            let (width, height) = if preview.screenshot_wants_native_frame || preview.recording {
                 (MAX_CAPTURE_WIDTH, MAX_CAPTURE_HEIGHT)
             } else {
                 let display_size = live_capture_display_size(preview, lod);
@@ -1676,7 +1676,8 @@ impl CanvasState {
         for preview in preview_manager.all_mut() {
             let id = preview.id;
             let preview_rect = preview.rect();
-            let is_visible = preview.viewport_pin.is_some()
+            let is_visible = preview.recording
+                || preview.viewport_pin.is_some()
                 || viewport.intersects(preview_rect)
                 || (self.layout_is_animating()
                     && self

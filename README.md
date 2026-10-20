@@ -490,6 +490,23 @@ Each new screenshot flies into the folder it is saved to.
 window or browser tile can be captured while it stays selected after freezing;
 otherwise resume it first. Playlist tiles cannot be captured.
 
+### Recording
+
+Select or focus one tile, then press `Shift+R` or click the record button next
+to the camera in the **Capture** section. The button turns into a red dot with
+the elapsed time. Press `P` to pause and again to resume; the paused stretch is
+left out of the video. Press `Shift+R` or click the timer to stop and save.
+Both shortcuts can be changed in Settings, and `P` does nothing unless a
+recording is running.
+
+Recordings are MP4 files (H.264 video, AAC sound, up to 4K at 30 FPS) saved in
+the `recordings` folder inside Pluriview's data folder; choose **Capture → Open
+Recordings Folder** to see them. They keep the tile's crop and use Windows' own
+video encoder, preferring the graphics card, so nothing extra is installed.
+Window tiles record their app's sound. Browser and video tiles record
+Pluriview's sound, which includes any other browser or video tile playing at
+the same time. The recorded tile keeps capturing while it is off screen.
+
 ## Sharing audio with Discord or OBS
 
 Browser audio plays normally while you use Pluriview. However, that sound
@@ -535,6 +552,8 @@ your installation still uses `Numpad 2`.
 | Focus current tile | `F` |
 | Screenshot selected or focused tile | `Shift+S` |
 | Show/hide Screenshots panel | `S` |
+| Start / stop recording the selected tile | `Shift+R` |
+| Pause / resume recording | `P` |
 | Group / ungroup selected tiles | `Ctrl+G` / `Ctrl+U` |
 | One / two / three large tiles / equal tiles | `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
 | Medium / large selection size | `Alt+6` / `Alt+7` |
