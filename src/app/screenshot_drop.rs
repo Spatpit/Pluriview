@@ -4,6 +4,8 @@ use std::path::PathBuf;
 /// Grid cells match the image tile box, so tiles never overlap.
 const CELL: Vec2 = Vec2::new(640.0, 480.0);
 const GAP: f32 = 24.0;
+/// Recordings land as playing video tiles of the usual 16:9 size.
+const VIDEO_TILE: Vec2 = Vec2::new(640.0, 360.0);
 /// One drop adds at most this many tiles; every image tile keeps its full
 /// decoded frames in memory.
 pub(super) const MAX_DROPPED_SCREENSHOTS: usize = 48;
@@ -84,9 +86,14 @@ impl PluriviewApp {
         // before any image decodes.
         let sizes: Vec<Vec2> = paths
             .iter()
-            .map(|path| match image::image_dimensions(path) {
-                Ok((width, height)) => media_tile_size(width, height),
-                Err(_) => CELL,
+            .map(|path| {
+                if crate::screenshot_library::is_video(path) {
+                    return VIDEO_TILE;
+                }
+                match image::image_dimensions(path) {
+                    Ok((width, height)) => media_tile_size(width, height),
+                    Err(_) => CELL,
+                }
             })
             .collect();
         let center = self.canvas.screen_to_canvas(screen_point, canvas_rect);
@@ -97,7 +104,12 @@ impl PluriviewApp {
         let now = Instant::now();
         for (index, ((path, size), position)) in paths.iter().zip(&sizes).zip(positions).enumerate()
         {
-            match self.import_media_tile_sized(path, position, *size) {
+            let added_tile = if crate::screenshot_library::is_video(path) {
+                self.add_recording_tile(path, position)
+            } else {
+                self.import_media_tile_sized(path, position, *size)
+            };
+            match added_tile {
                 Ok(id) => {
                     let delay = index as f32 * LANDING_STAGGER_SECS;
                     let texture = self.screenshots.panel.texture_handle(path);
@@ -134,6 +146,24 @@ impl PluriviewApp {
             self.media_error = Some(errors.join("\n\n"));
         }
         ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn add_recording_tile(
+        &mut self,
+        path: &std::path::Path,
+        position: Pos2,
+    ) -> Result<PreviewId, String> {
+        self.add_local_video_path(path.to_path_buf(), position)
+    }
+
+    #[cfg(not(windows))]
+    fn add_recording_tile(
+        &mut self,
+        _path: &std::path::Path,
+        _position: Pos2,
+    ) -> Result<PreviewId, String> {
+        Err("Video tiles need Windows.".to_owned())
     }
 
     /// Highlight the canvas while screenshots are dragged over it.

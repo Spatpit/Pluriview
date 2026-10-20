@@ -66,10 +66,6 @@ impl Storage {
         self.data_dir.join("screenshots")
     }
 
-    pub fn recordings_dir(&self) -> PathBuf {
-        self.data_dir.join("recordings")
-    }
-
     /// Get auto-save path
     pub fn autosave_path(&self) -> PathBuf {
         self.data_dir.join("autosave.json")

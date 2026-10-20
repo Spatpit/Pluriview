@@ -11,7 +11,7 @@ const VIDEO_SNAPSHOT_WAIT: Duration = Duration::from_secs(1);
 const FLASH_SECS: f32 = 0.28;
 const FLIGHT_SECS: f32 = 0.6;
 const PULSE_SECS: f32 = 0.4;
-const THUMBNAIL_SIDE: u32 = 240;
+pub(super) const THUMBNAIL_SIDE: u32 = 240;
 const LANDED_SIDE: f32 = 26.0;
 
 /// Runtime-only screenshot work and its animations.
@@ -333,32 +333,42 @@ impl PluriviewApp {
         let Some(directory) = self.screenshot_save_dir() else {
             return;
         };
-        let thumbnail = pixels.thumbnail(crop_uv, THUMBNAIL_SIDE);
-        let mut saved_thumbnail = None;
-        let from = self.canvas.tile_screen_rect(id, &self.preview_manager);
-        if let (Some(thumbnail), Some(from)) = (thumbnail, from) {
-            self.screenshots.next_thumbnail += 1;
-            let texture = ctx.load_texture(
-                format!("screenshot_flight_{}", self.screenshots.next_thumbnail),
-                thumbnail,
-                egui::TextureOptions::LINEAR,
-            );
-            // Fly the visible part of the tile, keeping the image's shape.
-            let [width, height] = texture.size().map(|value| value as f32);
-            let fit = (from.width() / width).min(from.height() / height);
-            let from = egui::Rect::from_center_size(from.center(), egui::vec2(width, height) * fit);
-            saved_thumbnail = Some(texture.clone());
-            self.screenshots.flights.push(Flight {
-                from,
-                texture,
-                started: Instant::now(),
-            });
-        }
+        let saved_thumbnail = pixels
+            .thumbnail(crop_uv, THUMBNAIL_SIDE)
+            .and_then(|thumbnail| self.launch_capture_flight(id, thumbnail, ctx));
         self.screenshots.saving.push(SavingShot {
             receiver: screenshot::spawn_save(directory, stem, pixels, crop_uv),
             thumbnail: saved_thumbnail,
         });
         ctx.request_repaint();
+    }
+
+    /// Fly a thumbnail from the tile into the save folder (or the Capture
+    /// button). Returns the texture so the panel can reuse it at once.
+    pub(super) fn launch_capture_flight(
+        &mut self,
+        id: PreviewId,
+        thumbnail: egui::ColorImage,
+        ctx: &egui::Context,
+    ) -> Option<egui::TextureHandle> {
+        let from = self.canvas.tile_screen_rect(id, &self.preview_manager)?;
+        self.screenshots.next_thumbnail += 1;
+        let texture = ctx.load_texture(
+            format!("screenshot_flight_{}", self.screenshots.next_thumbnail),
+            thumbnail,
+            egui::TextureOptions::LINEAR,
+        );
+        // Fly the visible part of the tile, keeping the image's shape.
+        let [width, height] = texture.size().map(|value| value as f32);
+        let fit = (from.width() / width).min(from.height() / height);
+        let from = egui::Rect::from_center_size(from.center(), egui::vec2(width, height) * fit);
+        self.screenshots.flights.push(Flight {
+            from,
+            texture: texture.clone(),
+            started: Instant::now(),
+        });
+        ctx.request_repaint();
+        Some(texture)
     }
 
     /// Top-bar section for things Pluriview captures itself: one-click

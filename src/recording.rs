@@ -218,6 +218,73 @@ fn draw_frame(frame: &Frame, width: u32, height: u32, out: &mut [u8]) {
     }
 }
 
+/// Length stored in an MP4's movie header, found by walking box headers
+/// so only a few bytes are read even for long recordings.
+pub fn mp4_duration(path: &std::path::Path) -> Option<Duration> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let (mut start, mut end) = (0, file.metadata().ok()?.len());
+    for wanted in [b"moov", b"mvhd"] {
+        let mut at = start;
+        let mut found = None;
+        while at + 8 <= end {
+            file.seek(SeekFrom::Start(at)).ok()?;
+            let mut header = [0u8; 16];
+            file.read_exact(&mut header[..8]).ok()?;
+            let mut size = u64::from(u32::from_be_bytes(header[..4].try_into().ok()?));
+            let mut header_len = 8;
+            if size == 1 {
+                file.read_exact(&mut header[8..]).ok()?;
+                size = u64::from_be_bytes(header[8..].try_into().ok()?);
+                header_len = 16;
+            } else if size == 0 {
+                size = end - at;
+            }
+            if size < header_len {
+                return None;
+            }
+            if &header[4..8] == wanted {
+                found = Some((at + header_len, at + size));
+                break;
+            }
+            at += size;
+        }
+        (start, end) = found?;
+    }
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut body = [0u8; 32];
+    file.read_exact(&mut body).ok()?;
+    let word = |at: usize| {
+        u64::from(u32::from_be_bytes([
+            body[at],
+            body[at + 1],
+            body[at + 2],
+            body[at + 3],
+        ]))
+    };
+    let (timescale, duration) = if body[0] == 1 {
+        (word(20), u64::from_be_bytes(body[24..32].try_into().ok()?))
+    } else {
+        (word(12), word(16))
+    };
+    (timescale > 0).then(|| Duration::from_secs_f64(duration as f64 / timescale as f64))
+}
+
+/// First picture of a video file, scaled to fit `max_side`, for the
+/// Screenshots panel. Decoded by Windows, like recordings are encoded.
+#[cfg(windows)]
+pub fn video_thumbnail(path: &std::path::Path, max_side: u32) -> Option<eframe::egui::ColorImage> {
+    mf::thumbnail(path, max_side)
+}
+
+#[cfg(not(windows))]
+pub fn video_thumbnail(
+    _path: &std::path::Path,
+    _max_side: u32,
+) -> Option<eframe::egui::ColorImage> {
+    None
+}
+
 #[cfg(not(windows))]
 fn run(
     _path: &std::path::Path,
@@ -539,6 +606,110 @@ mod mf {
         }
     }
 
+    pub(super) fn thumbnail(
+        path: &std::path::Path,
+        max_side: u32,
+    ) -> Option<eframe::egui::ColorImage> {
+        type CreateReader =
+            unsafe extern "system" fn(PCWSTR, *mut c_void, *mut *mut c_void) -> HRESULT;
+        unsafe {
+            let runtime = Runtime::new().ok()?;
+            let library: libloading::Library =
+                libloading::os::windows::Library::load_with_flags("mfreadwrite.dll", 0x800)
+                    .ok()?
+                    .into();
+            let create_reader = *library
+                .get::<CreateReader>(b"MFCreateSourceReaderFromURL\0")
+                .ok()?;
+            let mfplat: libloading::Library =
+                libloading::os::windows::Library::load_with_flags("mfplat.dll", 0x800)
+                    .ok()?
+                    .into();
+            let create_attributes = *mfplat
+                .get::<CreateAttributes>(b"MFCreateAttributes\0")
+                .ok()?;
+            let mut raw = std::ptr::null_mut();
+            create_attributes(&mut raw, 1).ok().ok()?;
+            let attributes = IMFAttributes::from_raw(raw);
+            // Let Windows convert the decoded picture to RGB for us.
+            attributes
+                .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+                .ok()?;
+            let url = HSTRING::from(path.as_os_str());
+            let mut raw = std::ptr::null_mut();
+            create_reader(PCWSTR(url.as_ptr()), attributes.as_raw(), &mut raw)
+                .ok()
+                .ok()?;
+            let reader = IMFSourceReader::from_raw(raw);
+            let video = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+            reader
+                .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)
+                .ok()?;
+            reader.SetStreamSelection(video, true).ok()?;
+            let wanted = runtime.media_type().ok()?;
+            wanted.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok()?;
+            wanted.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32).ok()?;
+            reader.SetCurrentMediaType(video, None, &wanted).ok()?;
+            let current = reader.GetCurrentMediaType(video).ok()?;
+            let size = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
+            let (width, height) = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
+            let stride = current
+                .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+                .map_or(width as isize * 4, |stride| stride as i32 as isize);
+            let mut sample = None;
+            for _ in 0..8 {
+                let mut flags = 0;
+                reader
+                    .ReadSample(video, 0, None, Some(&mut flags), None, Some(&mut sample))
+                    .ok()?;
+                if sample.is_some() || flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                    break;
+                }
+            }
+            let buffer = sample?.ConvertToContiguousBuffer().ok()?;
+            let mut data = std::ptr::null_mut();
+            let mut length = 0;
+            buffer.Lock(&mut data, None, Some(&mut length)).ok()?;
+            let image = (width > 0
+                && height > 0
+                && stride.unsigned_abs() >= width * 4
+                && length as usize >= stride.unsigned_abs() * height)
+                .then(|| {
+                    let bytes = std::slice::from_raw_parts(data, length as usize);
+                    let scale = (max_side as f32 / width.max(height) as f32).min(1.0);
+                    let out_width = ((width as f32 * scale) as usize).max(1);
+                    let out_height = ((height as f32 * scale) as usize).max(1);
+                    // A negative stride means the rows are stored bottom-up.
+                    let row_start = |y: usize| {
+                        if stride < 0 {
+                            (height - 1 - y) * stride.unsigned_abs()
+                        } else {
+                            y * stride as usize
+                        }
+                    };
+                    let pixels = (0..out_height)
+                        .flat_map(|y| {
+                            let row = row_start(y * height / out_height);
+                            (0..out_width).map(move |x| {
+                                let at = row + x * width / out_width * 4;
+                                eframe::egui::Color32::from_rgb(
+                                    bytes[at + 2],
+                                    bytes[at + 1],
+                                    bytes[at],
+                                )
+                            })
+                        })
+                        .collect();
+                    eframe::egui::ColorImage {
+                        size: [out_width, out_height],
+                        pixels,
+                    }
+                });
+            let _ = buffer.Unlock();
+            image
+        }
+    }
+
     pub(super) fn run(
         path: &std::path::Path,
         audio_pid: Option<u32>,
@@ -668,22 +839,6 @@ mod tests {
         assert_eq!(&out[8..], &[0; 8]);
     }
 
-    /// Seconds in an MP4's movie header.
-    fn mp4_duration(bytes: &[u8]) -> f64 {
-        let at = bytes.windows(4).position(|w| w == b"mvhd").unwrap() + 4;
-        let field = |offset: usize, len: usize| {
-            bytes[at + offset..at + offset + len]
-                .iter()
-                .fold(0u64, |value, byte| value << 8 | u64::from(*byte))
-        };
-        let (timescale, duration) = if bytes[at] == 1 {
-            (field(20, 4), field(24, 8))
-        } else {
-            (field(12, 4), field(16, 4))
-        };
-        duration as f64 / timescale as f64
-    }
-
     /// Encodes through the real Windows encoder; run with `--ignored`.
     #[cfg(windows)]
     #[test]
@@ -728,10 +883,15 @@ mod tests {
         let result = recorder.stop().recv().unwrap();
         let path = result.unwrap();
         let bytes = std::fs::read(&path).unwrap();
+        let seconds = mp4_duration(&path).unwrap().as_secs_f64();
+        let thumbnail = video_thumbnail(&path, 160).expect("first frame decodes");
         std::fs::remove_file(&path).unwrap();
+        assert_eq!(thumbnail.size, [160, 90]);
+        // The first frame is shade 0: no red, full blue.
+        let pixel = thumbnail.pixels[90 / 2 * 160 + 80];
+        assert!(pixel.r() < 40 && pixel.b() > 200, "{pixel:?}");
         assert_eq!(&bytes[4..8], b"ftyp");
         assert!(bytes.windows(4).any(|w| w == b"mp4a"), "no audio track");
-        let seconds = mp4_duration(&bytes);
         assert!((1.8..2.4).contains(&seconds), "recorded {seconds} s");
     }
 }

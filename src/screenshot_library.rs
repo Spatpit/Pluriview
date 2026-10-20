@@ -1,21 +1,40 @@
 //! The screenshots folder as a small library: one level of named folders
-//! inside Pluriview's `screenshots` data folder, each holding PNG files.
+//! inside Pluriview's `screenshots` data folder, each holding PNG
+//! screenshots and MP4 tile recordings.
 //! Every path that reaches the file system is checked to stay inside it.
 
 use std::cmp::Ordering;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 const MAX_FOLDER_CHARS: usize = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenshotEntry {
     pub path: PathBuf,
-    /// File name without the `.png` extension.
+    /// File name without the `.png` / `.mp4` extension.
     pub name: String,
     pub modified: SystemTime,
+    /// Length of a recording; `None` for screenshots.
+    pub duration: Option<Duration>,
+    pub is_video: bool,
+}
+
+/// PNG screenshots and MP4 recordings both belong to the library.
+pub fn is_library_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("png") || extension.eq_ignore_ascii_case("mp4")
+        })
+}
+
+pub fn is_video(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
 }
 
 /// One section of the panel. `name` is `None` for screenshots saved
@@ -75,14 +94,11 @@ fn scan_shots(directory: &Path) -> Vec<ScreenshotEntry> {
 }
 
 fn shot_entry(path: &Path, is_file: bool) -> Option<ScreenshotEntry> {
-    let is_png = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
-    if !is_file || !is_png {
+    if !is_file || !is_library_file(path) {
         return None;
     }
     let name = path.file_stem()?.to_str()?.to_owned();
+    let is_video = is_video(path);
     let modified = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -90,6 +106,10 @@ fn shot_entry(path: &Path, is_file: bool) -> Option<ScreenshotEntry> {
         path: path.to_path_buf(),
         name,
         modified,
+        duration: is_video
+            .then(|| crate::recording::mp4_duration(path))
+            .flatten(),
+        is_video,
     })
 }
 
@@ -179,15 +199,11 @@ pub fn rename_folder(root: &Path, old: &str, new: &str) -> Result<String, String
 }
 
 /// The library folder a screenshot lives in, or `None` if the path is not a
-/// PNG directly inside the library or one of its folders.
+/// PNG or MP4 directly inside the library or one of its folders.
 pub fn shot_folder(root: &Path, shot: &Path) -> Option<Option<String>> {
     let relative = shot.strip_prefix(root).ok()?;
     let parts: Vec<_> = relative.components().collect();
-    let is_png = shot
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
-    if !is_png {
+    if !is_library_file(shot) {
         return None;
     }
     match parts.as_slice() {
@@ -217,11 +233,12 @@ pub fn move_shot(root: &Path, shot: &Path, folder: Option<&str>) -> Result<PathB
         .file_stem()
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| "That screenshot has an unreadable name.".to_owned())?;
+    let extension = if is_video(shot) { "mp4" } else { "png" };
     for attempt in 1..=999 {
         let target = if attempt == 1 {
-            directory.join(format!("{stem}.png"))
+            directory.join(format!("{stem}.{extension}"))
         } else {
-            directory.join(format!("{stem} ({attempt}).png"))
+            directory.join(format!("{stem} ({attempt}).{extension}"))
         };
         if target.exists() {
             continue;
@@ -287,6 +304,7 @@ mod tests {
             Some(Some("Trips".to_owned()))
         );
         assert_eq!(shot_folder(root, &root.join("a.txt")), None);
+        assert_eq!(shot_folder(root, &root.join("clip.MP4")), Some(None));
         assert_eq!(
             shot_folder(root, &root.join("a").join("b").join("c.png")),
             None
@@ -303,6 +321,7 @@ mod tests {
         fs::create_dir(root.join("beta")).unwrap();
         fs::create_dir(root.join("Alpha")).unwrap();
         touch(&root.join("Alpha").join("One.png"));
+        touch(&root.join("Alpha").join("Clip.mp4"));
         fs::create_dir(root.join("Alpha").join("Nested")).unwrap();
 
         let folders = scan(&root);
@@ -313,7 +332,16 @@ mod tests {
         );
         assert_eq!(folders[0].shots.len(), 1);
         assert_eq!(folders[0].shots[0].name, "Loose");
-        assert_eq!(folders[1].shots.len(), 1);
+        assert!(!folders[0].shots[0].is_video);
+        assert_eq!(folders[1].shots.len(), 2);
+        let clip = folders[1]
+            .shots
+            .iter()
+            .find(|shot| shot.name == "Clip")
+            .unwrap();
+        assert!(clip.is_video);
+        // Not a real MP4, so it has no readable length.
+        assert_eq!(clip.duration, None);
         assert!(folders[2].shots.is_empty());
         let _ = fs::remove_dir_all(&root);
     }
@@ -345,6 +373,9 @@ mod tests {
         let back = move_shot(&root, &root.join("Holidays").join("Shot.png"), None).unwrap();
         assert_eq!(back, root.join("Shot.png"));
         assert!(move_shot(&root, Path::new("C:/elsewhere/x.png"), None).is_err());
+        touch(&root.join("Clip.mp4"));
+        let moved = move_shot(&root, &root.join("Clip.mp4"), Some("Holidays")).unwrap();
+        assert_eq!(moved, root.join("Holidays").join("Clip.mp4"));
         let _ = fs::remove_dir_all(&root);
     }
 }

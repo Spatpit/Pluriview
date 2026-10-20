@@ -493,16 +493,21 @@ otherwise resume it first. Playlist tiles cannot be captured.
 ### Recording
 
 Select or focus one tile, then press `Shift+R` or click the record button next
-to the camera in the **Capture** section. The button turns into a red dot with
-the elapsed time. Press `P` to pause and again to resume; the paused stretch is
-left out of the video. Press `Shift+R` or click the timer to stop and save.
-Both shortcuts can be changed in Settings, and `P` does nothing unless a
-recording is running.
+to the camera in the **Capture** section. While recording, the tile gets a
+pulsing red outline and a **REC** badge with the elapsed time; the record
+button shows the same timer. Press `P` to pause and again to resume: the
+outline and badge turn gold and read **PAUSED**, and the paused stretch is left
+out of the video. Press `Shift+R` or click the timer to stop and save; the
+recording flies into its folder like a screenshot. If the recorded tile is off
+screen, the badge shows at the top of the canvas. Both shortcuts can be changed
+in Settings, and `P` does nothing unless a recording is running.
 
-Recordings are MP4 files (H.264 video, AAC sound, up to 4K at 30 FPS) saved in
-the `recordings` folder inside Pluriview's data folder; choose **Capture → Open
-Recordings Folder** to see them. They keep the tile's crop and use Windows' own
-video encoder, preferring the graphics card, so nothing extra is installed.
+Recordings are MP4 files (H.264 video, AAC sound, up to 4K at 30 FPS) saved
+alongside your screenshots, in the folder chosen under **Save new shots to**.
+In the Screenshots panel they show a play mark and their length, and they can
+be moved, opened, or dragged onto the canvas as video tiles like screenshots.
+They keep the tile's crop and use Windows' own video encoder, preferring the
+graphics card, so nothing extra is installed.
 Window tiles record their app's sound. Browser and video tiles record
 Pluriview's sound, which includes any other browser or video tile playing at
 the same time. The recorded tile keeps capturing while it is off screen.

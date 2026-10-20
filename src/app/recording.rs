@@ -5,13 +5,23 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / MAX_FPS as u64);
+/// How often the flight thumbnail follows the recorded picture.
+const THUMBNAIL_REFRESH: Duration = Duration::from_secs(1);
+const RECORD_RED: egui::Color32 = egui::Color32::from_rgb(232, 72, 72);
 
 /// Runtime-only recording of one tile.
 #[derive(Default)]
 pub(super) struct RecordingState {
     active: Option<ActiveRecording>,
     /// Recordings whose worker is still finishing the MP4.
-    finishing: Vec<mpsc::Receiver<Result<PathBuf, String>>>,
+    finishing: Vec<FinishingRecording>,
+}
+
+struct FinishingRecording {
+    receiver: mpsc::Receiver<Result<PathBuf, String>>,
+    /// The flight thumbnail, reused by the Screenshots panel.
+    thumbnail: Option<egui::TextureHandle>,
+    length: Duration,
 }
 
 struct ActiveRecording {
@@ -22,6 +32,8 @@ struct ActiveRecording {
     /// Identity of the last frame handed over, so an unchanged source is
     /// not converted again; its picture simply holds in the video.
     last_source: usize,
+    /// Small copy of a recent frame that flies into the panel on stop.
+    thumbnail: Option<(egui::ColorImage, Instant)>,
     #[cfg(windows)]
     video_readback: Option<mpsc::Receiver<Option<VideoSnapshot>>>,
 }
@@ -43,9 +55,9 @@ impl PluriviewApp {
     }
 
     /// Start recording the selected or focused tile, or stop the recording.
-    pub(super) fn toggle_recording(&mut self) {
+    pub(super) fn toggle_recording(&mut self, ctx: &egui::Context) {
         if self.recording.active.is_some() {
-            self.stop_recording();
+            self.stop_recording(ctx);
             return;
         }
         let notice = |app: &mut Self, message: &str| {
@@ -60,7 +72,8 @@ impl PluriviewApp {
             };
             return notice(self, message);
         };
-        let Some(directory) = self.storage.as_ref().map(Storage::recordings_dir) else {
+        // Recordings join the screenshots in the folder new shots go to.
+        let Some(directory) = self.screenshot_save_dir() else {
             return notice(
                 self,
                 "Recording needs Pluriview's data folder, which is unavailable.",
@@ -84,7 +97,7 @@ impl PluriviewApp {
         if let Err(error) = std::fs::create_dir_all(&directory) {
             return notice(
                 self,
-                &format!("Could not create the recordings folder: {error}"),
+                &format!("Could not create the screenshots folder: {error}"),
             );
         }
         // Windows pick up their own process tree's sound. Browser and video
@@ -109,9 +122,11 @@ impl PluriviewApp {
             clock: Clock::new(started),
             last_sent: None,
             last_source: 0,
+            thumbnail: None,
             #[cfg(windows)]
             video_readback: None,
         });
+        ctx.request_repaint();
     }
 
     pub(super) fn toggle_recording_pause(&mut self) {
@@ -128,38 +143,60 @@ impl PluriviewApp {
         }
     }
 
-    pub(super) fn stop_recording(&mut self) {
+    /// Finish the file and fly the recording's picture into its folder in
+    /// the Screenshots panel (or the Capture button), like a screenshot.
+    pub(super) fn stop_recording(&mut self, ctx: &egui::Context) {
         let Some(active) = self.recording.active.take() else {
             return;
         };
         if let Some(preview) = self.preview_manager.get_mut(active.id) {
             preview.recording = false;
         }
-        self.recording.finishing.push(active.recorder.stop());
-        self.canvas_notice = Some(("Saving the recording…".to_owned(), Instant::now()));
+        let length = active.clock.media_time(Instant::now());
+        let thumbnail = active
+            .thumbnail
+            .and_then(|(image, _)| self.launch_capture_flight(active.id, image, ctx));
+        self.recording.finishing.push(FinishingRecording {
+            receiver: active.recorder.stop(),
+            thumbnail,
+            length,
+        });
+        self.canvas_notice = Some((
+            format!("Saving the {} recording…", format_elapsed(length)),
+            Instant::now(),
+        ));
     }
 
     /// Hand the recorded tile's newest frame to the encoder, at most
     /// `MAX_FPS` times a second. Runs after this frame's captures arrived.
     pub(super) fn recording_upkeep(&mut self, ctx: &egui::Context) {
+        let panel_shown = self.app_config.screenshots_panel_open && !self.canvas_only;
+        let panel = &mut self.screenshots.panel;
+        let mut notice = None;
         self.recording
             .finishing
-            .retain(|receiver| match receiver.try_recv() {
-                Ok(Ok(_)) => {
-                    self.canvas_notice = Some((
-                        "Recording saved to the Recordings folder.".to_owned(),
-                        Instant::now(),
+            .retain(|finishing| match finishing.receiver.try_recv() {
+                Ok(Ok(path)) => {
+                    if panel_shown {
+                        panel.add_saved_shot(path, finishing.thumbnail.clone());
+                    }
+                    notice = Some(format!(
+                        "Saved the {} recording with your screenshots.",
+                        format_elapsed(finishing.length)
                     ));
                     false
                 }
                 Ok(Err(error)) => {
                     log::error!("{error}");
-                    self.canvas_notice = Some((error, Instant::now()));
+                    notice = Some(error);
                     false
                 }
                 Err(mpsc::TryRecvError::Empty) => true,
                 Err(mpsc::TryRecvError::Disconnected) => false,
             });
+        if let Some(message) = notice {
+            self.canvas_notice = Some((message, Instant::now()));
+        }
         if !self.recording.finishing.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -179,11 +216,12 @@ impl PluriviewApp {
         let id = active.id;
         let Some(preview) = self.preview_manager.get_mut(id) else {
             // The tile was removed: keep what was recorded.
-            return self.stop_recording();
+            return self.stop_recording(ctx);
         };
-        // Keep the timer ticking even while nothing else repaints.
+        // Keep the timer and the REC badge moving even while nothing else
+        // repaints.
         ctx.request_repaint_after(if active.clock.paused() {
-            Duration::from_millis(500)
+            Duration::from_millis(250)
         } else {
             FRAME_INTERVAL
         });
@@ -241,6 +279,15 @@ impl PluriviewApp {
         let Some(pixels) = pixels else {
             return;
         };
+        if active
+            .thumbnail
+            .as_ref()
+            .is_none_or(|(_, made)| made.elapsed() >= THUMBNAIL_REFRESH)
+        {
+            if let Some(image) = pixels.thumbnail(crop_uv, super::screenshots::THUMBNAIL_SIDE) {
+                active.thumbnail = Some((image, now));
+            }
+        }
         let frame = Frame {
             pixels,
             crop_uv,
@@ -254,29 +301,109 @@ impl PluriviewApp {
         }
     }
 
-    pub(super) fn open_recordings_folder(&mut self) {
-        let Some(directory) = self.storage.as_ref().map(Storage::recordings_dir) else {
+    /// While recording: a pulsing red outline around the tile and a badge
+    /// with the elapsed time (gold and still while paused). If the tile is
+    /// off screen, the badge sits at the top of the canvas instead.
+    pub(super) fn recording_overlay_ui(&self, ctx: &egui::Context) {
+        let Some(active) = &self.recording.active else {
             return;
         };
-        if let Err(error) = std::fs::create_dir_all(&directory) {
-            self.canvas_notice = Some((
-                format!("Could not open the recordings folder: {error}"),
-                Instant::now(),
-            ));
+        let Some(canvas) = self.canvas.last_screen_rect else {
             return;
-        }
-        #[cfg(windows)]
-        unsafe {
-            let directory = HSTRING::from(directory.as_os_str());
-            ShellExecuteW(
-                None,
-                windows::core::w!("open"),
-                &directory,
-                None,
-                None,
-                SW_SHOWNORMAL,
+        };
+        let paused = active.clock.paused();
+        let color = if paused {
+            crate::ui_theme::GOLD
+        } else {
+            RECORD_RED
+        };
+        let time = ctx.input(|input| input.time);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("recording_overlay"),
+        ));
+        let tile = self
+            .canvas
+            .tile_screen_rect(active.id, &self.preview_manager)
+            .filter(|rect| rect.intersects(canvas));
+        if let Some(rect) = tile {
+            // Drawn just outside the tile so it also frames a browser tile
+            // while its live page window sits on top.
+            let strength = if paused {
+                0.9
+            } else {
+                0.55 + 0.45 * (time * std::f64::consts::PI).sin().abs() as f32
+            };
+            painter.rect_stroke(
+                rect.expand(3.0),
+                8.0,
+                egui::Stroke::new(3.0, color.gamma_multiply(strength)),
             );
         }
+
+        let elapsed = format_elapsed(active.clock.media_time(Instant::now()));
+        let mut label = if paused {
+            format!("PAUSED  {elapsed}")
+        } else {
+            format!("REC  {elapsed}")
+        };
+        if tile.is_none() {
+            if let Some(preview) = self.preview_manager.get(active.id) {
+                label.push_str(&format!("  ·  {}", short_title(&preview.title)));
+            }
+        }
+        let galley =
+            painter.layout_no_wrap(label, egui::FontId::monospace(13.0), egui::Color32::WHITE);
+        let size = galley.size() + egui::vec2(34.0, 10.0);
+        let corner = match tile {
+            // Above the tile's top-left corner, or just inside it when the
+            // tile touches the top of the canvas.
+            Some(rect) if rect.top() - size.y - 8.0 >= canvas.top() => {
+                rect.left_top() + egui::vec2(0.0, -size.y - 8.0)
+            }
+            Some(rect) => rect.left_top() + egui::vec2(8.0, 8.0),
+            None => egui::pos2(canvas.center().x - size.x / 2.0, canvas.top() + 12.0),
+        };
+        let x = corner.x.clamp(
+            canvas.left() + 4.0,
+            (canvas.right() - size.x - 4.0).max(canvas.left()),
+        );
+        let badge = egui::Rect::from_min_size(egui::pos2(x, corner.y), size);
+        painter.rect_filled(badge, size.y / 2.0, egui::Color32::from_black_alpha(215));
+        painter.rect_stroke(badge, size.y / 2.0, egui::Stroke::new(1.5, color));
+        let mark = egui::pos2(badge.left() + 15.0, badge.center().y);
+        if paused {
+            for offset in [-3.0, 3.0] {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(
+                        mark + egui::vec2(offset, 0.0),
+                        egui::vec2(3.0, 10.0),
+                    ),
+                    1.0,
+                    color,
+                );
+            }
+        } else {
+            // A blinking dot, like a camera's tally light.
+            let on = (time * 2.0) as i64 % 2 == 0;
+            painter.circle_filled(
+                mark,
+                5.0,
+                if on {
+                    color
+                } else {
+                    color.gamma_multiply(0.35)
+                },
+            );
+        }
+        painter.galley(
+            egui::pos2(
+                badge.left() + 26.0,
+                badge.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            egui::Color32::WHITE,
+        );
     }
 
     /// Record button beside the camera; while recording it becomes a red
@@ -304,10 +431,7 @@ impl PluriviewApp {
                 let (icon, color) = if paused {
                     (egui_phosphor::regular::PAUSE, crate::ui_theme::GOLD)
                 } else {
-                    (
-                        egui_phosphor::regular::RECORD,
-                        egui::Color32::from_rgb(232, 72, 72),
-                    )
+                    (egui_phosphor::regular::RECORD, RECORD_RED)
                 };
                 let elapsed = format_elapsed(active.clock.media_time(Instant::now()));
                 let pause_shortcut = self
@@ -338,7 +462,7 @@ impl PluriviewApp {
             }
         };
         if button.clicked() {
-            self.toggle_recording();
+            self.toggle_recording(ui.ctx());
         }
     }
 
@@ -364,7 +488,7 @@ impl PluriviewApp {
             .add(crate::ui_theme::shortcut_button(title, record))
             .clicked()
         {
-            self.toggle_recording();
+            self.toggle_recording(ui.ctx());
             ui.close_menu();
         }
         let (icon, title) = if recording == Some(true) {
@@ -382,17 +506,17 @@ impl PluriviewApp {
             self.toggle_recording_pause();
             ui.close_menu();
         }
-        if crate::ui_theme::action(
-            ui,
-            egui_phosphor::regular::FOLDER_OPEN,
-            "Open Recordings Folder",
-        )
-        .clicked()
-        {
-            self.open_recordings_folder();
-            ui.close_menu();
-        }
     }
+}
+
+/// Keep the off-screen badge to one short line.
+fn short_title(title: &str) -> String {
+    const MAX_CHARS: usize = 32;
+    let mut short: String = title.chars().take(MAX_CHARS).collect();
+    if title.chars().count() > MAX_CHARS {
+        short.push('…');
+    }
+    short
 }
 
 /// `stem.mp4`, or `stem (2).mp4` and so on when a recording of that name

@@ -145,13 +145,17 @@ impl ThumbnailWorker {
             .spawn(move || {
                 // Ends when the panel state (and its sender) is dropped.
                 while let Ok((path, modified)) = request_receiver.recv() {
-                    let image = image::open(&path).ok().map(|image| {
-                        let image = image
-                            .thumbnail(THUMBNAIL_DECODE_SIDE, THUMBNAIL_DECODE_SIDE)
-                            .to_rgba8();
-                        let size = [image.width() as usize, image.height() as usize];
-                        egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw())
-                    });
+                    let image = if screenshot_library::is_video(&path) {
+                        crate::recording::video_thumbnail(&path, THUMBNAIL_DECODE_SIDE)
+                    } else {
+                        image::open(&path).ok().map(|image| {
+                            let image = image
+                                .thumbnail(THUMBNAIL_DECODE_SIDE, THUMBNAIL_DECODE_SIDE)
+                                .to_rgba8();
+                            let size = [image.width() as usize, image.height() as usize];
+                            egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw())
+                        })
+                    };
                     if result_sender.send((path, modified, image)).is_err() {
                         break;
                     }
@@ -1297,10 +1301,17 @@ fn shot_grid(
                     painter.text(
                         image_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        egui_phosphor::regular::IMAGE,
+                        if shot.is_video {
+                            egui_phosphor::regular::FILM_STRIP
+                        } else {
+                            egui_phosphor::regular::IMAGE
+                        },
                         egui::FontId::proportional(18.0),
                         crate::ui_theme::SECONDARY,
                     );
+                }
+                if shot.is_video {
+                    video_badge(painter, image_rect, shot.duration);
                 }
                 let fresh_alpha = fresh
                     .as_ref()
@@ -1425,6 +1436,31 @@ fn shot_grid(
         });
         ui.add_space(CARD_GAP);
     }
+}
+
+/// Play mark and length in the corner of a recording's card, so videos
+/// stand out from screenshots at a glance.
+fn video_badge(painter: &egui::Painter, image_rect: egui::Rect, duration: Option<Duration>) {
+    let mut label = egui_phosphor::regular::PLAY.to_owned();
+    if let Some(duration) = duration {
+        let seconds = duration.as_secs_f64().round() as u64;
+        label.push_str(&format!(" {}:{:02}", seconds / 60, seconds % 60));
+    }
+    let galley = painter.layout_no_wrap(
+        label,
+        egui::FontId::proportional(11.0),
+        egui::Color32::WHITE,
+    );
+    let badge = egui::Rect::from_min_size(
+        image_rect.left_bottom() + egui::vec2(6.0, -6.0 - galley.size().y - 4.0),
+        galley.size() + egui::vec2(10.0, 4.0),
+    );
+    painter.rect_filled(badge, 4.0, egui::Color32::from_black_alpha(190));
+    painter.galley(
+        badge.min + egui::vec2(5.0, 2.0),
+        galley,
+        egui::Color32::WHITE,
+    );
 }
 
 /// Where the drag ghost draws the `index`th screenshot: a small stack of up

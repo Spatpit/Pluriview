@@ -5609,7 +5609,7 @@ impl eframe::App for PluriviewApp {
             self.set_screenshots_panel_open(!self.app_config.screenshots_panel_open);
         }
         if shortcut_presses.pressed(HotkeySlot::RecordTile) {
-            self.toggle_recording();
+            self.toggle_recording(ctx);
         }
         // P does nothing unless a recording is running.
         if shortcut_presses.pressed(HotkeySlot::PauseRecording) {
@@ -6008,6 +6008,7 @@ impl eframe::App for PluriviewApp {
         self.browser_data_confirmation_ui(ctx);
         self.canvas_view_undo_toast_ui(ctx);
         self.screenshot_animation_ui(ctx);
+        self.recording_overlay_ui(ctx);
         self.screenshot_landings_ui(ctx);
         self.canvas_notice_ui(ctx);
 
