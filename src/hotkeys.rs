@@ -168,7 +168,7 @@ impl HotkeySlot {
             Self::NextSpotlight => "Next Spotlight tile",
             Self::SizeMedium => "Medium group size",
             Self::SizeLarge => "Large group size",
-            Self::ScreenshotTile => "Screenshot selected tile",
+            Self::ScreenshotTile => "Screenshot selected tiles",
             Self::ToggleScreenshotsPanel => "Toggle Screenshots panel",
             Self::RecordTile => "Start/stop recording selected tile",
             Self::PauseRecording => "Pause/resume recording",

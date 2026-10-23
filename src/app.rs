@@ -5603,7 +5603,7 @@ impl eframe::App for PluriviewApp {
             self.show_shortcuts = true;
         }
         if shortcut_presses.pressed(HotkeySlot::ScreenshotTile) {
-            self.request_tile_screenshots(ctx);
+            self.request_tile_screenshots(ctx, false);
         }
         if shortcut_presses.pressed(HotkeySlot::ToggleScreenshotsPanel) {
             self.set_screenshots_panel_open(!self.app_config.screenshots_panel_open);
@@ -6276,7 +6276,7 @@ impl eframe::App for PluriviewApp {
                             );
                             ui.end_row();
 
-                            ui.label("Screenshot selected tile");
+                            ui.label("Screenshot selected tiles");
                             ui.label(
                                 egui::RichText::new(
                                     self.app_config

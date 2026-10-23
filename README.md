@@ -451,8 +451,12 @@ Use `Ctrl+1` through `Ctrl+9` to open a viewpoint directly, or
 ### Screenshots
 
 Select a tile, or focus it with `F`, then click the camera in the top bar's
-**Capture** section or press `Shift+S`. With several tiles selected, each one
-is saved as its own PNG. The screenshot keeps the tile's crop and is taken from
+**Capture** section or press `Shift+S`. With several tiles selected, they are
+saved together as one PNG laid out the way they sit on the canvas: each tile
+keeps its crop, a selected tile on top hides what it covers, and the space
+between tiles is transparent. The most detailed tile keeps its full resolution,
+up to 8K for the whole image. **Capture → Screenshot Each Tile Separately**
+saves one PNG per tile instead. The screenshot keeps the tile's crop and is taken from
 the source rather than the screen: window tiles briefly capture at their full
 size (up to 4K), images and GIFs use their original pixels, and videos use the
 frame as currently rendered, so focusing a video first gives a sharper shot.
@@ -555,7 +559,7 @@ your installation still uses `Numpad 2`.
 | Delete selected tiles | `Delete` |
 | Undo the latest tile deletion | `Ctrl+Z` |
 | Focus current tile | `F` |
-| Screenshot selected or focused tile | `Shift+S` |
+| Screenshot selected or focused tiles | `Shift+S` |
 | Show/hide Screenshots panel | `S` |
 | Start / stop recording the selected tile | `Shift+R` |
 | Pause / resume recording | `P` |

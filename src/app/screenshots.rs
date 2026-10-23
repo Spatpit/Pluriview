@@ -1,5 +1,5 @@
 use super::*;
-use crate::screenshot::{self, CapturedPixels, LocalTimestamp, ScreenshotImage};
+use crate::screenshot::{self, CapturedPixels, CombinedPart, LocalTimestamp, ScreenshotImage};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
@@ -18,6 +18,7 @@ const LANDED_SIDE: f32 = 26.0;
 #[derive(Default)]
 pub(super) struct ScreenshotState {
     pending: Vec<PendingShot>,
+    pending_combined: Vec<PendingCombined>,
     saving: Vec<SavingShot>,
     flashes: Vec<(egui::Rect, Instant)>,
     flights: Vec<Flight>,
@@ -44,6 +45,29 @@ struct PendingShot {
     source: PendingSource,
 }
 
+/// Several selected tiles saved as one image once each has its frame.
+struct PendingCombined {
+    stem: String,
+    requested_at: Instant,
+    /// Bottom to top, as the canvas paints them.
+    tiles: Vec<CombinedTile>,
+}
+
+struct CombinedTile {
+    id: PreviewId,
+    crop_uv: Option<(f32, f32, f32, f32)>,
+    /// Where the tile was on screen when the shot was taken.
+    rect: egui::Rect,
+    frame: CombinedFrame,
+}
+
+enum CombinedFrame {
+    Ready(CapturedPixels),
+    Pending(PendingSource),
+    /// The tile had nothing to show; the image leaves it out.
+    Missing,
+}
+
 enum PendingSource {
     /// Rereading a still image whose decoded pixels were released.
     ImageFile(mpsc::Receiver<Option<ScreenshotImage>>),
@@ -65,6 +89,62 @@ enum ShotStart {
     Ready(CapturedPixels),
     Pending(PendingSource),
     Unavailable(&'static str),
+}
+
+/// `None` while the tile's frame is still on its way, then the frame, or
+/// `Some(None)` when there is none to be had.
+fn poll_source(
+    source: &mut PendingSource,
+    preview: Option<&mut Preview>,
+    requested_at: Instant,
+) -> Option<Option<CapturedPixels>> {
+    let expired = |wait: Duration| requested_at.elapsed() >= wait;
+    match (source, preview) {
+        (_, None) => Some(None),
+        (PendingSource::ImageFile(receiver), Some(_)) => match receiver.try_recv() {
+            Ok(image) => Some(image.map(CapturedPixels::Straight)),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(None),
+        },
+        (PendingSource::NativeFrame { fallback }, Some(preview)) => {
+            if let Some(frame) = preview.take_screenshot_native_frame() {
+                Some(Some(CapturedPixels::Premultiplied(frame)))
+            } else if expired(NATIVE_FRAME_WAIT) {
+                preview.cancel_screenshot_native_frame();
+                fallback
+                    .take()
+                    .or_else(|| preview.latest_capture_frame())
+                    .map(|frame| Some(CapturedPixels::Premultiplied(frame)))
+                    .or(Some(None))
+            } else {
+                None
+            }
+        }
+        #[cfg(windows)]
+        (PendingSource::Video(receiver), Some(preview)) => match receiver.try_recv() {
+            Ok(Some(snapshot)) => Some(
+                ScreenshotImage::from_straight_rgba(snapshot.width, snapshot.height, snapshot.rgba)
+                    .map(CapturedPixels::Straight),
+            ),
+            Err(mpsc::TryRecvError::Empty) if !expired(VIDEO_SNAPSHOT_WAIT) => None,
+            _ => Some(
+                preview
+                    .latest_capture_frame()
+                    .map(CapturedPixels::Premultiplied),
+            ),
+        },
+    }
+}
+
+/// `"YouTube + Discord"`, or `"YouTube + Discord + 2 more"` for larger sets.
+fn combined_title<'a>(titles: impl ExactSizeIterator<Item = &'a str>) -> String {
+    let count = titles.len();
+    let shown = if count > 3 { 2 } else { count };
+    let mut title = titles.take(shown).collect::<Vec<_>>().join(" + ");
+    if count > shown {
+        title.push_str(&format!(" + {} more", count - shown));
+    }
+    title
 }
 
 /// Decode a still image's file again on a worker thread.
@@ -119,7 +199,9 @@ impl PluriviewApp {
         }
     }
 
-    pub(super) fn request_tile_screenshots(&mut self, ctx: &egui::Context) {
+    /// Screenshot the focused or selected tiles: several selected tiles make
+    /// one image unless `separately` saves each on its own.
+    pub(super) fn request_tile_screenshots(&mut self, ctx: &egui::Context, separately: bool) {
         let targets = self.canvas.capture_targets();
         if targets.is_empty() {
             self.canvas_notice = Some((
@@ -136,8 +218,12 @@ impl PluriviewApp {
             return;
         }
         let time = LocalTimestamp::now();
+        if targets.len() > 1 && !separately {
+            self.request_combined_screenshot(targets, time, ctx);
+            return;
+        }
         for id in targets {
-            if self.screenshots.pending.iter().any(|shot| shot.id == id) {
+            if self.screenshot_in_progress(id) {
                 continue;
             }
             let Some(preview) = self.preview_manager.get(id) else {
@@ -167,6 +253,138 @@ impl PluriviewApp {
             }
         }
         ctx.request_repaint();
+    }
+
+    fn screenshot_in_progress(&self, id: PreviewId) -> bool {
+        self.screenshots.pending.iter().any(|shot| shot.id == id)
+            || self.screenshots.pending_combined.iter().any(|combined| {
+                combined
+                    .tiles
+                    .iter()
+                    .any(|tile| tile.id == id && matches!(tile.frame, CombinedFrame::Pending(_)))
+            })
+    }
+
+    fn request_combined_screenshot(
+        &mut self,
+        targets: Vec<PreviewId>,
+        time: LocalTimestamp,
+        ctx: &egui::Context,
+    ) {
+        if targets.iter().any(|&id| self.screenshot_in_progress(id)) {
+            return;
+        }
+        let mut order: Vec<(bool, u32, PreviewId, egui::Rect)> = targets
+            .into_iter()
+            .filter_map(|id| {
+                let preview = self.preview_manager.get(id)?;
+                if preview.removing.is_some() || preview.is_playlist() {
+                    return None;
+                }
+                let rect = self.canvas.tile_screen_rect(id, &self.preview_manager)?;
+                Some((preview.viewport_pin.is_some(), preview.z_order, id, rect))
+            })
+            .collect();
+        // Pinned tiles paint above canvas tiles, then by z-order.
+        order.sort_by_key(|&(pinned, z_order, ..)| (pinned, z_order));
+        if order.is_empty() {
+            self.canvas_notice = Some((
+                "None of the selected tiles can be captured.".to_owned(),
+                Instant::now(),
+            ));
+            return;
+        }
+        let title = combined_title(order.iter().map(|&(_, _, id, _)| {
+            self.preview_manager
+                .get(id)
+                .map_or("Tile", |preview| preview.title.as_str())
+        }));
+        let mut tiles = Vec::with_capacity(order.len());
+        for (_, _, id, rect) in order {
+            let crop_uv = self
+                .preview_manager
+                .get(id)
+                .and_then(|preview| preview.crop_uv);
+            let frame = match self.start_tile_screenshot(id, ctx) {
+                ShotStart::Ready(pixels) => CombinedFrame::Ready(pixels),
+                ShotStart::Pending(source) => CombinedFrame::Pending(source),
+                ShotStart::Unavailable(_) => CombinedFrame::Missing,
+            };
+            self.screenshots.flashes.push((rect, Instant::now()));
+            tiles.push(CombinedTile {
+                id,
+                crop_uv,
+                rect,
+                frame,
+            });
+        }
+        self.screenshots.pending_combined.push(PendingCombined {
+            stem: screenshot::file_stem(&title, time),
+            requested_at: Instant::now(),
+            tiles,
+        });
+        // Every frame may already be in hand: save without waiting a frame.
+        self.combined_screenshot_upkeep(ctx);
+        ctx.request_repaint();
+    }
+
+    /// Save combined shots whose tiles have all delivered their frames.
+    fn combined_screenshot_upkeep(&mut self, ctx: &egui::Context) {
+        let mut index = 0;
+        while index < self.screenshots.pending_combined.len() {
+            let combined = &mut self.screenshots.pending_combined[index];
+            let mut waiting = false;
+            for tile in &mut combined.tiles {
+                let CombinedFrame::Pending(source) = &mut tile.frame else {
+                    continue;
+                };
+                let preview = self.preview_manager.get_mut(tile.id);
+                match poll_source(source, preview, combined.requested_at) {
+                    None => waiting = true,
+                    Some(Some(pixels)) => tile.frame = CombinedFrame::Ready(pixels),
+                    Some(None) => tile.frame = CombinedFrame::Missing,
+                }
+            }
+            if waiting {
+                index += 1;
+                continue;
+            }
+            let combined = self.screenshots.pending_combined.remove(index);
+            let total = combined.tiles.len();
+            let parts: Vec<CombinedPart> = combined
+                .tiles
+                .into_iter()
+                .filter_map(|tile| match tile.frame {
+                    CombinedFrame::Ready(pixels) => Some(CombinedPart {
+                        pixels,
+                        crop_uv: tile.crop_uv,
+                        rect: tile.rect,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            if parts.len() < total {
+                let message = if parts.is_empty() {
+                    "The selected tiles didn't show a frame to capture. Try again."
+                } else {
+                    "A tile without a frame was left out of the screenshot."
+                };
+                self.canvas_notice = Some((message.to_owned(), Instant::now()));
+            }
+            let Some(from) = parts.iter().map(|part| part.rect).reduce(|a, b| a.union(b)) else {
+                continue;
+            };
+            let Some(directory) = self.screenshot_save_dir() else {
+                continue;
+            };
+            let thumbnail = screenshot::combined_thumbnail(&parts, THUMBNAIL_SIDE)
+                .and_then(|thumbnail| self.launch_capture_flight_from(from, thumbnail, ctx));
+            self.screenshots.saving.push(SavingShot {
+                receiver: screenshot::spawn_save_combined(directory, combined.stem, parts),
+                thumbnail,
+            });
+            ctx.request_repaint();
+        }
     }
 
     fn start_tile_screenshot(&mut self, id: PreviewId, ctx: &egui::Context) -> ShotStart {
@@ -236,48 +454,8 @@ impl PluriviewApp {
         let mut index = 0;
         while index < self.screenshots.pending.len() {
             let shot = &mut self.screenshots.pending[index];
-            let expired = |wait: Duration| shot.requested_at.elapsed() >= wait;
             let preview = self.preview_manager.get_mut(shot.id);
-            let outcome: Option<Option<CapturedPixels>> = match (&mut shot.source, preview) {
-                (_, None) => Some(None),
-                (PendingSource::ImageFile(receiver), Some(_)) => match receiver.try_recv() {
-                    Ok(image) => Some(image.map(CapturedPixels::Straight)),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => Some(None),
-                },
-                (PendingSource::NativeFrame { fallback }, Some(preview)) => {
-                    if let Some(frame) = preview.take_screenshot_native_frame() {
-                        Some(Some(CapturedPixels::Premultiplied(frame)))
-                    } else if expired(NATIVE_FRAME_WAIT) {
-                        preview.cancel_screenshot_native_frame();
-                        fallback
-                            .take()
-                            .or_else(|| preview.latest_capture_frame())
-                            .map(|frame| Some(CapturedPixels::Premultiplied(frame)))
-                            .or(Some(None))
-                    } else {
-                        None
-                    }
-                }
-                #[cfg(windows)]
-                (PendingSource::Video(receiver), Some(preview)) => match receiver.try_recv() {
-                    Ok(Some(snapshot)) => Some(
-                        ScreenshotImage::from_straight_rgba(
-                            snapshot.width,
-                            snapshot.height,
-                            snapshot.rgba,
-                        )
-                        .map(CapturedPixels::Straight),
-                    ),
-                    Err(mpsc::TryRecvError::Empty) if !expired(VIDEO_SNAPSHOT_WAIT) => None,
-                    _ => Some(
-                        preview
-                            .latest_capture_frame()
-                            .map(CapturedPixels::Premultiplied),
-                    ),
-                },
-            };
-            let Some(pixels) = outcome else {
+            let Some(pixels) = poll_source(&mut shot.source, preview, shot.requested_at) else {
                 index += 1;
                 continue;
             };
@@ -294,6 +472,8 @@ impl PluriviewApp {
                 }
             }
         }
+
+        self.combined_screenshot_upkeep(ctx);
 
         let panel = &mut self.screenshots.panel;
         // A hidden panel caches nothing; it rescans when it opens.
@@ -317,7 +497,10 @@ impl PluriviewApp {
                 Err(mpsc::TryRecvError::Disconnected) => false,
             });
 
-        if !self.screenshots.pending.is_empty() || !self.screenshots.saving.is_empty() {
+        if !self.screenshots.pending.is_empty()
+            || !self.screenshots.pending_combined.is_empty()
+            || !self.screenshots.saving.is_empty()
+        {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
@@ -352,6 +535,16 @@ impl PluriviewApp {
         ctx: &egui::Context,
     ) -> Option<egui::TextureHandle> {
         let from = self.canvas.tile_screen_rect(id, &self.preview_manager)?;
+        self.launch_capture_flight_from(from, thumbnail, ctx)
+    }
+
+    /// Fly a thumbnail that starts over `from`, in screen points.
+    fn launch_capture_flight_from(
+        &mut self,
+        from: egui::Rect,
+        thumbnail: egui::ColorImage,
+        ctx: &egui::Context,
+    ) -> Option<egui::TextureHandle> {
         self.screenshots.next_thumbnail += 1;
         let texture = ctx.load_texture(
             format!("screenshot_flight_{}", self.screenshots.next_thumbnail),
@@ -392,12 +585,12 @@ impl PluriviewApp {
                     .min_size(egui::vec2(30.0, 26.0)),
             )
             .on_hover_text(format!(
-                "Screenshot the selected or focused tile ({})",
+                "Screenshot the selected or focused tile; several selected tiles make one image ({})",
                 shortcut.display()
             ));
         self.screenshots.button_rect = Some(camera.rect);
         if camera.clicked() {
-            self.request_tile_screenshots(ctx);
+            self.request_tile_screenshots(ctx, false);
         }
         self.record_button_ui(ui);
         let panel_shortcut = self
@@ -429,14 +622,25 @@ impl PluriviewApp {
             if ui
                 .add(crate::ui_theme::shortcut_button(
                     format!(
-                        "{}   Screenshot Selected Tile",
+                        "{}   Screenshot Selected Tiles",
                         egui_phosphor::regular::CAMERA
                     ),
                     shortcut,
                 ))
                 .clicked()
             {
-                self.request_tile_screenshots(ctx);
+                self.request_tile_screenshots(ctx, false);
+                ui.close_menu();
+            }
+            if self.canvas.capture_targets().len() > 1
+                && crate::ui_theme::action(
+                    ui,
+                    egui_phosphor::regular::SQUARES_FOUR,
+                    "Screenshot Each Tile Separately",
+                )
+                .clicked()
+            {
+                self.request_tile_screenshots(ctx, true);
                 ui.close_menu();
             }
             let mut panel_open = self.app_config.screenshots_panel_open;
@@ -592,6 +796,19 @@ mod tests {
         assert!((end.center() - target).length() < 0.01);
         assert!((end.width() - LANDED_SIDE).abs() < 0.01);
         assert!(end.height() < LANDED_SIDE);
+    }
+
+    #[test]
+    fn combined_titles_name_the_first_tiles() {
+        assert_eq!(
+            combined_title(["YouTube", "Discord"].into_iter()),
+            "YouTube + Discord"
+        );
+        assert_eq!(combined_title(["A", "B", "C"].into_iter()), "A + B + C");
+        assert_eq!(
+            combined_title(["A", "B", "C", "D", "E"].into_iter()),
+            "A + B + 3 more"
+        );
     }
 
     #[test]

@@ -9,6 +9,10 @@ use std::sync::{mpsc, Arc};
 
 /// Longest tile-title part of a screenshot file name, in characters.
 const MAX_TITLE_CHARS: usize = 60;
+/// Combined screenshots stay within 8K so a wide spread of tiles cannot
+/// allocate an enormous image.
+const MAX_COMBINED_SIDE: f32 = 7680.0;
+const MAX_COMBINED_PIXELS: f32 = 7680.0 * 4320.0;
 
 /// Straight (non-premultiplied) RGBA pixels ready for PNG encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +133,151 @@ impl CapturedPixels {
             pixels,
         })
     }
+}
+
+/// One tile in a combined screenshot: its pixels, crop, and where it was
+/// shown on screen, in points.
+pub struct CombinedPart {
+    pub pixels: CapturedPixels,
+    pub crop_uv: Option<(f32, f32, f32, f32)>,
+    pub rect: egui::Rect,
+}
+
+impl CombinedPart {
+    /// The visible crop as premultiplied RGBA bytes.
+    fn premultiplied_crop(&self) -> image::RgbaImage {
+        let (width, height) = self.pixels.size();
+        let (left, top, right, bottom) = crop_pixel_bounds(width, height, self.crop_uv);
+        let mut rgba = Vec::with_capacity((right - left) as usize * (bottom - top) as usize * 4);
+        for y in top..bottom {
+            match &self.pixels {
+                CapturedPixels::Premultiplied(image) => {
+                    let row = y as usize * image.size[0];
+                    for pixel in &image.pixels[row + left as usize..row + right as usize] {
+                        rgba.extend_from_slice(&pixel.to_array());
+                    }
+                }
+                CapturedPixels::Straight(image) => {
+                    let row = y as usize * image.width as usize;
+                    let start = (row + left as usize) * 4;
+                    let end = (row + right as usize) * 4;
+                    for pixel in image.rgba[start..end].chunks_exact(4) {
+                        let color = egui::Color32::from_rgba_unmultiplied(
+                            pixel[0], pixel[1], pixel[2], pixel[3],
+                        );
+                        rgba.extend_from_slice(&color.to_array());
+                    }
+                }
+            }
+        }
+        image::RgbaImage::from_raw(right - left, bottom - top, rgba)
+            .expect("crop bounds match the copied rows")
+    }
+}
+
+/// Lay `parts` (bottom to top) out as they sat on screen, the upper ones
+/// hiding what they cover, with transparency between them. The scale keeps
+/// the most detailed tile at its full resolution, within the given limits.
+/// Returns premultiplied RGBA.
+fn compose_premultiplied(
+    parts: &[CombinedPart],
+    max_side: f32,
+    max_pixels: f32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let bounds = parts
+        .iter()
+        .map(|part| part.rect)
+        .filter(|rect| rect.is_finite() && rect.is_positive())
+        .reduce(|a, b| a.union(b))?;
+    let density = parts
+        .iter()
+        .filter(|part| part.rect.is_positive())
+        .map(|part| {
+            let (width, height) = part.pixels.size();
+            let (left, top, right, bottom) = crop_pixel_bounds(width, height, part.crop_uv);
+            ((right - left) as f32 / part.rect.width())
+                .max((bottom - top) as f32 / part.rect.height())
+        })
+        .fold(1.0_f32, f32::max);
+    let scale = density
+        .min(max_side / bounds.width().max(bounds.height()))
+        .min((max_pixels / bounds.area()).sqrt());
+    let out_width = ((bounds.width() * scale).round() as u32).max(1);
+    let out_height = ((bounds.height() * scale).round() as u32).max(1);
+    let mut out = vec![0u8; out_width as usize * out_height as usize * 4];
+
+    for part in parts {
+        if !part.rect.is_finite() || !part.rect.is_positive() {
+            continue;
+        }
+        let edge = |value: f32, origin: f32, limit: u32| {
+            (((value - origin) * scale).round().max(0.0) as u32).min(limit)
+        };
+        let left = edge(part.rect.min.x, bounds.min.x, out_width);
+        let right = edge(part.rect.max.x, bounds.min.x, out_width);
+        let top = edge(part.rect.min.y, bounds.min.y, out_height);
+        let bottom = edge(part.rect.max.y, bounds.min.y, out_height);
+        if left >= right || top >= bottom {
+            continue;
+        }
+        let crop = part.premultiplied_crop();
+        let placed = if crop.dimensions() == (right - left, bottom - top) {
+            crop
+        } else {
+            image::imageops::thumbnail(&crop, right - left, bottom - top)
+        };
+        let row_bytes = (right - left) as usize * 4;
+        for (y, source) in (top..bottom).zip(placed.as_raw().chunks_exact(row_bytes)) {
+            let start = (y as usize * out_width as usize + left as usize) * 4;
+            for (destination, source) in out[start..start + row_bytes]
+                .chunks_exact_mut(4)
+                .zip(source.chunks_exact(4))
+            {
+                let keep = 255 - u16::from(source[3]);
+                for channel in 0..4 {
+                    let below = (u16::from(destination[channel]) * keep + 127) / 255;
+                    destination[channel] = source[channel].saturating_add(below as u8);
+                }
+            }
+        }
+    }
+    Some((out_width, out_height, out))
+}
+
+/// The combined screenshot, with straight alpha for PNG.
+pub fn compose(parts: &[CombinedPart]) -> Option<ScreenshotImage> {
+    let (width, height, mut rgba) =
+        compose_premultiplied(parts, MAX_COMBINED_SIDE, MAX_COMBINED_PIXELS)?;
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[3] != 255 {
+            let color =
+                egui::Color32::from_rgba_premultiplied(pixel[0], pixel[1], pixel[2], pixel[3]);
+            pixel.copy_from_slice(&color.to_srgba_unmultiplied());
+        }
+    }
+    ScreenshotImage::from_straight_rgba(width, height, rgba)
+}
+
+/// Small preview of the combined screenshot for the capture animation,
+/// built from cheap per-tile samples rather than the full frames.
+pub fn combined_thumbnail(parts: &[CombinedPart], max_side: u32) -> Option<egui::ColorImage> {
+    let samples: Vec<CombinedPart> = parts
+        .iter()
+        .filter_map(|part| {
+            Some(CombinedPart {
+                pixels: CapturedPixels::Premultiplied(Arc::new(
+                    part.pixels.thumbnail(part.crop_uv, max_side)?,
+                )),
+                crop_uv: None,
+                rect: part.rect,
+            })
+        })
+        .collect();
+    let (width, height, rgba) = compose_premultiplied(&samples, max_side as f32, f32::INFINITY)?;
+    Some(egui::ColorImage::from_rgba_premultiplied(
+        [width as usize, height as usize],
+        &rgba,
+    ))
 }
 
 /// Pixel rectangle `(left, top, right, bottom)` covered by a normalized crop.
@@ -287,15 +436,35 @@ pub fn spawn_save(
     pixels: CapturedPixels,
     crop_uv: Option<(f32, f32, f32, f32)>,
 ) -> mpsc::Receiver<Result<PathBuf, String>> {
+    spawn_worker(move || {
+        pixels
+            .into_image()
+            .ok_or_else(|| "The tile's frame was empty".to_owned())
+            .and_then(|image| save_png(&directory, &stem, &image.cropped(crop_uv)))
+    })
+}
+
+/// Compose several tiles into one screenshot and save it on a worker thread.
+pub fn spawn_save_combined(
+    directory: PathBuf,
+    stem: String,
+    parts: Vec<CombinedPart>,
+) -> mpsc::Receiver<Result<PathBuf, String>> {
+    spawn_worker(move || {
+        compose(&parts)
+            .ok_or_else(|| "The tiles had nothing to capture".to_owned())
+            .and_then(|image| save_png(&directory, &stem, &image))
+    })
+}
+
+fn spawn_worker(
+    save: impl FnOnce() -> Result<PathBuf, String> + Send + 'static,
+) -> mpsc::Receiver<Result<PathBuf, String>> {
     let (sender, receiver) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("pluriview-screenshot".to_owned())
         .spawn(move || {
-            let result = pixels
-                .into_image()
-                .ok_or_else(|| "The tile's frame was empty".to_owned())
-                .and_then(|image| save_png(&directory, &stem, &image.cropped(crop_uv)));
-            let _ = sender.send(result);
+            let _ = sender.send(save());
         });
     if let Err(error) = spawned {
         let (sender, failed) = mpsc::channel();
@@ -429,6 +598,119 @@ mod tests {
         assert_eq!(decoded.dimensions(), (2, 2));
         assert_eq!(&decoded.into_raw()[..4], &[1, 2, 3, 255]);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> CapturedPixels {
+        let pixels = rgba.repeat((width * height) as usize);
+        CapturedPixels::Straight(
+            ScreenshotImage::from_straight_rgba(width, height, pixels).unwrap(),
+        )
+    }
+
+    fn part(pixels: CapturedPixels, min: (f32, f32), max: (f32, f32)) -> CombinedPart {
+        CombinedPart {
+            pixels,
+            crop_uv: None,
+            rect: egui::Rect::from_min_max(egui::pos2(min.0, min.1), egui::pos2(max.0, max.1)),
+        }
+    }
+
+    fn pixel_at(image: &ScreenshotImage, x: u32, y: u32) -> [u8; 4] {
+        let offset = ((y * image.width + x) * 4) as usize;
+        image.rgba[offset..offset + 4].try_into().unwrap()
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    #[test]
+    fn combined_tiles_keep_their_screen_layout_with_clear_gaps() {
+        let image = compose(&[
+            part(solid(4, 2, RED), (100.0, 50.0), (104.0, 52.0)),
+            part(solid(2, 2, BLUE), (106.0, 51.0), (108.0, 53.0)),
+        ])
+        .unwrap();
+        assert_eq!((image.width, image.height), (8, 3));
+        assert_eq!(pixel_at(&image, 0, 0), RED);
+        assert_eq!(pixel_at(&image, 3, 1), RED);
+        assert_eq!(pixel_at(&image, 5, 1)[3], 0);
+        assert_eq!(pixel_at(&image, 0, 2)[3], 0);
+        assert_eq!(pixel_at(&image, 6, 1), BLUE);
+        assert_eq!(pixel_at(&image, 7, 2), BLUE);
+        assert_eq!(pixel_at(&image, 6, 0)[3], 0);
+    }
+
+    #[test]
+    fn upper_tiles_hide_the_parts_they_cover() {
+        let image = compose(&[
+            part(solid(4, 4, RED), (0.0, 0.0), (4.0, 4.0)),
+            part(solid(2, 2, BLUE), (2.0, 2.0), (4.0, 4.0)),
+        ])
+        .unwrap();
+        assert_eq!(pixel_at(&image, 1, 1), RED);
+        assert_eq!(pixel_at(&image, 3, 3), BLUE);
+        assert_eq!(pixel_at(&image, 2, 1), RED);
+    }
+
+    #[test]
+    fn transparent_tiles_blend_over_the_ones_below() {
+        let image = compose(&[
+            part(solid(2, 1, RED), (0.0, 0.0), (2.0, 1.0)),
+            part(solid(1, 1, [0, 0, 255, 128]), (1.0, 0.0), (2.0, 1.0)),
+        ])
+        .unwrap();
+        let blended = pixel_at(&image, 1, 0);
+        assert_eq!(blended[3], 255);
+        assert!(blended[0] > 0 && blended[2] > 0);
+    }
+
+    #[test]
+    fn the_most_detailed_tile_keeps_its_resolution() {
+        // 8x4 pixels shown in 4x2 points: two pixels per point.
+        let image = compose(&[
+            part(solid(8, 4, RED), (0.0, 0.0), (4.0, 2.0)),
+            part(solid(1, 1, BLUE), (4.0, 0.0), (6.0, 2.0)),
+        ])
+        .unwrap();
+        assert_eq!((image.width, image.height), (12, 4));
+        assert_eq!(pixel_at(&image, 11, 3), BLUE);
+    }
+
+    #[test]
+    fn combined_tiles_show_only_their_crop() {
+        let mut left = part(solid(4, 2, BLUE), (0.0, 0.0), (2.0, 2.0));
+        let mut rgba = BLUE.repeat(8);
+        rgba[8..16].copy_from_slice(&RED.repeat(2));
+        rgba[24..32].copy_from_slice(&RED.repeat(2));
+        left.pixels =
+            CapturedPixels::Straight(ScreenshotImage::from_straight_rgba(4, 2, rgba).unwrap());
+        left.crop_uv = Some((0.5, 0.0, 1.0, 1.0));
+        let image = compose(&[left]).unwrap();
+        assert_eq!((image.width, image.height), (2, 2));
+        assert!(image.rgba.chunks(4).all(|pixel| pixel == RED));
+    }
+
+    #[test]
+    fn combined_screenshots_stay_within_8k() {
+        let image = compose(&[
+            part(solid(4, 4, RED), (0.0, 0.0), (1.0, 1.0)),
+            part(solid(1, 1, BLUE), (20_000.0, 0.0), (20_001.0, 1.0)),
+        ])
+        .unwrap();
+        assert_eq!(image.width, 7680);
+        assert!(image.height <= 1);
+    }
+
+    #[test]
+    fn combined_thumbnails_fit_the_requested_size() {
+        let parts = [
+            part(solid(400, 200, RED), (0.0, 0.0), (400.0, 200.0)),
+            part(solid(400, 200, BLUE), (400.0, 0.0), (800.0, 200.0)),
+        ];
+        let thumbnail = combined_thumbnail(&parts, 100).unwrap();
+        assert_eq!(thumbnail.size, [100, 25]);
+        assert_eq!(thumbnail.pixels[0], egui::Color32::RED);
+        assert_eq!(thumbnail.pixels[99], egui::Color32::BLUE);
     }
 
     #[test]
