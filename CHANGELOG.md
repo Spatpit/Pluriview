@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Built the console logger without its optional regex, color and timestamp support, which makes `pluriview.exe` about 1 MB smaller. `RUST_LOG` filtering by level and module still works.
 - uBlock Origin Lite now ships as `lib/uBOLite_2026.714.1952.edge.zip` beside the executable instead of inside it, which makes `pluriview.exe` about 10 MB smaller. Pluriview only installs a package matching the pinned checksum; without it, browser tiles load unfiltered.
 - Reorganized the top bar. **View** now holds only panels and canvas display (Window Picker, Screenshots Panel, Always Show Top Bar, Saved Viewpoints, Reset View, Show Grid, Show Sound Badges, wallpaper), grouped under headings. A new **Tools** menu holds Phone Viewer, Stream Audio Monitor, the browser tile options (ad blocking, Restart Browser Tiles, Clear Browser Data) and Settings. Keyboard shortcuts are unchanged.
 - Phone Viewer requests are now signed with HMAC-SHA256 instead of sending the pairing token, and captured requests cannot be replayed. The QR/link works for one phone, expires after ten unused minutes, and can be replaced with **New pairing link**. Requires Android Viewer 0.3.12 together with this PC build.
