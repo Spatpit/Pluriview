@@ -148,7 +148,7 @@ fn combined_title<'a>(titles: impl ExactSizeIterator<Item = &'a str>) -> String 
 }
 
 /// Decode a still image's file again on a worker thread.
-fn reread_image(path: PathBuf) -> mpsc::Receiver<Option<ScreenshotImage>> {
+pub(super) fn reread_image(path: PathBuf) -> mpsc::Receiver<Option<ScreenshotImage>> {
     let (sender, receiver) = mpsc::channel();
     let _ = std::thread::Builder::new()
         .name("pluriview-screenshot-reread".to_owned())
@@ -192,10 +192,10 @@ impl PluriviewApp {
     /// uploaded frame, so a screenshot saves exactly what is on screen.
     pub(super) fn sync_screenshot_frame_retention(&mut self) {
         let targets = self.canvas.capture_targets();
-        let recording = self.recording_tile();
+        let recording = self.recording_tiles();
         for preview in self.preview_manager.all_mut() {
             preview
-                .set_retain_frame(targets.contains(&preview.id) || recording == Some(preview.id));
+                .set_retain_frame(targets.contains(&preview.id) || recording.contains(&preview.id));
         }
     }
 
@@ -539,7 +539,7 @@ impl PluriviewApp {
     }
 
     /// Fly a thumbnail that starts over `from`, in screen points.
-    fn launch_capture_flight_from(
+    pub(super) fn launch_capture_flight_from(
         &mut self,
         from: egui::Rect,
         thumbnail: egui::ColorImage,

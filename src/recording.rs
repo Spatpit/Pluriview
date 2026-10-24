@@ -4,8 +4,9 @@
 //! writing all run on one worker per recording.
 
 use crate::screenshot::CapturedPixels;
+use eframe::egui;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 /// Frames per second a recording keeps at most. Unchanged sources simply
@@ -13,10 +14,22 @@ use std::time::{Duration, Instant};
 pub const MAX_FPS: u32 = 30;
 /// Largest recorded picture; bigger sources are scaled down to fit.
 const MAX_SIZE: (u32, u32) = (3840, 2160);
+/// Several tiles recorded together fit inside 1080p, which keeps putting
+/// them together cheap enough to do 30 times a second.
+pub const MAX_COMBINED_SIZE: (u32, u32) = (1920, 1080);
 
-pub struct Frame {
-    pub pixels: CapturedPixels,
+/// One tile's picture within a recorded frame.
+pub struct Layer {
+    pub pixels: Arc<CapturedPixels>,
     pub crop_uv: Option<(f32, f32, f32, f32)>,
+    /// Where the tile sits in the video, as fractions of the frame. `None`
+    /// fills the frame (a single tile), keeping its shape between bars.
+    pub place: Option<egui::Rect>,
+}
+
+/// Layers are drawn bottom to top, each hiding what it covers.
+pub struct Frame {
+    pub layers: Vec<Layer>,
     pub at: Instant,
 }
 
@@ -35,9 +48,15 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Start recording into `path`. `audio_pid` is the process tree whose
-    /// sound is recorded alongside the picture, if any.
-    pub fn start(path: PathBuf, audio_pid: Option<u32>, started: Instant) -> Self {
+    /// Start recording into `path`. `audio_pids` are the process trees whose
+    /// sound is mixed into the recording. `size` fixes the video's size;
+    /// without it the first frame's single tile decides.
+    pub fn start(
+        path: PathBuf,
+        audio_pids: Vec<u32>,
+        size: Option<(u32, u32)>,
+        started: Instant,
+    ) -> Self {
         // Small queue: when encoding falls behind, the UI drops frames
         // instead of holding full-size copies.
         let (commands, receiver) = mpsc::sync_channel(4);
@@ -45,7 +64,7 @@ impl Recorder {
         let worker = std::thread::Builder::new()
             .name("pluriview-recording".to_owned())
             .spawn(move || {
-                let result = run(&path, audio_pid, started, &receiver);
+                let result = run(&path, &audio_pids, size, started, &receiver);
                 if result.is_err() {
                     let _ = std::fs::remove_file(&path);
                 }
@@ -146,10 +165,17 @@ impl Clock {
 /// Even output size for a source of `width`×`height`, fitted inside
 /// `MAX_SIZE` without changing its shape. H.264 needs even dimensions.
 fn output_size(width: u32, height: u32) -> (u32, u32) {
-    let scale = (MAX_SIZE.0 as f64 / width.max(1) as f64)
-        .min(MAX_SIZE.1 as f64 / height.max(1) as f64)
+    fitted_size(width as f32, height as f32, MAX_SIZE)
+}
+
+/// Even size with the shape of `width`×`height`, no larger than it or
+/// `limit`.
+pub fn fitted_size(width: f32, height: f32, limit: (u32, u32)) -> (u32, u32) {
+    let (width, height) = (width.max(1.0) as f64, height.max(1.0) as f64);
+    let scale = (limit.0 as f64 / width)
+        .min(limit.1 as f64 / height)
         .min(1.0);
-    let even = |value: u32| ((value as f64 * scale) as u32 & !1).max(2);
+    let even = |value: f64| ((value * scale) as u32 & !1).max(2);
     (even(width), even(height))
 }
 
@@ -170,35 +196,86 @@ fn rgba_bytes(pixels: &CapturedPixels) -> (&[u8], u32, u32, bool) {
     }
 }
 
-/// Draw the cropped frame into a top-down BGRX picture of `width`×`height`,
-/// over black. A source that changed shape mid-recording is fitted inside
-/// with bars rather than stretched.
+/// Draw the frame's layers into a top-down BGRX picture of
+/// `width`×`height`, over black. A single tile that changed shape
+/// mid-recording is fitted inside with bars rather than stretched.
 fn draw_frame(frame: &Frame, width: u32, height: u32, out: &mut [u8]) {
-    let (source, source_width, source_height, premultiplied) = rgba_bytes(&frame.pixels);
-    let (left, top, right, bottom) =
-        crate::screenshot::crop_pixel_bounds(source_width, source_height, frame.crop_uv);
-    let (crop_width, crop_height) = (right - left, bottom - top);
-    let scale = (width as f32 / crop_width as f32).min(height as f32 / crop_height as f32);
-    let draw_width = ((crop_width as f32 * scale).round() as u32).clamp(1, width);
-    let draw_height = ((crop_height as f32 * scale).round() as u32).clamp(1, height);
-    let (offset_x, offset_y) = ((width - draw_width) / 2, (height - draw_height) / 2);
-    if (draw_width, draw_height) != (width, height) {
-        out.fill(0);
+    // One tile filling the whole picture is drawn straight over black,
+    // without clearing the buffer first.
+    let covers_all = |layer: &Layer| layer.place.is_none() && !has_bars(layer, width, height);
+    let over_black = frame.layers.len() == 1 && covers_all(&frame.layers[0]);
+    if !over_black {
+        for pixel in out.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 0, 0, 255]);
+        }
     }
-    let columns: Vec<usize> = (0..draw_width)
-        .map(|x| {
-            let source_x =
-                left + (u64::from(x) * u64::from(crop_width) / u64::from(draw_width)) as u32;
-            source_x as usize * 4
-        })
+    for layer in &frame.layers {
+        draw_layer(layer, width, height, over_black, out);
+    }
+}
+
+fn crop_size(layer: &Layer) -> (u32, u32, u32, u32) {
+    let (width, height) = layer.pixels.size();
+    crate::screenshot::crop_pixel_bounds(width, height, layer.crop_uv)
+}
+
+/// Pixel rectangle `(left, top, right, bottom)` the layer covers. A tile
+/// moved partly outside a combined recording reaches past the picture and
+/// is clipped when drawn.
+fn layer_target(layer: &Layer, width: u32, height: u32) -> (i64, i64, i64, i64) {
+    match layer.place {
+        Some(place) => {
+            let edge = |value: f32, size: u32| (value * size as f32).round() as i64;
+            (
+                edge(place.min.x, width),
+                edge(place.min.y, height),
+                edge(place.max.x, width),
+                edge(place.max.y, height),
+            )
+        }
+        None => {
+            let (left, top, right, bottom) = crop_size(layer);
+            let (crop_width, crop_height) = ((right - left) as f32, (bottom - top) as f32);
+            let scale = (width as f32 / crop_width).min(height as f32 / crop_height);
+            let draw_width = ((crop_width * scale).round() as u32).clamp(1, width);
+            let draw_height = ((crop_height * scale).round() as u32).clamp(1, height);
+            let (x, y) = ((width - draw_width) / 2, (height - draw_height) / 2);
+            (
+                i64::from(x),
+                i64::from(y),
+                i64::from(x + draw_width),
+                i64::from(y + draw_height),
+            )
+        }
+    }
+}
+
+fn has_bars(layer: &Layer, width: u32, height: u32) -> bool {
+    layer_target(layer, width, height) != (0, 0, i64::from(width), i64::from(height))
+}
+
+fn draw_layer(layer: &Layer, width: u32, height: u32, over_black: bool, out: &mut [u8]) {
+    let (source, source_width, _, premultiplied) = rgba_bytes(&layer.pixels);
+    let (left, top, right, bottom) = crop_size(layer);
+    let (crop_width, crop_height) = (right - left, bottom - top);
+    let (x0, y0, x1, y1) = layer_target(layer, width, height);
+    let (draw_width, draw_height) = (x1 - x0, y1 - y0);
+    // Only the part inside the picture is drawn.
+    let (clip_x0, clip_x1) = (x0.max(0), x1.min(i64::from(width)));
+    let (clip_y0, clip_y1) = (y0.max(0), y1.min(i64::from(height)));
+    if draw_width <= 0 || draw_height <= 0 || clip_x0 >= clip_x1 || clip_y0 >= clip_y1 {
+        return;
+    }
+    let source_at = |offset: i64, crop: u32, draw: i64| (offset * i64::from(crop) / draw) as u32;
+    let columns: Vec<usize> = (clip_x0..clip_x1)
+        .map(|x| (left + source_at(x - x0, crop_width, draw_width)) as usize * 4)
         .collect();
     let row_bytes = width as usize * 4;
-    for y in 0..draw_height {
-        let source_y =
-            top + (u64::from(y) * u64::from(crop_height) / u64::from(draw_height)) as u32;
+    for y in clip_y0..clip_y1 {
+        let source_y = top + source_at(y - y0, crop_height, draw_height);
         let source_row = &source[source_y as usize * source_width as usize * 4..];
-        let start = (offset_y + y) as usize * row_bytes + offset_x as usize * 4;
-        let target = &mut out[start..start + draw_width as usize * 4];
+        let start = y as usize * row_bytes + clip_x0 as usize * 4;
+        let target = &mut out[start..start + columns.len() * 4];
         for (pixel, &column) in target.chunks_exact_mut(4).zip(&columns) {
             let [r, g, b, a] = [
                 source_row[column],
@@ -206,14 +283,23 @@ fn draw_frame(frame: &Frame, width: u32, height: u32, out: &mut [u8]) {
                 source_row[column + 2],
                 source_row[column + 3],
             ];
-            // Transparent areas record as black, like the canvas behind them.
-            let (r, g, b) = if premultiplied || a == 255 {
+            if a == 255 {
+                pixel.copy_from_slice(&[b, g, r, 255]);
+                continue;
+            }
+            // Transparent areas show what is below: another tile or black.
+            let scale = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
+            let (r, g, b) = if premultiplied {
                 (r, g, b)
             } else {
-                let over_black = |c: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
-                (over_black(r), over_black(g), over_black(b))
+                (scale(r), scale(g), scale(b))
             };
-            pixel.copy_from_slice(&[b, g, r, 255]);
+            let keep = if over_black { 0 } else { 255 - u16::from(a) };
+            for (channel, value) in pixel[..3].iter_mut().zip([b, g, r]) {
+                let below = ((u16::from(*channel) * keep + 127) / 255) as u8;
+                *channel = value.saturating_add(below);
+            }
+            pixel[3] = 255;
         }
     }
 }
@@ -288,7 +374,8 @@ pub fn video_thumbnail(
 #[cfg(not(windows))]
 fn run(
     _path: &std::path::Path,
-    _audio_pid: Option<u32>,
+    _audio_pids: &[u32],
+    _size: Option<(u32, u32)>,
     _started: Instant,
     _commands: &mpsc::Receiver<Command>,
 ) -> Result<(), String> {
@@ -298,11 +385,12 @@ fn run(
 #[cfg(windows)]
 fn run(
     path: &std::path::Path,
-    audio_pid: Option<u32>,
+    audio_pids: &[u32],
+    size: Option<(u32, u32)>,
     started: Instant,
     commands: &mpsc::Receiver<Command>,
 ) -> Result<(), String> {
-    mf::run(path, audio_pid, started, commands)
+    mf::run(path, audio_pids, size, started, commands)
 }
 
 #[cfg(windows)]
@@ -537,71 +625,97 @@ mod mf {
             .to_owned()
     }
 
-    /// Stereo audio kept in step with the recording clock: silence fills
-    /// stretches where the source played nothing, so sound never drifts
-    /// ahead of the picture.
-    struct AudioTrack {
+    /// One recorded tile's sound, waiting to be mixed.
+    struct AudioSource {
         capture: TileAudioCapture,
+        /// Interleaved stereo samples.
+        queue: std::collections::VecDeque<f32>,
+    }
+
+    /// Stereo audio mixed from every recorded source and kept in step with
+    /// the recording clock: a source that played nothing adds silence, so
+    /// sound never drifts away from the picture.
+    struct AudioTrack {
+        sources: Vec<AudioSource>,
         scratch: Vec<f32>,
-        pending: Vec<i16>,
+        mixed: Vec<f32>,
+        samples: Vec<i16>,
         /// Stereo frames handed to the writer so far.
         written: i64,
     }
 
     impl AudioTrack {
-        fn start(pid: u32) -> Option<Self> {
+        fn start(pids: &[u32]) -> Option<Self> {
             let deadline = Instant::now() + Duration::from_secs(3);
-            match TileAudioCapture::start(pid, &|| Instant::now() > deadline) {
-                Ok(capture) => Some(Self {
-                    capture,
-                    scratch: Vec::new(),
-                    pending: Vec::new(),
-                    written: 0,
-                }),
-                Err(error) => {
-                    log::warn!("Recording without sound: {error}");
-                    None
-                }
-            }
+            let sources: Vec<AudioSource> = pids
+                .iter()
+                .filter_map(|&pid| {
+                    match TileAudioCapture::start(pid, &|| Instant::now() > deadline) {
+                        Ok(capture) => Some(AudioSource {
+                            capture,
+                            queue: Default::default(),
+                        }),
+                        Err(error) => {
+                            log::warn!("Recording one source without sound: {error}");
+                            None
+                        }
+                    }
+                })
+                .collect();
+            (!sources.is_empty()).then(|| Self {
+                sources,
+                scratch: Vec::new(),
+                mixed: Vec::new(),
+                samples: Vec::new(),
+                written: 0,
+            })
         }
 
-        /// Read what the source played; keep it only while not paused.
+        /// Read what each source played; keep it only while not paused.
         fn read(&mut self, keep: bool) {
-            while let Ok(true) = self.capture.read(&mut self.scratch) {
-                if keep {
-                    self.pending.extend(
-                        self.scratch
-                            .iter()
-                            .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16),
-                    );
+            for source in &mut self.sources {
+                while let Ok(true) = source.capture.read(&mut self.scratch) {
+                    if keep {
+                        source.queue.extend(self.scratch.iter().copied());
+                    }
                 }
             }
         }
 
-        /// Write whole AAC chunks up to `media_time`, padding with silence
-        /// when the source was quiet and trimming any backlog beyond it.
+        /// Write mixed AAC chunks up to `media_time`, less ~100 ms of
+        /// capture latency until the end, dropping any backlog beyond it.
         unsafe fn flush(&mut self, writer: &mut Writer, media_time: Duration, finish: bool) {
             let due = (media_time.as_nanos() * u128::from(AUDIO_RATE) / 1_000_000_000) as i64;
-            let queued = self.written + (self.pending.len() / 2) as i64;
-            // Allow ~100 ms of capture latency before inserting silence.
             let slack = i64::from(AUDIO_RATE) / 10;
-            if queued < due - slack || (finish && queued < due) {
-                let missing = (due - queued).max(0) as usize;
-                self.pending
-                    .splice(0..0, std::iter::repeat_n(0, missing * 2));
-            } else if queued > due + 2 * slack {
-                let extra = ((queued - due - slack) as usize * 2).min(self.pending.len());
-                self.pending.drain(..extra);
+            let target = if finish { due } else { due - slack };
+            for source in &mut self.sources {
+                let ahead = self.written + (source.queue.len() / 2) as i64 - (due + slack);
+                if ahead > 0 {
+                    let extra = (ahead as usize * 2).min(source.queue.len());
+                    source.queue.drain(..extra);
+                }
             }
-            let chunk = AUDIO_CHUNK * 2;
-            while self.pending.len() >= chunk || (finish && !self.pending.is_empty()) {
-                let take = chunk.min(self.pending.len());
+            while self.written + AUDIO_CHUNK as i64 <= target || (finish && self.written < target) {
+                let frames = (AUDIO_CHUNK as i64).min(target - self.written) as usize;
+                self.mixed.clear();
+                self.mixed.resize(frames * 2, 0.0);
+                for source in &mut self.sources {
+                    let take = (frames * 2).min(source.queue.len());
+                    for (mixed, sample) in self.mixed.iter_mut().zip(source.queue.drain(..take)) {
+                        *mixed += sample;
+                    }
+                }
+                self.samples.clear();
+                self.samples.extend(
+                    self.mixed
+                        .iter()
+                        .map(|sample| (sample.clamp(-1.0, 1.0) * 32767.0) as i16),
+                );
                 let time = self.written * HNS_PER_SECOND / i64::from(AUDIO_RATE);
-                if let Err(error) = writer.audio_chunk(time, &self.pending[..take]) {
+                if let Err(error) = writer.audio_chunk(time, &self.samples) {
                     log::warn!("Recording audio write failed: {error}");
                 }
-                self.written += (take / 2) as i64;
-                self.pending.drain(..take);
+                self.written += frames as i64;
             }
         }
     }
@@ -712,12 +826,13 @@ mod mf {
 
     pub(super) fn run(
         path: &std::path::Path,
-        audio_pid: Option<u32>,
+        audio_pids: &[u32],
+        size: Option<(u32, u32)>,
         started: Instant,
         commands: &mpsc::Receiver<Command>,
     ) -> Result<(), String> {
         let runtime = Runtime::new().map_err(|_| unavailable())?;
-        let mut audio = audio_pid.and_then(AudioTrack::start);
+        let mut audio = AudioTrack::start(audio_pids);
         let mut clock = Clock::new(started);
         let mut writer: Option<Writer> = None;
         let mut last_frame: Option<Frame> = None;
@@ -734,10 +849,12 @@ mod mf {
             match command {
                 Some(Command::Frame(frame)) if !clock.paused() => {
                     if writer.is_none() {
-                        let (width, height) = frame.pixels.size();
-                        let (left, top, right, bottom) =
-                            crate::screenshot::crop_pixel_bounds(width, height, frame.crop_uv);
-                        let (width, height) = output_size(right - left, bottom - top);
+                        let (width, height) = size.unwrap_or_else(|| {
+                            frame.layers.first().map_or((2, 2), |layer| {
+                                let (left, top, right, bottom) = crop_size(layer);
+                                output_size(right - left, bottom - top)
+                            })
+                        });
                         match unsafe {
                             Writer::open(&runtime, path, width, height, audio.is_some())
                         } {
@@ -822,8 +939,11 @@ mod tests {
             ScreenshotImage::from_straight_rgba(2, 1, vec![255, 0, 0, 255, 255, 255, 255, 128])
                 .unwrap();
         let frame = |crop_uv| Frame {
-            pixels: CapturedPixels::Straight(image.clone()),
-            crop_uv,
+            layers: vec![Layer {
+                pixels: Arc::new(CapturedPixels::Straight(image.clone())),
+                crop_uv,
+                place: None,
+            }],
             at: Instant::now(),
         };
         let mut out = vec![9; 4];
@@ -836,7 +956,67 @@ mod tests {
         let mut out = vec![9; 2 * 2 * 4];
         draw_frame(&frame(None), 2, 2, &mut out);
         assert_eq!(&out[..8], &[0, 0, 255, 255, 128, 128, 128, 255]);
-        assert_eq!(&out[8..], &[0; 8]);
+        assert_eq!(&out[8..], &[0, 0, 0, 255, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn combined_tiles_sit_where_placed_and_cover_lower_ones() {
+        let solid = |rgba: [u8; 4]| {
+            Arc::new(CapturedPixels::Straight(
+                ScreenshotImage::from_straight_rgba(1, 1, rgba.to_vec()).unwrap(),
+            ))
+        };
+        let layer = |pixels, min: (f32, f32), max: (f32, f32)| Layer {
+            pixels,
+            crop_uv: None,
+            place: Some(egui::Rect::from_min_max(min.into(), max.into())),
+        };
+        let frame = Frame {
+            layers: vec![
+                // Red on the left half, then half-transparent white over
+                // the middle two pixels.
+                layer(solid([255, 0, 0, 255]), (0.0, 0.0), (0.5, 1.0)),
+                layer(solid([255, 255, 255, 128]), (0.25, 0.0), (0.75, 1.0)),
+            ],
+            at: Instant::now(),
+        };
+        let mut out = vec![9; 4 * 4];
+        draw_frame(&frame, 4, 1, &mut out);
+        assert_eq!(&out[..4], &[0, 0, 255, 255]);
+        assert_eq!(&out[4..8], &[128, 128, 255, 255]);
+        assert_eq!(&out[8..12], &[128, 128, 128, 255]);
+        // Nothing placed here: black.
+        assert_eq!(&out[12..], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn tiles_moved_past_the_edge_are_clipped_not_squeezed() {
+        // Red | blue source, placed half outside on the left.
+        let pixels = Arc::new(CapturedPixels::Straight(
+            ScreenshotImage::from_straight_rgba(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255])
+                .unwrap(),
+        ));
+        let frame = Frame {
+            layers: vec![Layer {
+                pixels,
+                crop_uv: None,
+                place: Some(egui::Rect::from_min_max(
+                    egui::pos2(-0.5, 0.0),
+                    egui::pos2(0.5, 1.0),
+                )),
+            }],
+            at: Instant::now(),
+        };
+        let mut out = vec![9; 2 * 4];
+        draw_frame(&frame, 2, 1, &mut out);
+        // Only the blue half is still inside.
+        assert_eq!(out, [255, 0, 0, 255, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn combined_size_keeps_the_shape_inside_1080p() {
+        assert_eq!(fitted_size(3000.0, 1000.0, MAX_COMBINED_SIZE), (1920, 640));
+        assert_eq!(fitted_size(801.0, 601.0, MAX_COMBINED_SIZE), (800, 600));
     }
 
     /// Encodes through the real Windows encoder; run with `--ignored`.
@@ -850,17 +1030,20 @@ mod tests {
         ));
         let start = Instant::now();
         // Our own silent process: exercises the AAC track and its padding.
-        let recorder = Recorder::start(path.clone(), Some(std::process::id()), start);
+        let recorder = Recorder::start(path.clone(), vec![std::process::id()], None, start);
         let frame = |shade: u8, at: Instant| Frame {
-            pixels: CapturedPixels::Straight(
-                ScreenshotImage::from_straight_rgba(
-                    641,
-                    361,
-                    [shade, 64, 255 - shade, 255].repeat(641 * 361),
-                )
-                .unwrap(),
-            ),
-            crop_uv: None,
+            layers: vec![Layer {
+                pixels: Arc::new(CapturedPixels::Straight(
+                    ScreenshotImage::from_straight_rgba(
+                        641,
+                        361,
+                        [shade, 64, 255 - shade, 255].repeat(641 * 361),
+                    )
+                    .unwrap(),
+                )),
+                crop_uv: None,
+                place: None,
+            }],
             at,
         };
         let tick = Duration::from_millis(1000 / u64::from(MAX_FPS));
@@ -893,5 +1076,50 @@ mod tests {
         assert_eq!(&bytes[4..8], b"ftyp");
         assert!(bytes.windows(4).any(|w| w == b"mp4a"), "no audio track");
         assert!((1.8..2.4).contains(&seconds), "recorded {seconds} s");
+    }
+
+    /// Two tiles side by side through the real encoder; run with `--ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn records_tiles_together_side_by_side() {
+        let path = std::env::temp_dir().join(format!(
+            "pluriview-combined-recording-test-{}.mp4",
+            std::process::id()
+        ));
+        let start = Instant::now();
+        let recorder = Recorder::start(path.clone(), Vec::new(), Some((640, 360)), start);
+        let solid = |rgba: [u8; 4]| {
+            Arc::new(CapturedPixels::Straight(
+                ScreenshotImage::from_straight_rgba(32, 32, rgba.repeat(32 * 32)).unwrap(),
+            ))
+        };
+        let (red, blue) = (solid([255, 0, 0, 255]), solid([0, 0, 255, 255]));
+        let tick = Duration::from_millis(1000 / u64::from(MAX_FPS));
+        for index in 0..15 {
+            let layer = |pixels: &Arc<CapturedPixels>, left: f32| Layer {
+                pixels: pixels.clone(),
+                crop_uv: None,
+                place: Some(egui::Rect::from_min_max(
+                    egui::pos2(left, 0.0),
+                    egui::pos2(left + 0.5, 1.0),
+                )),
+            };
+            let frame = || Frame {
+                layers: vec![layer(&red, 0.0), layer(&blue, 0.5)],
+                at: start + tick * index,
+            };
+            while !recorder.push(frame()) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let path = recorder.stop().recv().unwrap().unwrap();
+        let thumbnail = video_thumbnail(&path, 160).expect("first frame decodes");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(thumbnail.size, [160, 90]);
+        let left = thumbnail.pixels[45 * 160 + 20];
+        let right = thumbnail.pixels[45 * 160 + 140];
+        assert!(left.r() > 200 && left.b() < 60, "{left:?}");
+        assert!(right.b() > 200 && right.r() < 60, "{right:?}");
     }
 }

@@ -317,6 +317,9 @@ pub struct Preview {
     /// Runtime-only: this tile is being recorded, so it keeps capturing at
     /// full size and stays live while off screen.
     pub recording: bool,
+    /// Runtime-only: a single recorded tile captures at its full source
+    /// size; tiles recorded together keep their on-screen size.
+    pub recording_full_size: bool,
 
     /// Current URL when this preview is a browser tile, None otherwise.
     /// Kept up to date as the page navigates so layouts save where the
@@ -441,6 +444,7 @@ impl Preview {
             screenshot_wants_native_frame: false,
             screenshot_native_frame: None,
             recording: false,
+            recording_full_size: false,
             browser_url: None,
             browser_muted: false,
             browser_page_zoom: 1.0,

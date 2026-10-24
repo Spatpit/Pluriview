@@ -506,6 +506,15 @@ recording flies into its folder like a screenshot. If the recorded tile is off
 screen, the badge shows at the top of the canvas. Both shortcuts can be changed
 in Settings, and `P` does nothing unless a recording is running.
 
+With several tiles selected, `Shift+R` records them into one video laid out as
+they sit on the canvas, like a combined screenshot. Any mix of tiles works:
+windows, browsers, images, GIFs and videos. The video shows the area around
+the selected tiles when recording starts and fits inside 1080p; tiles moved
+while recording appear where they are, cut off at the edge of that area. Upper
+tiles hide what they cover, and gaps between tiles are black. Panning or
+zooming the canvas does not change the video. Sound from all of the recorded
+tiles is mixed together.
+
 Recordings are MP4 files (H.264 video, AAC sound, up to 4K at 30 FPS) saved
 alongside your screenshots, in the folder chosen under **Save new shots to**.
 In the Screenshots panel they show a play mark and their length, and they can
@@ -514,7 +523,7 @@ They keep the tile's crop and use Windows' own video encoder, preferring the
 graphics card, so nothing extra is installed.
 Window tiles record their app's sound. Browser and video tiles record
 Pluriview's sound, which includes any other browser or video tile playing at
-the same time. The recorded tile keeps capturing while it is off screen.
+the same time. Recorded tiles keep capturing while they are off screen.
 
 ## Sharing audio with Discord or OBS
 
