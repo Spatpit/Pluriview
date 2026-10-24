@@ -60,6 +60,7 @@ use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 #[cfg(windows)]
 mod browser_maintenance;
 mod media_sources;
+mod picture_in_picture;
 mod recording;
 mod screenshot_drop;
 mod screenshot_panel;
@@ -857,6 +858,7 @@ fn video_tile_needs_canvas_repaint(preview: &Preview, viewport: Option<egui::Rec
     preview.is_video()
         && !preview.manually_frozen
         && (preview.viewport_pin.is_some()
+            || preview.picture_in_picture.is_some()
             || viewport.is_none_or(|viewport| viewport.intersects(preview.rect())))
 }
 
@@ -1017,6 +1019,7 @@ pub struct PluriviewApp {
     /// Pending tile screenshots, saves and their capture animations.
     screenshots: screenshots::ScreenshotState,
     recording: recording::RecordingState,
+    picture_in_picture: picture_in_picture::PictureInPicture,
     source_loads: SourceLoads,
 
     /// Missing optional tools encountered by a video creation action.
@@ -1226,6 +1229,7 @@ impl PluriviewApp {
             canvas_notice: None,
             screenshots: Default::default(),
             recording: Default::default(),
+            picture_in_picture: Default::default(),
             source_loads: SourceLoads::new(_cc.egui_ctx.clone()),
             external_tool_error: None,
             video_action_error: None,
@@ -5615,6 +5619,9 @@ impl eframe::App for PluriviewApp {
         if shortcut_presses.pressed(HotkeySlot::PauseRecording) {
             self.toggle_recording_pause();
         }
+        if shortcut_presses.pressed(HotkeySlot::PictureInPicture) {
+            self.picture_in_picture_shortcut(ctx);
+        }
         let numbered_canvas_view = HotkeySlot::CANVAS_VIEWS
             .iter()
             .position(|slot| shortcut_presses.pressed(*slot));
@@ -5790,6 +5797,10 @@ impl eframe::App for PluriviewApp {
         if let Some(value) = self.canvas.pending_always_on_top.take() {
             self.handle_window_action(ctx, WindowAction::SetAlwaysOnTop(value));
         }
+        if let Some(id) = self.canvas.pending_picture_in_picture.take() {
+            self.toggle_picture_in_picture(id, ctx);
+        }
+        self.picture_in_picture_ui(ctx);
 
         #[cfg(windows)]
         self.sync_wallpaper_under_tile_focus();
@@ -6303,6 +6314,7 @@ impl eframe::App for PluriviewApp {
                             for (label, slot) in [
                                 ("Start/stop recording", HotkeySlot::RecordTile),
                                 ("Pause/resume recording", HotkeySlot::PauseRecording),
+                                ("Picture in picture", HotkeySlot::PictureInPicture),
                             ] {
                                 ui.label(label);
                                 ui.label(

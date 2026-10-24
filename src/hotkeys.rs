@@ -78,6 +78,7 @@ pub enum HotkeySlot {
     ToggleScreenshotsPanel,
     RecordTile,
     PauseRecording,
+    PictureInPicture,
 }
 
 impl HotkeySlot {
@@ -93,7 +94,7 @@ impl HotkeySlot {
         Self::CanvasView9,
     ];
 
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
@@ -131,6 +132,7 @@ impl HotkeySlot {
         Self::ToggleScreenshotsPanel,
         Self::RecordTile,
         Self::PauseRecording,
+        Self::PictureInPicture,
     ];
 
     pub fn label(self) -> &'static str {
@@ -172,6 +174,7 @@ impl HotkeySlot {
             Self::ToggleScreenshotsPanel => "Toggle Screenshots panel",
             Self::RecordTile => "Start/stop recording selected tiles",
             Self::PauseRecording => "Pause/resume recording",
+            Self::PictureInPicture => "Picture in picture",
         }
     }
 }
@@ -216,6 +219,7 @@ pub struct HotkeyBindings {
     pub toggle_screenshots_panel: Hotkey,
     pub record_tile: Hotkey,
     pub pause_recording: Hotkey,
+    pub picture_in_picture: Hotkey,
 }
 
 impl Default for HotkeyBindings {
@@ -258,6 +262,7 @@ impl Default for HotkeyBindings {
             toggle_screenshots_panel: Hotkey::key(0x53), // S
             record_tile: Hotkey::pair(0x10, 0x52),     // Shift+R
             pause_recording: Hotkey::key(0x50),        // P
+            picture_in_picture: Hotkey::pair(0x10, 0x50), // Shift+P
         }
     }
 }
@@ -302,6 +307,7 @@ impl HotkeyBindings {
             HotkeySlot::ToggleScreenshotsPanel => self.toggle_screenshots_panel,
             HotkeySlot::RecordTile => self.record_tile,
             HotkeySlot::PauseRecording => self.pause_recording,
+            HotkeySlot::PictureInPicture => self.picture_in_picture,
         }
     }
 
@@ -344,6 +350,7 @@ impl HotkeyBindings {
             HotkeySlot::ToggleScreenshotsPanel => self.toggle_screenshots_panel = hotkey,
             HotkeySlot::RecordTile => self.record_tile = hotkey,
             HotkeySlot::PauseRecording => self.pause_recording = hotkey,
+            HotkeySlot::PictureInPicture => self.picture_in_picture = hotkey,
         }
     }
 
@@ -791,6 +798,21 @@ mod tests {
         );
         assert_eq!(restored.get(HotkeySlot::RecordTile).display(), "Shift+R");
         assert_eq!(restored.get(HotkeySlot::PauseRecording).display(), "P");
+    }
+
+    #[test]
+    fn picture_in_picture_defaults_to_shift_p_for_older_settings() {
+        let mut value = serde_json::to_value(HotkeyBindings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("picture_in_picture");
+        let restored: HotkeyBindings = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.get(HotkeySlot::PictureInPicture).display(),
+            "Shift+P"
+        );
+        assert_eq!(
+            restored.conflict(HotkeySlot::PictureInPicture, restored.picture_in_picture),
+            None
+        );
     }
 
     #[test]

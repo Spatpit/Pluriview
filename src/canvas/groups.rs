@@ -848,7 +848,7 @@ impl CanvasState {
             });
     }
 
-    fn group_members(&self, id: PreviewId, previews: &PreviewManager) -> Vec<PreviewId> {
+    pub fn group_members(&self, id: PreviewId, previews: &PreviewManager) -> Vec<PreviewId> {
         let group = previews.get(id).and_then(|p| p.tile_group.as_ref());
         let Some(group) = group else {
             return vec![id];

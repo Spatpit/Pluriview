@@ -853,6 +853,32 @@ fn media_placeholder_content() -> (&'static str, &'static str) {
     )
 }
 
+fn paint_picture_in_picture_placeholder(painter: &egui::Painter, rect: Rect) {
+    painter.rect_filled(rect, 8.0, Color32::from_rgb(22, 22, 24));
+    if rect.width() < 60.0 || rect.height() < 40.0 {
+        return;
+    }
+    let icon_size = (rect.height() * 0.22).clamp(14.0, 40.0);
+    let text_size = (icon_size * 0.45).clamp(10.0, 15.0);
+    let center = rect.center();
+    painter.text(
+        center - Vec2::new(0.0, text_size * 0.7),
+        egui::Align2::CENTER_CENTER,
+        egui_phosphor::regular::PICTURE_IN_PICTURE,
+        egui::FontId::proportional(icon_size),
+        crate::ui_theme::GOLD,
+    );
+    if rect.height() >= 80.0 {
+        painter.text(
+            center + Vec2::new(0.0, icon_size * 0.5 + 2.0),
+            egui::Align2::CENTER_CENTER,
+            "Picture in picture",
+            egui::FontId::proportional(text_size),
+            Color32::from_rgb(150, 150, 150),
+        );
+    }
+}
+
 fn paint_missing_media_placeholder(painter: &egui::Painter, rect: Rect) {
     let (title, detail) = media_placeholder_content();
     painter.rect_filled(rect, 8.0, Color32::from_rgb(24, 20, 20));
@@ -1264,6 +1290,8 @@ pub struct CanvasState {
     /// App-global window state mirrored for the empty-canvas menu.
     pub always_on_top: bool,
     pub pending_always_on_top: Option<bool>,
+    /// Tile whose picture-in-picture window the context menu toggled.
+    pub pending_picture_in_picture: Option<PreviewId>,
 
     /// True when Tools → Stream Audio Monitor has a target device.
     pub stream_monitor_ready: bool,
@@ -1329,6 +1357,7 @@ impl Default for CanvasState {
             interactive_browser: None,
             always_on_top: false,
             pending_always_on_top: None,
+            pending_picture_in_picture: None,
             stream_monitor_ready: false,
             last_screen_rect: None,
             last_double_clicked: None,
@@ -1647,7 +1676,9 @@ impl CanvasState {
                 if preview.screenshot_wants_native_frame || preview.recording_full_size {
                     (MAX_CAPTURE_WIDTH, MAX_CAPTURE_HEIGHT)
                 } else {
-                    let display_size = live_capture_display_size(preview, lod);
+                    let display_size = preview
+                        .picture_in_picture
+                        .unwrap_or_else(|| live_capture_display_size(preview, lod));
                     window_capture_target(
                         display_size.x,
                         display_size.y,
@@ -1678,6 +1709,7 @@ impl CanvasState {
             let id = preview.id;
             let preview_rect = preview.rect();
             let is_visible = preview.recording
+                || preview.picture_in_picture.is_some()
                 || preview.viewport_pin.is_some()
                 || viewport.intersects(preview_rect)
                 || (self.layout_is_animating()
@@ -2416,6 +2448,15 @@ impl CanvasState {
                 self.handle_pinned_pointer_drag(id, pin, screen_rect, frame, preview_manager)
             });
 
+            // The picture-in-picture window shows this tile's content. Drawing
+            // it here too would render a video twice at two sizes per frame.
+            let in_picture_in_picture = preview_manager
+                .get(id)
+                .is_some_and(|preview| preview.picture_in_picture.is_some());
+            if in_picture_in_picture {
+                paint_picture_in_picture_placeholder(&painter, anim_rect);
+            }
+
             // Minimal Void: No background fill - content fills entire area
             // Draw preview content (full rect, no title bar offset)
             #[cfg(windows)]
@@ -2424,6 +2465,7 @@ impl CanvasState {
             } else {
                 preview_manager
                     .get(id)
+                    .filter(|_| !in_picture_in_picture)
                     .and_then(|preview| preview.video_renderer.clone())
                     .map(|renderer| {
                         painter.add(egui::PaintCallback {
@@ -2451,15 +2493,17 @@ impl CanvasState {
             // A transparent WebView frame is valid for overlay pages, but the
             // first completely transparent frames look like the tile vanished.
             // Keep the loading card underneath until capture sees content.
-            let browser_loading_placeholder =
-                is_browser && browser_waiting_for_content && !manually_frozen;
+            let browser_loading_placeholder = is_browser
+                && browser_waiting_for_content
+                && !manually_frozen
+                && !in_picture_in_picture;
             if browser_loading_placeholder {
                 paint_browser_placeholder(&painter, anim_rect, browser_status, input.time as f32);
                 transparent_browser_waiting |=
                     !matches!(browser_status, BrowserTileStatus::Failed(_));
             }
 
-            let has_texture = if has_playlist_content || has_direct_video {
+            let has_texture = if has_playlist_content || has_direct_video || in_picture_in_picture {
                 true
             } else if let Some(preview) = preview_manager.get_mut(id) {
                 // Get UV rect first (immutable borrow ends before get_texture)
@@ -3470,6 +3514,27 @@ impl CanvasState {
                     .clicked()
                 {
                     self.toggle_viewport_pin(id, canvas_rect, preview_manager);
+                    ui.close_menu();
+                }
+                if !is_playlist
+                    && ui
+                        .add(
+                            crate::ui_theme::shortcut_button(
+                                "Picture in Picture",
+                                keyboard_shortcuts.get(HotkeySlot::PictureInPicture),
+                            )
+                            .selected(
+                                preview_manager
+                                    .get(id)
+                                    .is_some_and(|preview| preview.picture_in_picture.is_some()),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Show this tile, or its whole group, in a small window that stays on top of other apps",
+                        )
+                        .clicked()
+                {
+                    self.pending_picture_in_picture = Some(id);
                     ui.close_menu();
                 }
 

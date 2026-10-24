@@ -320,6 +320,10 @@ pub struct Preview {
     /// Runtime-only: a single recorded tile captures at its full source
     /// size; tiles recorded together keep their on-screen size.
     pub recording_full_size: bool,
+    /// Runtime-only: shown in the picture-in-picture window at this size in
+    /// points. The tile keeps capturing for that window, sized for it, while
+    /// the canvas shows a placeholder in its place.
+    pub picture_in_picture: Option<Vec2>,
 
     /// Current URL when this preview is a browser tile, None otherwise.
     /// Kept up to date as the page navigates so layouts save where the
@@ -445,6 +449,7 @@ impl Preview {
             screenshot_native_frame: None,
             recording: false,
             recording_full_size: false,
+            picture_in_picture: None,
             browser_url: None,
             browser_muted: false,
             browser_page_zoom: 1.0,

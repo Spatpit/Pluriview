@@ -405,6 +405,7 @@ Live streams do not provide seek-bar thumbnails.
 |---|---|
 | **Crop** | Shows only the part of a tile you need. Use **Crop → Edit Crop** to drag its handles, or hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
 | **Pin to Viewport** | Keeps any tile fixed on screen while you pan or zoom the canvas. |
+| **Picture in Picture** | Pops a tile out into a small window that stays on top of other apps, including games in borderless or windowed mode. A grouped tile brings its whole group, and several selected tiles go together, laid out as on the canvas. Drag the window to move it, drag an edge to resize it, and double-click it or use its close button to send the tiles back. Clicking it does not take focus from the game. Right-click a tile → **Picture in Picture**, or press `Shift+P`. |
 | **Freeze** | Holds the current frame of selected tiles until you resume them. |
 | **Focus on This Tile** | Fits a tile to the canvas. Press `Esc` to return. |
 | **Canvas-only mode** | Hides the interface with `H`; right-click menus remain available. |
@@ -572,6 +573,7 @@ your installation still uses `Numpad 2`.
 | Show/hide Screenshots panel | `S` |
 | Start / stop recording the selected tile | `Shift+R` |
 | Pause / resume recording | `P` |
+| Picture in picture for the selected tile or its group | `Shift+P` |
 | Group / ungroup selected tiles | `Ctrl+G` / `Ctrl+U` |
 | One / two / three large tiles / equal tiles | `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
 | Medium / large selection size | `Alt+6` / `Alt+7` |

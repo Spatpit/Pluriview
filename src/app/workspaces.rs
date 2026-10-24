@@ -484,6 +484,7 @@ impl PluriviewApp {
 
     /// Apply a SavedLayout to restore state
     pub(super) fn apply_layout(&mut self, layout: &SavedLayout) {
+        self.close_picture_in_picture();
         self.source_loads.clear();
         self.canvas_view_dialog = None;
         self.active_canvas_view = None;
