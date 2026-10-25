@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Updated the `zip` crate to 9.1 to clear RustSec advisories RUSTSEC-2026-0367/0368/0369. Pluriview never used the affected `extract` helpers; uBlock Origin Lite extraction still validates every path itself.
 - Built the console logger without its optional regex, color and timestamp support, which makes `pluriview.exe` about 1 MB smaller. `RUST_LOG` filtering by level and module still works.
 - uBlock Origin Lite now ships as `lib/uBOLite_2026.714.1952.edge.zip` beside the executable instead of inside it, which makes `pluriview.exe` about 10 MB smaller. Pluriview only installs a package matching the pinned checksum; without it, browser tiles load unfiltered.
 - Reorganized the top bar. **View** now holds only panels and canvas display (Window Picker, Screenshots Panel, Always Show Top Bar, Saved Viewpoints, Reset View, Show Grid, Show Sound Badges, wallpaper), grouped under headings. A new **Tools** menu holds Phone Viewer, Stream Audio Monitor, the browser tile options (ad blocking, Restart Browser Tiles, Clear Browser Data) and Settings. Keyboard shortcuts are unchanged.

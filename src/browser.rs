@@ -2240,9 +2240,12 @@ fn extract_ubol_archive_with_progress(
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("Read extension archive entry: {error}"))?;
-        let relative = entry
-            .enclosed_name()
-            .ok_or_else(|| format!("Unsafe path in extension archive: {}", entry.name()))?;
+        let relative = entry.enclosed_name().ok_or_else(|| {
+            format!(
+                "Unsafe path in extension archive: {}",
+                entry.name_raw().escape_ascii()
+            )
+        })?;
         let output = destination.join(relative);
 
         if entry.is_dir() {
