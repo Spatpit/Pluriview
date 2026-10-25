@@ -2,10 +2,11 @@ use crate::preview::{PreviewId, PreviewManager};
 use crate::privacy;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use windows_capture::capture::GraphicsCaptureApiError;
 use windows_capture::graphics_capture_api::GraphicsCaptureApi;
 use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
@@ -14,11 +15,69 @@ use super::downsample::{fitted_capture_size, RgbaDownsampler};
 
 /// Frame data sent from capture threads
 pub(crate) struct CapturedFrame {
-    pub width: u32,
-    pub height: u32,
     pub source_width: u32,
     pub source_height: u32,
-    pub data: Vec<u8>,
+    /// Already converted to egui's premultiplied format on the capture
+    /// worker, so the UI thread only hands it to the texture upload.
+    pub image: eframe::egui::ColorImage,
+}
+
+impl CapturedFrame {
+    pub fn from_rgba(
+        width: u32,
+        height: u32,
+        source_width: u32,
+        source_height: u32,
+        rgba: &[u8],
+    ) -> Self {
+        Self {
+            source_width,
+            source_height,
+            image: eframe::egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                rgba,
+            ),
+        }
+    }
+}
+
+/// Wakes the UI when a worker publishes a frame. A static source therefore
+/// costs no repaints, while busy sources still repaint at most once per UI
+/// frame and no faster than the fastest live capture FPS.
+#[derive(Default)]
+pub(crate) struct FrameWake {
+    context: std::sync::OnceLock<eframe::egui::Context>,
+    pending: AtomicBool,
+    min_interval_micros: AtomicU64,
+    last_ui_frame: Mutex<Option<Instant>>,
+}
+
+impl FrameWake {
+    pub fn notify(&self) {
+        let Some(context) = self.context.get() else {
+            return;
+        };
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let interval = Duration::from_micros(self.min_interval_micros.load(Ordering::Relaxed));
+        let elapsed = self
+            .last_ui_frame
+            .lock()
+            .map_or(interval, |frame| frame.elapsed());
+        context.request_repaint_after(interval.saturating_sub(elapsed));
+    }
+
+    /// Called by the UI before it takes pending frames, so any frame stored
+    /// afterwards schedules the next wake.
+    fn frames_consumed(&self, min_interval: Duration) {
+        *self.last_ui_frame.lock() = Some(Instant::now());
+        self.min_interval_micros.store(
+            u64::try_from(min_interval.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.pending.store(false, Ordering::Release);
+    }
 }
 
 /// Shared controls and result slots passed to either capture worker type.
@@ -33,6 +92,7 @@ pub(crate) struct CaptureWorkerState {
     pub has_produced_frame: Arc<AtomicBool>,
     pub latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
     pub failure: Arc<Mutex<Option<String>>>,
+    pub frame_wake: Arc<FrameWake>,
 }
 
 /// Manages all window capture sessions
@@ -43,6 +103,8 @@ pub struct CaptureCoordinator {
     /// Stopped/replaced workers are retained until they actually finish, then
     /// joined during regular UI upkeep instead of being silently detached.
     retired_workers: Vec<JoinHandle<()>>,
+
+    frame_wake: Arc<FrameWake>,
 }
 
 /// A single capture session
@@ -106,7 +168,13 @@ impl CaptureCoordinator {
         Self {
             sessions: HashMap::new(),
             retired_workers: Vec::new(),
+            frame_wake: Arc::default(),
         }
+    }
+
+    /// Let capture workers wake this UI when they publish a frame.
+    pub fn set_repaint_context(&self, context: &eframe::egui::Context) {
+        let _ = self.frame_wake.context.set(context.clone());
     }
 
     /// Start capturing a window for a preview
@@ -142,6 +210,7 @@ impl CaptureCoordinator {
             has_produced_frame: has_produced_frame.clone(),
             latest_frame: latest_frame.clone(),
             failure: failure.clone(),
+            frame_wake: self.frame_wake.clone(),
         };
         let (stop_sender, stop_receiver) = mpsc::channel();
 
@@ -206,6 +275,7 @@ impl CaptureCoordinator {
             has_produced_frame: has_produced_frame.clone(),
             latest_frame: latest_frame.clone(),
             failure: failure.clone(),
+            frame_wake: self.frame_wake.clone(),
         };
         let (stop_sender, stop_receiver) = mpsc::channel();
 
@@ -299,6 +369,10 @@ impl CaptureCoordinator {
 
     /// Process the newest pending frame for each preview.
     pub fn process_frames(&mut self, preview_manager: &mut PreviewManager) {
+        let min_interval = self
+            .max_live_fps()
+            .map_or(Duration::ZERO, |fps| Duration::from_secs(1) / fps);
+        self.frame_wake.frames_consumed(min_interval);
         for (preview_id, session) in &self.sessions {
             let frame = session.latest_frame.lock().take();
             let failure = session.failure.lock().take();
@@ -317,11 +391,9 @@ impl CaptureCoordinator {
                         crate::app::performance::counters::CAPTURE_CONSUMED,
                     );
                     preview.update_capture_frame(
-                        frame.width,
-                        frame.height,
                         frame.source_width,
                         frame.source_height,
-                        frame.data,
+                        frame.image,
                     );
                 } else if let Some(error) = failure {
                     preview.set_capture_error(error);
@@ -474,6 +546,7 @@ fn capture_window_loop(
         has_produced_frame,
         latest_frame,
         failure,
+        frame_wake,
     } = worker_state;
 
     // Capture flags passed to the handler
@@ -489,6 +562,7 @@ fn capture_window_loop(
         target_width: Arc<AtomicU32>,
         target_height: Arc<AtomicU32>,
         target_generation: Arc<AtomicU32>,
+        frame_wake: Arc<FrameWake>,
     }
 
     struct Capture {
@@ -502,6 +576,7 @@ fn capture_window_loop(
         target_width: Arc<AtomicU32>,
         target_height: Arc<AtomicU32>,
         target_generation: Arc<AtomicU32>,
+        frame_wake: Arc<FrameWake>,
         last_frame: std::time::Instant,
         handled_target_generation: u32,
         // windows-capture 2 lets the caller retain row-unpacking storage.
@@ -527,6 +602,7 @@ fn capture_window_loop(
                 target_width: ctx.flags.target_width,
                 target_height: ctx.flags.target_height,
                 target_generation: ctx.flags.target_generation,
+                frame_wake: ctx.flags.frame_wake,
                 last_frame: std::time::Instant::now(),
                 // Generation zero is a valid initial request. Start at a
                 // sentinel so the first callback is never FPS-throttled.
@@ -595,24 +671,18 @@ fn capture_window_loop(
                 crate::app::performance::counters::record(
                     crate::app::performance::counters::CAPTURE_GPU_RESIZED,
                 );
-                CapturedFrame {
-                    width: out_width,
-                    height: out_height,
-                    source_width: width,
-                    source_height: height,
-                    data,
-                }
+                CapturedFrame::from_rgba(out_width, out_height, width, height, &data)
             } else if out_width == width && out_height == height {
                 let buffer = frame.buffer()?;
-                CapturedFrame {
+                // Convert straight from the reused readback scratch: no
+                // intermediate byte copy, and no per-pixel work on the UI thread.
+                CapturedFrame::from_rgba(
                     width,
                     height,
-                    source_width: width,
-                    source_height: height,
-                    data: buffer
-                        .as_nopadding_buffer(&mut self.readback_scratch)
-                        .to_vec(),
-                }
+                    width,
+                    height,
+                    buffer.as_nopadding_buffer(&mut self.readback_scratch),
+                )
             } else {
                 let mut buffer = frame.buffer()?;
                 let stride = buffer.row_pitch();
@@ -627,13 +697,7 @@ fn capture_window_loop(
                 else {
                     return Err("Could not downscale the captured frame".into());
                 };
-                CapturedFrame {
-                    width: out_width,
-                    height: out_height,
-                    source_width: width,
-                    source_height: height,
-                    data,
-                }
+                CapturedFrame::from_rgba(out_width, out_height, width, height, &data)
             };
             *self.latest_frame.lock() = Some(captured_frame);
             #[cfg(pluriview_performance)]
@@ -642,6 +706,7 @@ fn capture_window_loop(
             );
             self.has_produced_frame.store(true, Ordering::Relaxed);
             self.handled_target_generation = requested_generation;
+            self.frame_wake.notify();
 
             Ok(())
         }
@@ -649,6 +714,7 @@ fn capture_window_loop(
         fn on_closed(&mut self) -> Result<(), Self::Error> {
             self.closed.store(true, Ordering::Release);
             self.active.store(false, Ordering::Relaxed);
+            self.frame_wake.notify();
             log::info!("Capture closed for preview {:?}", self.preview_id);
             Ok(())
         }
@@ -659,9 +725,11 @@ fn capture_window_loop(
         privacy::redact_title(&window_title)
     );
 
-    // Use default minimum update interval (windows-capture handles FPS internally)
-    // We do our own throttling in on_frame_arrived
-    let min_interval = MinimumUpdateIntervalSettings::Default;
+    // Exact per-tile FPS throttling stays in on_frame_arrived (presets change
+    // live). Where supported, also stop Windows from delivering, and copying
+    // on the GPU, frames faster than any preset can use: a 144/240 Hz source
+    // otherwise produces every refresh for us to discard.
+    let min_interval = probed_minimum_update_interval();
 
     // Configure capture settings
     let completion_active = active.clone();
@@ -676,6 +744,7 @@ fn capture_window_loop(
         target_width,
         target_height,
         target_generation,
+        frame_wake: frame_wake.clone(),
     };
 
     // Request WithoutCursor / WithoutBorder only when those Graphics Capture
@@ -684,7 +753,7 @@ fn capture_window_loop(
     // start if those settings are not Default and the API is missing.
     let cursor = probed_cursor_capture_setting();
     let border = probed_draw_border_setting();
-    let try_start = |cursor, border, flags| {
+    let try_start = |cursor, border, min_interval, flags| {
         let settings = Settings::new(
             capture_target_from_hwnd(hwnd),
             cursor,
@@ -698,16 +767,18 @@ fn capture_window_loop(
         Capture::start_free_threaded(settings)
     };
 
-    let start_result = match try_start(cursor, border, flags.clone()) {
+    let start_result = match try_start(cursor, border, min_interval, flags.clone()) {
         Err(error)
             if capture_settings_unsupported(&error)
                 && (cursor != CursorCaptureSettings::Default
-                    || border != DrawBorderSettings::Default) =>
+                    || border != DrawBorderSettings::Default
+                    || min_interval != MinimumUpdateIntervalSettings::Default) =>
         {
-            log::warn!("Retrying capture with default cursor and border settings: {error}");
+            log::warn!("Retrying capture with default capture settings: {error}");
             try_start(
                 CursorCaptureSettings::Default,
                 DrawBorderSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
                 flags,
             )
         }
@@ -731,6 +802,7 @@ fn capture_window_loop(
         Err(error) => {
             log::error!("Failed to start capture: {error}");
             *failure.lock() = Some(error.to_string());
+            frame_wake.notify();
         }
     }
     completion_active.store(false, Ordering::Relaxed);
@@ -778,8 +850,34 @@ fn capture_settings_unsupported<E>(error: &GraphicsCaptureApiError<E>) -> bool {
         GraphicsCaptureApiError::GraphicsCaptureApiError(
             windows_capture::graphics_capture_api::Error::BorderConfigUnsupported
                 | windows_capture::graphics_capture_api::Error::CursorConfigUnsupported
+                | windows_capture::graphics_capture_api::Error::MinimumUpdateIntervalUnsupported
         )
     )
+}
+
+/// Twice the highest FPS preset. Keeping headroom above every preset means
+/// delivery jitter can never make the FPS throttle skip a due frame.
+const CAPTURE_MIN_UPDATE_INTERVAL: Duration = Duration::from_micros(1_000_000 / 120);
+
+fn minimum_update_interval(
+    supported: bool,
+) -> windows_capture::settings::MinimumUpdateIntervalSettings {
+    use windows_capture::settings::MinimumUpdateIntervalSettings;
+    if supported {
+        MinimumUpdateIntervalSettings::Custom(CAPTURE_MIN_UPDATE_INTERVAL)
+    } else {
+        MinimumUpdateIntervalSettings::Default
+    }
+}
+
+fn probed_minimum_update_interval() -> windows_capture::settings::MinimumUpdateIntervalSettings {
+    match GraphicsCaptureApi::is_minimum_update_interval_supported() {
+        Ok(supported) => minimum_update_interval(supported),
+        Err(error) => {
+            log::debug!("Could not probe capture update interval support: {error}");
+            windows_capture::settings::MinimumUpdateIntervalSettings::Default
+        }
+    }
 }
 
 #[cfg(test)]
@@ -901,13 +999,7 @@ mod tests {
         closed
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
-        *closed.latest_frame.lock() = Some(CapturedFrame {
-            width: 1,
-            height: 1,
-            source_width: 1,
-            source_height: 1,
-            data: vec![255; 4],
-        });
+        *closed.latest_frame.lock() = Some(CapturedFrame::from_rgba(1, 1, 1, 1, &[255; 4]));
         coordinator.sessions.insert(id, closed);
         coordinator.process_frames(&mut previews);
         let preview = previews.get_mut(id).unwrap();
@@ -991,26 +1083,37 @@ mod tests {
     }
 
     #[test]
+    fn frame_wake_schedules_one_repaint_per_consumed_frame() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let wake = super::FrameWake::default();
+        // Without a UI context there is nothing to wake.
+        wake.notify();
+        assert!(!wake.pending.load(Ordering::Acquire));
+
+        let _ = wake.context.set(eframe::egui::Context::default());
+        wake.notify();
+        assert!(wake.pending.load(Ordering::Acquire));
+        // Further frames before the UI runs share the scheduled repaint.
+        wake.notify();
+        assert!(wake.pending.load(Ordering::Acquire));
+
+        wake.frames_consumed(Duration::from_millis(33));
+        assert!(!wake.pending.load(Ordering::Acquire));
+        assert_eq!(wake.min_interval_micros.load(Ordering::Relaxed), 33_000);
+        wake.notify();
+        assert!(wake.pending.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn pending_frames_replace_stale_frames_per_preview() {
         let pending = Mutex::new(None);
-        *pending.lock() = Some(CapturedFrame {
-            width: 1,
-            height: 1,
-            source_width: 1,
-            source_height: 1,
-            data: vec![1; 4],
-        });
-        *pending.lock() = Some(CapturedFrame {
-            width: 2,
-            height: 2,
-            source_width: 2,
-            source_height: 2,
-            data: vec![2; 16],
-        });
+        *pending.lock() = Some(CapturedFrame::from_rgba(1, 1, 1, 1, &[1; 4]));
+        *pending.lock() = Some(CapturedFrame::from_rgba(2, 2, 2, 2, &[2; 16]));
 
         let latest = pending.lock().take().unwrap();
-        assert_eq!(latest.width, 2);
-        assert_eq!(latest.data, vec![2; 16]);
+        assert_eq!(latest.image.size[0], 2);
+        assert_eq!(latest.image.size, [2, 2]);
     }
 
     #[test]
@@ -1056,20 +1159,8 @@ mod tests {
         let stale_slot = Arc::new(Mutex::new(None));
         let current = session(30, true, false);
 
-        *stale_slot.lock() = Some(CapturedFrame {
-            width: 1,
-            height: 1,
-            source_width: 1,
-            source_height: 1,
-            data: vec![1; 4],
-        });
-        *current.latest_frame.lock() = Some(CapturedFrame {
-            width: 2,
-            height: 2,
-            source_width: 4,
-            source_height: 4,
-            data: vec![2; 16],
-        });
+        *stale_slot.lock() = Some(CapturedFrame::from_rgba(1, 1, 1, 1, &[1; 4]));
+        *current.latest_frame.lock() = Some(CapturedFrame::from_rgba(2, 2, 4, 4, &[2; 16]));
         let mut coordinator = CaptureCoordinator::new();
         coordinator.sessions.insert(preview_id, current);
         coordinator.process_frames(&mut previews);
@@ -1079,7 +1170,7 @@ mod tests {
             previews.get(preview_id).unwrap().source_frame_size,
             Some((4, 4))
         );
-        assert_eq!(stale_slot.lock().as_ref().unwrap().width, 1);
+        assert_eq!(stale_slot.lock().as_ref().unwrap().image.size[0], 1);
     }
 
     #[test]
@@ -1162,6 +1253,17 @@ mod tests {
         );
         assert_eq!(draw_border_setting(true), DrawBorderSettings::WithoutBorder);
         assert_eq!(draw_border_setting(false), DrawBorderSettings::Default);
+        use windows_capture::settings::MinimumUpdateIntervalSettings;
+        assert_eq!(
+            super::minimum_update_interval(false),
+            MinimumUpdateIntervalSettings::Default
+        );
+        let MinimumUpdateIntervalSettings::Custom(interval) = super::minimum_update_interval(true)
+        else {
+            panic!("supported systems request a custom interval");
+        };
+        // Faster than the 60 FPS preset, so the throttle never misses a frame.
+        assert!(interval < std::time::Duration::from_secs(1) / 60);
     }
 
     #[test]

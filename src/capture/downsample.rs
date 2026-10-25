@@ -65,6 +65,17 @@ pub fn fitted_capture_size(
     }
 }
 
+/// Output size a capture delivers while a screenshot asks for the full
+/// source: native pixels, still bounded by the 4K cap.
+pub fn screenshot_capture_size(source_width: u32, source_height: u32) -> (u32, u32) {
+    fitted_capture_size(
+        source_width,
+        source_height,
+        MAX_CAPTURE_WIDTH,
+        MAX_CAPTURE_HEIGHT,
+    )
+}
+
 /// Cached area-average RGBA8 downsampler. Capture dimensions are normally
 /// stable for many frames, so source ranges are rebuilt only when either the
 /// source or requested output size changes.
@@ -198,8 +209,8 @@ impl RgbaDownsampler {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_lod_factor, fitted_capture_size, window_capture_target, RgbaDownsampler,
-        MAX_CAPTURE_HEIGHT, MAX_CAPTURE_WIDTH,
+        capture_lod_factor, fitted_capture_size, screenshot_capture_size, window_capture_target,
+        RgbaDownsampler, MAX_CAPTURE_HEIGHT, MAX_CAPTURE_WIDTH,
     };
 
     #[test]
@@ -261,6 +272,12 @@ mod tests {
     #[test]
     fn preserves_aspect_inside_a_square_box() {
         assert_eq!(fitted_capture_size(3840, 2160, 800, 800), (800, 450));
+    }
+
+    #[test]
+    fn screenshots_request_native_pixels_within_the_4k_cap() {
+        assert_eq!(screenshot_capture_size(1920, 1080), (1920, 1080));
+        assert_eq!(screenshot_capture_size(5120, 2880), (3840, 2160));
     }
 
     #[test]

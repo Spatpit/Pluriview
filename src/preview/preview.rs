@@ -1,8 +1,10 @@
 use eframe::egui::{self, Pos2, Rect, TextureHandle, Vec2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
+use super::VideoPlaybackPreferences;
 use crate::media::MediaFrame;
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout};
 
@@ -19,6 +21,14 @@ fn ease_out_cubic(t: f32) -> f32 {
 /// Unique identifier for a preview
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct PreviewId(pub u64);
+
+/// Workspace group identity travels with each member, including deletion undo.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TileGroup {
+    pub id: u64,
+    pub name: String,
+    pub order: u32,
+}
 
 /// Browser-specific startup state shown inside a tile before capture begins.
 #[derive(Clone, Debug, PartialEq)]
@@ -209,6 +219,8 @@ pub struct Preview {
     /// Unique ID
     pub id: PreviewId,
 
+    pub tile_group: Option<TileGroup>,
+
     /// Position on canvas (top-left corner, in canvas coordinates)
     pub position: Pos2,
 
@@ -289,6 +301,30 @@ pub struct Preview {
     /// Frame data buffer (BGRA)
     frame_buffer: Option<FrameData>,
 
+    /// Last uploaded capture frame, shared with the texture upload rather
+    /// than copied. Runtime-only and kept only for selected tiles (and frozen
+    /// tiles that were selected when frozen), so a screenshot can save the
+    /// exact visible moment without holding a CPU copy of every tile.
+    retain_frame: bool,
+    retained_frame: Option<Arc<egui::ColorImage>>,
+
+    /// Runtime screenshot request for a live capture: the next frame at the
+    /// source's full capture size (any next frame for a browser) is kept here
+    /// for the screenshot.
+    pub screenshot_wants_native_frame: bool,
+    screenshot_native_frame: Option<Arc<egui::ColorImage>>,
+
+    /// Runtime-only: this tile is being recorded, so it keeps capturing at
+    /// full size and stays live while off screen.
+    pub recording: bool,
+    /// Runtime-only: a single recorded tile captures at its full source
+    /// size; tiles recorded together keep their on-screen size.
+    pub recording_full_size: bool,
+    /// Runtime-only: shown in the picture-in-picture window at this size in
+    /// points. The tile keeps capturing for that window, sized for it, while
+    /// the canvas shows a placeholder in its place.
+    pub picture_in_picture: Option<Vec2>,
+
     /// Current URL when this preview is a browser tile, None otherwise.
     /// Kept up to date as the page navigates so layouts save where the
     /// user actually is, not where the tile started.
@@ -296,6 +332,13 @@ pub struct Preview {
 
     /// Is this browser tile's audio muted? (Only meaningful for browsers.)
     pub browser_muted: bool,
+
+    /// Page zoom chosen for this browser tile, on top of the zoom that keeps
+    /// the page layout independent of the tile size. 1.0 is the page's own size.
+    pub browser_page_zoom: f32,
+
+    /// The browser tile's page is playing sound (runtime only).
+    pub browser_playing_audio: bool,
 
     /// Replay this window-capture tile's process audio through the stream
     /// audio monitor (Discord/OBS). Ignored for browser, video, and image tiles.
@@ -315,6 +358,8 @@ pub struct Preview {
     /// Original local path for image and GIF tiles. Legacy layouts may still
     /// point into Pluriview's former managed-media directory.
     pub media_path: Option<PathBuf>,
+    /// Runtime-only background decode status.
+    pub media_loading: bool,
 
     /// Local file or Streamlink URL when this is an mpv-backed video tile.
     pub video_source: Option<VideoSource>,
@@ -334,6 +379,7 @@ pub struct Preview {
 
     /// Last playback state received from mpv.
     pub video_playback: VideoPlaybackState,
+    pub video_preferences: VideoPlaybackPreferences,
 
     /// In-process libmpv renderer. Unlike a captured external mpv window,
     /// this paints directly into Pluriview's OpenGL canvas.
@@ -347,6 +393,9 @@ pub struct Preview {
 
     /// Decoded frames for a managed image. A single frame is a static image.
     media_frames: Vec<MediaFrame>,
+    /// A still image drops its decoded pixels once they are on the GPU; the
+    /// texture is what the tile shows, and the file is reread when needed.
+    media_pixels_released: bool,
     media_frame_index: usize,
     media_frame_dirty: bool,
     media_frame_started: Instant,
@@ -362,9 +411,7 @@ pub struct Preview {
 
 /// Raw frame data from capture
 struct FrameData {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
+    image: Arc<egui::ColorImage>,
 }
 
 impl Preview {
@@ -396,25 +443,38 @@ impl Preview {
             source_frame_size: None,
             texture: None,
             frame_buffer: None,
+            retain_frame: false,
+            retained_frame: None,
+            screenshot_wants_native_frame: false,
+            screenshot_native_frame: None,
+            recording: false,
+            recording_full_size: false,
+            picture_in_picture: None,
             browser_url: None,
             browser_muted: false,
+            browser_page_zoom: 1.0,
+            browser_playing_audio: false,
             stream_audio: false,
             capture_error: None,
             browser_status: BrowserTileStatus::Ready,
             browser_waiting_for_content: false,
             media_path: None,
+            media_loading: false,
             video_source: None,
             folder_playlist: None,
             playlist_group: None,
+            tile_group: None,
             playlist_linked_video: None,
             video_status: VideoTileStatus::Ready,
             video_playback: VideoPlaybackState::default(),
+            video_preferences: VideoPlaybackPreferences::default(),
             #[cfg(windows)]
             video_renderer: None,
             seek_preview_time: None,
             seek_preview_texture: None,
             seek_preview_frame: None,
             media_frames: Vec::new(),
+            media_pixels_released: false,
             media_frame_index: 0,
             media_frame_dirty: false,
             media_frame_started: Instant::now(),
@@ -482,6 +542,8 @@ impl Preview {
         self.capture_hibernated = false;
         self.capture_offscreen_since = None;
         self.frame_buffer = None;
+        self.retained_frame = None;
+        self.cancel_screenshot_native_frame();
         self.texture = None;
         self.clear_capture_error();
     }
@@ -517,9 +579,10 @@ impl Preview {
     pub fn update_seek_preview(&mut self, time: f64, width: u32, height: u32, data: Vec<u8>) {
         self.seek_preview_time = Some(time);
         self.seek_preview_frame = Some(FrameData {
-            width,
-            height,
-            data,
+            image: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                &data,
+            )),
         });
     }
 
@@ -535,10 +598,7 @@ impl Preview {
 
     pub fn get_seek_preview_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         if let Some(frame) = self.seek_preview_frame.take() {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.data,
-            );
+            let image = frame.image;
             if let Some(texture) = self.seek_preview_texture.as_mut() {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
@@ -554,11 +614,13 @@ impl Preview {
 
     /// Attach decoded image data to this preview.
     pub fn set_media(&mut self, path: PathBuf, frames: Vec<MediaFrame>) {
+        self.media_loading = false;
         self.texture = None;
         self.frame_buffer = None;
         self.clear_capture_error();
         self.media_path = Some(path);
         self.media_frames = frames;
+        self.media_pixels_released = false;
         self.media_frame_index = 0;
         self.media_frame_dirty = true;
         self.media_frame_started = Instant::now();
@@ -607,23 +669,26 @@ impl Preview {
 
     /// Update frame data from capture
     pub fn update_frame(&mut self, width: u32, height: u32, data: Vec<u8>) {
-        self.update_capture_frame(width, height, width, height, data);
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &data);
+        self.update_capture_frame(width, height, image);
     }
 
     /// Update a live-capture texture while retaining the source's native size.
+    /// The image arrives already premultiplied (capture workers convert it),
+    /// so this path does no per-pixel work beyond the browser startup check.
     pub fn update_capture_frame(
         &mut self,
-        width: u32,
-        height: u32,
         source_width: u32,
         source_height: u32,
-        data: Vec<u8>,
+        image: egui::ColorImage,
     ) {
+        let [width, height] = image.size.map(|value| value as u32);
         #[cfg(all(windows, pluriview_performance))]
         crate::app::performance::counters::capture_tile(self.id.0);
         self.clear_capture_error();
-        let transparent_browser_startup = self.browser_waiting_for_content
-            && !data.iter().skip(3).step_by(4).any(|alpha| *alpha != 0);
+        let transparent_browser_startup =
+            self.browser_waiting_for_content && !image.pixels.iter().any(|pixel| pixel.a() != 0);
         if self.browser_waiting_for_content && !transparent_browser_startup {
             self.browser_waiting_for_content = false;
         }
@@ -645,11 +710,17 @@ impl Preview {
             return;
         }
 
-        self.frame_buffer = Some(FrameData {
-            width,
-            height,
-            data,
-        });
+        let image = Arc::new(image);
+        // Browser captures are not resized for screenshots; take their next frame.
+        if self.screenshot_wants_native_frame
+            && (self.is_browser()
+                || (width, height)
+                    == crate::capture::screenshot_capture_size(source_width, source_height))
+        {
+            self.screenshot_wants_native_frame = false;
+            self.screenshot_native_frame = Some(Arc::clone(&image));
+        }
+        self.frame_buffer = Some(FrameData { image });
     }
 
     /// Release a CPU-side frame that arrived just before a capture was
@@ -657,6 +728,47 @@ impl Preview {
     /// visual snapshot.
     pub fn discard_pending_capture_frame(&mut self) {
         self.frame_buffer = None;
+    }
+
+    /// Keep (or release) a shared reference to each uploaded capture frame.
+    /// A frozen tile keeps the frame it already holds, because no new frame
+    /// will arrive to replace it once it is selected again.
+    pub fn set_retain_frame(&mut self, retain: bool) {
+        self.retain_frame = retain;
+        if !retain && !self.manually_frozen {
+            self.retained_frame = None;
+        }
+    }
+
+    /// Newest capture frame this tile can hand to a screenshot without a GPU
+    /// readback: a frame waiting for upload, else the retained upload.
+    pub fn latest_capture_frame(&self) -> Option<Arc<egui::ColorImage>> {
+        self.frame_buffer
+            .as_ref()
+            .map(|frame| Arc::clone(&frame.image))
+            .or_else(|| self.retained_frame.clone())
+    }
+
+    pub fn take_screenshot_native_frame(&mut self) -> Option<Arc<egui::ColorImage>> {
+        self.screenshot_native_frame.take()
+    }
+
+    pub fn cancel_screenshot_native_frame(&mut self) {
+        self.screenshot_wants_native_frame = false;
+        self.screenshot_native_frame = None;
+    }
+
+    /// Current decoded image/GIF frame as straight-alpha RGBA. `None` for a
+    /// still image whose pixels were released after upload; see
+    /// `media_pixels_released`.
+    pub fn current_media_frame(&self) -> Option<&MediaFrame> {
+        self.media_frames.get(self.media_frame_index)
+    }
+
+    /// The still image is shown from its GPU texture only; read the file to
+    /// get its pixels again.
+    pub fn media_pixels_released(&self) -> bool {
+        self.media_pixels_released
     }
 
     /// Get UV coordinates for rendering (either crop region or full frame)
@@ -676,23 +788,30 @@ impl Preview {
         // image directly from that slice instead of cloning a second buffer.
         let media_image = if self.media_frame_dirty {
             self.media_frame_dirty = false;
-            self.media_frames.get(self.media_frame_index).map(|frame| {
+            let image = self.media_frames.get(self.media_frame_index).map(|frame| {
                 egui::ColorImage::from_rgba_unmultiplied(
                     [frame.width as usize, frame.height as usize],
                     &frame.rgba,
                 )
-            })
+            });
+            // A still image never uploads again, so its decoded copy would
+            // only double its memory. GIF frames stay for animation.
+            if image.is_some() && self.media_frames.len() == 1 {
+                self.media_frames = Vec::new();
+                self.media_pixels_released = true;
+            }
+            image
         } else {
             None
         };
         let capture_image = self.frame_buffer.take().map(|frame| {
-            egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.data,
-            )
+            if self.retain_frame {
+                self.retained_frame = Some(Arc::clone(&frame.image));
+            }
+            egui::ImageData::from(frame.image)
         });
 
-        if let Some(image) = media_image.or(capture_image) {
+        if let Some(image) = media_image.map(egui::ImageData::from).or(capture_image) {
             #[cfg(all(windows, pluriview_performance))]
             crate::app::performance::counters::record(
                 crate::app::performance::counters::TEXTURE_UPLOAD,
@@ -783,6 +902,8 @@ impl Preview {
 /// Serializable layout for persistence
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreviewLayout {
+    #[serde(default)]
+    pub tile_group: Option<TileGroup>,
     pub position: (f32, f32),
     pub size: (f32, f32),
     pub window_title: String,
@@ -805,6 +926,9 @@ pub struct PreviewLayout {
     /// WebView2 mute is per-session, so remember it and reapply on restore.
     #[serde(default)]
     pub browser_muted: bool,
+    /// Per-tile page zoom for browser tiles.
+    #[serde(default = "default_browser_page_zoom")]
+    pub browser_page_zoom: f32,
     /// Replay this captured window's audio through the stream monitor.
     #[serde(default)]
     pub stream_audio: bool,
@@ -815,6 +939,9 @@ pub struct PreviewLayout {
     /// Optional mpv-backed local file or Streamlink source.
     #[serde(default)]
     pub video_source: Option<VideoSource>,
+    /// Playback choices survive missing files and delayed player startup.
+    #[serde(default)]
+    pub video_preferences: VideoPlaybackPreferences,
     /// Relationship shared by a folder playlist and its linked video.
     #[serde(default)]
     pub playlist_group: Option<u64>,
@@ -835,6 +962,7 @@ pub struct PreviewLayout {
 impl From<&Preview> for PreviewLayout {
     fn from(preview: &Preview) -> Self {
         Self {
+            tile_group: preview.tile_group.clone(),
             position: (preview.position.x, preview.position.y),
             size: (preview.size.x, preview.size.y),
             window_title: match preview.video_source.as_ref() {
@@ -849,9 +977,11 @@ impl From<&Preview> for PreviewLayout {
             crop_uv: preview.crop_uv,
             browser_url: preview.browser_url.clone(),
             browser_muted: preview.browser_muted,
+            browser_page_zoom: preview.browser_page_zoom,
             stream_audio: preview.stream_audio,
             media_path: preview.media_path.clone(),
             video_source: preview.video_source.as_ref().map(scrub_video_source),
+            video_preferences: preview.video_preferences.clone().normalized(),
             playlist_group: preview.playlist_group,
             folder_playlist: preview.folder_playlist.as_ref().map(FolderPlaylist::layout),
             spout_sender: preview.spout_sender.clone(),
@@ -859,6 +989,10 @@ impl From<&Preview> for PreviewLayout {
             left_click_disabled: preview.left_click_disabled,
         }
     }
+}
+
+fn default_browser_page_zoom() -> f32 {
+    1.0
 }
 
 fn scrub_video_source(source: &VideoSource) -> VideoSource {
@@ -1059,6 +1193,62 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn video_preferences_round_trip_without_runtime_state() {
+        use crate::preview::{VideoPlaybackPreferences, VideoTrackPreference};
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "video".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        preview.video_source = Some(VideoSource::LocalFile {
+            path: PathBuf::from("movie.mp4"),
+        });
+        preview.video_preferences = VideoPlaybackPreferences {
+            volume: 31.0,
+            muted: true,
+            speed: 1.5,
+            looping: true,
+            audio_track: VideoTrackPreference::Track(2),
+            subtitle_track: VideoTrackPreference::Off,
+        };
+        preview.video_playback.time_pos = Some(42.0);
+        preview.video_playback.connected = true;
+        let json = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert!(json.get("video_playback").is_none());
+        assert!(json["video_preferences"].get("time_pos").is_none());
+        let saved: PreviewLayout = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(saved.video_preferences, preview.video_preferences);
+
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("video_preferences");
+        let saved: PreviewLayout = serde_json::from_value(legacy).unwrap();
+        assert_eq!(saved.video_preferences, VideoPlaybackPreferences::default());
+    }
+
+    #[test]
+    fn browser_page_zoom_round_trips_and_defaults_to_full_size() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "page".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        preview.browser_url = Some("https://example.com".to_owned());
+        preview.browser_page_zoom = 1.25;
+        preview.browser_playing_audio = true;
+        let json = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert!(json.get("browser_playing_audio").is_none());
+        let saved: PreviewLayout = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(saved.browser_page_zoom, 1.25);
+
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("browser_page_zoom");
+        let saved: PreviewLayout = serde_json::from_value(legacy).unwrap();
+        assert_eq!(saved.browser_page_zoom, 1.0);
+    }
+
+    #[test]
     fn frame_updates_reuse_the_texture() {
         let context = Context::default();
         let mut preview = Preview::new(
@@ -1100,6 +1290,47 @@ mod tests {
         assert!(preview.get_texture(&context).is_some());
         assert!(!preview.media_frame_dirty);
         assert!(preview.frame_buffer.is_none());
+    }
+
+    #[test]
+    fn still_images_release_decoded_pixels_after_upload_but_gifs_keep_them() {
+        let ctx = eframe::egui::Context::default();
+        let frame = |duration_ms| MediaFrame {
+            width: 2,
+            height: 1,
+            rgba: vec![255; 8],
+            duration: std::time::Duration::from_millis(duration_ms),
+        };
+        let mut still = Preview::new(
+            PreviewId(1),
+            "still".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(10.0),
+        );
+        still.set_media(PathBuf::from("still.png"), vec![frame(0)]);
+        assert!(still.current_media_frame().is_some());
+        assert!(still.get_texture(&ctx).is_some());
+        assert!(still.current_media_frame().is_none());
+        assert!(still.media_pixels_released());
+        assert_eq!(still.frame_size, Some((2, 1)));
+        // The texture remains after the pixels are gone.
+        assert!(still.get_texture(&ctx).is_some());
+
+        let mut gif = Preview::new(
+            PreviewId(2),
+            "gif".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(10.0),
+        );
+        gif.set_media(PathBuf::from("anim.gif"), vec![frame(100), frame(100)]);
+        assert!(gif.get_texture(&ctx).is_some());
+        assert!(gif.current_media_frame().is_some());
+        assert!(!gif.media_pixels_released());
+
+        // Replacing the source decodes again and starts with pixels.
+        still.set_media(PathBuf::from("other.png"), vec![frame(0)]);
+        assert!(!still.media_pixels_released());
+        assert!(still.current_media_frame().is_some());
     }
 
     #[test]

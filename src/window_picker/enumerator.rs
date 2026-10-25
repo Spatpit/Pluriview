@@ -65,6 +65,25 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
     windows
 }
 
+/// Current title of a window. For another process's window this reads the
+/// stored caption without sending it a message, so a hung app cannot block.
+pub fn window_title(hwnd: isize) -> Option<String> {
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return Some(String::new());
+        }
+        let mut buffer: Vec<u16> = vec![0; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, &mut buffer);
+        (copied >= 0).then(|| {
+            OsString::from_wide(&buffer[..copied as usize])
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+}
+
 /// Callback for EnumWindows
 unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let windows = &mut *(lparam.0 as *mut Vec<WindowInfo>);
@@ -198,6 +217,39 @@ fn get_process_name(process_id: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::WindowInfo;
+
+    #[test]
+    fn live_titles_feed_the_privacy_filter() {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, SetWindowTextW, WINDOW_EX_STYLE, WS_POPUP,
+        };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Shopping list"),
+                WS_POPUP,
+                0,
+                0,
+                10,
+                10,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let id = hwnd.0 as isize;
+        let title = super::window_title(id).unwrap();
+        assert_eq!(title, "Shopping list");
+        assert!(!crate::privacy::is_sensitive_window("app.exe", &title));
+        unsafe { SetWindowTextW(hwnd, w!("InPrivate - Microsoft Edge")) }.unwrap();
+        let title = super::window_title(id).unwrap();
+        assert!(crate::privacy::is_sensitive_window("msedge.exe", &title));
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
 
     #[test]
     fn cached_search_text_matches_titles_and_executables() {

@@ -61,6 +61,11 @@ impl Storage {
         })
     }
 
+    /// Saved tile screenshots, beside the rest of Pluriview's data.
+    pub fn screenshots_dir(&self) -> PathBuf {
+        self.data_dir.join("screenshots")
+    }
+
     /// Get auto-save path
     pub fn autosave_path(&self) -> PathBuf {
         self.data_dir.join("autosave.json")
@@ -524,12 +529,6 @@ fn remove_file_if_exists(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
-impl Default for Storage {
-    fn default() -> Self {
-        Self::new().expect("Failed to initialize storage")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::Storage;
@@ -783,6 +782,35 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn data_directory_lease_excludes_another_writer_and_releases_on_drop() {
+        let root = temp_root("exclusive-storage");
+        let storage = Storage {
+            data_dir: root.clone(),
+        };
+        let lease = storage.acquire_lease().unwrap();
+        let second = Storage {
+            data_dir: root.join("."),
+        };
+        assert_eq!(
+            second.acquire_lease().err().unwrap().raw_os_error(),
+            Some(32)
+        );
+        // Locks are scoped to a directory, not to all Pluriview processes.
+        let other_root = temp_root("independent-storage");
+        let other = Storage {
+            data_dir: other_root.clone(),
+        };
+        let independent = other.acquire_lease().unwrap();
+        drop(lease);
+        let reopened = second.acquire_lease().unwrap();
+        drop(reopened);
+        drop(independent);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other_root).unwrap();
     }
 
     #[test]

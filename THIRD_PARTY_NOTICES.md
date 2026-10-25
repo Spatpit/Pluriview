@@ -1,13 +1,39 @@
 # Third-party notices
 
+## QR code encoder
+
+The phone viewer uses the `qrcode` Rust crate, version 0.14.1
+([source](https://github.com/kennytm/qrcode-rust)), under its MIT license:
+
+Copyright (c) 2016 kennytm
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 ## uBlock Origin Lite
 
-Pluriview includes an unmodified official release package of uBlock Origin
-Lite, version `2026.714.1952`, by Raymond Hill and contributors.
+Pluriview ships an unmodified official release package of uBlock Origin
+Lite, version `2026.714.1952`, by Raymond Hill and contributors, as
+`lib/uBOLite_2026.714.1952.edge.zip` beside `pluriview.exe`.
 
 uBlock Origin Lite is licensed under the GNU General Public License, version
-3. Its license text is included inside the embedded package at
-`assets/third_party/ubol/uBOLite_2026.714.1952.edge.zip` as `LICENSE.txt`.
+3. Its license text is included inside the package as `LICENSE.txt`. The
+source tree keeps the package at
+`assets/third_party/ubol/uBOLite_2026.714.1952.edge.zip`.
 The corresponding upstream source is available from the
 [`uBOLite_2026.714.1952` tag](https://github.com/gorhill/uBlock/tree/uBOLite_2026.714.1952).
 
@@ -50,11 +76,11 @@ into the executable, and it is not stored in this git repository.
 
 The pinned Windows runtime is extracted from the shinchiro mpv-dev archive:
 
-- Build date: `20260610`
-- mpv git: `304426c`
-- Asset: [`mpv-dev-x86_64-v3-20260610-git-304426c.7z`](https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-x86_64-v3-20260610-git-304426c.7z)
-- Archive SHA-256: `D4B3D6DF9FDB33D5591C4ECE7D0CC24D2F7822B298F6A1528595E0CCFF7424A6`
-- Extracted `libmpv-2.dll` SHA-256: `ADE5CAC46CFC397A3D5CD356A968CDA7ACF0DEBFFB705A16509DAFDF93029F5E`
+- Build date: `20261018`
+- mpv git: `01e2533f31`
+- Asset: [`mpv-dev-x86_64-v3-20261018-git-01e2533f31.7z`](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-v3-20261018-git-01e2533f31.7z) (SourceForge mirror of the shinchiro GitHub release, which removes old builds)
+- Archive SHA-256: `49533E80D681672E42AB38FCCFDB9DB0CC9FC423F86D34F5F9634EBA71109912`
+- Extracted `libmpv-2.dll` SHA-256: `5C5C9D094859BDC60B8B27B2D832DB8FA8C2E487EFBD35F5AEA5AFE6960DAD39`
 - Prepare script: `scripts/prepare-libmpv.ps1`
 
 mpv is copyright the mpv-player contributors. The mpv project is GPLv2+ by
@@ -63,7 +89,7 @@ default, and can be built as LGPLv2.1+ without GPL-only files. These shinchiro
 [mpv Copyright](https://github.com/mpv-player/mpv/blob/master/Copyright),
 [LICENSE.GPL](https://github.com/mpv-player/mpv/blob/master/LICENSE.GPL), and
 the matching source at
-[`mpv@304426c`](https://github.com/mpv-player/mpv/tree/304426c).
+[`mpv@01e2533f31`](https://github.com/mpv-player/mpv/tree/01e2533f31).
 
 `libmpv-2.dll` also contains FFmpeg and other libraries with their own
 licenses. Typical licenses in this stack include LGPLv2.1+ / GPLv2+ (FFmpeg

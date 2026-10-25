@@ -18,8 +18,7 @@ fn configure_local_performance() {
 
 fn expose_ubol_fingerprint() {
     println!("cargo:rerun-if-changed={UBOL_ARCHIVE_PATH}");
-    let archive =
-        std::fs::read(UBOL_ARCHIVE_PATH).expect("read embedded uBlock Origin Lite archive");
+    let archive = std::fs::read(UBOL_ARCHIVE_PATH).expect("read pinned uBlock Origin Lite archive");
     println!(
         "cargo:rustc-env=PLURIVIEW_UBOL_SHA256={:x}",
         Sha256::digest(archive)

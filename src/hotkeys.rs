@@ -63,6 +63,22 @@ pub enum HotkeySlot {
     InteractBrowser,
     InteractBrowserAlternate,
     ShowShortcutHelp,
+    GroupTiles,
+    UngroupTiles,
+    LayoutGrid,
+    LayoutRow,
+    LayoutColumn,
+    LayoutSideStack,
+    ToggleSpotlight,
+    PreviousSpotlight,
+    NextSpotlight,
+    SizeMedium,
+    SizeLarge,
+    ScreenshotTile,
+    ToggleScreenshotsPanel,
+    RecordTile,
+    PauseRecording,
+    PictureInPicture,
 }
 
 impl HotkeySlot {
@@ -78,7 +94,7 @@ impl HotkeySlot {
         Self::CanvasView9,
     ];
 
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 38] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
@@ -101,6 +117,22 @@ impl HotkeySlot {
         Self::InteractBrowser,
         Self::InteractBrowserAlternate,
         Self::ShowShortcutHelp,
+        Self::GroupTiles,
+        Self::UngroupTiles,
+        Self::LayoutGrid,
+        Self::LayoutRow,
+        Self::LayoutColumn,
+        Self::LayoutSideStack,
+        Self::ToggleSpotlight,
+        Self::PreviousSpotlight,
+        Self::NextSpotlight,
+        Self::SizeMedium,
+        Self::SizeLarge,
+        Self::ScreenshotTile,
+        Self::ToggleScreenshotsPanel,
+        Self::RecordTile,
+        Self::PauseRecording,
+        Self::PictureInPicture,
     ];
 
     pub fn label(self) -> &'static str {
@@ -127,6 +159,22 @@ impl HotkeySlot {
             Self::InteractBrowser => "Interact with browser",
             Self::InteractBrowserAlternate => "Interact with browser (alternate)",
             Self::ShowShortcutHelp => "Show shortcut help",
+            Self::GroupTiles => "Group selected tiles",
+            Self::UngroupTiles => "Ungroup selected tiles",
+            Self::LayoutGrid => "Layout: one large tile",
+            Self::LayoutRow => "Layout: two large tiles",
+            Self::LayoutColumn => "Layout: three large tiles",
+            Self::LayoutSideStack => "Layout: equal tiles",
+            Self::ToggleSpotlight => "Toggle group Spotlight",
+            Self::PreviousSpotlight => "Previous Spotlight tile",
+            Self::NextSpotlight => "Next Spotlight tile",
+            Self::SizeMedium => "Medium group size",
+            Self::SizeLarge => "Large group size",
+            Self::ScreenshotTile => "Screenshot selected tiles",
+            Self::ToggleScreenshotsPanel => "Toggle Screenshots panel",
+            Self::RecordTile => "Start/stop recording selected tiles",
+            Self::PauseRecording => "Pause/resume recording",
+            Self::PictureInPicture => "Picture in picture",
         }
     }
 }
@@ -156,6 +204,22 @@ pub struct HotkeyBindings {
     pub interact_browser: Hotkey,
     pub interact_browser_alternate: Hotkey,
     pub show_shortcut_help: Hotkey,
+    pub group_tiles: Hotkey,
+    pub ungroup_tiles: Hotkey,
+    pub layout_grid: Hotkey,
+    pub layout_row: Hotkey,
+    pub layout_column: Hotkey,
+    pub layout_side_stack: Hotkey,
+    pub toggle_spotlight: Hotkey,
+    pub previous_spotlight: Hotkey,
+    pub next_spotlight: Hotkey,
+    pub size_medium: Hotkey,
+    pub size_large: Hotkey,
+    pub screenshot_tile: Hotkey,
+    pub toggle_screenshots_panel: Hotkey,
+    pub record_tile: Hotkey,
+    pub pause_recording: Hotkey,
+    pub picture_in_picture: Hotkey,
 }
 
 impl Default for HotkeyBindings {
@@ -183,6 +247,22 @@ impl Default for HotkeyBindings {
             interact_browser: Hotkey::pair(0x11, 0x42),     // Ctrl+B
             interact_browser_alternate: Hotkey::key(0x61),  // Numpad 1
             show_shortcut_help: Hotkey::key(0x70),          // F1
+            group_tiles: Hotkey::pair(0x11, 0x47),
+            ungroup_tiles: Hotkey::pair(0x11, 0x55),
+            layout_grid: Hotkey::pair(0x12, 0x31),
+            layout_row: Hotkey::pair(0x12, 0x32),
+            layout_column: Hotkey::pair(0x12, 0x33),
+            layout_side_stack: Hotkey::pair(0x12, 0x34),
+            toggle_spotlight: Hotkey::pair(0x10, 0x46),
+            previous_spotlight: Hotkey::pair(0x10, 0x25),
+            next_spotlight: Hotkey::pair(0x10, 0x27),
+            size_medium: Hotkey::pair(0x12, 0x36),
+            size_large: Hotkey::pair(0x12, 0x37),
+            screenshot_tile: Hotkey::pair(0x10, 0x53), // Shift+S
+            toggle_screenshots_panel: Hotkey::key(0x53), // S
+            record_tile: Hotkey::pair(0x10, 0x52),     // Shift+R
+            pause_recording: Hotkey::key(0x50),        // P
+            picture_in_picture: Hotkey::pair(0x10, 0x50), // Shift+P
         }
     }
 }
@@ -212,6 +292,22 @@ impl HotkeyBindings {
             HotkeySlot::InteractBrowser => self.interact_browser,
             HotkeySlot::InteractBrowserAlternate => self.interact_browser_alternate,
             HotkeySlot::ShowShortcutHelp => self.show_shortcut_help,
+            HotkeySlot::GroupTiles => self.group_tiles,
+            HotkeySlot::UngroupTiles => self.ungroup_tiles,
+            HotkeySlot::LayoutGrid => self.layout_grid,
+            HotkeySlot::LayoutRow => self.layout_row,
+            HotkeySlot::LayoutColumn => self.layout_column,
+            HotkeySlot::LayoutSideStack => self.layout_side_stack,
+            HotkeySlot::ToggleSpotlight => self.toggle_spotlight,
+            HotkeySlot::PreviousSpotlight => self.previous_spotlight,
+            HotkeySlot::NextSpotlight => self.next_spotlight,
+            HotkeySlot::SizeMedium => self.size_medium,
+            HotkeySlot::SizeLarge => self.size_large,
+            HotkeySlot::ScreenshotTile => self.screenshot_tile,
+            HotkeySlot::ToggleScreenshotsPanel => self.toggle_screenshots_panel,
+            HotkeySlot::RecordTile => self.record_tile,
+            HotkeySlot::PauseRecording => self.pause_recording,
+            HotkeySlot::PictureInPicture => self.picture_in_picture,
         }
     }
 
@@ -239,6 +335,22 @@ impl HotkeyBindings {
             HotkeySlot::InteractBrowser => self.interact_browser = hotkey,
             HotkeySlot::InteractBrowserAlternate => self.interact_browser_alternate = hotkey,
             HotkeySlot::ShowShortcutHelp => self.show_shortcut_help = hotkey,
+            HotkeySlot::GroupTiles => self.group_tiles = hotkey,
+            HotkeySlot::UngroupTiles => self.ungroup_tiles = hotkey,
+            HotkeySlot::LayoutGrid => self.layout_grid = hotkey,
+            HotkeySlot::LayoutRow => self.layout_row = hotkey,
+            HotkeySlot::LayoutColumn => self.layout_column = hotkey,
+            HotkeySlot::LayoutSideStack => self.layout_side_stack = hotkey,
+            HotkeySlot::ToggleSpotlight => self.toggle_spotlight = hotkey,
+            HotkeySlot::PreviousSpotlight => self.previous_spotlight = hotkey,
+            HotkeySlot::NextSpotlight => self.next_spotlight = hotkey,
+            HotkeySlot::SizeMedium => self.size_medium = hotkey,
+            HotkeySlot::SizeLarge => self.size_large = hotkey,
+            HotkeySlot::ScreenshotTile => self.screenshot_tile = hotkey,
+            HotkeySlot::ToggleScreenshotsPanel => self.toggle_screenshots_panel = hotkey,
+            HotkeySlot::RecordTile => self.record_tile = hotkey,
+            HotkeySlot::PauseRecording => self.pause_recording = hotkey,
+            HotkeySlot::PictureInPicture => self.picture_in_picture = hotkey,
         }
     }
 
@@ -265,8 +377,14 @@ impl HotkeyBindings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct HotkeyPresses([bool; HotkeySlot::ALL.len()]);
+
+impl Default for HotkeyPresses {
+    fn default() -> Self {
+        Self([false; HotkeySlot::ALL.len()])
+    }
+}
 
 impl HotkeyPresses {
     pub fn pressed(self, slot: HotkeySlot) -> bool {
@@ -296,6 +414,11 @@ impl HotkeyPresses {
 pub struct HotkeyTracker {
     held: [bool; 256],
     newly_pressed: Vec<u16>,
+    /// When Pluriview last sampled while owning the foreground.
+    last_foreground_sample: Option<std::time::Instant>,
+    /// Edges are only trusted while Pluriview has owned the foreground
+    /// since the previous sample; see `key_press_edge`.
+    accept_edges: bool,
 }
 
 impl Default for HotkeyTracker {
@@ -303,13 +426,39 @@ impl Default for HotkeyTracker {
         Self {
             held: [false; 256],
             newly_pressed: Vec::new(),
+            last_foreground_sample: None,
+            accept_edges: false,
         }
     }
 }
 
+/// Longest gap between foreground samples that still counts as continuous
+/// ownership. Idle frames run at least every 250 ms.
+const FOREGROUND_CONTINUITY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Decide whether a sampled `GetAsyncKeyState` value is a new press.
+///
+/// The low "pressed since the last call" bit is system-wide, so it is also
+/// set by keys typed in other applications. Only trust edges while Pluriview
+/// owned the foreground at both this and the previous sample; on the frame
+/// focus returns, just record which keys are already down.
+fn key_press_edge(state: u16, held: bool, accept_edges: bool) -> bool {
+    let down = state & 0x8000 != 0;
+    let pressed_since_sample = state & 1 != 0;
+    accept_edges && ((down && !held) || (!down && pressed_since_sample))
+}
+
 impl HotkeyTracker {
-    pub fn sample(&mut self, bindings: &HotkeyBindings, recording: bool) {
+    pub fn sample(&mut self, bindings: &HotkeyBindings, recording: bool, foreground: bool) {
         self.newly_pressed.clear();
+        // A long gap (for example while minimized, when no frames run) also
+        // breaks continuity even if the previous sample owned the foreground.
+        let now = std::time::Instant::now();
+        self.accept_edges = foreground
+            && self
+                .last_foreground_sample
+                .is_some_and(|last| now.duration_since(last) < FOREGROUND_CONTINUITY);
+        self.last_foreground_sample = foreground.then_some(now);
         #[cfg(windows)]
         {
             let configured = bindings.configured_keys();
@@ -341,7 +490,7 @@ impl HotkeyTracker {
         }
         #[cfg(not(windows))]
         {
-            let _ = (bindings, recording);
+            let _ = (bindings, recording, foreground);
             self.held.fill(false);
         }
     }
@@ -363,12 +512,10 @@ impl HotkeyTracker {
             return;
         }
         let state = key_state(virtual_key);
-        let down = state & 0x8000 != 0;
-        let pressed_since_sample = state & 1 != 0;
-        if (down && !self.held[index]) || (!down && pressed_since_sample) {
+        if key_press_edge(state, self.held[index], self.accept_edges) {
             self.newly_pressed.push(virtual_key);
         }
-        self.held[index] = down;
+        self.held[index] = state & 0x8000 != 0;
         sampled[index] = true;
     }
 
@@ -525,6 +672,28 @@ const SUPPORTED_KEYS: &[(u16, &str)] = &[
 #[cfg(test)]
 mod tests {
     #[test]
+    fn key_edges_from_other_apps_never_become_shortcuts() {
+        use super::key_press_edge;
+        const DOWN: u16 = 0x8000;
+        const PRESSED_SINCE_LAST_CALL: u16 = 1;
+
+        // Continuous foreground ownership: real presses, including a quick
+        // tap between samples, are accepted.
+        assert!(key_press_edge(DOWN, false, true));
+        assert!(key_press_edge(PRESSED_SINCE_LAST_CALL, false, true));
+        assert!(!key_press_edge(DOWN, true, true));
+
+        // Delete typed in another app before focus returned: neither the
+        // low bit nor a still-held key fires on the first focused sample.
+        assert!(!key_press_edge(PRESSED_SINCE_LAST_CALL, false, false));
+        assert!(!key_press_edge(
+            DOWN | PRESSED_SINCE_LAST_CALL,
+            false,
+            false
+        ));
+    }
+
+    #[test]
     fn undo_defaults_for_legacy_settings_and_respects_keyboard_focus() {
         let mut value = serde_json::to_value(super::HotkeyBindings::default()).unwrap();
         value.as_object_mut().unwrap().remove("undo_removed_tiles");
@@ -560,6 +729,90 @@ mod tests {
         assert_eq!(shortcuts.next_canvas_view.display(), "Ctrl+Page Down");
         assert_eq!(shortcuts.canvas_view_1.display(), "Ctrl+1");
         assert_eq!(shortcuts.canvas_view_9.display(), "Ctrl+9");
+    }
+
+    #[test]
+    fn spotlight_presets_keep_saved_bindings_and_remove_alt_five() {
+        let old = serde_json::json!({
+            "layout_row": {"first_key": 17, "second_key": 81},
+            "size_small": {"first_key": 18, "second_key": 53}
+        });
+        let restored: HotkeyBindings = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.layout_row, Hotkey::pair(0x11, 0x51));
+        let defaults = HotkeyBindings::default();
+        for (slot, number) in [
+            (HotkeySlot::LayoutGrid, 0x31),
+            (HotkeySlot::LayoutRow, 0x32),
+            (HotkeySlot::LayoutColumn, 0x33),
+            (HotkeySlot::LayoutSideStack, 0x34),
+        ] {
+            assert_eq!(defaults.get(slot), Hotkey::pair(0x12, number));
+        }
+        assert!(!HotkeySlot::ALL
+            .iter()
+            .any(|slot| defaults.get(*slot) == Hotkey::pair(0x12, 0x35)));
+        assert!(serde_json::to_value(restored)
+            .unwrap()
+            .get("size_small")
+            .is_none());
+    }
+
+    #[test]
+    fn group_shortcuts_migrate_without_changing_existing_bindings() {
+        let old = serde_json::json!({"focus_current_tile": {"first_key": null, "second_key": 98}});
+        let restored: HotkeyBindings = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.focus_current_tile, Hotkey::key(0x62));
+        assert_eq!(restored.group_tiles.display(), "Ctrl+G");
+        assert_eq!(restored.toggle_spotlight.display(), "Shift+F");
+        let defaults = HotkeyBindings::default();
+        for slot in HotkeySlot::ALL {
+            assert_eq!(defaults.conflict(slot, defaults.get(slot)), None);
+        }
+        let mut tracker = HotkeyTracker::default();
+        tracker.held[0x10] = true;
+        tracker.held[0x46] = true;
+        tracker.newly_pressed.push(0x46);
+        let presses = tracker.presses(&defaults, true);
+        assert!(presses.pressed(HotkeySlot::ToggleSpotlight));
+        assert!(!presses.pressed(HotkeySlot::FocusCurrentTile));
+        assert!(!tracker
+            .presses(&defaults, false)
+            .pressed(HotkeySlot::ToggleSpotlight));
+    }
+
+    #[test]
+    fn screenshot_shortcut_defaults_to_shift_s_for_older_settings() {
+        let old = serde_json::json!({"select_all": {"first_key": 17, "second_key": 65}});
+        let restored: HotkeyBindings = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.get(HotkeySlot::ScreenshotTile).display(),
+            "Shift+S"
+        );
+        assert_eq!(
+            restored.get(HotkeySlot::ToggleScreenshotsPanel).display(),
+            "S"
+        );
+        assert_eq!(
+            restored.conflict(HotkeySlot::ScreenshotTile, restored.screenshot_tile),
+            None
+        );
+        assert_eq!(restored.get(HotkeySlot::RecordTile).display(), "Shift+R");
+        assert_eq!(restored.get(HotkeySlot::PauseRecording).display(), "P");
+    }
+
+    #[test]
+    fn picture_in_picture_defaults_to_shift_p_for_older_settings() {
+        let mut value = serde_json::to_value(HotkeyBindings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("picture_in_picture");
+        let restored: HotkeyBindings = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.get(HotkeySlot::PictureInPicture).display(),
+            "Shift+P"
+        );
+        assert_eq!(
+            restored.conflict(HotkeySlot::PictureInPicture, restored.picture_in_picture),
+            None
+        );
     }
 
     #[test]
@@ -663,13 +916,14 @@ mod tests {
         let configured = shortcuts.configured_keys();
         assert_eq!(
             configured.into_iter().filter(|enabled| *enabled).count(),
-            23
+            31
         );
         assert!(configured[0x11]); // Ctrl
         assert!(configured[0x31]); // 1
         assert!(configured[0x39]); // 9
         assert!(configured[0x47]); // G
         assert!(configured[0x57]); // W
+        assert!(configured[0x53]); // S
         assert!(!configured[0x51]); // Q
     }
 

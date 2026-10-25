@@ -119,6 +119,9 @@ try {
     $glesSource = Join-Path $workspace "vendor\libGLESv2.dll"
     $distEgl = Join-Path $distLibDirectory "libEGL.dll"
     $distGles = Join-Path $distLibDirectory "libGLESv2.dll"
+    $ubolName = "uBOLite_2026.714.1952.edge.zip"
+    $ubolSource = Join-Path $workspace "assets\third_party\ubol\$ubolName"
+    $distUbol = Join-Path $distLibDirectory $ubolName
     $licensePath = Join-Path $workspace "LICENSE"
     $noticesPath = Join-Path $workspace "THIRD_PARTY_NOTICES.md"
     $angleLicensesPath = Join-Path $workspace "assets\third_party\angle\ANGLE_LICENSES.txt"
@@ -141,6 +144,7 @@ try {
     Copy-Item -LiteralPath $libmpvSource -Destination $distLibmpv -Force
     Copy-Item -LiteralPath $eglSource -Destination $distEgl -Force
     Copy-Item -LiteralPath $glesSource -Destination $distGles -Force
+    Copy-Item -LiteralPath $ubolSource -Destination $distUbol -Force
     Copy-Item -LiteralPath $licensePath -Destination $distLicense -Force
     Copy-Item -LiteralPath $noticesPath -Destination $distNotices -Force
     Copy-Item -LiteralPath $angleLicensesPath -Destination $distAngleLicenses -Force
@@ -167,9 +171,14 @@ try {
     $libmpvHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distLibmpv).Hash
     $eglHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distEgl).Hash
     $glesHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distGles).Hash
-    $expectedLibmpvHash = "ADE5CAC46CFC397A3D5CD356A968CDA7ACF0DEBFFB705A16509DAFDF93029F5E"
+    $expectedLibmpvHash = "5C5C9D094859BDC60B8B27B2D832DB8FA8C2E487EFBD35F5AEA5AFE6960DAD39"
     $expectedEglHash = "FFC4565AD5839AC9FE6719D399B7E90CF5C7984E609D7876DE1D9FA9BF9EDAF3"
     $expectedGlesHash = "CB302095BACCBEC3BD30184A837B342E3260970C9934558762A5415FB85D12BA"
+    $ubolHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distUbol).Hash
+    $expectedUbolHash = "B218ED46118E1E6E8C0ECE23DA8DA373807F26C5A60AFF4322F72730CDA6E39E"
+    if ($ubolHash -ne $expectedUbolHash) {
+        throw "The uBlock Origin Lite package does not match the pinned release in assets\third_party\ubol."
+    }
     if ($eglHash -ne $expectedEglHash -or $glesHash -ne $expectedGlesHash) {
         throw "The ANGLE runtime does not match the pinned standalone build. Run .\scripts\prepare-angle.ps1, then build again."
     }
@@ -222,6 +231,7 @@ try {
         foreach ($runtimeFile in @(
             $distEgl,
             $distGles,
+            $distUbol,
             $distLicense,
             $distNotices,
             $distAngleLicenses,

@@ -16,6 +16,10 @@ mod persistence;
 mod playlist;
 mod preview;
 mod privacy;
+mod recording;
+mod remote_view;
+mod screenshot;
+mod screenshot_library;
 #[cfg(windows)]
 mod source_dialog;
 mod spout;
@@ -53,6 +57,31 @@ fn main() -> eframe::Result<()> {
         ));
     }
 
+    let storage = Storage::new();
+    // Acquire before loading geometry or initializing a catalog. Keep the
+    // lease alive until run_native has completed its exit save and cleanup.
+    #[cfg(windows)]
+    let _storage_lease = match storage.as_ref().map(Storage::acquire_lease).transpose() {
+        Ok(lease) => lease,
+        Err(error) => {
+            let message = if error.raw_os_error() == Some(32) {
+                "This Pluriview data folder is already in use. Close the other Pluriview window before opening it again.".to_owned()
+            } else {
+                format!("Pluriview could not protect its data folder for saving: {error}")
+            };
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+                MessageBoxW(
+                    None,
+                    &windows::core::HSTRING::from(&message),
+                    windows::core::w!("Pluriview"),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            return Err(eframe::Error::AppCreation(message.into()));
+        }
+    };
+
     // Share the Canvas P branding with the tray and executable resource.
     let icon = create_window_icon();
 
@@ -74,7 +103,7 @@ fn main() -> eframe::Result<()> {
     // the app re-maximizes on its first frame. Building it maximized here
     // would not survive anyway: winit applies the position afterwards, which
     // restores the window.
-    if let Some(window) = saved_window_geometry() {
+    if let Some(window) = storage.as_ref().and_then(saved_window_geometry) {
         viewport = viewport.with_inner_size([window.size.0, window.size.1]);
         if let Some(position) = window.position.filter(is_on_screen) {
             viewport = viewport.with_position([position.0, position.1]);
@@ -89,7 +118,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Pluriview",
         options,
-        Box::new(|cc| Ok(Box::new(PluriviewApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(PluriviewApp::with_storage(cc, storage)))),
     )
 }
 
@@ -149,8 +178,8 @@ fn runtime_library_candidates(executable: Option<&std::path::Path>) -> Vec<std::
 }
 
 /// Geometry the main window was last closed at, if a layout has one.
-fn saved_window_geometry() -> Option<WindowLayout> {
-    Storage::new()?.load_autosave().ok()?.window
+fn saved_window_geometry(storage: &Storage) -> Option<WindowLayout> {
+    storage.load_autosave().ok()?.window
 }
 
 /// Whether a saved top-left corner still lands somewhere the user can reach.

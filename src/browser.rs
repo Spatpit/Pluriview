@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, TryRecvError},
         Arc, OnceLock,
     },
@@ -17,21 +17,31 @@ use std::{
 use eframe::egui;
 use parking_lot::Mutex;
 use webview2_com::{
-    take_pwstr, BrowserExtensionEnableCompletedHandler,
+    take_pwstr, BrowserExtensionEnableCompletedHandler, ClearBrowsingDataCompletedHandler,
+    IsDocumentPlayingAudioChangedEventHandler,
     Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2BrowserExtension, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_3,
-        ICoreWebView2_8,
+        ICoreWebView2BrowserExtension, ICoreWebView2PermissionRequestedEventArgs3,
+        ICoreWebView2Profile2, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_3,
+        ICoreWebView2_8, COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
+        COREWEBVIEW2_PERMISSION_STATE_DENY, COREWEBVIEW2_PROCESS_FAILED_KIND,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE,
     },
-    ProfileAddBrowserExtensionCompletedHandler, ProfileGetBrowserExtensionsCompletedHandler,
-    TrySuspendCompletedHandler,
+    NewBrowserVersionAvailableEventHandler, PermissionRequestedEventHandler,
+    ProcessFailedEventHandler, ProfileAddBrowserExtensionCompletedHandler,
+    ProfileGetBrowserExtensionsCompletedHandler, TrySuspendCompletedHandler,
 };
 use webview2_core::{Interface, HSTRING as WebViewHString, PWSTR as WebViewPWSTR};
 use windows::{
     core::w,
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WPARAM},
         Graphics::Gdi::ClientToScreen,
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+        },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindowLongW,
             IsChild, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, GWL_EXSTYLE,
@@ -72,9 +82,100 @@ const MAX_CAPTURE_HEIGHT: i32 = 2160;
 /// the native host replaces the frozen captured preview onscreen.
 const INTERACTION_PREP_DELAY: Duration = Duration::from_millis(80);
 
+/// wry's default WebView2 arguments also disable `msSmartScreenProtection`,
+/// which turns off Microsoft Defender SmartScreen's phishing and malware site
+/// warnings. Browser tiles open arbitrary websites, so keep only wry's other
+/// two (Edge's text-selection mini menu and PDF mini menu). All tiles share
+/// one WebView2 environment, so every builder must pass this same string.
+const BROWSER_ARGUMENTS: &str = "--disable-features=msWebOOUI,msPdfOOUI";
+
+/// Page zoom limits offered per tile, before the tile-size zoom is applied.
+pub const MIN_PAGE_ZOOM: f32 = 0.5;
+pub const MAX_PAGE_ZOOM: f32 = 3.0;
+/// The zoom steps browsers use, so - and + feel familiar.
+const PAGE_ZOOM_STEPS: [f32; 13] = [
+    0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
+];
+
+/// The next page zoom step above (`zoom_in`) or below the current zoom.
+pub fn step_page_zoom(current: f32, zoom_in: bool) -> f32 {
+    const EPSILON: f32 = 0.005;
+    if zoom_in {
+        PAGE_ZOOM_STEPS
+            .into_iter()
+            .find(|step| *step > current + EPSILON)
+            .unwrap_or(MAX_PAGE_ZOOM)
+    } else {
+        PAGE_ZOOM_STEPS
+            .into_iter()
+            .rev()
+            .find(|step| *step < current - EPSILON)
+            .unwrap_or(MIN_PAGE_ZOOM)
+    }
+}
+
+/// Scroll the innermost scrollable element under a normalized page point,
+/// falling back to the page itself, as a mouse wheel over that point would.
+/// Arguments: horizontal and vertical position (0..1) and CSS pixels.
+const SCROLL_PAGE_SCRIPT: &str = r#"
+((u, v, dy) => {
+    let element = document.elementFromPoint(u * innerWidth, v * innerHeight);
+    while (element && element !== document.body && element !== document.documentElement) {
+        const overflow = getComputedStyle(element).overflowY;
+        if (/(auto|scroll|overlay)/.test(overflow) && element.scrollHeight > element.clientHeight + 1) {
+            const before = element.scrollTop;
+            element.scrollBy({ top: dy, behavior: "instant" });
+            if (element.scrollTop !== before) return;
+        }
+        element = element.parentElement;
+    }
+    window.scrollBy({ top: dy, behavior: "instant" });
+})"#;
+
+/// The largest visible video's picture as normalized viewport coordinates
+/// `[left, top, right, bottom]`, excluding the letterbox bars a video element
+/// adds by default, or null when no video covers at least 1% of the page.
+const FIND_VIDEO_SCRIPT: &str = r#"
+(() => {
+    const width = innerWidth, height = innerHeight;
+    let best = null, bestArea = 0;
+    for (const video of document.querySelectorAll("video")) {
+        const box = video.getBoundingClientRect();
+        if (box.width < 2 || box.height < 2) continue;
+        let left = box.left, top = box.top, w = box.width, h = box.height;
+        const fit = getComputedStyle(video).objectFit;
+        if (video.videoWidth && video.videoHeight && fit !== "fill" && fit !== "cover") {
+            const scale = Math.min(w / video.videoWidth, h / video.videoHeight);
+            const pictureWidth = video.videoWidth * scale, pictureHeight = video.videoHeight * scale;
+            left += (w - pictureWidth) / 2;
+            top += (h - pictureHeight) / 2;
+            w = pictureWidth;
+            h = pictureHeight;
+        }
+        const l = Math.max(0, left), t = Math.max(0, top);
+        const r = Math.min(width, left + w), b = Math.min(height, top + h);
+        const area = Math.max(0, r - l) * Math.max(0, b - t);
+        if (area > bestArea) {
+            bestArea = area;
+            best = [l / width, t / height, r / width, b / height];
+        }
+    }
+    return bestArea >= width * height * 0.01 ? best : null;
+})()
+"#;
+
+/// A page that crashes again this soon after being reloaded is left alone
+/// rather than reloaded in a loop; the tile menu's Reload still works.
+const CRASH_RELOAD_COOLDOWN: Duration = Duration::from_secs(60);
+/// Upper bound on waiting for the old WebView2 browser process to exit
+/// before restarted tiles create a new one.
+const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 const UBOL_VERSION: &str = "2026.714.1952";
-const UBOL_ARCHIVE: &[u8] =
-    include_bytes!("../assets/third_party/ubol/uBOLite_2026.714.1952.edge.zip");
+/// Shipped in the `lib` folder beside the executable instead of embedded,
+/// which keeps ~10 MB out of pluriview.exe. The build still pins its SHA-256,
+/// and only a package matching that fingerprint is ever extracted.
+const UBOL_ARCHIVE_NAME: &str = "uBOLite_2026.714.1952.edge.zip";
 const UBOL_ARCHIVE_FINGERPRINT: &str = env!("PLURIVIEW_UBOL_SHA256");
 const PREPARATION_PROGRESS_SCALE: u32 = 10_000;
 
@@ -236,6 +337,46 @@ fn is_sensitive_query_key(key: &str) -> bool {
     .any(|marker| key.contains(marker))
 }
 
+/// Ordinary new-tab links keep navigating inside the tile. A sized popup
+/// (`window.open` with dimensions, as sign-in providers use) opens as its own
+/// WebView2 window while the user is interacting with the tile.
+fn opens_as_popup(interactive: bool, sized: bool) -> bool {
+    interactive && sized
+}
+
+/// Parked tiles are offscreen, so a site's camera, microphone, location,
+/// notification or clipboard prompt would be invisible and could be answered
+/// for every tile through the shared profile. Deny those requests while
+/// parked; an interactive tile is visible, so WebView2 asks the user as usual.
+fn deny_permission(kind: COREWEBVIEW2_PERMISSION_KIND, interactive: bool) -> bool {
+    !interactive && kind != COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY
+}
+
+fn register_permission_policy(
+    webview: &WebView,
+    interactive: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let handler = PermissionRequestedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+        unsafe { args.PermissionKind(&mut kind)? };
+        if deny_permission(kind, interactive.load(std::sync::atomic::Ordering::Relaxed)) {
+            // Do not remember the refusal: the same site may ask again once
+            // the user is interacting with the tile.
+            if let Ok(args) = args.cast::<ICoreWebView2PermissionRequestedEventArgs3>() {
+                let _ = unsafe { args.SetSavesInProfile(false) };
+            }
+            unsafe { args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)? };
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe { core.add_PermissionRequested(&handler, &mut token) }.map_err(|e| e.to_string())
+}
+
 /// Schemes a page may navigate to while staying inside the tile. `about:` is
 /// needed because sites navigate iframes/blank targets through it.
 fn is_allowed_navigation(url: &str) -> bool {
@@ -271,7 +412,159 @@ struct SharedState {
     current_title: Option<String>,
     /// A page requested a new window; we navigate the same tile instead.
     pending_navigation: Option<String>,
+    /// A download was refused since the last poll.
+    download_blocked: bool,
+    /// The page's renderer process exited or stopped responding.
+    page_crashed: bool,
+    /// Whether the page is producing sound, reported by WebView2.
+    playing_audio: bool,
+    /// A finished Fit to Video lookup (see [`FIND_VIDEO_SCRIPT`]).
+    video_rect: Option<Option<(f32, f32, f32, f32)>>,
     dirty: bool,
+}
+
+fn parse_video_rect(json: &str) -> Option<(f32, f32, f32, f32)> {
+    let [left, top, right, bottom] = serde_json::from_str::<Option<[f32; 4]>>(json).ok()??;
+    let valid = [left, top, right, bottom]
+        .iter()
+        .all(|value| (0.0..=1.0).contains(value))
+        && right - left > 0.01
+        && bottom - top > 0.01;
+    valid.then_some((left, top, right, bottom))
+}
+
+fn register_audio_handler(
+    webview: &WebView,
+    shared: Arc<Mutex<SharedState>>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let core8: ICoreWebView2_8 = core.cast().map_err(|e| e.to_string())?;
+    let handler = IsDocumentPlayingAudioChangedEventHandler::create(Box::new(move |sender, _| {
+        let Some(sender) = sender else {
+            return Ok(());
+        };
+        let mut playing = Default::default();
+        unsafe {
+            sender
+                .cast::<ICoreWebView2_8>()?
+                .IsDocumentPlayingAudio(&mut playing)?
+        };
+        let mut state = shared.lock();
+        state.playing_audio = playing.as_bool();
+        state.dirty = true;
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe { core8.add_IsDocumentPlayingAudioChanged(&handler, &mut token) }
+        .map_err(|e| e.to_string())
+}
+
+/// Engine-wide WebView2 events, shared by every host's handlers.
+#[derive(Clone, Default)]
+struct EngineSignals {
+    /// A newer WebView2 Runtime (usually a security update) was installed.
+    /// Running tiles keep the old engine until every WebView is released.
+    update_ready: Arc<AtomicBool>,
+    /// The shared browser process exited, taking every tile's page with it.
+    lost: Arc<AtomicBool>,
+}
+
+/// Unread state a page advertises in its title, as Discord, YouTube, Gmail
+/// and most chat sites do ("(3) Discord", "• Discord", "Inbox (12) - ...").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnreadIndicator {
+    Count(u32),
+    /// Something is unread, without a number.
+    Dot,
+}
+
+pub fn unread_indicator(title: &str) -> Option<UnreadIndicator> {
+    let title = title.trim_start();
+    if let Some(count) = title.strip_prefix('(').and_then(parenthesized_count) {
+        return Some(UnreadIndicator::Count(count));
+    }
+    if title.starts_with('\u{2022}') || title.starts_with('\u{25CF}') {
+        return Some(UnreadIndicator::Dot);
+    }
+    let inbox = title.find("Inbox (")?;
+    parenthesized_count(&title[inbox + "Inbox (".len()..]).map(UnreadIndicator::Count)
+}
+
+/// The positive count in `12)`, `99+)` or `1,234)`.
+fn parenthesized_count(text: &str) -> Option<u32> {
+    let inner = &text[..text.find(')')?];
+    let digits: String = inner
+        .trim()
+        .trim_end_matches('+')
+        .chars()
+        .filter(|character| *character != ',')
+        .collect();
+    if digits.is_empty() || !digits.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|count| *count > 0)
+}
+
+/// How a tile handled its page crashing since the last poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageCrash {
+    Reloaded,
+    /// It crashed again within [`CRASH_RELOAD_COOLDOWN`] and was left as is.
+    Repeated,
+}
+
+fn crash_response(last_reload: Option<Instant>, now: Instant) -> PageCrash {
+    if last_reload.is_some_and(|at| now.duration_since(at) < CRASH_RELOAD_COOLDOWN) {
+        PageCrash::Repeated
+    } else {
+        PageCrash::Reloaded
+    }
+}
+
+/// Chromium restarts its GPU and utility processes by itself, and a crashed
+/// iframe only replaces that frame. These are the failures a tile must act on.
+fn register_process_failure_handler(
+    webview: &WebView,
+    shared: Arc<Mutex<SharedState>>,
+    engine_lost: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let handler = ProcessFailedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+        unsafe { args.ProcessFailedKind(&mut kind)? };
+        if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
+            engine_lost.store(true, Ordering::Release);
+        } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
+            || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE
+        {
+            let mut state = shared.lock();
+            state.page_crashed = true;
+            state.dirty = true;
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe { core.add_ProcessFailed(&handler, &mut token) }.map_err(|e| e.to_string())
+}
+
+fn register_engine_update_handler(
+    webview: &WebView,
+    update_ready: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let handler = NewBrowserVersionAvailableEventHandler::create(Box::new(move |_, _| {
+        update_ready.store(true, Ordering::Release);
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe {
+        webview
+            .environment()
+            .add_NewBrowserVersionAvailable(&handler, &mut token)
+    }
+    .map_err(|e| e.to_string())
 }
 
 /// Title/URL changes since the last poll, for the app to mirror onto the tile.
@@ -279,6 +572,13 @@ struct SharedState {
 pub struct BrowserUpdate {
     pub title: Option<String>,
     pub url: Option<String>,
+    /// The page tried to download a file, which browser tiles do not allow.
+    pub download_blocked: bool,
+    pub page_crash: Option<PageCrash>,
+    pub playing_audio: bool,
+    /// A Fit to Video request finished: the video's crop, or None if the
+    /// page has no visible video.
+    pub video_rect: Option<Option<(f32, f32, f32, f32)>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -332,6 +632,8 @@ pub struct BrowserHost {
     webview: Option<WebView>,
     window: NativeWindow,
     active: bool,
+    /// Mirrors `active` for the WebView2 permission handler.
+    interactive: Arc<std::sync::atomic::AtomicBool>,
     muted: bool,
     /// Last host/page geometry applied while active (physical px), to skip
     /// redundant positioning calls while glued to the tile.
@@ -351,6 +653,12 @@ pub struct BrowserHost {
     /// Ad-block activation may request navigation while a tile sleeps. Keep
     /// it deferred because WebView2 navigation would otherwise auto-resume it.
     after_resume: Option<AfterResume>,
+    /// When this tile last reloaded itself after its page crashed.
+    last_crash_reload: Option<Instant>,
+    /// A repeated crash was already reported for the current cooldown.
+    crash_reported: bool,
+    /// The tile's own page zoom, multiplied into every zoom this host sets.
+    page_zoom: f64,
 }
 
 enum AfterResume {
@@ -359,7 +667,7 @@ enum AfterResume {
 }
 
 impl BrowserHost {
-    pub fn new(context: &mut WebContext, url: &str) -> Result<Self, String> {
+    fn new(context: &mut WebContext, url: &str, signals: &EngineSignals) -> Result<Self, String> {
         static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
         REGISTERED.get_or_init(register_window_class).clone()?;
 
@@ -393,12 +701,16 @@ impl BrowserHost {
         let nav_shared = shared.clone();
         let title_shared = shared.clone();
         let new_window_shared = shared.clone();
+        let download_shared = shared.clone();
+        let interactive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let popup_interactive = interactive.clone();
 
         let webview = WebViewBuilder::new_with_web_context(context)
             // All tiles share one WebView2 environment/profile, so this must
             // be identical on every builder. Runtime 120+ supports the flag;
             // uBOL itself requires Chromium/WebView2 122+.
             .with_browser_extensions_enabled(true)
+            .with_additional_browser_args(BROWSER_ARGUMENTS)
             // Preserve transparent page backgrounds for overlay widgets.
             .with_transparent(true)
             // Captured hosts start parked; focus belongs to the canvas until
@@ -412,7 +724,12 @@ impl BrowserHost {
             .with_initialization_script(MEDIA_AUTOPLAY_GUARD)
             .with_url(url)
             .with_bounds(parked_bounds())
-            .with_download_started_handler(|_, _| false)
+            .with_download_started_handler(move |_, _| {
+                let mut state = download_shared.lock();
+                state.download_blocked = true;
+                state.dirty = true;
+                false
+            })
             .with_navigation_handler(move |url| {
                 if !is_allowed_navigation(&url) {
                     return false;
@@ -429,7 +746,14 @@ impl BrowserHost {
                 state.current_title = Some(title);
                 state.dirty = true;
             })
-            .with_new_window_req_handler(move |url, _features| {
+            .with_new_window_req_handler(move |url, features| {
+                let interactive = popup_interactive.load(std::sync::atomic::Ordering::Relaxed);
+                if opens_as_popup(interactive, features.size.is_some()) && is_web_url(&url) {
+                    // Sign-in flows ("Continue with Google/Discord") open a
+                    // sized popup and talk back to this page through
+                    // window.opener; replacing the tile's page breaks them.
+                    return NewWindowResponse::Allow;
+                }
                 if is_web_url(&url) {
                     new_window_shared.lock().pending_navigation = Some(url);
                 }
@@ -437,11 +761,26 @@ impl BrowserHost {
             })
             .build_as_child(&window)
             .map_err(|error| error.to_string())?;
+        if let Err(error) = register_permission_policy(&webview, interactive.clone()) {
+            log::warn!("Browser permission requests use WebView2 defaults: {error}");
+        }
+        if let Err(error) =
+            register_process_failure_handler(&webview, shared.clone(), signals.lost.clone())
+        {
+            log::warn!("Browser tiles cannot detect crashed pages: {error}");
+        }
+        if let Err(error) = register_audio_handler(&webview, shared.clone()) {
+            log::warn!("Browser tiles cannot report playing audio: {error}");
+        }
+        if let Err(error) = register_engine_update_handler(&webview, signals.update_ready.clone()) {
+            log::warn!("Browser tiles cannot detect WebView2 updates: {error}");
+        }
 
         Ok(Self {
             webview: Some(webview),
             window,
             active: false,
+            interactive,
             muted: false,
             last_geometry: None,
             reveal_at: None,
@@ -450,6 +789,9 @@ impl BrowserHost {
             shared,
             suspended: false,
             after_resume: None,
+            last_crash_reload: None,
+            crash_reported: false,
+            page_zoom: 1.0,
         })
     }
 
@@ -497,7 +839,69 @@ impl BrowserHost {
                 position: PhysicalPosition::new(0, 0).into(),
                 size: PhysicalSize::new(size.0, size.1).into(),
             });
-            let _ = webview.zoom((size.0 as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
+            let _ = webview.zoom(self.zoom_for_width(size.0));
+        }
+    }
+
+    /// WebView2 zoom for a page `width` physical pixels wide: the tile-size
+    /// zoom that keeps the layout at WIDTH CSS pixels, times the tile's own
+    /// page zoom.
+    fn zoom_for_width(&self, width: i32) -> f64 {
+        (width as f64 / WIDTH as f64 * self.page_zoom).clamp(MIN_ZOOM, MAX_ZOOM)
+    }
+
+    /// Apply the tile's page zoom (1.0 = the page's normal size).
+    pub fn set_page_zoom(&mut self, zoom: f32) {
+        let zoom = f64::from(zoom.clamp(MIN_PAGE_ZOOM, MAX_PAGE_ZOOM));
+        if (self.page_zoom - zoom).abs() < 1e-4 || self.suspended {
+            return;
+        }
+        self.page_zoom = zoom;
+        let width = match (self.active, self.last_geometry) {
+            (true, Some(geometry)) => geometry.page_width,
+            _ => self.capture_size.0,
+        };
+        if let Some(webview) = self.webview.as_ref() {
+            let _ = webview.zoom(self.zoom_for_width(width));
+        }
+    }
+
+    /// Scroll the page under a normalized point by `delta` CSS pixels
+    /// (positive scrolls down), without entering interaction mode.
+    pub fn scroll_page(&self, u: f32, v: f32, delta: f32) {
+        if self.suspended || !u.is_finite() || !v.is_finite() || !delta.is_finite() {
+            return;
+        }
+        if let Some(webview) = self.webview.as_ref() {
+            let script = format!(
+                "{SCROLL_PAGE_SCRIPT}({}, {}, {});",
+                u.clamp(0.0, 1.0),
+                v.clamp(0.0, 1.0),
+                delta
+            );
+            let _ = webview.evaluate_script(&script);
+        }
+    }
+
+    /// Look for the page's main video. The answer arrives through
+    /// [`BrowserUpdate::video_rect`].
+    pub fn request_video_rect(&self) {
+        if self.suspended {
+            return;
+        }
+        let Some(webview) = self.webview.as_ref() else {
+            return;
+        };
+        let shared = self.shared.clone();
+        let requested = webview.evaluate_script_with_callback(FIND_VIDEO_SCRIPT, move |json| {
+            let mut state = shared.lock();
+            state.video_rect = Some(parse_video_rect(&json));
+            state.dirty = true;
+        });
+        if requested.is_err() {
+            let mut state = self.shared.lock();
+            state.video_rect = Some(None);
+            state.dirty = true;
         }
     }
 
@@ -541,7 +945,7 @@ impl BrowserHost {
             return BrowserUpdate::default();
         }
         self.refresh_live_url();
-        let (update, navigate) = {
+        let (mut update, navigate, crashed) = {
             let mut state = self.shared.lock();
             let navigate = state.pending_navigation.take();
             if !state.dirty && navigate.is_none() {
@@ -552,14 +956,41 @@ impl BrowserHost {
                 BrowserUpdate {
                     title: state.current_title.clone(),
                     url: Some(state.current_url.clone()),
+                    download_blocked: std::mem::take(&mut state.download_blocked),
+                    page_crash: None,
+                    playing_audio: state.playing_audio,
+                    video_rect: state.video_rect.take(),
                 },
                 navigate,
+                std::mem::take(&mut state.page_crashed),
             )
         };
         if let Some(url) = navigate {
             self.load(&url);
         }
+        if crashed {
+            update.page_crash = self.recover_crashed_page();
+        }
         update
+    }
+
+    /// Reload a crashed page, unless it already crashed shortly after the
+    /// last reload. Returns what to tell the user, if anything.
+    fn recover_crashed_page(&mut self) -> Option<PageCrash> {
+        let now = Instant::now();
+        match crash_response(self.last_crash_reload, now) {
+            PageCrash::Reloaded => {
+                self.last_crash_reload = Some(now);
+                self.crash_reported = false;
+                self.reload();
+                Some(PageCrash::Reloaded)
+            }
+            PageCrash::Repeated if self.crash_reported => None,
+            PageCrash::Repeated => {
+                self.crash_reported = true;
+                Some(PageCrash::Repeated)
+            }
+        }
     }
 
     /// Position the host over the visible part of `page_rect` inside
@@ -612,6 +1043,7 @@ impl BrowserHost {
             return;
         }
 
+        let zoom = self.zoom_for_width(geometry.page_width);
         let resize_webview = |webview: &WebView| {
             let _ = webview.set_bounds(Rect {
                 position: PhysicalPosition::new(geometry.page_x, geometry.page_y).into(),
@@ -619,8 +1051,7 @@ impl BrowserHost {
             });
             // Keep the page's apparent scale identical to the captured
             // texture: layout width stays WIDTH/dpi CSS px in both modes.
-            let _ =
-                webview.zoom((geometry.page_width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
+            let _ = webview.zoom(zoom);
         };
 
         if take_focus {
@@ -641,7 +1072,7 @@ impl BrowserHost {
             if let Some(webview) = self.webview.as_ref() {
                 resize_webview(webview);
             }
-            self.active = true;
+            self.set_active(true);
             self.last_geometry = Some(geometry);
             self.reveal_at = Some(Instant::now() + INTERACTION_PREP_DELAY);
             return;
@@ -709,8 +1140,14 @@ impl BrowserHost {
         if let Some(webview) = self.webview.as_ref() {
             resize_webview(webview);
         }
-        self.active = true;
+        self.set_active(true);
         self.last_geometry = Some(geometry);
+    }
+
+    fn set_active(&mut self, active: bool) {
+        self.active = active;
+        self.interactive
+            .store(active, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Move the host back offscreen at capture resolution. Audio keeps
@@ -735,7 +1172,7 @@ impl BrowserHost {
             });
             let _ = webview.zoom((width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
         }
-        self.active = false;
+        self.set_active(false);
         self.last_geometry = None;
         self.reveal_at = None;
     }
@@ -984,6 +1421,40 @@ pub struct BrowserManager {
     adblock_settle_until: Option<Instant>,
     /// Tiles parked on `about:blank` until that moment, and where they go.
     deferred_loads: HashMap<PreviewId, String>,
+    signals: EngineSignals,
+    /// Set after [`Self::shut_down_engine`] until the old browser process
+    /// has exited, so new tiles start on a fresh (possibly updated) engine.
+    engine_shutdown: Option<EngineShutdown>,
+    /// Result slot of a Clear Browser Data request still in progress.
+    clearing_data: Option<ClearDataSlot>,
+}
+
+/// Filled by WebView2's completion callback for Clear Browser Data.
+type ClearDataSlot = Arc<Mutex<Option<Result<(), String>>>>;
+
+/// The old WebView2 browser process, while it shuts down.
+struct EngineShutdown {
+    process: Option<HANDLE>,
+    deadline: Instant,
+}
+
+impl EngineShutdown {
+    fn finished(&self) -> bool {
+        Instant::now() >= self.deadline
+            || self
+                .process
+                .is_none_or(|process| unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0)
+    }
+}
+
+impl Drop for EngineShutdown {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            unsafe {
+                let _ = CloseHandle(process);
+            }
+        }
+    }
 }
 
 impl BrowserManager {
@@ -1010,6 +1481,9 @@ impl BrowserManager {
             adblock_error: None,
             adblock_settle_until: None,
             deferred_loads: HashMap::new(),
+            signals: EngineSignals::default(),
+            engine_shutdown: None,
+            clearing_data: None,
         }
     }
 
@@ -1031,7 +1505,7 @@ impl BrowserManager {
         }
         let hold_navigation = initialize_extension || self.adblock_settling();
         let initial_url = if hold_navigation { "about:blank" } else { url };
-        let host = BrowserHost::new(&mut self.context, initial_url)?;
+        let host = BrowserHost::new(&mut self.context, initial_url, &self.signals)?;
 
         if initialize_extension {
             self.extension_initialized = true;
@@ -1319,6 +1793,112 @@ impl BrowserManager {
         self.hosts.clear();
         self.deferred_loads.clear();
     }
+
+    /// A newer WebView2 Runtime is installed and running tiles still use the
+    /// old one. Restarting every browser tile applies it.
+    pub fn engine_update_ready(&self) -> bool {
+        self.signals.update_ready.load(Ordering::Acquire)
+    }
+
+    /// True once after the shared browser process exits unexpectedly.
+    pub fn take_engine_lost(&self) -> bool {
+        self.signals.lost.swap(false, Ordering::AcqRel)
+    }
+
+    /// Close every host and release the extension so WebView2 can shut its
+    /// browser process down. Returns each closed tile and the address it was
+    /// showing; the caller recreates them once [`Self::engine_restarting`]
+    /// turns false.
+    pub fn shut_down_engine(&mut self) -> Vec<(PreviewId, String)> {
+        let process = self
+            .browser_process_id()
+            .and_then(|pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.ok());
+        let tiles = self
+            .hosts
+            .iter()
+            .map(|(id, host)| (*id, host.current_url()))
+            .collect();
+        self.hosts.clear();
+        self.deferred_loads.clear();
+        self.extension = None;
+        self.extension_initialized = false;
+        self.adblock_settle_until = None;
+        self.clearing_data = None;
+        self.engine_shutdown = Some(EngineShutdown {
+            process,
+            deadline: Instant::now() + ENGINE_SHUTDOWN_TIMEOUT,
+        });
+        tiles
+    }
+
+    /// True while the previous browser process is still exiting. New hosts
+    /// must not be created until this returns false. Call once per frame.
+    pub fn engine_restarting(&mut self) -> bool {
+        let Some(shutdown) = &self.engine_shutdown else {
+            return false;
+        };
+        if !shutdown.finished() {
+            return true;
+        }
+        self.engine_shutdown = None;
+        // The next environment loads the newest installed runtime, and any
+        // failure reported while the old engine closed is no longer relevant.
+        self.signals.update_ready.store(false, Ordering::Release);
+        self.signals.lost.store(false, Ordering::Release);
+        false
+    }
+
+    /// Erase cookies, logins, site storage, cache, history and saved form
+    /// data from the shared profile. Installed extensions stay. Finishes
+    /// asynchronously; see [`Self::poll_clear_browsing_data`].
+    pub fn clear_browsing_data(&mut self) -> Result<(), String> {
+        if self.clearing_data.is_some() {
+            return Ok(());
+        }
+        let host = self
+            .hosts
+            .values()
+            .next()
+            .ok_or("Open a browser tile first")?;
+        let slot = Arc::new(Mutex::new(None));
+        let completed = slot.clone();
+        host.with_core(|core| {
+            let profile: ICoreWebView2Profile2 = unsafe {
+                core.cast::<ICoreWebView2_13>()
+                    .and_then(|core13| core13.Profile())
+                    .and_then(|profile| profile.cast())
+            }
+            .map_err(|error| format!("This WebView2 Runtime cannot clear browser data: {error}"))?;
+            let handler = ClearBrowsingDataCompletedHandler::create(Box::new(move |result| {
+                *completed.lock() = Some(result.map_err(|error| error.to_string()));
+                Ok(())
+            }));
+            unsafe { profile.ClearBrowsingDataAll(&handler) }.map_err(|e| e.to_string())
+        })?;
+        self.clearing_data = Some(slot);
+        Ok(())
+    }
+
+    pub fn clearing_browsing_data(&self) -> bool {
+        self.clearing_data.is_some()
+    }
+
+    /// The finished Clear Browser Data result, once. On success every tile
+    /// reloads so pages drop the signed-in state they still hold in memory.
+    pub fn poll_clear_browsing_data(&mut self) -> Option<Result<(), String>> {
+        let result = self.clearing_data.as_ref()?.lock().take()?;
+        self.clearing_data = None;
+        if result.is_ok() {
+            for host in self.hosts.values_mut() {
+                if host.suspended {
+                    host.after_resume.get_or_insert(AfterResume::Reload);
+                } else {
+                    host.reload();
+                }
+            }
+        }
+        Some(result)
+    }
 }
 
 /// Result of putting uBOL into the state the user asked for.
@@ -1448,7 +2028,8 @@ fn prepare_ubol_with_progress(extension_dir: &Path, progress: &AtomicU32) -> Res
         return Ok(());
     }
 
-    if installed_ubol_matches_embedded_with_progress(extension_dir, progress, 0.03, 0.38) {
+    let archive = load_ubol_archive()?;
+    if installed_ubol_matches_package_with_progress(extension_dir, &archive, progress, 0.03, 0.38) {
         write_ubol_verification_marker(extension_dir);
         set_preparation_progress(progress, 1.0);
         return Ok(());
@@ -1468,12 +2049,13 @@ fn prepare_ubol_with_progress(extension_dir: &Path, progress: &AtomicU32) -> Res
         .map_err(|error| format!("Create extension staging directory: {error}"))?;
 
     set_preparation_progress(progress, 0.4);
-    let extract_result = extract_ubol_archive_with_progress(&staging, progress, 0.4, 0.74);
+    let extract_result =
+        extract_ubol_archive_with_progress(&staging, &archive, progress, 0.4, 0.74);
     if let Err(error) = extract_result {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
-    if !installed_ubol_matches_embedded_with_progress(&staging, progress, 0.75, 0.98) {
+    if !installed_ubol_matches_package_with_progress(&staging, &archive, progress, 0.75, 0.98) {
         let _ = fs::remove_dir_all(&staging);
         return Err("Extracted uBlock Origin Lite package failed its integrity check".to_owned());
     }
@@ -1499,28 +2081,132 @@ fn ubol_verification_marker_path(extension_dir: &Path) -> Option<PathBuf> {
 }
 
 fn installed_ubol_has_current_marker(extension_dir: &Path) -> bool {
-    if !extension_dir.is_dir() || !installed_ubol_manifest_matches_embedded(extension_dir) {
+    if !extension_dir.is_dir() || !installed_ubol_manifest_is_pinned_version(extension_dir) {
         return false;
     }
     let Some(marker_path) = ubol_verification_marker_path(extension_dir) else {
         return false;
     };
-    fs::read_to_string(marker_path)
-        .is_ok_and(|fingerprint| fingerprint.trim() == UBOL_ARCHIVE_FINGERPRINT)
+    let Some(expected) = installed_ubol_marker(extension_dir) else {
+        return false;
+    };
+    fs::read_to_string(marker_path).is_ok_and(|marker| marker.trim() == expected)
 }
 
-fn installed_ubol_manifest_matches_embedded(extension_dir: &Path) -> bool {
-    let Ok(installed_manifest) = fs::read(extension_dir.join("manifest.json")) else {
+/// The verified archive fingerprint plus a digest of every installed file's
+/// path, size and modification time. Startup skips re-hashing file contents
+/// only while nothing in the extension folder has been added, removed or
+/// rewritten since the last full verification. WebView2 itself writes
+/// generated rule indexes under `_metadata`, which is therefore excluded.
+fn installed_ubol_marker(extension_dir: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut files = Vec::new();
+    let mut pending = vec![extension_dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).ok()? {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                if entry.path() != extension_dir.join("_metadata") {
+                    pending.push(entry.path());
+                }
+            } else if file_type.is_file() {
+                let metadata = entry.metadata().ok()?;
+                let modified = metadata
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_nanos();
+                let relative = entry.path().strip_prefix(extension_dir).ok()?.to_owned();
+                files.push((relative, metadata.len(), modified));
+            } else {
+                return None;
+            }
+        }
+    }
+    files.sort();
+    let mut digest = Sha256::new();
+    for (path, length, modified) in files {
+        digest.update(path.to_string_lossy().as_bytes());
+        digest.update([0]);
+        digest.update(length.to_le_bytes());
+        digest.update(modified.to_le_bytes());
+    }
+    let digest: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(format!("{UBOL_ARCHIVE_FINGERPRINT} {digest}"))
+}
+
+/// Cheap launch check that needs no package read; the verification marker
+/// already ties the installed files to the pinned archive fingerprint.
+fn installed_ubol_manifest_is_pinned_version(extension_dir: &Path) -> bool {
+    let Ok(manifest) = fs::read(extension_dir.join("manifest.json")) else {
         return false;
     };
-    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(UBOL_ARCHIVE)) else {
-        return false;
+    serde_json::from_slice::<serde_json::Value>(&manifest)
+        .is_ok_and(|manifest| manifest["version"] == UBOL_VERSION)
+}
+
+/// Where the pinned package may live: the `lib` folder beside the
+/// executable, or the source tree's copy when running a cargo build.
+fn ubol_archive_candidates(executable: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let Some(directory) = executable.and_then(Path::parent) else {
+        return candidates;
     };
-    let Ok(mut embedded_manifest) = archive.by_name("manifest.json") else {
-        return false;
-    };
-    let mut expected = Vec::with_capacity(embedded_manifest.size() as usize);
-    embedded_manifest.read_to_end(&mut expected).is_ok() && installed_manifest == expected
+    candidates.push(directory.join("lib").join(UBOL_ARCHIVE_NAME));
+
+    let is_build_profile = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "debug" | "release"));
+    let target_directory = directory.parent();
+    let is_target_directory = target_directory
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("target");
+    if is_build_profile && is_target_directory {
+        if let Some(workspace) = target_directory.and_then(Path::parent) {
+            candidates.push(
+                workspace
+                    .join("assets")
+                    .join("third_party")
+                    .join("ubol")
+                    .join(UBOL_ARCHIVE_NAME),
+            );
+        }
+    }
+    candidates
+}
+
+fn load_ubol_archive() -> Result<Vec<u8>, String> {
+    let executable = std::env::current_exe().ok();
+    let path = ubol_archive_candidates(executable.as_deref())
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| format!("{UBOL_ARCHIVE_NAME} is missing from the lib folder"))?;
+    let archive = fs::read(&path).map_err(|error| format!("Read {UBOL_ARCHIVE_NAME}: {error}"))?;
+    verify_ubol_archive(archive)
+}
+
+/// Only the exact package this build was pinned to is ever extracted.
+fn verify_ubol_archive(archive: Vec<u8>) -> Result<Vec<u8>, String> {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(&archive)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if digest == UBOL_ARCHIVE_FINGERPRINT {
+        Ok(archive)
+    } else {
+        Err(format!(
+            "{UBOL_ARCHIVE_NAME} in the lib folder doesn't match this version of Pluriview"
+        ))
+    }
 }
 
 fn write_ubol_verification_marker(extension_dir: &Path) {
@@ -1528,7 +2214,11 @@ fn write_ubol_verification_marker(extension_dir: &Path) {
         log::warn!("Could not determine the uBlock Origin Lite verification marker path");
         return;
     };
-    if let Err(error) = fs::write(marker_path, UBOL_ARCHIVE_FINGERPRINT) {
+    let Some(marker) = installed_ubol_marker(extension_dir) else {
+        log::warn!("Could not describe the verified uBlock Origin Lite files");
+        return;
+    };
+    if let Err(error) = fs::write(marker_path, marker) {
         // The verified extension is still safe to use. A missing marker only
         // means the next launch will repeat the full verification.
         log::warn!("Could not cache uBlock Origin Lite verification: {error}");
@@ -1537,22 +2227,25 @@ fn write_ubol_verification_marker(extension_dir: &Path) {
 
 fn extract_ubol_archive_with_progress(
     destination: &Path,
+    archive: &[u8],
     progress: &AtomicU32,
     start: f32,
     end: f32,
 ) -> Result<(), String> {
-    let reader = Cursor::new(UBOL_ARCHIVE);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|error| format!("Open embedded uBlock Origin Lite package: {error}"))?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(archive))
+        .map_err(|error| format!("Open uBlock Origin Lite package: {error}"))?;
 
     let entry_count = archive.len().max(1);
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("Read extension archive entry: {error}"))?;
-        let relative = entry
-            .enclosed_name()
-            .ok_or_else(|| format!("Unsafe path in extension archive: {}", entry.name()))?;
+        let relative = entry.enclosed_name().ok_or_else(|| {
+            format!(
+                "Unsafe path in extension archive: {}",
+                entry.name_raw().escape_ascii()
+            )
+        })?;
         let output = destination.join(relative);
 
         if entry.is_dir() {
@@ -1576,19 +2269,19 @@ fn extract_ubol_archive_with_progress(
 }
 
 #[cfg(test)]
-fn installed_ubol_matches_embedded(extension_dir: &Path) -> bool {
+fn installed_ubol_matches_package(extension_dir: &Path, archive: &[u8]) -> bool {
     let progress = AtomicU32::new(0);
-    installed_ubol_matches_embedded_with_progress(extension_dir, &progress, 0.0, 1.0)
+    installed_ubol_matches_package_with_progress(extension_dir, archive, &progress, 0.0, 1.0)
 }
 
-fn installed_ubol_matches_embedded_with_progress(
+fn installed_ubol_matches_package_with_progress(
     extension_dir: &Path,
+    archive: &[u8],
     progress: &AtomicU32,
     start: f32,
     end: f32,
 ) -> bool {
-    let reader = Cursor::new(UBOL_ARCHIVE);
-    let Ok(mut archive) = zip::ZipArchive::new(reader) else {
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(archive)) else {
         return false;
     };
     let mut expected_files = HashSet::new();
@@ -1627,6 +2320,11 @@ fn installed_ubol_matches_embedded_with_progress(
             };
             if file_type.is_symlink() {
                 return false;
+            }
+            // WebView2 writes generated rule indexes here; they are not part
+            // of the package and must not force a reinstall.
+            if file_type.is_dir() && path == extension_dir.join("_metadata") {
+                continue;
             }
             if file_type.is_dir() {
                 pending.push(path);
@@ -1676,11 +2374,11 @@ unsafe extern "system" fn browser_window_proc(
 mod tests {
     use super::{
         browser_geometry, capture_size_for_tile, extract_ubol_archive_with_progress,
-        installed_ubol_has_current_marker, installed_ubol_matches_embedded, is_allowed_navigation,
+        installed_ubol_has_current_marker, installed_ubol_matches_package, is_allowed_navigation,
         normalize_url, parked_bounds, profile_install_marker_path, read_profile_install_marker,
-        scrub_url_for_storage, ubol_verification_marker_path, write_profile_install_marker,
-        write_ubol_verification_marker, NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE,
-        UBOL_VERSION,
+        scrub_url_for_storage, ubol_archive_candidates, ubol_verification_marker_path,
+        verify_ubol_archive, write_profile_install_marker, write_ubol_verification_marker,
+        NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE_NAME, UBOL_VERSION,
     };
     use eframe::egui;
     use std::io::{Cursor, Read};
@@ -1761,6 +2459,102 @@ mod tests {
     }
 
     #[test]
+    fn only_sized_popups_from_interactive_tiles_open_windows() {
+        assert!(super::opens_as_popup(true, true));
+        assert!(!super::opens_as_popup(true, false));
+        assert!(!super::opens_as_popup(false, true));
+        assert!(!super::opens_as_popup(false, false));
+    }
+
+    #[test]
+    fn page_titles_report_unread_counts() {
+        use super::{unread_indicator, UnreadIndicator::*};
+        assert_eq!(unread_indicator("(3) Discord | #general"), Some(Count(3)));
+        assert_eq!(unread_indicator("(99+) YouTube"), Some(Count(99)));
+        assert_eq!(
+            unread_indicator("Inbox (1,204) - me@example.com - Gmail"),
+            Some(Count(1204))
+        );
+        assert_eq!(unread_indicator("\u{2022} Discord | #general"), Some(Dot));
+        assert_eq!(unread_indicator("Discord | #general"), None);
+        assert_eq!(unread_indicator("(0) Feed"), None);
+        assert_eq!(unread_indicator("(Live) Concert"), None);
+        assert_eq!(unread_indicator("Song (2024 Remaster) - YouTube"), None);
+    }
+
+    #[test]
+    fn page_zoom_steps_like_a_browser() {
+        use super::{step_page_zoom, MAX_PAGE_ZOOM, MIN_PAGE_ZOOM};
+        assert_eq!(step_page_zoom(1.0, true), 1.1);
+        assert_eq!(step_page_zoom(1.0, false), 0.9);
+        assert_eq!(step_page_zoom(1.17, true), 1.25);
+        assert_eq!(step_page_zoom(1.17, false), 1.1);
+        assert_eq!(step_page_zoom(MAX_PAGE_ZOOM, true), MAX_PAGE_ZOOM);
+        assert_eq!(step_page_zoom(MIN_PAGE_ZOOM, false), MIN_PAGE_ZOOM);
+    }
+
+    #[test]
+    fn video_rect_results_are_validated() {
+        use super::parse_video_rect;
+        assert_eq!(
+            parse_video_rect("[0.1,0.2,0.9,0.8]"),
+            Some((0.1, 0.2, 0.9, 0.8))
+        );
+        assert_eq!(parse_video_rect("null"), None);
+        assert_eq!(parse_video_rect("[0.5,0.5,0.5,0.9]"), None);
+        assert_eq!(parse_video_rect("[-0.1,0,1,1]"), None);
+        assert_eq!(parse_video_rect("oops"), None);
+    }
+
+    #[test]
+    fn browser_arguments_keep_smartscreen_enabled() {
+        assert!(!super::BROWSER_ARGUMENTS.contains("SmartScreen"));
+        // Keep the mini menus wry removes by default turned off.
+        assert!(super::BROWSER_ARGUMENTS.contains("msWebOOUI"));
+        assert!(super::BROWSER_ARGUMENTS.contains("msPdfOOUI"));
+    }
+
+    #[test]
+    fn crashed_pages_reload_unless_they_crash_again_soon() {
+        use super::{crash_response, PageCrash, CRASH_RELOAD_COOLDOWN};
+        use std::time::{Duration, Instant};
+        let now = Instant::now() + CRASH_RELOAD_COOLDOWN * 2;
+        assert_eq!(crash_response(None, now), PageCrash::Reloaded);
+        assert_eq!(
+            crash_response(Some(now - Duration::from_secs(5)), now),
+            PageCrash::Repeated
+        );
+        assert_eq!(
+            crash_response(Some(now - CRASH_RELOAD_COOLDOWN), now),
+            PageCrash::Reloaded
+        );
+    }
+
+    #[test]
+    fn parked_tiles_cannot_request_device_or_data_permissions() {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+            COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION,
+            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS,
+        };
+        for kind in [
+            COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+            COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION,
+            COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS,
+            COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ,
+        ] {
+            assert!(super::deny_permission(kind, false));
+            // Interactive tiles are visible, so WebView2 asks the user.
+            assert!(!super::deny_permission(kind, true));
+        }
+        assert!(!super::deny_permission(
+            COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
+            false
+        ));
+    }
+
+    #[test]
     fn navigation_filter_blocks_local_schemes() {
         assert!(is_allowed_navigation("https://youtube.com/watch"));
         assert!(is_allowed_navigation("about:blank"));
@@ -1780,9 +2574,19 @@ mod tests {
         );
     }
 
+    fn source_ubol_archive() -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("third_party")
+            .join("ubol")
+            .join(UBOL_ARCHIVE_NAME);
+        verify_ubol_archive(std::fs::read(path).unwrap()).unwrap()
+    }
+
     #[test]
-    fn embedded_ubol_package_matches_pinned_version() {
-        let mut archive = zip::ZipArchive::new(Cursor::new(UBOL_ARCHIVE)).unwrap();
+    fn packaged_ubol_matches_pinned_version() {
+        let archive = source_ubol_archive();
+        let mut archive = zip::ZipArchive::new(Cursor::new(archive)).unwrap();
         let mut manifest = String::new();
         archive
             .by_name("manifest.json")
@@ -1827,19 +2631,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&destination);
         let _ = std::fs::remove_file(&marker);
         std::fs::create_dir(&destination).unwrap();
+        let archive = source_ubol_archive();
         let progress = AtomicU32::new(0);
-        extract_ubol_archive_with_progress(&destination, &progress, 0.0, 1.0).unwrap();
+        extract_ubol_archive_with_progress(&destination, &archive, &progress, 0.0, 1.0).unwrap();
         assert_eq!(progress.load(Ordering::Relaxed), PREPARATION_PROGRESS_SCALE);
-        assert!(installed_ubol_matches_embedded(&destination));
+        assert!(installed_ubol_matches_package(&destination, &archive));
         assert!(!installed_ubol_has_current_marker(&destination));
 
         write_ubol_verification_marker(&destination);
         assert!(installed_ubol_has_current_marker(&destination));
 
+        // Rule indexes WebView2 generates at runtime are not tampering.
+        let generated = destination
+            .join("_metadata")
+            .join("generated_indexed_rulesets");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(generated.join("_ruleset1"), b"index").unwrap();
+        assert!(installed_ubol_has_current_marker(&destination));
+        assert!(installed_ubol_matches_package(&destination, &archive));
+
+        // Rewriting any package file, not just the manifest, is detected.
+        let script = std::fs::read_dir(&destination)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file() && path.file_name().unwrap() != "manifest.json")
+            .unwrap();
+        let mut original = std::fs::read(&script).unwrap();
+        original.extend_from_slice(b"// tampered");
+        std::fs::write(&script, original).unwrap();
+        assert!(!installed_ubol_has_current_marker(&destination));
+        assert!(!installed_ubol_matches_package(&destination, &archive));
+
         std::fs::write(destination.join("manifest.json"), b"{}").unwrap();
         assert!(!installed_ubol_has_current_marker(&destination));
-        assert!(!installed_ubol_matches_embedded(&destination));
+        assert!(!installed_ubol_matches_package(&destination, &archive));
         std::fs::remove_dir_all(&destination).unwrap();
         std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn ubol_package_with_wrong_fingerprint_is_rejected() {
+        let mut archive = source_ubol_archive();
+        archive.push(0);
+        assert!(verify_ubol_archive(archive).is_err());
+    }
+
+    #[test]
+    fn ubol_package_is_looked_up_in_lib_then_source_tree() {
+        let workspace = std::path::Path::new(r"C:\work\pluriview");
+        let built = workspace.join(r"target\release\pluriview.exe");
+        assert_eq!(
+            ubol_archive_candidates(Some(&built)),
+            vec![
+                workspace
+                    .join(r"target\release\lib")
+                    .join(UBOL_ARCHIVE_NAME),
+                workspace
+                    .join(r"assets\third_party\ubol")
+                    .join(UBOL_ARCHIVE_NAME),
+            ]
+        );
+        let installed = std::path::Path::new(r"D:\Apps\Pluriview\pluriview.exe");
+        assert_eq!(
+            ubol_archive_candidates(Some(installed)),
+            vec![std::path::Path::new(r"D:\Apps\Pluriview\lib").join(UBOL_ARCHIVE_NAME)]
+        );
     }
 }
