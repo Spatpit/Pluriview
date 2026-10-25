@@ -171,7 +171,7 @@ try {
     $libmpvHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distLibmpv).Hash
     $eglHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distEgl).Hash
     $glesHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distGles).Hash
-    $expectedLibmpvHash = "ADE5CAC46CFC397A3D5CD356A968CDA7ACF0DEBFFB705A16509DAFDF93029F5E"
+    $expectedLibmpvHash = "5C5C9D094859BDC60B8B27B2D832DB8FA8C2E487EFBD35F5AEA5AFE6960DAD39"
     $expectedEglHash = "FFC4565AD5839AC9FE6719D399B7E90CF5C7984E609D7876DE1D9FA9BF9EDAF3"
     $expectedGlesHash = "CB302095BACCBEC3BD30184A837B342E3260970C9934558762A5415FB85D12BA"
     $ubolHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $distUbol).Hash

@@ -7,9 +7,9 @@ $workspace = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $vendorDirectory = Join-Path $workspace "vendor"
 $runtimePath = Join-Path $vendorDirectory "libmpv-2.dll"
 $archivePath = Join-Path $vendorDirectory "mpv-dev-x86_64.7z"
-$downloadUrl = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-x86_64-v3-20260610-git-304426c.7z"
-$expectedSha256 = "D4B3D6DF9FDB33D5591C4ECE7D0CC24D2F7822B298F6A1528595E0CCFF7424A6"
-$expectedRuntimeSha256 = "ADE5CAC46CFC397A3D5CD356A968CDA7ACF0DEBFFB705A16509DAFDF93029F5E"
+$downloadUrl = "https://downloads.sourceforge.net/project/mpv-player-windows/libmpv/mpv-dev-x86_64-v3-20261018-git-01e2533f31.7z"
+$expectedSha256 = "49533E80D681672E42AB38FCCFDB9DB0CC9FC423F86D34F5F9634EBA71109912"
+$expectedRuntimeSha256 = "5C5C9D094859BDC60B8B27B2D832DB8FA8C2E487EFBD35F5AEA5AFE6960DAD39"
 
 if (Test-Path -LiteralPath $runtimePath -PathType Leaf) {
     $actualRuntimeSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $runtimePath).Hash
