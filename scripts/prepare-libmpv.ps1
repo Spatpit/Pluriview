@@ -24,7 +24,9 @@ New-Item -ItemType Directory -Path $vendorDirectory -Force | Out-Null
 
 try {
     Write-Host "Downloading the pinned libmpv runtime..."
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath
+    # SourceForge serves a browser download page unless the client looks like a
+    # plain download tool.
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UserAgent "Wget"
 
     $actualSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash
     if ($actualSha256 -ne $expectedSha256) {
