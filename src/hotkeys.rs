@@ -79,6 +79,7 @@ pub enum HotkeySlot {
     RecordTile,
     PauseRecording,
     PictureInPicture,
+    RecordGif,
 }
 
 impl HotkeySlot {
@@ -94,7 +95,7 @@ impl HotkeySlot {
         Self::CanvasView9,
     ];
 
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 39] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
@@ -133,6 +134,7 @@ impl HotkeySlot {
         Self::RecordTile,
         Self::PauseRecording,
         Self::PictureInPicture,
+        Self::RecordGif,
     ];
 
     pub fn label(self) -> &'static str {
@@ -175,6 +177,7 @@ impl HotkeySlot {
             Self::RecordTile => "Start/stop recording selected tiles",
             Self::PauseRecording => "Pause/resume recording",
             Self::PictureInPicture => "Picture in picture",
+            Self::RecordGif => "Start/stop GIF of selected tiles",
         }
     }
 }
@@ -220,6 +223,7 @@ pub struct HotkeyBindings {
     pub record_tile: Hotkey,
     pub pause_recording: Hotkey,
     pub picture_in_picture: Hotkey,
+    pub record_gif: Hotkey,
 }
 
 impl Default for HotkeyBindings {
@@ -263,6 +267,7 @@ impl Default for HotkeyBindings {
             record_tile: Hotkey::pair(0x10, 0x52),     // Shift+R
             pause_recording: Hotkey::key(0x50),        // P
             picture_in_picture: Hotkey::pair(0x10, 0x50), // Shift+P
+            record_gif: Hotkey::pair(0x10, 0x47),      // Shift+G
         }
     }
 }
@@ -308,6 +313,7 @@ impl HotkeyBindings {
             HotkeySlot::RecordTile => self.record_tile,
             HotkeySlot::PauseRecording => self.pause_recording,
             HotkeySlot::PictureInPicture => self.picture_in_picture,
+            HotkeySlot::RecordGif => self.record_gif,
         }
     }
 
@@ -351,6 +357,7 @@ impl HotkeyBindings {
             HotkeySlot::RecordTile => self.record_tile = hotkey,
             HotkeySlot::PauseRecording => self.pause_recording = hotkey,
             HotkeySlot::PictureInPicture => self.picture_in_picture = hotkey,
+            HotkeySlot::RecordGif => self.record_gif = hotkey,
         }
     }
 
@@ -798,6 +805,7 @@ mod tests {
         );
         assert_eq!(restored.get(HotkeySlot::RecordTile).display(), "Shift+R");
         assert_eq!(restored.get(HotkeySlot::PauseRecording).display(), "P");
+        assert_eq!(restored.get(HotkeySlot::RecordGif).display(), "Shift+G");
     }
 
     #[test]

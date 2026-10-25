@@ -1312,6 +1312,8 @@ fn shot_grid(
                 }
                 if shot.is_video {
                     video_badge(painter, image_rect, shot.duration);
+                } else if screenshot_library::is_gif(&shot.path) {
+                    corner_badge(painter, image_rect, "GIF".to_owned());
                 }
                 let fresh_alpha = fresh
                     .as_ref()
@@ -1446,6 +1448,10 @@ fn video_badge(painter: &egui::Painter, image_rect: egui::Rect, duration: Option
         let seconds = duration.as_secs_f64().round() as u64;
         label.push_str(&format!(" {}:{:02}", seconds / 60, seconds % 60));
     }
+    corner_badge(painter, image_rect, label);
+}
+
+fn corner_badge(painter: &egui::Painter, image_rect: egui::Rect, label: String) {
     let galley = painter.layout_no_wrap(
         label,
         egui::FontId::proportional(11.0),

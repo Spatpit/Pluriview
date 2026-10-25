@@ -5613,7 +5613,10 @@ impl eframe::App for PluriviewApp {
             self.set_screenshots_panel_open(!self.app_config.screenshots_panel_open);
         }
         if shortcut_presses.pressed(HotkeySlot::RecordTile) {
-            self.toggle_recording(ctx);
+            self.toggle_recording(ctx, crate::recording::Format::Mp4);
+        }
+        if shortcut_presses.pressed(HotkeySlot::RecordGif) {
+            self.toggle_recording(ctx, crate::recording::Format::Gif);
         }
         // P does nothing unless a recording is running.
         if shortcut_presses.pressed(HotkeySlot::PauseRecording) {
@@ -6313,6 +6316,7 @@ impl eframe::App for PluriviewApp {
 
                             for (label, slot) in [
                                 ("Start/stop recording", HotkeySlot::RecordTile),
+                                ("Record a GIF", HotkeySlot::RecordGif),
                                 ("Pause/resume recording", HotkeySlot::PauseRecording),
                                 ("Picture in picture", HotkeySlot::PictureInPicture),
                             ] {

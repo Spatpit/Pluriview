@@ -1,7 +1,8 @@
 //! Tile recordings: H.264 + AAC in MP4 through Windows' own Media Foundation
-//! sink writer, so no codec ships with Pluriview. The UI thread only hands
-//! over frames it already holds; conversion, audio capture, encoding and file
-//! writing all run on one worker per recording.
+//! sink writer, so no codec ships with Pluriview, or short silent GIFs
+//! through the `gif` crate the image decoder already brings. The UI thread
+//! only hands over frames it already holds; conversion, audio capture,
+//! encoding and file writing all run on one worker per recording.
 
 use crate::screenshot::CapturedPixels;
 use eframe::egui;
@@ -17,6 +18,52 @@ const MAX_SIZE: (u32, u32) = (3840, 2160);
 /// Several tiles recorded together fit inside 1080p, which keeps putting
 /// them together cheap enough to do 30 times a second.
 pub const MAX_COMBINED_SIZE: (u32, u32) = (1920, 1080);
+/// GIFs are kept short and small: they are for sharing, and every frame
+/// carries its own 256-color picture.
+pub const GIF_FPS: u32 = 15;
+pub const GIF_MAX_LENGTH: Duration = Duration::from_secs(10);
+const GIF_MAX_SIZE: (u32, u32) = (640, 640);
+
+/// What a recording is saved as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Mp4,
+    /// Silent, at most `GIF_MAX_LENGTH` long.
+    Gif,
+}
+
+impl Format {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Gif => "gif",
+        }
+    }
+
+    pub fn max_fps(self) -> u32 {
+        match self {
+            Self::Mp4 => MAX_FPS,
+            Self::Gif => GIF_FPS,
+        }
+    }
+
+    /// Recordings in this format stop on their own after this long.
+    pub fn max_length(self) -> Option<Duration> {
+        match self {
+            Self::Mp4 => None,
+            Self::Gif => Some(GIF_MAX_LENGTH),
+        }
+    }
+
+    /// Largest picture for one tile, or for several recorded together.
+    pub fn max_size(self, combined: bool) -> (u32, u32) {
+        match self {
+            Self::Mp4 if combined => MAX_COMBINED_SIZE,
+            Self::Mp4 => MAX_SIZE,
+            Self::Gif => GIF_MAX_SIZE,
+        }
+    }
+}
 
 /// One tile's picture within a recorded frame.
 pub struct Layer {
@@ -49,10 +96,11 @@ pub struct Recorder {
 
 impl Recorder {
     /// Start recording into `path`. `audio_pids` are the process trees whose
-    /// sound is mixed into the recording. `size` fixes the video's size;
-    /// without it the first frame's single tile decides.
+    /// sound is mixed into an MP4. `size` fixes the video's size; without it
+    /// the first frame's single tile decides.
     pub fn start(
         path: PathBuf,
+        format: Format,
         audio_pids: Vec<u32>,
         size: Option<(u32, u32)>,
         started: Instant,
@@ -64,7 +112,10 @@ impl Recorder {
         let worker = std::thread::Builder::new()
             .name("pluriview-recording".to_owned())
             .spawn(move || {
-                let result = run(&path, &audio_pids, size, started, &receiver);
+                let result = match format {
+                    Format::Mp4 => run(&path, &audio_pids, size, started, &receiver),
+                    Format::Gif => gif_file::run(&path, size, started, &receiver),
+                };
                 if result.is_err() {
                     let _ = std::fs::remove_file(&path);
                 }
@@ -162,14 +213,16 @@ impl Clock {
     }
 }
 
-/// Even output size for a source of `width`×`height`, fitted inside
-/// `MAX_SIZE` without changing its shape. H.264 needs even dimensions.
-fn output_size(width: u32, height: u32) -> (u32, u32) {
-    fitted_size(width as f32, height as f32, MAX_SIZE)
+/// Size taken from the first frame's single tile, fitted inside `limit`.
+fn first_frame_size(frame: &Frame, limit: (u32, u32)) -> (u32, u32) {
+    frame.layers.first().map_or((2, 2), |layer| {
+        let (left, top, right, bottom) = crop_size(layer);
+        fitted_size((right - left) as f32, (bottom - top) as f32, limit)
+    })
 }
 
 /// Even size with the shape of `width`×`height`, no larger than it or
-/// `limit`.
+/// `limit`. H.264 needs even dimensions.
 pub fn fitted_size(width: f32, height: f32, limit: (u32, u32)) -> (u32, u32) {
     let (width, height) = (width.max(1.0) as f64, height.max(1.0) as f64);
     let scale = (limit.0 as f64 / width)
@@ -849,12 +902,8 @@ mod mf {
             match command {
                 Some(Command::Frame(frame)) if !clock.paused() => {
                     if writer.is_none() {
-                        let (width, height) = size.unwrap_or_else(|| {
-                            frame.layers.first().map_or((2, 2), |layer| {
-                                let (left, top, right, bottom) = crop_size(layer);
-                                output_size(right - left, bottom - top)
-                            })
-                        });
+                        let (width, height) =
+                            size.unwrap_or_else(|| first_frame_size(&frame, MAX_SIZE));
                         match unsafe {
                             Writer::open(&runtime, path, width, height, audio.is_some())
                         } {
@@ -904,6 +953,280 @@ mod mf {
     }
 }
 
+/// Animated GIF recordings. Each frame stores only the rectangle that
+/// changed, with unchanged pixels inside it left transparent, so a mostly
+/// still tile stays small.
+mod gif_file {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::{BufWriter, Write};
+
+    /// Browsers stretch shorter GIF delays to 100 ms, so frames that would
+    /// show for less than this are skipped instead.
+    const MIN_DELAY: u64 = 2;
+
+    /// Recording time in the GIF's 10 ms units.
+    fn centiseconds(time: Duration) -> u64 {
+        ((time.as_millis() + 5) / 10) as u64
+    }
+
+    fn failed(error: impl std::fmt::Display) -> String {
+        format!("Writing the GIF failed: {error}")
+    }
+
+    struct Writer {
+        encoder: gif::Encoder<BufWriter<std::fs::File>>,
+        width: usize,
+        height: usize,
+        /// The newest frame as RGBA.
+        drawn: Vec<u8>,
+        /// What the GIF shows so far; empty before the first frame.
+        shown: Vec<u8>,
+        /// Encoded frame waiting to learn how long it stays up, with the
+        /// time it appears.
+        pending: Option<(gif::Frame<'static>, u64)>,
+    }
+
+    impl Writer {
+        fn create(path: &std::path::Path, width: u32, height: u32) -> Result<Self, String> {
+            let file = std::fs::File::create(path).map_err(failed)?;
+            let mut encoder =
+                gif::Encoder::new(BufWriter::new(file), width as u16, height as u16, &[])
+                    .map_err(failed)?;
+            encoder.set_repeat(gif::Repeat::Infinite).map_err(failed)?;
+            Ok(Self {
+                encoder,
+                width: width as usize,
+                height: height as usize,
+                drawn: vec![0; width as usize * height as usize * 4],
+                shown: Vec::new(),
+                pending: None,
+            })
+        }
+
+        fn frame(&mut self, time: Duration, frame: &Frame) -> Result<(), String> {
+            // The first frame opens the GIF, however late it arrived.
+            let start = match &self.pending {
+                None => 0,
+                Some((_, shown_at)) => {
+                    let start = centiseconds(time);
+                    if start < shown_at + MIN_DELAY {
+                        return Ok(());
+                    }
+                    start
+                }
+            };
+            draw_frame(
+                frame,
+                self.width as u32,
+                self.height as u32,
+                &mut self.drawn,
+            );
+            // BGRX to RGBA; `draw_frame` leaves every pixel opaque.
+            for pixel in self.drawn.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            let Some(next) = self.changes() else {
+                return Ok(());
+            };
+            self.flush(start)?;
+            self.pending = Some((next, start));
+            Ok(())
+        }
+
+        /// The changed part of `drawn` as a GIF frame, or `None` when it
+        /// matches what is shown.
+        fn changes(&mut self) -> Option<gif::Frame<'static>> {
+            let first = self.shown.is_empty();
+            let (left, top, right, bottom) = if first {
+                (0, 0, self.width, self.height)
+            } else {
+                changed_bounds(&self.drawn, &self.shown, self.width)?
+            };
+            let width = self.width;
+            let row = |y: usize| (y * width + left) * 4..(y * width + right) * 4;
+            // Every pixel of the area paired with whether it changed.
+            let pixels = || {
+                let (drawn, shown) = (&self.drawn, &self.shown);
+                (top..bottom).flat_map(move |y| {
+                    let now = &drawn[row(y)];
+                    let before = shown.get(row(y));
+                    now.chunks_exact(4).enumerate().map(move |(x, pixel)| {
+                        let changed = before.is_none_or(|before| pixel != &before[x * 4..][..4]);
+                        (pixel, changed)
+                    })
+                })
+            };
+            let colors: Vec<u8> = pixels()
+                .filter(|&(_, changed)| changed)
+                .flat_map(|(pixel, _)| pixel.iter().copied())
+                .collect();
+            let palette = Palette::new(&colors);
+            let buffer: Vec<u8> = pixels()
+                .map(|(pixel, changed)| {
+                    if changed {
+                        palette.index(pixel)
+                    } else {
+                        palette.transparent
+                    }
+                })
+                .collect();
+            if first {
+                self.shown = self.drawn.clone();
+            } else {
+                for y in top..bottom {
+                    self.shown[row(y)].copy_from_slice(&self.drawn[row(y)]);
+                }
+            }
+            Some(gif::Frame {
+                left: left as u16,
+                top: top as u16,
+                width: (right - left) as u16,
+                height: (bottom - top) as u16,
+                buffer: buffer.into(),
+                transparent: (!first).then_some(palette.transparent),
+                palette: Some(palette.rgb),
+                // Later frames draw over what earlier ones left.
+                dispose: gif::DisposalMethod::Keep,
+                ..Default::default()
+            })
+        }
+
+        /// Write the pending frame, shown until `until`.
+        fn flush(&mut self, until: u64) -> Result<(), String> {
+            let Some((mut frame, start)) = self.pending.take() else {
+                return Ok(());
+            };
+            frame.delay = until
+                .saturating_sub(start)
+                .clamp(MIN_DELAY, u64::from(u16::MAX)) as u16;
+            self.encoder.write_frame(&frame).map_err(failed)
+        }
+
+        fn finish(mut self, end: Duration) -> Result<(), String> {
+            self.flush(centiseconds(end))?;
+            let mut file = self.encoder.into_inner().map_err(failed)?;
+            file.flush().map_err(failed)
+        }
+    }
+
+    /// `(left, top, right, bottom)` around every pixel that differs.
+    fn changed_bounds(
+        now: &[u8],
+        before: &[u8],
+        width: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let mut bounds: Option<(usize, usize, usize, usize)> = None;
+        let row_bytes = width * 4;
+        for (y, (now, before)) in now
+            .chunks_exact(row_bytes)
+            .zip(before.chunks_exact(row_bytes))
+            .enumerate()
+        {
+            if now == before {
+                continue;
+            }
+            let differs = |x: &usize| now[x * 4..][..4] != before[x * 4..][..4];
+            let left = (0..width).find(differs).unwrap_or(0);
+            let right = (0..width).rev().find(differs).map_or(width, |x| x + 1);
+            bounds = Some(match bounds {
+                None => (left, y, right, y + 1),
+                Some((l, t, r, _)) => (l.min(left), t, r.max(right), y + 1),
+            });
+        }
+        bounds
+    }
+
+    /// Colors for one frame: exact when it has few (sharp text and UI),
+    /// otherwise learned by NeuQuant. One slot stays free for transparency.
+    struct Palette {
+        exact: Option<HashMap<[u8; 3], u8>>,
+        quantizer: Option<color_quant::NeuQuant>,
+        rgb: Vec<u8>,
+        transparent: u8,
+    }
+
+    impl Palette {
+        fn new(rgba: &[u8]) -> Self {
+            let mut exact = HashMap::new();
+            for pixel in rgba.chunks_exact(4) {
+                let next = exact.len() as u8;
+                exact.entry([pixel[0], pixel[1], pixel[2]]).or_insert(next);
+                if exact.len() > 255 {
+                    let quantizer = color_quant::NeuQuant::new(10, 255, rgba);
+                    let mut rgb = quantizer.color_map_rgb();
+                    rgb.extend_from_slice(&[0, 0, 0]);
+                    return Self {
+                        exact: None,
+                        quantizer: Some(quantizer),
+                        rgb,
+                        transparent: 255,
+                    };
+                }
+            }
+            let mut rgb = vec![0; exact.len() * 3 + 3];
+            for (color, &index) in &exact {
+                rgb[usize::from(index) * 3..][..3].copy_from_slice(color);
+            }
+            Self {
+                transparent: exact.len() as u8,
+                exact: Some(exact),
+                quantizer: None,
+                rgb,
+            }
+        }
+
+        fn index(&self, pixel: &[u8]) -> u8 {
+            match (&self.exact, &self.quantizer) {
+                (Some(exact), _) => exact[&[pixel[0], pixel[1], pixel[2]]],
+                (None, Some(quantizer)) => quantizer.index_of(pixel) as u8,
+                (None, None) => 0,
+            }
+        }
+    }
+
+    pub(super) fn run(
+        path: &std::path::Path,
+        size: Option<(u32, u32)>,
+        started: Instant,
+        commands: &mpsc::Receiver<Command>,
+    ) -> Result<(), String> {
+        let mut clock = Clock::new(started);
+        let mut writer: Option<Writer> = None;
+        loop {
+            // The UI side vanished without Stop: finish what we have.
+            let command = commands
+                .recv()
+                .unwrap_or_else(|_| Command::Stop(Instant::now()));
+            match command {
+                Command::Frame(frame) if !clock.paused() => {
+                    let time = clock.media_time(frame.at);
+                    if time >= GIF_MAX_LENGTH {
+                        continue;
+                    }
+                    if writer.is_none() {
+                        let (width, height) =
+                            size.unwrap_or_else(|| first_frame_size(&frame, GIF_MAX_SIZE));
+                        writer = Some(Writer::create(path, width, height)?);
+                    }
+                    if let Some(writer) = writer.as_mut() {
+                        writer.frame(time, &frame)?;
+                    }
+                }
+                Command::Frame(_) => {}
+                Command::Pause(at) => clock.pause(at),
+                Command::Resume(at) => clock.resume(at),
+                Command::Stop(at) => {
+                    let Some(writer) = writer else {
+                        return Err("The tile didn't show anything to record.".to_owned());
+                    };
+                    return writer.finish(clock.media_time(at).min(GIF_MAX_LENGTH));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -927,9 +1250,10 @@ mod tests {
 
     #[test]
     fn output_is_even_and_fits_4k() {
-        assert_eq!(output_size(1921, 1081), (1920, 1080));
-        assert_eq!(output_size(7680, 4320), (3840, 2160));
-        assert_eq!(output_size(1, 1), (2, 2));
+        let output_size = |width, height| fitted_size(width, height, MAX_SIZE);
+        assert_eq!(output_size(1921.0, 1081.0), (1920, 1080));
+        assert_eq!(output_size(7680.0, 4320.0), (3840, 2160));
+        assert_eq!(output_size(1.0, 1.0), (2, 2));
     }
 
     #[test]
@@ -1019,6 +1343,70 @@ mod tests {
         assert_eq!(fitted_size(801.0, 601.0, MAX_COMBINED_SIZE), (800, 600));
     }
 
+    #[test]
+    fn gifs_are_small_keep_unchanged_pixels_and_stop_at_ten_seconds() {
+        use image::AnimationDecoder;
+        let path = std::env::temp_dir().join(format!(
+            "pluriview-gif-recording-test-{}.gif",
+            std::process::id()
+        ));
+        // Started 12 s ago, so stopping now runs past the limit.
+        let start = Instant::now().checked_sub(Duration::from_secs(12)).unwrap();
+        let recorder = Recorder::start(path.clone(), Format::Gif, Vec::new(), None, start);
+        let picture = |patch: [u8; 4]| {
+            let mut rgba = [255, 0, 0, 255].repeat(1280 * 720);
+            for y in 0..64 {
+                for x in 0..64 {
+                    rgba[(y * 1280 + x) * 4..][..4].copy_from_slice(&patch);
+                }
+            }
+            Arc::new(CapturedPixels::Straight(
+                ScreenshotImage::from_straight_rgba(1280, 720, rgba).unwrap(),
+            ))
+        };
+        let (red, patched) = (picture([255, 0, 0, 255]), picture([0, 0, 255, 255]));
+        let green = Arc::new(CapturedPixels::Straight(
+            ScreenshotImage::from_straight_rgba(1280, 720, [0, 255, 0, 255].repeat(1280 * 720))
+                .unwrap(),
+        ));
+        for (pixels, millis) in [
+            (&red, 0),
+            // Unchanged: the first frame just stays up longer.
+            (&red, 100),
+            (&patched, 300),
+            // Past the ten-second limit: left out.
+            (&green, 11_000),
+        ] {
+            let frame = || Frame {
+                layers: vec![Layer {
+                    pixels: pixels.clone(),
+                    crop_uv: None,
+                    place: None,
+                }],
+                at: start + Duration::from_millis(millis),
+            };
+            while !recorder.push(frame()) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let path = recorder.stop().recv().unwrap().unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let decoder = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file)).unwrap();
+        let frames = decoder.into_frames().collect_frames().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(frames.len(), 2);
+        let delays: Vec<u32> = frames
+            .iter()
+            .map(|frame| frame.delay().numer_denom_ms().0)
+            .collect();
+        assert_eq!(delays, [300, 9_700]);
+        let last = frames[1].buffer();
+        assert_eq!(last.dimensions(), (640, 360));
+        assert_eq!(last.get_pixel(5, 5).0, [0, 0, 255, 255]);
+        // Outside the patch the first frame still shows through.
+        assert_eq!(last.get_pixel(320, 200).0, [255, 0, 0, 255]);
+    }
+
     /// Encodes through the real Windows encoder; run with `--ignored`.
     #[cfg(windows)]
     #[test]
@@ -1030,7 +1418,13 @@ mod tests {
         ));
         let start = Instant::now();
         // Our own silent process: exercises the AAC track and its padding.
-        let recorder = Recorder::start(path.clone(), vec![std::process::id()], None, start);
+        let recorder = Recorder::start(
+            path.clone(),
+            Format::Mp4,
+            vec![std::process::id()],
+            None,
+            start,
+        );
         let frame = |shade: u8, at: Instant| Frame {
             layers: vec![Layer {
                 pixels: Arc::new(CapturedPixels::Straight(
@@ -1088,7 +1482,13 @@ mod tests {
             std::process::id()
         ));
         let start = Instant::now();
-        let recorder = Recorder::start(path.clone(), Vec::new(), Some((640, 360)), start);
+        let recorder = Recorder::start(
+            path.clone(),
+            Format::Mp4,
+            Vec::new(),
+            Some((640, 360)),
+            start,
+        );
         let solid = |rgba: [u8; 4]| {
             Arc::new(CapturedPixels::Straight(
                 ScreenshotImage::from_straight_rgba(32, 32, rgba.repeat(32 * 32)).unwrap(),

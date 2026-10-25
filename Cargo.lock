@@ -2444,11 +2444,13 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 name = "pluriview"
 version = "0.7.2"
 dependencies = [
+ "color_quant",
  "directories",
  "eframe",
  "egui-phosphor",
  "env_logger",
  "getrandom 0.2.17",
+ "gif",
  "image",
  "libloading 0.8.9",
  "log",

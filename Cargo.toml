@@ -34,6 +34,9 @@ env_logger = { version = "0.11", default-features = false }
 url = "2.5"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# GIF recordings; both already come with image's GIF support.
+gif = { version = "0.14", default-features = false, features = ["std"] }
+color_quant = "1.1"
 libloading = "0.8"
 sha2 = "0.10"
 
