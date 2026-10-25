@@ -149,7 +149,7 @@ struct Shared {
 /// network: requests prove knowledge of it with `auth` signatures.
 struct Invite {
     token: String,
-    created: Instant,
+    expires: Instant,
     client: Option<String>,
     replay: auth::ReplayGuard,
 }
@@ -158,14 +158,14 @@ impl Invite {
     fn new() -> io::Result<Self> {
         Ok(Self {
             token: pairing::random_id()?,
-            created: Instant::now(),
+            expires: Instant::now() + INVITE_LIFETIME,
             client: None,
             replay: auth::ReplayGuard::default(),
         })
     }
 
     fn expired(&self) -> bool {
-        self.client.is_none() && self.created.elapsed() >= INVITE_LIFETIME
+        self.client.is_none() && Instant::now() >= self.expires
     }
 
     fn authorized(&mut self, request: &Request, credentials: &auth::Credentials) -> bool {
@@ -1939,7 +1939,9 @@ mod tests {
 
         // An unused link expires; a new link replaces the old secret.
         host.refresh_invite().unwrap();
-        host.shared.invite.lock().created -= INVITE_LIFETIME;
+        // Expire it directly: subtracting ten minutes from Instant::now()
+        // panics on a freshly booted machine such as a CI runner.
+        host.shared.invite.lock().expires = Instant::now();
         let fresh = url::Url::parse(&host.invite).unwrap();
         let fresh: std::collections::HashMap<_, _> = fresh.query_pairs().collect();
         assert!(send(&auth::test_authorization(
