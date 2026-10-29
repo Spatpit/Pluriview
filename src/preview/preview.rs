@@ -743,11 +743,9 @@ impl Preview {
         }
 
         let image = Arc::new(image);
-        // Browser captures are not resized for screenshots; take their next frame.
         if self.screenshot_wants_native_frame
-            && (self.is_browser()
-                || (width, height)
-                    == crate::capture::screenshot_capture_size(source_width, source_height))
+            && (width, height)
+                == crate::capture::screenshot_capture_size(source_width, source_height)
         {
             self.screenshot_wants_native_frame = false;
             self.screenshot_native_frame = Some(Arc::clone(&image));
@@ -1306,12 +1304,17 @@ mod tests {
         preview.browser_url = Some("https://example.com/b".to_owned());
         let mut playing = BrowserTab::new("https://example.com/b");
         playing.playing_audio = true;
-        preview.browser_tabs = vec![BrowserTab::new("https://example.com/a"), playing];
+        let mut sleeping = BrowserTab::new("https://example.com/a");
+        sleeping.sleeping = true;
+        preview.browser_tabs = vec![sleeping, playing];
         preview.browser_active_tab = 1;
         preview.browser_chrome = true;
         preview.browser_tabs_collapsed = true;
         let json = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
         assert!(json["browser_tabs"][1].get("playing_audio").is_none());
+        // Sleep state and site icons belong to the running app only.
+        assert!(json["browser_tabs"][0].get("sleeping").is_none());
+        assert!(json["browser_tabs"][0].get("favicon").is_none());
         let saved: PreviewLayout = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(saved.browser_tabs.len(), 2);
         assert_eq!(saved.browser_active_tab, 1);

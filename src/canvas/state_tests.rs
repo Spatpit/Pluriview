@@ -1,8 +1,8 @@
 use super::{
     apply_crop, apply_resize, browser_control_colors, capture_resolution_badge_rect, format_time,
     live_capture_display_size, media_placeholder_content, native_capture_canvas_size,
-    pixel_aligned_rect, playlist_first_row_center, rect_for_crop_change, stream_audio_badge_rect,
-    submenu_should_open_left, video_placeholder_content, video_time_style,
+    pixel_aligned_rect, pixel_exact_image, playlist_first_row_center, rect_for_crop_change,
+    stream_audio_badge_rect, submenu_should_open_left, video_placeholder_content, video_time_style,
     video_volume_popover_rect, video_volume_slider_rect, window_capture_placeholder_content,
     window_capture_target, BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle,
     TileActivityAction, VideoAction,
@@ -612,6 +612,46 @@ fn capture_rect_edges_align_to_physical_pixels() {
     ] {
         assert!((edge * 1.25 - (edge * 1.25).round()).abs() < 0.001);
     }
+}
+
+#[test]
+fn browser_frames_at_their_shown_size_are_drawn_pixel_for_pixel() {
+    let full = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    let close = |a: Vec2, b: Vec2| (a - b).length() < 0.001;
+    // A page at a fractional position, its frame two spare pixels larger.
+    let rect = Rect::from_min_size(Pos2::new(10.4, 20.6), Vec2::new(100.2, 50.0));
+    let (drawn, uv) = pixel_exact_image(rect, full, [102, 52], 1.0).unwrap();
+    assert_eq!(
+        drawn,
+        Rect::from_min_size(Pos2::new(10.0, 21.0), Vec2::new(101.0, 50.0))
+    );
+    assert_eq!(uv.min, Pos2::ZERO);
+    assert!(close(
+        uv.size() * Vec2::new(102.0, 52.0),
+        Vec2::new(101.0, 50.0)
+    ));
+
+    // At 150% display scale, edges land on physical pixels.
+    let rect = Rect::from_min_size(Pos2::new(10.1, 10.0), Vec2::new(100.0, 50.0));
+    let (drawn, uv) = pixel_exact_image(rect, full, [152, 77], 1.5).unwrap();
+    for edge in [drawn.left(), drawn.top(), drawn.right(), drawn.bottom()] {
+        assert!((edge * 1.5 - (edge * 1.5).round()).abs() < 0.001);
+    }
+    assert!(close(
+        uv.size() * Vec2::new(152.0, 77.0),
+        drawn.size() * 1.5
+    ));
+
+    // A crop starts on a whole texel and shows as many texels as pixels.
+    let crop = Rect::from_min_max(Pos2::new(0.25, 0.0), Pos2::new(0.75, 1.0));
+    let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(100.0, 50.0));
+    let (_, uv) = pixel_exact_image(rect, crop, [202, 52], 1.0).unwrap();
+    assert!((uv.min.x * 202.0 - (0.25_f32 * 202.0).round()).abs() < 0.001);
+    assert!((uv.width() * 202.0 - 100.0).abs() < 0.001);
+
+    // A frame for another zoom, or one smaller than the page, is scaled.
+    assert!(pixel_exact_image(rect, full, [200, 100], 1.0).is_none());
+    assert!(pixel_exact_image(rect, full, [99, 50], 1.0).is_none());
 }
 
 #[test]
@@ -1342,6 +1382,7 @@ impl CropUiTest {
             })
     }
 
+    /// Crop lives in the tile menu's Tile Settings submenu.
     fn open_crop_menu(&mut self, id: PreviewId) -> egui::FullOutput {
         let rect = self
             .canvas
@@ -1350,7 +1391,7 @@ impl CropUiTest {
         for _ in 0..12 {
             if output.shapes.iter().any(|shape| {
                 matches!(&shape.shape,
-                Shape::Text(text) if text.galley.text() == "Crop"
+                Shape::Text(text) if text.galley.text() == "Tile Settings"
                     && shape.clip_rect.contains(text.pos + text.galley.rect.center().to_vec2()))
             }) {
                 break;
@@ -1365,7 +1406,10 @@ impl CropUiTest {
             ]);
             output = self.frame(vec![]);
         }
-        self.click(Self::label_pos(&output, "Crop"), PointerButton::Primary)
+        self.click(
+            Self::label_pos(&output, "Tile Settings"),
+            PointerButton::Primary,
+        )
     }
 
     fn drag(&mut self, start: Pos2, end: Pos2) {
@@ -1448,6 +1492,72 @@ fn menu_crop_handles_work_for_all_sources_and_pinned_tiles() {
                 PointerButton::Primary,
             );
             assert!(test.canvas.crop_mode.is_none());
+        }
+    }
+}
+
+#[test]
+fn tile_menu_puts_the_tiles_own_actions_first_and_remove_last() {
+    for frozen in [false, true] {
+        let (mut test, id) = CropUiTest::new(1, false);
+        test.previews.get_mut(id).unwrap().manually_frozen = frozen;
+        test.frame(vec![]);
+        let rect = test
+            .canvas
+            .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+        test.click(rect.center(), PointerButton::Secondary);
+        // A popup takes a few frames to grow to its full height.
+        test.frame(vec![]);
+        let output = test.frame(vec![]);
+        let top = |label: &str| CropUiTest::label_pos(&output, label).y;
+        let mut order = vec![
+            "Browser · example.com",
+            "Interact",
+            "Reload",
+            "Page",
+            "Focus on This Tile",
+            "Picture in Picture",
+            "Pin to Viewport",
+            "Arrange",
+            "Group",
+            "Tile Settings",
+            "Remove",
+        ];
+        if frozen {
+            // Resuming comes first: the page's own actions wait for it.
+            order.insert(1, "Resume Tile");
+        } else {
+            order.insert(order.len() - 1, "Freeze Tile");
+        }
+        for pair in order.windows(2) {
+            assert!(
+                top(pair[0]) < top(pair[1]),
+                "frozen {frozen}: {} should come before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        // Group-only items stay out of a lone tile's menu, and settings stay
+        // in their submenu until it opens.
+        for hidden in [
+            "Spotlight This Tile",
+            "Fit Group to View",
+            "Edit Crop",
+            "Lock Aspect Ratio",
+            "Bring to Front",
+        ] {
+            assert!(
+                !labels.iter().any(|label| label == hidden),
+                "{hidden} should not be on the top level"
+            );
         }
     }
 }

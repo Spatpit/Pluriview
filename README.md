@@ -61,7 +61,12 @@ reopen Pluriview. Built-in ad blocking requires WebView2 Runtime 122 or newer.
 - **Arrange your tiles:** drag to move them and use their edges or corners to resize.
 - **Explore the canvas:** use the middle mouse button to pan and the scroll wheel to zoom.
 
-Hover over tiles for controls, or right-click a tile for more options.
+Hover over tiles for controls, or right-click a tile for more options. Every
+tile's menu has the same order: its own actions first (such as **Interact**,
+**Reload** and **Page** for a browser, or **Play** and **Playback** for a
+video), then **Focus on This Tile**, **Picture in Picture** and **Pin to
+Viewport**, then **Arrange** and **Group**, then **Tile Settings** (crop, frame
+rate, aspect ratio and click-through), **Freeze Tile** and **Remove**.
 Press `F1` to see shortcuts.
 
 ## Android phone viewer (development preview)
@@ -171,7 +176,7 @@ its canvas available. An independent phone camera remains future work.
 Use the **Window Picker** to add an open application as a live tile. You can
 resize, crop, freeze, or pin its preview.
 
-Choose **Crop → Edit Crop** from a tile's right-click menu, then drag the
+Choose **Tile Settings → Edit Crop** from a tile's right-click menu, then drag the
 highlighted edge or corner handles directly on the tile. Click empty canvas,
 press **Esc**, or choose **Finish Cropping** to finish. **Clear Crop** restores
 the full source. This also works for browser, image/GIF, video, and Spout tiles,
@@ -179,7 +184,7 @@ including tiles pinned to the viewport. The **Alt+drag** shortcut remains availa
 
 Search by window title or application name, then use **+** to add the source.
 Clear the search with **×**; hover a shortened name to read it in full.
-Right-click a tile for its settings, including the **Frame Rate** submenu.
+Right-click a tile → **Tile Settings** to change its **Frame Rate**.
 Menu shortcuts appear on the right and follow your bindings in **Settings**.
 
 Live Spout2 senders appear in the same picker. Select one to display its shared
@@ -274,14 +279,22 @@ New browser tiles open with a toolbar and vertical tabs around the page:
   anything else to search the web.
 - **Tabs:** click a tab to show it and **New tab** to open another. Hover a
   tab for its close button, or middle-click it. Links that open a new window
-  become tabs. Background tabs keep running (and playing sound) hidden, and
-  every tab shares the tile's sign-ins and mute state.
+  become tabs. Every tab shares the tile's sign-ins and mute state, and shows
+  its site's icon once the page has loaded.
+- **Scroll** the strip with the mouse wheel when it holds more tabs than fit.
+- **Drag** a tab up or down to reorder it, or drop it outside the tile to open
+  it as a tile of its own there. The page reloads in the new tile.
+- **Sleeping tabs:** a background tab that has not been shown or played sound
+  for 10 minutes unloads to free memory. It fades with a moon icon and
+  reloads when you open it.
 - **Collapse** the strip to site badges with the button at its bottom.
 - **Right-click** the address bar for **Cut**, **Copy**, **Paste**, **Paste
   and Go** and **Select All** (or **Copy Address** when you are not typing),
-  and a tab for **Copy Address**, **New Tab** and **Close Tab**. The tile's
-  own menu opens from the page.
-- Turn the frame on or off with right-click → **Show Toolbar and Tabs**. Tiles
+  and a tab for **Copy Address**, **New Tab**, **Move to New Tile** and **Close
+  Tab**. The tile's own menu opens from the page.
+- **Open Link in New Tile:** while using a page, right-click a link to open it
+  in a new browser tile beside this one.
+- Turn the frame on or off with right-click → **Page → Show Toolbar and Tabs**. Tiles
   from earlier versions start without it. Hiding it shows only the current
   tab; the others stay open.
 
@@ -299,8 +312,8 @@ than 360 × 200 show just the page.
 - **Page Zoom:** right-click → **Page Zoom** `−` / `+` makes a page's text and
   layout larger or smaller without resizing the tile. Click the percentage to
   return to 100%. Each tile remembers its zoom.
-- **Fit to Video:** right-click → **Fit to Video** crops the tile to the page's
-  video player, such as a YouTube, Twitch or Netflix video. **Crop → Clear Crop**
+- **Fit to Video:** right-click → **Page → Fit to Video** crops the tile to the page's
+  video player, such as a YouTube, Twitch or Netflix video. **Tile Settings → Clear Crop**
   shows the whole page again. Videos inside embedded players from another site
   cannot be found.
 
@@ -357,10 +370,10 @@ unavailable.
 Pages designed with transparent backgrounds stay transparent. This allows
 widgets such as heart-rate monitors to blend into your canvas.
 
-- **Change the page shape:** right-click the tile and turn off **Lock Aspect Ratio** to resize it into a portrait, square, or wide layout.
+- **Change the page shape:** right-click the tile and turn off **Tile Settings → Lock Aspect Ratio** to resize it into a portrait, square, or wide layout.
 - **Show part of a page:** hold `Alt` and drag a tile edge or corner to crop.
 - **Keep a widget in place:** right-click → **Pin to Viewport**.
-- **Click content underneath an overlay:** use the tile's **Disable Left Click** option.
+- **Click content underneath an overlay:** use the tile's **Tile Settings → Disable Left Click** option.
 
 Cropping keeps the page's proportions, and you can still interact with the
 visible region.
@@ -427,7 +440,7 @@ Live streams do not provide seek-bar thumbnails.
 
 | Option | What it does |
 |---|---|
-| **Crop** | Shows only the part of a tile you need. Use **Crop → Edit Crop** to drag its handles, or hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
+| **Crop** | Shows only the part of a tile you need. Use **Tile Settings → Edit Crop** to drag its handles, or hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
 | **Pin to Viewport** | Keeps any tile fixed on screen while you pan or zoom the canvas. |
 | **Picture in Picture** | Pops a tile out into a small window that stays on top of other apps, including games in borderless or windowed mode. A grouped tile brings its whole group, and several selected tiles go together, laid out as on the canvas. Drag the window to move it, drag an edge to resize it, and double-click it or use its close button to send the tiles back. Clicking it does not take focus from the game. Right-click a tile → **Picture in Picture**, or press `Shift+P`. |
 | **Freeze** | Holds the current frame of selected tiles until you resume them. |

@@ -6,6 +6,8 @@ mod browser_chrome;
 mod groups;
 #[path = "navigation.rs"]
 mod navigation;
+#[path = "tile_menu.rs"]
+mod tile_menu;
 use crate::capture::{
     capture_lod_factor, window_capture_target, CaptureCoordinator, MAX_CAPTURE_HEIGHT,
     MAX_CAPTURE_WIDTH,
@@ -20,10 +22,11 @@ use crate::preview::{
 };
 #[cfg(debug_assertions)]
 use crate::privacy;
-use browser_chrome::AddressEdit;
-pub use browser_chrome::BrowserNavigation;
+use browser_chrome::{AddressEdit, TabDrag, TabScroll};
+pub use browser_chrome::{BrowserNavigation, TabDetach};
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
 use groups::GroupState;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -137,6 +140,11 @@ pub enum BrowserAction {
     FitToVideo,
     SelectTab(usize),
     CloseTab(usize),
+    /// Drag a tab to another place in the strip.
+    MoveTab {
+        from: usize,
+        to: usize,
+    },
 }
 
 /// CSS pixels a browser page scrolls per egui point of Shift+wheel, so one
@@ -203,8 +211,12 @@ fn show_context_menu_if(
             crate::ui_theme::menu(ui);
             // Source-specific controls can exceed a short viewport. Keep the
             // entire menu reachable instead of clipping its final actions.
+            let max_height = (ui.ctx().screen_rect().height() - 32.0).max(100.0);
             egui::ScrollArea::vertical()
-                .max_height((ui.ctx().screen_rect().height() - 32.0).max(100.0))
+                .max_height(max_height)
+                // A popup's first frame only offers egui's default 400
+                // points. Grow to the screen instead of scrolling from then on.
+                .min_scrolled_height(max_height)
                 .show(ui, add_contents);
         });
     }
@@ -746,6 +758,49 @@ fn pixel_aligned_rect(rect: Rect, pixels_per_point: f32) -> Rect {
         Pos2::new(snap(rect.min.x), snap(rect.min.y)),
         Pos2::new(snap(rect.max.x), snap(rect.max.y)),
     )
+}
+
+/// Where to draw a texture so each of its pixels covers exactly one screen
+/// pixel: `rect` snapped to whole pixels, showing that many texels from where
+/// `uv` starts. `None` when the texture is not at the size it is shown, for
+/// example mid-zoom, so it should simply be scaled into `rect`.
+fn pixel_exact_image(
+    rect: Rect,
+    uv: Rect,
+    texture_size: [usize; 2],
+    pixels_per_point: f32,
+) -> Option<(Rect, Rect)> {
+    let scale = pixels_per_point.max(0.01);
+    let left = (rect.min.x * scale).round();
+    let top = (rect.min.y * scale).round();
+    let width = (rect.max.x * scale).round() - left;
+    let height = (rect.max.y * scale).round() - top;
+    let [texture_width, texture_height] = texture_size.map(|size| size as f32);
+    // Browser frames come a couple of pixels larger than the page so the
+    // snapped rect always has texels to show; anything further off is a frame
+    // for another size.
+    let fits = |pixels: f32, texels: f32, available: f32| {
+        pixels >= 1.0 && pixels <= available && (texels - pixels).abs() <= 4.0
+    };
+    if !fits(width, uv.width() * texture_width, texture_width)
+        || !fits(height, uv.height() * texture_height, texture_height)
+    {
+        return None;
+    }
+    let first =
+        |start: f32, texels: f32, shown: f32| (start * texels).round().clamp(0.0, texels - shown);
+    let u = first(uv.min.x, texture_width, width);
+    let v = first(uv.min.y, texture_height, height);
+    Some((
+        Rect::from_min_size(
+            Pos2::new(left / scale, top / scale),
+            Vec2::new(width / scale, height / scale),
+        ),
+        Rect::from_min_size(
+            Pos2::new(u / texture_width, v / texture_height),
+            Vec2::new(width / texture_width, height / texture_height),
+        ),
+    ))
 }
 
 fn native_capture_canvas_size(
@@ -1294,6 +1349,18 @@ pub struct CanvasState {
     /// The address bar being edited, if any.
     browser_address_edit: Option<AddressEdit>,
 
+    /// Tabs dragged out of their tile to open as a tile of their own.
+    pub pending_tab_detaches: Vec<TabDetach>,
+
+    /// The browser tab being dragged, if any.
+    browser_tab_drag: Option<TabDrag>,
+
+    /// How far each tile's tab list is scrolled.
+    browser_tab_scroll: HashMap<PreviewId, TabScroll>,
+
+    /// Site icons uploaded for drawing, by the address they came from.
+    favicon_textures: HashMap<String, egui::TextureHandle>,
+
     /// The pointer is on the interactive browser tile's toolbar or tabs, or
     /// its address bar has focus. Clicking there focuses the canvas, which
     /// must not end the interaction.
@@ -1383,6 +1450,10 @@ impl Default for CanvasState {
             pending_browser_scrolls: Vec::new(),
             pending_browser_navigations: Vec::new(),
             browser_address_edit: None,
+            pending_tab_detaches: Vec::new(),
+            browser_tab_drag: None,
+            browser_tab_scroll: HashMap::new(),
+            favicon_textures: HashMap::new(),
             browser_chrome_holds_interaction: false,
             pending_video_actions: Vec::new(),
             video_volume_hover: None,
@@ -2051,7 +2122,17 @@ impl CanvasState {
                             -page_scroll * PAGE_SCROLL_CSS_PER_POINT,
                         ));
                     }
-                    let scroll_delta = if page_target.is_some() {
+                    // The wheel scrolls a tab strip with more tabs than fit.
+                    let strip_scrolled = page_target.is_none()
+                        && !input.shift
+                        && input.scroll_y != 0.0
+                        && self.scroll_tab_strip_at(
+                            mouse_pos,
+                            input.scroll_y,
+                            canvas_rect,
+                            preview_manager,
+                        );
+                    let scroll_delta = if page_target.is_some() || strip_scrolled {
                         0.0
                     } else {
                         input.scroll_y
@@ -2360,7 +2441,6 @@ impl CanvasState {
             let rect = info.rect;
             let title = &info.title;
             let target_fps = info.target_fps;
-            let current_preset = info.fps_preset;
             let crop_uv = info.crop_uv;
             let is_removing = info.is_removing;
             let spawn_t = info.spawn_t;
@@ -2374,7 +2454,6 @@ impl CanvasState {
             let window_exe = info.window_exe.as_deref();
             let is_spout_capture = info.is_spout_capture;
             let viewport_pin = info.viewport_pin;
-            let lock_aspect_ratio = info.lock_aspect_ratio;
             let left_click_disabled = info.left_click_disabled;
             let playing_audio = info.playing_audio;
             let muted = if is_video {
@@ -2391,7 +2470,6 @@ impl CanvasState {
             let supports_seek_preview = info.supports_seek_preview;
             let manually_frozen = info.manually_frozen;
             let frame_size = info.frame_size;
-            let source_frame_size = info.source_frame_size;
             let screen_rect = viewport_pin
                 .map(|pin| pin.rect(canvas_rect))
                 .unwrap_or_else(|| self.canvas_rect_to_screen(rect, canvas_rect));
@@ -2561,11 +2639,24 @@ impl CanvasState {
                 // Get UV rect first (immutable borrow ends before get_texture)
                 let uv_rect = preview.get_uv_rect();
                 if let Some(texture) = preview.get_texture(ctx) {
+                    // A parked browser's frames arrive at the size its page is
+                    // shown at. Place them pixel for pixel to keep text sharp.
+                    let (image_rect, image_uv) = is_browser
+                        .then(|| {
+                            pixel_exact_image(
+                                content_rect,
+                                uv_rect,
+                                texture.size(),
+                                ctx.pixels_per_point(),
+                            )
+                        })
+                        .flatten()
+                        .unwrap_or((content_rect, uv_rect));
                     // Minimal Void: content fills entire rect
                     painter.image(
                         texture.id(),
-                        content_rect,
-                        uv_rect,
+                        image_rect,
+                        image_uv,
                         Color32::from_white_alpha(alpha_u8),
                     );
                     true
@@ -3504,522 +3595,15 @@ impl CanvasState {
             let context_menu_interaction_active = !secondary_on_chrome
                 && (context_response.context_menu_opened() || secondary_target);
             show_context_menu_if(&context_response, context_menu_interaction_active, |ui| {
-                crate::ui_theme::menu(ui);
-                ui.set_max_width(280.0);
-                ui.label(egui::RichText::new(compact_title(title, 42)).strong());
-                ui.separator();
-                if self.is_spotlighting() {
-                    self.spotlight_menu(ui, canvas_rect, preview_manager);
-                    return;
-                }
-                self.group_menu(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
-                ui.separator();
-
-                let selected_ids = if self.selection.contains(&id) {
-                    self.selection.clone()
-                } else {
-                    vec![id]
-                };
-                let any_live = selected_ids.iter().any(|selected_id| {
-                    preview_manager
-                        .get(*selected_id)
-                        .is_some_and(|preview| !preview.manually_frozen)
-                });
-                let any_frozen = selected_ids.iter().any(|selected_id| {
-                    preview_manager
-                        .get(*selected_id)
-                        .is_some_and(|preview| preview.manually_frozen)
-                });
-                let group = selected_ids.len() > 1;
-                if any_live
-                    && ui
-                        .button(if group {
-                            "Freeze Selected"
-                        } else {
-                            "Freeze Tile"
-                        })
-                        .clicked()
-                {
-                    self.queue_activity_for_selection(&selected_ids, TileActivityAction::Freeze);
-                    ui.close_menu();
-                }
-                if any_frozen
-                    && ui
-                        .button(if group {
-                            "Resume Selected"
-                        } else {
-                            "Resume Tile"
-                        })
-                        .clicked()
-                {
-                    self.queue_activity_for_selection(&selected_ids, TileActivityAction::Resume);
-                    ui.close_menu();
-                }
-                ui.separator();
-
-                if !is_media && !is_playlist {
-                    ui.menu_button(format!("Frame Rate: {}", current_preset.label()), |ui| {
-                        crate::ui_theme::menu(ui);
-                        for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
-                            let is_current = current_preset == preset;
-                            if ui.selectable_label(is_current, preset.label()).clicked() {
-                                self.pending_fps_changes.push(PendingFpsChange {
-                                    preview_id: id,
-                                    new_fps: preset,
-                                });
-                                ui.close_menu();
-                            }
-                        }
-                    });
-                    ui.separator();
-                }
-
-                if is_window_capture {
-                    let native_size = ui
-                        .add_enabled(
-                            source_frame_size.is_some(),
-                            egui::Button::new("Native Size (1:1)"),
-                        )
-                        .on_hover_text(
-                            "Resize this tile so every captured source pixel maps to one screen pixel",
-                        );
-                    if native_size.clicked() {
-                        if let Some(source_size) = source_frame_size {
-                            self.set_native_capture_size(
-                                id,
-                                source_size,
-                                canvas_rect,
-                                ctx.pixels_per_point(),
-                                preview_manager,
-                            );
-                        }
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                }
-
-                if is_media {
-                    if let Some(error) = preview_manager
-                        .get(id)
-                        .and_then(|preview| preview.capture_error.as_deref())
-                    {
-                        ui.label(egui::RichText::new(error).small().weak());
-                    }
-                    if ui.button("Retry Image").clicked() {
-                        self.pending_media_actions.push((id, MediaAction::Retry));
-                        ui.close_menu();
-                    }
-                    if ui.button("Locate Image…").clicked() {
-                        self.pending_media_actions.push((id, MediaAction::Locate));
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                }
-
-                if ui
-                    .selectable_label(viewport_pin.is_some(), "Pin to Viewport")
-                    .on_hover_text("Keep this tile fixed above the canvas while panning or zooming")
-                    .clicked()
-                {
-                    self.toggle_viewport_pin(id, canvas_rect, preview_manager);
-                    ui.close_menu();
-                }
-                if !is_playlist
-                    && ui
-                        .add(
-                            crate::ui_theme::shortcut_button(
-                                "Picture in Picture",
-                                keyboard_shortcuts.get(HotkeySlot::PictureInPicture),
-                            )
-                            .selected(
-                                preview_manager
-                                    .get(id)
-                                    .is_some_and(|preview| preview.picture_in_picture.is_some()),
-                            ),
-                        )
-                        .on_hover_text(
-                            "Show this tile, or its whole group, in a small window that stays on top of other apps",
-                        )
-                        .clicked()
-                {
-                    self.pending_picture_in_picture = Some(id);
-                    ui.close_menu();
-                }
-
-                if is_browser
-                    && ui
-                        .selectable_label(lock_aspect_ratio, "Lock Aspect Ratio")
-                        .on_hover_text(
-                            "Turn this off to resize the browser into portrait or any custom shape",
-                        )
-                        .clicked()
-                {
-                    self.toggle_aspect_ratio_lock(id, preview_manager);
-                    ui.close_menu();
-                }
-
-                if ui
-                    .selectable_label(left_click_disabled, "Disable Left Click")
-                    .on_hover_text("Let primary clicks and drags pass through to tiles underneath")
-                    .clicked()
-                {
-                    self.toggle_left_click_disabled(id, preview_manager);
-                    ui.close_menu();
-                }
-                ui.separator();
-
-                if is_playlist {
-                    ui.label(egui::RichText::new("Folder playlist tile").weak());
-                    if ui.button("Previous video").clicked() {
-                        self.pending_playlist_actions
-                            .push((id, PlaylistAction::Previous));
-                        ui.close_menu();
-                    }
-                    if ui.button("Next video").clicked() {
-                        self.pending_playlist_actions
-                            .push((id, PlaylistAction::Next));
-                        ui.close_menu();
-                    }
-                    if ui.button("Rescan folder").clicked() {
-                        self.pending_playlist_actions
-                            .push((id, PlaylistAction::Rescan));
-                        ui.close_menu();
-                    }
-                    let (autoplay, shuffle, repeat) = preview_manager
-                        .get(id)
-                        .and_then(|preview| preview.folder_playlist.as_ref())
-                        .map(|playlist| (playlist.autoplay, playlist.shuffle, playlist.repeat))
-                        .unwrap_or((true, false, false));
-                    if ui.selectable_label(autoplay, "Autoplay next").clicked() {
-                        self.pending_playlist_actions
-                            .push((id, PlaylistAction::ToggleAutoplay));
-                        ui.close_menu();
-                    }
-                    if ui.selectable_label(shuffle, "Shuffle").clicked() {
-                        self.pending_playlist_actions
-                            .push((id, PlaylistAction::ToggleShuffle));
-                        ui.close_menu();
-                    }
-                    if ui.selectable_label(repeat, "Repeat playlist").clicked() {
-                        self.pending_playlist_actions
-                            .push((id, PlaylistAction::ToggleRepeat));
-                        ui.close_menu();
-                    }
-                } else if is_media {
-                    ui.label(egui::RichText::new("Image / animated GIF tile").weak());
-                    ui.separator();
-                    self.crop_menu(ui, id, canvas_rect, preview_manager);
-                } else if is_browser {
-                    let browser_ready =
-                        *browser_status == BrowserTileStatus::Ready && !manually_frozen;
-                    if !browser_ready {
-                        ui.label(egui::RichText::new("Browser preview is starting…").weak());
-                    }
-                    if ui
-                        .add_enabled(
-                            browser_ready && !left_click_disabled,
-                            crate::ui_theme::shortcut_button(
-                                "Interact",
-                                keyboard_shortcuts.get(HotkeySlot::InteractBrowser),
-                            ),
-                        )
-                        .clicked()
-                    {
-                        self.last_double_clicked = Some(id);
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            browser_ready,
-                            egui::Button::new(if muted { "Unmute" } else { "Mute" }),
-                        )
-                        .clicked()
-                    {
-                        self.pending_browser_actions
-                            .push((id, BrowserAction::ToggleMute));
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(browser_ready, egui::Button::new("Reload"))
-                        .clicked()
-                    {
-                        self.pending_browser_actions
-                            .push((id, BrowserAction::Reload));
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(browser_ready, egui::Button::new("Fit to Video"))
-                        .on_hover_text("Crop the tile to the page's video player")
-                        .clicked()
-                    {
-                        self.pending_browser_actions
-                            .push((id, BrowserAction::FitToVideo));
-                        ui.close_menu();
-                    }
-                    let page_zoom = preview_manager
-                        .get(id)
-                        .map_or(1.0, |preview| preview.browser_page_zoom);
-                    let mut new_page_zoom = None;
-                    ui.horizontal(|ui| {
-                        ui.label("Page Zoom");
-                        if ui
-                            .add_enabled(
-                                browser_ready && page_zoom > crate::browser::MIN_PAGE_ZOOM + 0.005,
-                                egui::Button::new(egui_phosphor::regular::MINUS),
-                            )
-                            .on_hover_text("Zoom out")
-                            .clicked()
-                        {
-                            new_page_zoom = Some(crate::browser::step_page_zoom(page_zoom, false));
-                        }
-                        if ui
-                            .add_enabled(
-                                browser_ready,
-                                egui::Button::new(format!("{:.0}%", page_zoom * 100.0)),
-                            )
-                            .on_hover_text("Reset to 100%")
-                            .clicked()
-                        {
-                            new_page_zoom = Some(1.0);
-                        }
-                        if ui
-                            .add_enabled(
-                                browser_ready && page_zoom < crate::browser::MAX_PAGE_ZOOM - 0.005,
-                                egui::Button::new(egui_phosphor::regular::PLUS),
-                            )
-                            .on_hover_text("Zoom in")
-                            .clicked()
-                        {
-                            new_page_zoom = Some(crate::browser::step_page_zoom(page_zoom, true));
-                        }
-                    });
-                    if let Some(zoom) = new_page_zoom {
-                        if let Some(preview) = preview_manager.get_mut(id) {
-                            preview.browser_page_zoom = zoom;
-                        }
-                    }
-                    let (show_frame, has_tabs) = preview_manager
-                        .get(id)
-                        .map(|preview| (preview.browser_chrome, preview.browser_tabs.len() > 1))
-                        .unwrap_or_default();
-                    if ui
-                        .selectable_label(show_frame, "Show Toolbar and Tabs")
-                        .on_hover_text(if has_tabs && show_frame {
-                            "Hiding them shows only the current tab; the others stay open"
-                        } else {
-                            "Back, forward, an address bar and vertical tabs around the page"
-                        })
-                        .clicked()
-                    {
-                        if let Some(preview) = preview_manager.get_mut(id) {
-                            preview.browser_chrome = !preview.browser_chrome;
-                        }
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(browser_ready, egui::Button::new("Change URL..."))
-                        .clicked()
-                    {
-                        self.pending_browser_actions
-                            .push((id, BrowserAction::EditUrl));
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(browser_ready, egui::Button::new("Copy URL"))
-                        .clicked()
-                    {
-                        self.pending_browser_actions
-                            .push((id, BrowserAction::CopyUrl));
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(browser_ready, egui::Button::new("Open in Default Browser"))
-                        .clicked()
-                    {
-                        self.pending_browser_actions
-                            .push((id, BrowserAction::OpenExternal));
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    self.crop_menu(ui, id, canvas_rect, preview_manager);
-                } else if is_video {
-                    let controls_enabled = !manually_frozen
-                        && video_playback.connected
-                        && !matches!(video_status, VideoTileStatus::Failed(_));
-                    if !controls_enabled {
-                        ui.label(egui::RichText::new("Video controls are unavailable").weak());
-                    }
-                    if ui
-                        .add_enabled(!manually_frozen, egui::Button::new("Reload"))
-                        .clicked()
-                    {
-                        self.pending_video_actions.push((id, VideoAction::Reload));
-                        ui.close_menu();
-                    }
-                    ui.add_enabled_ui(controls_enabled, |ui| {
-                        if ui
-                            .button(if video_playback.paused {
-                                "Play"
-                            } else {
-                                "Pause"
-                            })
-                            .clicked()
-                        {
-                            self.pending_video_actions
-                                .push((id, VideoAction::SetPaused(!video_playback.paused)));
-                            ui.close_menu();
-                        }
-                        if ui.button(if muted { "Unmute" } else { "Mute" }).clicked() {
-                            self.pending_video_actions
-                                .push((id, VideoAction::ToggleMute));
-                            ui.close_menu();
-                        }
-
-                        let mut volume = video_playback.volume;
-                        if ui
-                            .add(egui::Slider::new(&mut volume, 0.0..=100.0).text("Volume"))
-                            .changed()
-                        {
-                            self.pending_video_actions
-                                .push((id, VideoAction::SetVolume(volume)));
-                        }
-
-                        if ui
-                            .selectable_label(video_playback.looping, "Loop")
-                            .clicked()
-                        {
-                            self.pending_video_actions
-                                .push((id, VideoAction::ToggleLoop));
-                            ui.close_menu();
-                        }
-
-                        ui.menu_button(format!("Speed: {}×", video_playback.speed), |ui| {
-                            crate::ui_theme::menu(ui);
-                            for speed in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
-                                let selected = (video_playback.speed - speed).abs() < 0.001;
-                                if ui.selectable_label(selected, format!("{speed}×")).clicked() {
-                                    self.pending_video_actions
-                                        .push((id, VideoAction::SetSpeed(speed)));
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-
-                        ui.menu_button("Audio Track", |ui| {
-                            crate::ui_theme::menu(ui);
-                            let audio_tracks: Vec<_> = video_playback
-                                .tracks
-                                .iter()
-                                .filter(|track| track.kind == "audio")
-                                .collect();
-                            if audio_tracks.is_empty() {
-                                ui.label(egui::RichText::new("No audio tracks").weak());
-                            }
-                            for track in audio_tracks {
-                                let label = track
-                                    .title
-                                    .clone()
-                                    .or_else(|| track.language.clone())
-                                    .unwrap_or_else(|| format!("Track {}", track.id));
-                                if ui
-                                    .selectable_label(
-                                        video_playback.audio_track == Some(track.id),
-                                        label,
-                                    )
-                                    .clicked()
-                                {
-                                    self.pending_video_actions
-                                        .push((id, VideoAction::SelectAudioTrack(track.id)));
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-
-                        ui.menu_button("Subtitles", |ui| {
-                            crate::ui_theme::menu(ui);
-                            if ui
-                                .selectable_label(video_playback.subtitle_track.is_none(), "Off")
-                                .clicked()
-                            {
-                                self.pending_video_actions
-                                    .push((id, VideoAction::SelectSubtitleTrack(None)));
-                                ui.close_menu();
-                            }
-                            for track in video_playback
-                                .tracks
-                                .iter()
-                                .filter(|track| track.kind == "sub")
-                            {
-                                let label = track
-                                    .title
-                                    .clone()
-                                    .or_else(|| track.language.clone())
-                                    .unwrap_or_else(|| format!("Track {}", track.id));
-                                if ui
-                                    .selectable_label(
-                                        video_playback.subtitle_track == Some(track.id),
-                                        label,
-                                    )
-                                    .clicked()
-                                {
-                                    self.pending_video_actions.push((
-                                        id,
-                                        VideoAction::SelectSubtitleTrack(Some(track.id)),
-                                    ));
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-                    });
-
-                    if video_status_needs_settings(video_status)
-                        && ui.button("Open Settings").clicked()
-                    {
-                        self.pending_video_actions
-                            .push((id, VideoAction::OpenSettings));
-                        ui.close_menu();
-                    }
-
-                    ui.separator();
-                    self.crop_menu(ui, id, canvas_rect, preview_manager);
-                } else {
-                    self.crop_menu(ui, id, canvas_rect, preview_manager);
-                }
-
-                ui.separator();
-
-                if ui
-                    .add_enabled(
-                        viewport_pin.is_none(),
-                        crate::ui_theme::shortcut_button(
-                            "Focus on This Tile",
-                            keyboard_shortcuts.get(HotkeySlot::FocusCurrentTile),
-                        ),
-                    )
-                    .clicked()
-                {
-                    self.focus_on_tile(id, rect, canvas_rect);
-                    ui.close_menu();
-                }
-
-                if ui.button("Bring to Front").clicked() {
-                    preview_manager.bring_to_front(id);
-                    ui.close_menu();
-                }
-
-                if ui.button("Send to Back").clicked() {
-                    preview_manager.send_to_back(id);
-                    ui.close_menu();
-                }
-
-                ui.separator();
-
-                if crate::ui_theme::destructive(ui, "Remove").clicked() {
-                    capture_coordinator.stop_capture(id);
-                    preview_manager.start_removal(id);
-                    self.selection.retain(|&x| x != id);
-                    ui.close_menu();
-                }
+                self.tile_menu(
+                    ui,
+                    info,
+                    canvas_rect,
+                    ctx.pixels_per_point(),
+                    preview_manager,
+                    capture_coordinator,
+                    keyboard_shortcuts,
+                );
             });
         }
         self.tile_scratch = preview_info;

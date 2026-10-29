@@ -18,11 +18,16 @@ use eframe::egui;
 use parking_lot::Mutex;
 use webview2_com::{
     take_pwstr, BrowserExtensionEnableCompletedHandler, ClearBrowsingDataCompletedHandler,
-    HistoryChangedEventHandler, IsDocumentPlayingAudioChangedEventHandler,
+    ContextMenuRequestedEventHandler, CustomItemSelectedEventHandler, FaviconChangedEventHandler,
+    GetFaviconCompletedHandler, HistoryChangedEventHandler,
+    IsDocumentPlayingAudioChangedEventHandler,
     Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2BrowserExtension, ICoreWebView2PermissionRequestedEventArgs3,
-        ICoreWebView2Profile2, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_3,
-        ICoreWebView2_8, COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
+        ICoreWebView2BrowserExtension, ICoreWebView2ContextMenuItemCollection,
+        ICoreWebView2Environment9, ICoreWebView2PermissionRequestedEventArgs3,
+        ICoreWebView2Profile2, ICoreWebView2Profile7, ICoreWebView2_11, ICoreWebView2_13,
+        ICoreWebView2_15, ICoreWebView2_3, ICoreWebView2_8,
+        COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND, COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
+        COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
         COREWEBVIEW2_PERMISSION_STATE_DENY, COREWEBVIEW2_PROCESS_FAILED_KIND,
         COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
         COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
@@ -60,7 +65,7 @@ use wry::{
     WebViewBuilderExtWindows, WebViewExtWindows,
 };
 
-use crate::preview::{BrowserTab, PreviewId};
+use crate::preview::{BrowserTab, Favicon, PreviewId};
 
 const PARK_X: i32 = -30_000;
 const PARK_Y: i32 = -30_000;
@@ -85,6 +90,16 @@ const INTERACTION_PREP_DELAY: Duration = Duration::from_millis(80);
 /// the tile keeps showing the last interactive frame instead of the frames
 /// WebView2 renders while it grows back to capture resolution.
 const PARK_SETTLE_DELAY: Duration = Duration::from_millis(150);
+/// A background tab that has not been shown or played sound for this long
+/// unloads its page to free memory. It reloads when shown, like a browser's
+/// memory saver.
+const TAB_SLEEP_AFTER: Duration = Duration::from_secs(10 * 60);
+/// Site icons are drawn at most this many pixels across.
+const FAVICON_SIZE: u32 = 64;
+/// Larger downloads are not icons; ignore them.
+const MAX_FAVICON_BYTES: usize = 512 * 1024;
+/// WebView2's own context menu item after which "Open Link in New Tile" goes.
+const OPEN_LINK_IN_NEW_WINDOW_ITEM: &str = "openLinkInNewWindow";
 
 /// wry's default WebView2 arguments also disable `msSmartScreenProtection`,
 /// which turns off Microsoft Defender SmartScreen's phishing and malware site
@@ -368,7 +383,7 @@ pub fn scrub_tabs_for_storage(tabs: &[BrowserTab], active: usize) -> (Vec<Browse
         kept.push(BrowserTab {
             url,
             title: tab.title.clone(),
-            playing_audio: false,
+            ..BrowserTab::default()
         });
     }
     (kept, kept_active)
@@ -480,7 +495,159 @@ struct SharedState {
     playing_audio: bool,
     /// A finished Fit to Video lookup (see [`FIND_VIDEO_SCRIPT`]).
     video_rect: Option<Option<(f32, f32, f32, f32)>>,
+    /// The page's icon changed: its address and PNG bytes (empty when the
+    /// page has none).
+    favicon: Option<(String, Vec<u8>)>,
+    /// Links chosen with "Open Link in New Tile".
+    new_tile_requests: Vec<String>,
     dirty: bool,
+}
+
+/// Report the page's icon whenever it changes. Needs WebView2 Runtime 108+;
+/// older runtimes keep the letter badges.
+fn register_favicon_handler(
+    webview: &WebView,
+    shared: Arc<Mutex<SharedState>>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let core15: ICoreWebView2_15 = core.cast().map_err(|e| e.to_string())?;
+    let handler = FaviconChangedEventHandler::create(Box::new(move |sender, _| {
+        let Some(sender) = sender else {
+            return Ok(());
+        };
+        let sender: ICoreWebView2_15 = sender.cast()?;
+        let mut uri = WebViewPWSTR::null();
+        unsafe { sender.FaviconUri(&mut uri)? };
+        let uri = take_pwstr(uri);
+        if uri.is_empty() {
+            let mut state = shared.lock();
+            state.favicon = Some((uri, Vec::new()));
+            state.dirty = true;
+            return Ok(());
+        }
+        let shared = shared.clone();
+        let completed = GetFaviconCompletedHandler::create(Box::new(move |result, stream| {
+            result?;
+            let png = stream.as_ref().map(read_stream).unwrap_or_default();
+            let mut state = shared.lock();
+            state.favicon = Some((uri, png));
+            state.dirty = true;
+            Ok(())
+        }));
+        unsafe { sender.GetFavicon(COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, &completed) }
+    }));
+    let mut token = 0i64;
+    unsafe { core15.add_FaviconChanged(&handler, &mut token) }.map_err(|e| e.to_string())
+}
+
+fn read_stream(stream: &webview2_windows::Win32::System::Com::IStream) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let mut read = 0u32;
+        let result = unsafe {
+            stream.Read(
+                chunk.as_mut_ptr().cast(),
+                chunk.len() as u32,
+                Some(&mut read),
+            )
+        };
+        if result.is_err() || read == 0 {
+            return bytes;
+        }
+        bytes.extend_from_slice(&chunk[..read as usize]);
+        if bytes.len() > MAX_FAVICON_BYTES {
+            return Vec::new();
+        }
+    }
+}
+
+/// Decode a site icon for drawing, scaled down to [`FAVICON_SIZE`].
+fn decode_favicon(uri: String, png: &[u8]) -> Option<Favicon> {
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+    let image = if image.width() > FAVICON_SIZE || image.height() > FAVICON_SIZE {
+        image.thumbnail(FAVICON_SIZE, FAVICON_SIZE)
+    } else {
+        image
+    };
+    let rgba = image.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(Favicon {
+        uri,
+        image: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+            size,
+            rgba.as_raw(),
+        )),
+    })
+}
+
+/// Add "Open Link in New Tile" to the page's right-click menu on links.
+/// Needs WebView2 Runtime 98+; older runtimes keep the standard menu.
+fn register_context_menu_handler(
+    webview: &WebView,
+    shared: Arc<Mutex<SharedState>>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let core11: ICoreWebView2_11 = core.cast().map_err(|e| e.to_string())?;
+    let environment: ICoreWebView2Environment9 =
+        webview.environment().cast().map_err(|e| e.to_string())?;
+    let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let target = unsafe { args.ContextMenuTarget()? };
+        let mut has_link = Default::default();
+        unsafe { target.HasLinkUri(&mut has_link)? };
+        if !has_link.as_bool() {
+            return Ok(());
+        }
+        let mut link = WebViewPWSTR::null();
+        unsafe { target.LinkUri(&mut link)? };
+        let link = take_pwstr(link);
+        if !is_web_url(&link) {
+            return Ok(());
+        }
+        let item = unsafe {
+            environment.CreateContextMenuItem(
+                &WebViewHString::from("Open Link in New Tile"),
+                None::<&webview2_windows::Win32::System::Com::IStream>,
+                COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
+            )?
+        };
+        let shared = shared.clone();
+        let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
+            let mut state = shared.lock();
+            state.new_tile_requests.push(link.clone());
+            state.dirty = true;
+            Ok(())
+        }));
+        let mut token = 0i64;
+        unsafe { item.add_CustomItemSelected(&selected, &mut token)? };
+        let items = unsafe { args.MenuItems()? };
+        let index = menu_index_after(&items, OPEN_LINK_IN_NEW_WINDOW_ITEM);
+        unsafe { items.InsertValueAtIndex(index, &item) }
+    }));
+    let mut token = 0i64;
+    unsafe { core11.add_ContextMenuRequested(&handler, &mut token) }.map_err(|e| e.to_string())
+}
+
+/// The position just after the menu item called `name`, or the top.
+fn menu_index_after(items: &ICoreWebView2ContextMenuItemCollection, name: &str) -> u32 {
+    let mut count = 0u32;
+    if unsafe { items.Count(&mut count) }.is_err() {
+        return 0;
+    }
+    (0..count)
+        .find(|&index| {
+            unsafe { items.GetValueAtIndex(index) }
+                .and_then(|item| {
+                    let mut item_name = WebViewPWSTR::null();
+                    unsafe { item.Name(&mut item_name)? };
+                    Ok(take_pwstr(item_name))
+                })
+                .is_ok_and(|item_name| item_name == name)
+        })
+        .map_or(0, |index| index + 1)
 }
 
 fn parse_video_rect(json: &str) -> Option<(f32, f32, f32, f32)> {
@@ -663,6 +830,8 @@ pub struct BrowserUpdate {
     pub loading: bool,
     /// Pages asked to open these addresses in a new window.
     pub new_window_requests: Vec<String>,
+    /// Links chosen with "Open Link in New Tile".
+    pub new_tile_requests: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -728,6 +897,19 @@ fn set_page_geometry(webview: &WebView, position: (i32, i32), size: (i32, i32), 
             bottom: size.1,
         };
         let _ = controller.SetBoundsAndZoomFactor(bounds, zoom);
+    }
+}
+
+/// Where the tab at `index` ends up after the tab at `from` moves to `to`.
+fn moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
     }
 }
 
@@ -920,15 +1102,20 @@ struct HostTab {
     url: String,
     title: String,
     playing_audio: bool,
+    favicon: Option<Favicon>,
+    /// When this loaded tab was last hidden or heard; None while shown.
+    hidden_since: Option<Instant>,
 }
 
 impl HostTab {
-    fn loaded(view: TabView, url: &str) -> Self {
+    fn loaded(view: TabView, url: &str, shown: bool) -> Self {
         Self {
             view: Some(view),
             url: url.to_owned(),
             title: String::new(),
             playing_audio: false,
+            favicon: None,
+            hidden_since: (!shown).then(Instant::now),
         }
     }
 
@@ -938,7 +1125,32 @@ impl HostTab {
             url: tab.url.clone(),
             title: tab.title.clone(),
             playing_audio: false,
+            favicon: tab.favicon.clone(),
+            hidden_since: None,
         }
+    }
+
+    fn snapshot(&self) -> BrowserTab {
+        BrowserTab {
+            url: self.url.clone(),
+            title: self.title.clone(),
+            playing_audio: self.playing_audio,
+            favicon: self.favicon.clone(),
+            sleeping: self.view.is_none(),
+        }
+    }
+
+    /// Whether a background tab has been idle long enough to sleep.
+    fn ready_to_sleep(&mut self, now: Instant) -> bool {
+        if self.view.is_none() {
+            return false;
+        }
+        if self.playing_audio {
+            self.hidden_since = Some(now);
+            return false;
+        }
+        self.hidden_since
+            .is_some_and(|since| now.duration_since(since) >= TAB_SLEEP_AFTER)
     }
 }
 
@@ -1021,7 +1233,7 @@ impl BrowserHost {
             page_zoom: 1.0,
         };
         let view = host.build_view(context, url, signals, true)?;
-        host.tabs.push(HostTab::loaded(view, url));
+        host.tabs.push(HostTab::loaded(view, url, true));
         Ok(host)
     }
 
@@ -1125,6 +1337,12 @@ impl BrowserHost {
         if let Err(error) = register_history_handler(&webview, shared.clone()) {
             log::warn!("Browser tiles cannot follow page history: {error}");
         }
+        if let Err(error) = register_favicon_handler(&webview, shared.clone()) {
+            log::warn!("Browser tabs cannot show site icons: {error}");
+        }
+        if let Err(error) = register_context_menu_handler(&webview, shared.clone()) {
+            log::warn!("Browser pages cannot offer Open Link in New Tile: {error}");
+        }
         if let Err(error) = register_engine_update_handler(&webview, signals.update_ready.clone()) {
             log::warn!("Browser tiles cannot detect WebView2 updates: {error}");
         }
@@ -1220,7 +1438,7 @@ impl BrowserHost {
         }
         let view = self.build_view(context, url, signals, false)?;
         let index = (self.active_tab + 1).min(self.tabs.len());
-        self.tabs.insert(index, HostTab::loaded(view, url));
+        self.tabs.insert(index, HostTab::loaded(view, url, false));
         self.tabs_dirty = true;
         if activate {
             self.select_tab(context, signals, index)?;
@@ -1247,11 +1465,43 @@ impl BrowserHost {
             if let Some(previous) = self.webview() {
                 let _ = previous.set_visible(false);
             }
+            self.tabs[self.active_tab].hidden_since = Some(Instant::now());
             self.active_tab = index;
             self.tabs_dirty = true;
         }
+        self.tabs[index].hidden_since = None;
         self.show_active_view();
         Ok(())
+    }
+
+    /// Move tab `from` to position `to`, keeping the same tab shown.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = moved_index(self.active_tab, from, to);
+        self.tabs_dirty = true;
+    }
+
+    /// Unload background tabs that have been idle for [`TAB_SLEEP_AFTER`].
+    fn sleep_idle_tabs(&mut self, now: Instant) {
+        if self.suspended {
+            return;
+        }
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if index == self.active_tab || !tab.ready_to_sleep(now) {
+                continue;
+            }
+            if let Some(url) = tab.view.as_ref().and_then(TabView::live_url) {
+                tab.url = url;
+            }
+            tab.view = None;
+            tab.hidden_since = None;
+            tab.playing_audio = false;
+            self.tabs_dirty = true;
+        }
     }
 
     /// Close tab `index`. The last tab stays: closing it would leave the tile
@@ -1279,6 +1529,7 @@ impl BrowserHost {
                 self.tabs[next].view = Some(view);
             }
             self.active_tab = next;
+            self.tabs[next].hidden_since = None;
             self.show_active_view();
         }
         Ok(())
@@ -1445,12 +1696,14 @@ impl BrowserHost {
                 url,
                 title,
                 playing_audio,
+                favicon,
+                ..
             } = tab;
             let Some(view) = view.as_mut() else {
                 continue;
             };
             view.refresh_live_url();
-            let (navigate, crashed, video_rect) = {
+            let (navigate, crashed, video_rect, icon) = {
                 let mut state = view.shared.lock();
                 if !state.dirty {
                     continue;
@@ -1462,13 +1715,20 @@ impl BrowserHost {
                 }
                 *playing_audio = state.playing_audio;
                 update.download_blocked |= std::mem::take(&mut state.download_blocked);
+                update
+                    .new_tile_requests
+                    .append(&mut state.new_tile_requests);
                 (
                     state.pending_navigation.take(),
                     std::mem::take(&mut state.page_crashed),
                     state.video_rect.take(),
+                    state.favicon.take(),
                 )
             };
             changed = true;
+            if let Some((uri, png)) = icon {
+                *favicon = decode_favicon(uri, &png);
+            }
             if let Some(url) = navigate {
                 update.new_window_requests.push(url);
             }
@@ -1492,15 +1752,7 @@ impl BrowserHost {
             update.loading = view.shared.lock().loading;
             (update.can_go_back, update.can_go_forward) = view.history_state();
         }
-        update.tabs = self
-            .tabs
-            .iter()
-            .map(|tab| BrowserTab {
-                url: tab.url.clone(),
-                title: tab.title.clone(),
-                playing_audio: tab.playing_audio,
-            })
-            .collect();
+        update.tabs = self.tabs.iter().map(HostTab::snapshot).collect();
         update.active_tab = self.active_tab;
         update
     }
@@ -2303,6 +2555,20 @@ impl BrowserManager {
         }
     }
 
+    pub fn move_tab(&mut self, id: PreviewId, from: usize, to: usize) {
+        if let Some(host) = self.hosts.get_mut(&id) {
+            host.move_tab(from, to);
+        }
+    }
+
+    /// Put idle background tabs of every tile to sleep.
+    pub fn sleep_idle_tabs(&mut self) {
+        let now = Instant::now();
+        for host in self.hosts.values_mut() {
+            host.sleep_idle_tabs(now);
+        }
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = PreviewId> + '_ {
         self.hosts.keys().copied()
     }
@@ -2926,13 +3192,38 @@ unsafe extern "system" fn browser_window_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_geometry, capture_size_for_tile, extract_ubol_archive_with_progress,
-        installed_ubol_has_current_marker, installed_ubol_matches_package, is_allowed_navigation,
-        normalize_url, parked_bounds, profile_install_marker_path, read_profile_install_marker,
+        browser_geometry, capture_size_for_tile, decode_favicon,
+        extract_ubol_archive_with_progress, installed_ubol_has_current_marker,
+        installed_ubol_matches_package, is_allowed_navigation, moved_index, normalize_url,
+        parked_bounds, profile_install_marker_path, read_profile_install_marker,
         scrub_url_for_storage, ubol_archive_candidates, ubol_verification_marker_path,
         verify_ubol_archive, write_profile_install_marker, write_ubol_verification_marker,
-        NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE_NAME, UBOL_VERSION,
+        NativeWindow, FAVICON_SIZE, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE_NAME, UBOL_VERSION,
     };
+
+    #[test]
+    fn moving_a_tab_keeps_track_of_every_other_tab() {
+        // Tabs a b c d; move b (1) to the end (3): a c d b.
+        assert_eq!(moved_index(1, 1, 3), 3);
+        assert_eq!(moved_index(2, 1, 3), 1);
+        assert_eq!(moved_index(3, 1, 3), 2);
+        assert_eq!(moved_index(0, 1, 3), 0);
+        // Move d (3) to the front (0): d a b c.
+        assert_eq!(moved_index(3, 3, 0), 0);
+        assert_eq!(moved_index(0, 3, 0), 1);
+        assert_eq!(moved_index(2, 3, 0), 3);
+    }
+
+    #[test]
+    fn site_icons_decode_and_shrink_to_badge_size() {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(128, 128, image::Rgba([200, 40, 40, 255]))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let favicon = decode_favicon("https://example.com/favicon.ico".to_owned(), &png).unwrap();
+        assert_eq!(favicon.image.size, [FAVICON_SIZE as usize; 2]);
+        assert!(decode_favicon(String::new(), b"not a png").is_none());
+    }
     use eframe::egui;
     use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicU32, Ordering};

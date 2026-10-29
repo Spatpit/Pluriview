@@ -1530,30 +1530,35 @@ impl CanvasState {
                 ui.label(error);
             }
         });
+    }
+
+    /// Group layouts (for a tile in a group), sizes and stacking order.
+    pub(super) fn arrange_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: PreviewId,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+        shortcuts: &HotkeyBindings,
+    ) {
+        let grouped = self.group_members(id, previews).len() > 1;
         ui.menu_button("Arrange", |ui| {
             crate::ui_theme::menu(ui);
-            for (large_count, slot, label) in LAYOUTS {
-                if ui
-                    .add_enabled(
-                        self.group_members(id, previews).len() > 1,
-                        crate::ui_theme::shortcut_button(label, shortcuts.get(slot)),
-                    )
-                    .clicked()
-                {
-                    self.apply_spotlight_layout(large_count, Some(id), viewport, previews);
+            if grouped {
+                for (large_count, slot, label) in LAYOUTS {
+                    if ui
+                        .add(crate::ui_theme::shortcut_button(label, shortcuts.get(slot)))
+                        .clicked()
+                    {
+                        self.apply_spotlight_layout(large_count, Some(id), viewport, previews);
+                        ui.close_menu();
+                    }
+                }
+                if ui.button("Fit Group to View").clicked() {
+                    self.fit_group_to_view(id, viewport, previews);
                     ui.close_menu();
                 }
-            }
-            ui.separator();
-            if ui
-                .add_enabled(
-                    self.group_members(id, previews).len() > 1,
-                    egui::Button::new("Fit Group to View"),
-                )
-                .clicked()
-            {
-                self.fit_group_to_view(id, viewport, previews);
-                ui.close_menu();
+                ui.separator();
             }
             ui.menu_button("Size", |ui| {
                 crate::ui_theme::menu(ui);
@@ -1567,16 +1572,34 @@ impl CanvasState {
                     }
                 }
             });
+            ui.separator();
+            if ui.button("Bring to Front").clicked() {
+                previews.bring_to_front(id);
+                ui.close_menu();
+            }
+            if ui.button("Send to Back").clicked() {
+                previews.send_to_back(id);
+                ui.close_menu();
+            }
         });
-        if ui
-            .add_enabled(
-                self.group_members(id, previews).len() > 1,
-                crate::ui_theme::shortcut_button(
+    }
+
+    /// Spotlight is only offered for a tile in a group.
+    pub(super) fn spotlight_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: PreviewId,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+        shortcuts: &HotkeyBindings,
+    ) {
+        if self.group_members(id, previews).len() > 1
+            && ui
+                .add(crate::ui_theme::shortcut_button(
                     "Spotlight This Tile",
                     shortcuts.get(HotkeySlot::ToggleSpotlight),
-                ),
-            )
-            .clicked()
+                ))
+                .clicked()
         {
             self.toggle_spotlight(id, viewport, previews);
             ui.close_menu();

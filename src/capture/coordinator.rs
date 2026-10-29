@@ -11,7 +11,7 @@ use windows_capture::capture::GraphicsCaptureApiError;
 use windows_capture::graphics_capture_api::GraphicsCaptureApi;
 use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
 
-use super::downsample::{fitted_capture_size, RgbaDownsampler};
+use super::downsample::{exact_capture_size, fitted_capture_size, RgbaDownsampler};
 
 /// Frame data sent from capture threads
 pub(crate) struct CapturedFrame {
@@ -126,6 +126,10 @@ struct CaptureSession {
     /// repaint request because they are polled continuously.
     window_hwnd: Option<isize>,
 
+    /// Browser sessions keep their newest frame on the GPU and resize that
+    /// copy when the target changes, instead of asking the source to repaint.
+    retains_source: bool,
+
     /// Is capture active?
     active: Arc<AtomicBool>,
 
@@ -185,6 +189,30 @@ impl CaptureCoordinator {
         window_title: String,
         target_fps: u32,
     ) {
+        self.start_window_capture(preview_id, hwnd, window_title, target_fps, false);
+    }
+
+    /// Capture a parked browser tile. Its output follows the size the page is
+    /// shown at (see [`Self::set_target_size`]), even while a static page
+    /// sends no new frames.
+    pub fn start_browser_capture(
+        &mut self,
+        preview_id: PreviewId,
+        hwnd: isize,
+        url: String,
+        target_fps: u32,
+    ) {
+        self.start_window_capture(preview_id, hwnd, url, target_fps, true);
+    }
+
+    fn start_window_capture(
+        &mut self,
+        preview_id: PreviewId,
+        hwnd: isize,
+        window_title: String,
+        target_fps: u32,
+        retain_source: bool,
+    ) {
         // Windows Graphics Capture rejects a second session on the same HWND
         // while the previous one is still shutting down. Replacing a live
         // tile must wait for that release, or the new session fails and the
@@ -225,6 +253,7 @@ impl CaptureCoordinator {
                 worker_state,
                 stop_receiver,
                 worker_closed,
+                retain_source,
             );
         });
 
@@ -234,6 +263,7 @@ impl CaptureCoordinator {
             target_height,
             target_generation,
             window_hwnd: Some(hwnd),
+            retains_source: retain_source,
             active,
             paused,
             has_produced_frame,
@@ -291,6 +321,7 @@ impl CaptureCoordinator {
                 target_height,
                 target_generation,
                 window_hwnd: None,
+                retains_source: false,
                 active,
                 paused,
                 has_produced_frame,
@@ -359,7 +390,9 @@ impl CaptureCoordinator {
             // Windows Graphics Capture may not emit another callback for a
             // static source. Invalidating it is asynchronous and coalesced by
             // Windows, but prompts traditional windows to paint a fresh frame.
-            if (width > old_width || height > old_height)
+            // A browser session resizes its retained frame instead.
+            if !session.retains_source
+                && (width > old_width || height > old_height)
                 && session.window_hwnd.is_some_and(request_capture_repaint)
             {
                 log::trace!("Requested a source repaint for capture resolution upgrade");
@@ -525,6 +558,7 @@ fn capture_window_loop(
     worker_state: CaptureWorkerState,
     stop_receiver: Receiver<()>,
     closed: Arc<AtomicBool>,
+    retain_source: bool,
 ) {
     use windows_capture::{
         capture::{Context, GraphicsCaptureApiHandler},
@@ -563,6 +597,7 @@ fn capture_window_loop(
         target_height: Arc<AtomicU32>,
         target_generation: Arc<AtomicU32>,
         frame_wake: Arc<FrameWake>,
+        retain_source: bool,
     }
 
     struct Capture {
@@ -584,6 +619,53 @@ fn capture_window_loop(
         readback_scratch: Vec<u8>,
         downsampler: RgbaDownsampler,
         gpu_downsampler: super::gpu_downsample::GpuDownsampler,
+        retain_source: bool,
+    }
+
+    impl Capture {
+        /// The size a `width` x `height` source frame is delivered at. A
+        /// browser's page is shown at exactly its requested size.
+        fn output_size(&self, width: u32, height: u32) -> (u32, u32) {
+            let target_width = self.target_width.load(Ordering::Relaxed);
+            let target_height = self.target_height.load(Ordering::Relaxed);
+            if self.retain_source {
+                exact_capture_size(width, height, target_width, target_height)
+            } else {
+                fitted_capture_size(width, height, target_width, target_height)
+            }
+        }
+
+        /// Publish the retained frame at a newly requested size. A static page
+        /// sends no new frame after a zoom, so without this it would keep
+        /// showing a frame sized for the old zoom.
+        fn refresh_from_retained(&mut self) {
+            if !self.retain_source
+                || !self.active.load(Ordering::Relaxed)
+                || self.paused.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            let requested_generation = self.target_generation.load(Ordering::Acquire);
+            if requested_generation == self.handled_target_generation {
+                return;
+            }
+            let Some((width, height)) = self.gpu_downsampler.retained_size() else {
+                return;
+            };
+            let (out_width, out_height) = self.output_size(width, height);
+            let Some(data) = self
+                .gpu_downsampler
+                .resample_retained(out_width, out_height)
+            else {
+                return;
+            };
+            *self.latest_frame.lock() = Some(CapturedFrame::from_rgba(
+                out_width, out_height, width, height, &data,
+            ));
+            self.handled_target_generation = requested_generation;
+            self.last_frame = std::time::Instant::now();
+            self.frame_wake.notify();
+        }
     }
 
     impl GraphicsCaptureApiHandler for Capture {
@@ -613,6 +695,7 @@ fn capture_window_loop(
                     ctx.device,
                     ctx.device_context,
                 ),
+                retain_source: ctx.flags.retain_source,
             })
         }
 
@@ -655,17 +738,26 @@ fn capture_window_loop(
             // Decide output geometry while the source is still GPU-only.
             let width = frame.width();
             let height = frame.height();
-            let (out_width, out_height) = fitted_capture_size(
-                width,
-                height,
-                self.target_width.load(Ordering::Relaxed),
-                self.target_height.load(Ordering::Relaxed),
-            );
+            let (out_width, out_height) = self.output_size(width, height);
 
-            let gpu_pixels = self.gpu_downsampler.downsample(
-                frame.as_raw_texture(),
-                [width, height, out_width, out_height],
-            );
+            // A browser keeps its newest frame on the GPU and resizes from that
+            // copy, so `refresh_from_retained` can resize it again later.
+            let retained = self.retain_source
+                && self
+                    .gpu_downsampler
+                    .retain(frame.as_raw_texture(), width, height);
+            let gpu_pixels = retained
+                .then(|| {
+                    self.gpu_downsampler
+                        .resample_retained(out_width, out_height)
+                })
+                .flatten()
+                .or_else(|| {
+                    self.gpu_downsampler.downsample(
+                        frame.as_raw_texture(),
+                        [width, height, out_width, out_height],
+                    )
+                });
             let captured_frame = if let Some(data) = gpu_pixels {
                 #[cfg(pluriview_performance)]
                 crate::app::performance::counters::record(
@@ -745,6 +837,7 @@ fn capture_window_loop(
         target_height,
         target_generation,
         frame_wake: frame_wake.clone(),
+        retain_source,
     };
 
     // Request WithoutCursor / WithoutBorder only when those Graphics Capture
@@ -789,10 +882,17 @@ fn capture_window_loop(
     // without waiting for another frame callback to arrive.
     match start_result {
         Ok(control) => {
+            // A browser session also wakes often enough to follow a zoom on a
+            // page that sends no new frames.
+            let handler = control.callback();
+            let wake = std::time::Duration::from_millis(if retain_source { 20 } else { 100 });
             while active.load(Ordering::Relaxed) {
-                match stop_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                match stop_receiver.recv_timeout(wake) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {}
+                }
+                if retain_source {
+                    handler.lock().refresh_from_retained();
                 }
             }
             if let Err(error) = control.stop() {
@@ -901,6 +1001,7 @@ mod tests {
             target_height: Arc::new(AtomicU32::new(0)),
             target_generation: Arc::new(AtomicU32::new(0)),
             window_hwnd: None,
+            retains_source: false,
             active: Arc::new(AtomicBool::new(active)),
             paused: Arc::new(AtomicBool::new(paused)),
             has_produced_frame: Arc::new(AtomicBool::new(true)),
@@ -1190,6 +1291,7 @@ mod tests {
                 target_height: Arc::new(AtomicU32::new(0)),
                 target_generation: Arc::new(AtomicU32::new(0)),
                 window_hwnd: None,
+                retains_source: false,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 has_produced_frame: Arc::new(AtomicBool::new(false)),
@@ -1221,6 +1323,7 @@ mod tests {
                 target_height: Arc::new(AtomicU32::new(0)),
                 target_generation: Arc::new(AtomicU32::new(0)),
                 window_hwnd: None,
+                retains_source: false,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 has_produced_frame: Arc::new(AtomicBool::new(false)),
@@ -1307,6 +1410,7 @@ mod tests {
                 target_height: Arc::new(AtomicU32::new(0)),
                 target_generation: Arc::new(AtomicU32::new(0)),
                 window_hwnd: None,
+                retains_source: false,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 has_produced_frame: Arc::new(AtomicBool::new(false)),

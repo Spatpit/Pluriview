@@ -5,7 +5,7 @@ mod manager;
 mod preview;
 mod video_preferences;
 
-pub use browser_chrome::BrowserTab;
+pub use browser_chrome::{BrowserTab, Favicon};
 pub use video_preferences::{VideoPlaybackPreferences, VideoTrackPreference};
 
 pub use manager::{PreviewManager, RemovedPreviewInfo};

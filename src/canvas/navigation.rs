@@ -319,52 +319,44 @@ impl CanvasState {
         }
     }
 
-    pub(super) fn crop_menu(
+    pub(super) fn crop_items(
         &mut self,
         ui: &mut egui::Ui,
         id: PreviewId,
         canvas_rect: Rect,
         preview_manager: &mut PreviewManager,
     ) {
-        ui.menu_button("Crop", |ui| {
-            crate::ui_theme::menu(ui);
-            let editing = self.crop_mode == Some(id);
-            let can_crop = preview_manager.get(id).is_some_and(Self::can_edit_crop);
-            if ui
-                .add_enabled(
-                    can_crop,
-                    egui::Button::new(if editing {
-                        "Finish Cropping"
-                    } else {
-                        "Edit Crop"
-                    }),
-                )
-                .clicked()
-            {
-                if editing {
-                    self.finish_crop();
+        let editing = self.crop_mode == Some(id);
+        let can_crop = preview_manager.get(id).is_some_and(Self::can_edit_crop);
+        if ui
+            .add_enabled(
+                can_crop,
+                egui::Button::new(if editing {
+                    "Finish Cropping"
                 } else {
-                    self.begin_crop(id, preview_manager);
-                }
-                ui.close_menu();
+                    "Edit Crop"
+                }),
+            )
+            .on_hover_text("Alt+drag edges or corners also crops")
+            .clicked()
+        {
+            if editing {
+                self.finish_crop();
+            } else {
+                self.begin_crop(id, preview_manager);
             }
-            let has_crop = preview_manager
-                .get(id)
-                .is_some_and(|preview| preview.crop_uv.is_some());
-            if ui
-                .add_enabled(has_crop, egui::Button::new("Clear Crop"))
-                .clicked()
-            {
-                self.set_preview_crop(id, None, canvas_rect, preview_manager);
-                ui.close_menu();
-            }
-            ui.separator();
-            ui.label(
-                egui::RichText::new("Alt+drag edges or corners also crops")
-                    .weak()
-                    .small(),
-            );
-        });
+            ui.close_menu();
+        }
+        let has_crop = preview_manager
+            .get(id)
+            .is_some_and(|preview| preview.crop_uv.is_some());
+        if ui
+            .add_enabled(has_crop, egui::Button::new("Clear Crop"))
+            .clicked()
+        {
+            self.set_preview_crop(id, None, canvas_rect, preview_manager);
+            ui.close_menu();
+        }
     }
 
     /// Apply or clear crop UVs while changing the tile bounds by the same
@@ -779,6 +771,13 @@ impl CanvasState {
             return false;
         };
         if self.left_click_preview_at_screen(pointer, canvas_rect, preview_manager) != Some(id) {
+            return false;
+        }
+        // Tabs drag within their strip instead of moving the tile.
+        if preview_manager
+            .get(id)
+            .is_some_and(|preview| self.over_tab_list(preview, screen_rect, pointer))
+        {
             return false;
         }
         let over_resize_handle = show_overlays

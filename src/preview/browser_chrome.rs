@@ -5,7 +5,9 @@
 //! the canvas never changes the page's share of the tile and therefore never
 //! relayouts the page.
 
-use eframe::egui::{Pos2, Rect, Vec2};
+use std::sync::Arc;
+
+use eframe::egui::{ColorImage, Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
 
 use super::Preview;
@@ -26,6 +28,33 @@ pub struct BrowserTab {
     /// The page is producing sound (runtime only).
     #[serde(skip)]
     pub playing_audio: bool,
+    /// The site's icon, once the page has reported one (runtime only).
+    #[serde(skip)]
+    pub favicon: Option<Favicon>,
+    /// The tab has no page loaded: it was restored with the workspace, or
+    /// put to sleep in the background. It loads when shown (runtime only).
+    #[serde(skip)]
+    pub sleeping: bool,
+}
+
+/// A site icon decoded for drawing. Tabs on the same site share one.
+#[derive(Clone)]
+pub struct Favicon {
+    /// Where the page loaded it from; identifies the icon.
+    pub uri: String,
+    pub image: Arc<ColorImage>,
+}
+
+impl PartialEq for Favicon {
+    fn eq(&self, other: &Self) -> bool {
+        self.uri == other.uri
+    }
+}
+
+impl std::fmt::Debug for Favicon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Favicon").field("uri", &self.uri).finish()
+    }
 }
 
 impl BrowserTab {

@@ -15,7 +15,16 @@ pub(super) struct GpuDownsampler {
     shader: Option<ID3D11ComputeShader>,
     input_view: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
     resources: Option<Resources>,
+    retained: Option<Retained>,
     disabled: bool,
+}
+
+/// This worker's own copy of the newest accepted frame, so the output can be
+/// resized again when a static source sends no new frame.
+struct Retained {
+    texture: ID3D11Texture2D,
+    width: u32,
+    height: u32,
 }
 
 struct Resources {
@@ -28,7 +37,8 @@ struct Resources {
     constants: ID3D11Buffer,
 }
 
-fn eligible([width, height, out_width, out_height]: [u32; 4]) -> bool {
+/// `same_size` also accepts an output as large as the source, which copies it.
+fn eligible([width, height, out_width, out_height]: [u32; 4], same_size: bool) -> bool {
     width > 0
         && height > 0
         && out_width > 0
@@ -37,7 +47,7 @@ fn eligible([width, height, out_width, out_height]: [u32; 4]) -> bool {
         && height <= 16384
         && out_width <= width
         && out_height <= height
-        && (out_width < width || out_height < height)
+        && (same_size || out_width < width || out_height < height)
         && width.div_ceil(out_width) * height.div_ceil(out_height) <= MAX_SAMPLES_PER_PIXEL
 }
 
@@ -53,6 +63,7 @@ impl GpuDownsampler {
             shader: None,
             input_view: None,
             resources: None,
+            retained: None,
             disabled,
         }
     }
@@ -64,10 +75,51 @@ impl GpuDownsampler {
         source: &ID3D11Texture2D,
         dimensions: [u32; 4],
     ) -> Option<Vec<u8>> {
+        self.resample(source, dimensions, false)
+    }
+
+    /// Copy the `width` x `height` content of `source` into this worker's own
+    /// texture for [`Self::resample_retained`]. Returns whether it was kept.
+    pub fn retain(&mut self, source: &ID3D11Texture2D, width: u32, height: u32) -> bool {
+        if self.disabled {
+            return false;
+        }
+        match self.try_retain(source, width, height) {
+            Ok(()) => true,
+            Err(error) => {
+                self.retained = None;
+                log::warn!("Could not keep a capture frame on the GPU: {error}");
+                false
+            }
+        }
+    }
+
+    /// Size of the retained frame, if there is one.
+    pub fn retained_size(&self) -> Option<(u32, u32)> {
+        self.retained
+            .as_ref()
+            .map(|retained| (retained.width, retained.height))
+    }
+
+    /// The retained frame resized to `out_width` x `out_height`, at most its
+    /// own size.
+    pub fn resample_retained(&mut self, out_width: u32, out_height: u32) -> Option<Vec<u8>> {
+        let retained = self.retained.as_ref()?;
+        let texture = retained.texture.clone();
+        let dimensions = [retained.width, retained.height, out_width, out_height];
+        self.resample(&texture, dimensions, true)
+    }
+
+    fn resample(
+        &mut self,
+        source: &ID3D11Texture2D,
+        dimensions: [u32; 4],
+        same_size: bool,
+    ) -> Option<Vec<u8>> {
         if self.disabled {
             return None;
         }
-        if !eligible(dimensions) {
+        if !eligible(dimensions, same_size) {
             self.resources = None;
             self.input_view = None;
             return None;
@@ -83,6 +135,77 @@ impl GpuDownsampler {
                 None
             }
         }
+    }
+
+    fn try_retain(
+        &mut self,
+        source: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        unsafe {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            source.GetDesc(&mut desc);
+            if desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM
+                || desc.SampleDesc.Count != 1
+                || width == 0
+                || height == 0
+                || desc.Width < width
+                || desc.Height < height
+            {
+                return Err("unsupported capture texture".into());
+            }
+            if self
+                .retained
+                .as_ref()
+                .is_none_or(|retained| (retained.width, retained.height) != (width, height))
+            {
+                self.retained = None;
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: width,
+                    Height: height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                let mut texture = None;
+                self.device
+                    .CreateTexture2D(&desc, None, Some(&mut texture))
+                    .map_err(|e| e.to_string())?;
+                self.retained = Some(Retained {
+                    texture: texture.ok_or("no texture")?,
+                    width,
+                    height,
+                });
+            }
+            let retained = self.retained.as_ref().unwrap();
+            // A frame pool can be larger than the content; copy only the content.
+            let content = D3D11_BOX {
+                right: width,
+                bottom: height,
+                back: 1,
+                ..Default::default()
+            };
+            self.context.CopySubresourceRegion(
+                &retained.texture,
+                0,
+                0,
+                0,
+                0,
+                source,
+                0,
+                Some(&content),
+            );
+        }
+        Ok(())
     }
 
     fn try_downsample(
@@ -347,12 +470,15 @@ mod tests {
 
     #[test]
     fn gpu_resize_eligibility_preserves_native_and_extreme_cpu_paths() {
-        assert!(eligible([3840, 2160, 800, 450]));
-        assert!(!eligible([640, 360, 640, 360]));
-        assert!(!eligible([640, 360, 1280, 720]));
-        assert!(!eligible([3840, 2160, 1, 1]));
-        assert!(!eligible([0, 360, 0, 180]));
-        assert!(!eligible([u32::MAX, u32::MAX, 1, 1]));
+        assert!(eligible([3840, 2160, 800, 450], false));
+        assert!(!eligible([640, 360, 640, 360], false));
+        assert!(!eligible([640, 360, 1280, 720], false));
+        assert!(!eligible([3840, 2160, 1, 1], false));
+        assert!(!eligible([0, 360, 0, 180], false));
+        assert!(!eligible([u32::MAX, u32::MAX, 1, 1], false));
+        // A retained frame may be copied out at its own size, never larger.
+        assert!(eligible([640, 360, 640, 360], true));
+        assert!(!eligible([640, 360, 1280, 720], true));
     }
 
     #[test]
@@ -505,6 +631,95 @@ mod tests {
                     assert!(unsupported.resources.is_none());
                 }
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Direct3D 11 GPU; resizes a retained frame without a new source frame"]
+    fn retained_frames_resize_again_without_a_new_source_frame() {
+        unsafe {
+            let mut device = None;
+            let mut context = None;
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .unwrap();
+            let device = device.unwrap();
+            let mut gpu = GpuDownsampler::new(device.clone(), context.unwrap());
+            let mut cpu = RgbaDownsampler::default();
+            // The frame pool's texture is larger than the content in it.
+            let (width, height) = (97_u32, 41_u32);
+            let (backing_width, backing_height) = (width + 9, height + 5);
+            let stride = backing_width * 4;
+            let pixels: Vec<u8> = (0..stride * backing_height)
+                .map(|index| (index * 31 % 251) as u8)
+                .collect();
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: backing_width,
+                Height: backing_height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                ..Default::default()
+            };
+            let initial = D3D11_SUBRESOURCE_DATA {
+                pSysMem: pixels.as_ptr().cast(),
+                SysMemPitch: stride,
+                ..Default::default()
+            };
+            let mut source = None;
+            device
+                .CreateTexture2D(&desc, Some(&initial), Some(&mut source))
+                .unwrap();
+            let source = source.unwrap();
+
+            assert!(gpu.retained_size().is_none());
+            assert!(gpu.resample_retained(width, height).is_none());
+            assert!(gpu.retain(&source, width, height));
+            assert_eq!(gpu.retained_size(), Some((width, height)));
+            // At its own size the copy is the content, byte for byte.
+            let content: Vec<u8> = (0..height)
+                .flat_map(|y| {
+                    let row = (y * stride) as usize;
+                    pixels[row..row + (width * 4) as usize].to_vec()
+                })
+                .collect();
+            assert_eq!(gpu.resample_retained(width, height).unwrap(), content);
+            // Smaller sizes, including one off the source's shape, match the CPU.
+            for (out_width, out_height) in [(48, 20), (13, 7), (49, 20), (48, 20)] {
+                assert_eq!(
+                    gpu.resample_retained(out_width, out_height).unwrap(),
+                    cpu.downsample(&pixels, width, height, stride, out_width, out_height)
+                        .unwrap(),
+                    "{out_width}x{out_height}"
+                );
+            }
+            assert!(gpu.resample_retained(width + 1, height).is_none());
+            assert!(
+                !gpu.disabled,
+                "asking for a larger size must not disable resizing"
+            );
+
+            // New content of another size replaces the copy; bad input drops it.
+            assert!(gpu.retain(&source, width - 10, height - 3));
+            assert_eq!(gpu.retained_size(), Some((width - 10, height - 3)));
+            assert!(!gpu.retain(&source, backing_width + 1, height));
+            assert!(gpu.retained_size().is_none());
+            assert!(!gpu.disabled, "a failed copy must not disable resizing");
         }
     }
 }

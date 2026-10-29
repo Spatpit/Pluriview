@@ -5,7 +5,7 @@ use crate::browser::{
 };
 use crate::canvas::{
     BrowserAction, BrowserNavigation, CanvasKeyboardInput, CanvasState, CanvasWallpaper,
-    MediaAction, PlaylistAction, TileActivityAction, VideoAction, WallpaperSource,
+    MediaAction, PlaylistAction, TabDetach, TileActivityAction, VideoAction, WallpaperSource,
     WALLPAPER_VIDEO_ID,
 };
 use crate::capture::CaptureCoordinator;
@@ -224,6 +224,39 @@ fn browser_capture_display_size(preview: &Preview) -> Vec2 {
         preview.crop_uv,
     )
     .size()
+}
+
+/// The pixel size a parked browser's frames are shrunk to: its whole page as
+/// it appears on screen, plus a couple of spare pixels so the page snapped to
+/// whole screen pixels never needs more than a frame has. A screenshot, a
+/// recording or a Picture in Picture window takes full frames instead.
+#[cfg(windows)]
+fn browser_capture_target(
+    preview: &Preview,
+    canvas_zoom: f32,
+    pixels_per_point: f32,
+) -> (u32, u32) {
+    const SPARE_PIXELS: f32 = 2.0;
+    if preview.screenshot_wants_native_frame
+        || preview.recording
+        || preview.recording_full_size
+        || preview.picture_in_picture.is_some()
+    {
+        return (
+            crate::capture::MAX_CAPTURE_WIDTH,
+            crate::capture::MAX_CAPTURE_HEIGHT,
+        );
+    }
+    let zoom = if preview.viewport_pin.is_some() {
+        1.0
+    } else {
+        canvas_zoom
+    };
+    let size = browser_capture_display_size(preview) * zoom * pixels_per_point;
+    (
+        (size.x.round() + SPARE_PIXELS).max(1.0) as u32,
+        (size.y.round() + SPARE_PIXELS).max(1.0) as u32,
+    )
 }
 
 fn restore_layout_tile_state(preview: &mut Preview, saved: &PreviewLayout) {
@@ -2025,7 +2058,8 @@ impl PluriviewApp {
                         }
                     });
                 if let Some(hwnd) = resumed_hwnd {
-                    self.capture_coordinator.start_capture(id, hwnd, title, fps);
+                    self.capture_coordinator
+                        .start_browser_capture(id, hwnd, title, fps);
                 }
             } else if let Some(sender) = spout_sender {
                 self.capture_coordinator
@@ -2505,7 +2539,7 @@ impl PluriviewApp {
             preview.set_fps_preset(fps);
         }
         self.capture_coordinator
-            .start_capture(id, hwnd, url.to_owned(), fps.as_u32());
+            .start_browser_capture(id, hwnd, url.to_owned(), fps.as_u32());
         Ok(())
     }
 
@@ -3011,6 +3045,7 @@ impl PluriviewApp {
                         Some((format!("Could not open this tab: {error}"), Instant::now()));
                 }
             }
+            BrowserAction::MoveTab { from, to } => self.browser.move_tab(id, from, to),
             BrowserAction::CloseTab(index) => {
                 if let Err(error) = self.browser.close_tab(id, index) {
                     self.canvas_notice = Some((
@@ -3068,6 +3103,70 @@ impl PluriviewApp {
         }
         if !browser::is_search_url(&url) {
             self.remember_recent_url(&url);
+        }
+    }
+
+    /// Open tab `detach.index` of a tile as a tile of its own, then close it
+    /// in the original tile.
+    #[cfg(windows)]
+    fn detach_browser_tab(&mut self, detach: TabDetach) {
+        let Some(url) = self
+            .browser
+            .get(detach.id)
+            .and_then(|host| host.tab_urls().get(detach.index).cloned())
+        else {
+            return;
+        };
+        // Drop the new tile under the pointer, its toolbar where the tab was.
+        let position = detach.position.map(|point| point - Vec2::new(60.0, 18.0));
+        if self.open_url_in_new_tile(detach.id, &url, position) {
+            if let Err(error) = self.browser.close_tab(detach.id, detach.index) {
+                log::warn!("Could not close a tab moved to a new tile: {error}");
+            }
+        }
+    }
+
+    /// Open `url` in a new browser tile shaped like `source`, at `position`
+    /// (canvas units) or just right of it. Returns whether the tile opened.
+    #[cfg(windows)]
+    fn open_url_in_new_tile(
+        &mut self,
+        source: PreviewId,
+        url: &str,
+        position: Option<Pos2>,
+    ) -> bool {
+        const DEFAULT_SIZE: Vec2 = Vec2::new(1000.0, 620.0);
+        const GAP: f32 = 24.0;
+        let (size, beside, fps, framed) = match self.preview_manager.get(source) {
+            Some(preview) => {
+                let size = if preview.viewport_pin.is_some() {
+                    DEFAULT_SIZE
+                } else {
+                    preview.size
+                };
+                (
+                    size,
+                    preview.position + Vec2::new(preview.size.x + GAP, 0.0),
+                    preview.fps_preset,
+                    preview.browser_chrome,
+                )
+            }
+            None => (DEFAULT_SIZE, Pos2::ZERO, FpsPreset::Medium, true),
+        };
+        match self.create_browser_tile(url, position.unwrap_or(beside), size, fps) {
+            Ok(id) => {
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.browser_chrome = framed;
+                }
+                true
+            }
+            Err(error) => {
+                self.canvas_notice = Some((
+                    format!("Could not open a new tile: {error}"),
+                    Instant::now(),
+                ));
+                false
+            }
         }
     }
 
@@ -3381,7 +3480,11 @@ impl PluriviewApp {
         }
         let mut video_fits = Vec::new();
         let mut new_windows = Vec::new();
+        let mut new_tiles = Vec::new();
         for (id, mut update) in updates {
+            for url in std::mem::take(&mut update.new_tile_requests) {
+                new_tiles.push((id, url));
+            }
             if let Some(found) = update.video_rect {
                 video_fits.push((id, found));
             }
@@ -3426,6 +3529,11 @@ impl PluriviewApp {
                 }
             }
         }
+        for (id, url) in new_tiles {
+            self.open_url_in_new_tile(id, &url, None);
+        }
+        // Background tabs left alone for a while unload to free memory.
+        self.browser.sleep_idle_tabs();
         if let Some(crash) = page_crash {
             self.note_browser_page_crash(crash);
         }
@@ -3453,7 +3561,9 @@ impl PluriviewApp {
         // Give parked browsers a stable supersampled backing derived from the
         // tile's model size, not the canvas zoom. A viewport-pinned browser
         // uses its fixed screen size. This keeps previews sharp without making
-        // responsive pages resize while the canvas zooms.
+        // responsive pages resize while the canvas zooms. Their frames are
+        // then shrunk on the GPU to the size the page is shown at, so each
+        // captured pixel lands on one screen pixel.
         let pixels_per_point = ctx.pixels_per_point();
         let ids: Vec<_> = self.browser.ids().collect();
         for id in ids {
@@ -3470,6 +3580,9 @@ impl PluriviewApp {
                 physical_size.x.round() as i32,
                 physical_size.y.round() as i32,
             );
+            let target = browser_capture_target(preview, self.canvas.zoom, pixels_per_point);
+            self.capture_coordinator
+                .set_target_size(id, target.0, target.1);
             if let Some(host) = self.browser.get_mut(id) {
                 host.sync_capture_size(capture_size.0, capture_size.1);
                 host.set_page_zoom(page_zoom);
@@ -4683,12 +4796,13 @@ mod tests {
     use super::{
         active_canvas_view_after_deletion, active_canvas_view_after_insertion,
         adjacent_canvas_view_index, browser_capture_display_size, browser_capture_fps,
-        browser_page_screen_rect, browser_tile_screen_rect, camera_matches_canvas_view,
-        find_saved_window, mark_pending_browser_placeholders_shown, preview_video_status,
-        restore_browser_geometry, restored_browser_ready, restored_video_ready,
-        resumable_video_position, video_launch_for_source, video_session_is_stale,
-        wallpaper_hibernation_due, CanvasView, FpsPreset, PendingBrowserTile, PendingVideoTile,
-        VideoSource, VideoTileStatus, WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID,
+        browser_capture_target, browser_page_screen_rect, browser_tile_screen_rect,
+        camera_matches_canvas_view, find_saved_window, mark_pending_browser_placeholders_shown,
+        preview_video_status, restore_browser_geometry, restored_browser_ready,
+        restored_video_ready, resumable_video_position, video_launch_for_source,
+        video_session_is_stale, wallpaper_hibernation_due, CanvasView, FpsPreset,
+        PendingBrowserTile, PendingVideoTile, VideoSource, VideoTileStatus,
+        WALLPAPER_HIBERNATE_AFTER, WALLPAPER_VIDEO_ID,
     };
     use crate::canvas::CanvasState;
     use crate::external_tools::{DiscoverySource, ToolStatus};
@@ -5295,6 +5409,35 @@ mod tests {
         assert_eq!(
             browser_capture_display_size(&preview),
             Vec2::new(2000.0, 1240.0)
+        );
+    }
+
+    #[test]
+    fn parked_browser_frames_follow_the_pages_size_on_screen() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "browser".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(640.0, 360.0),
+        );
+        preview.browser_url = Some("https://example.com".to_owned());
+        // The canvas zoom and display scale, plus two spare pixels each way.
+        assert_eq!(browser_capture_target(&preview, 1.0, 1.0), (642, 362));
+        assert_eq!(browser_capture_target(&preview, 0.5, 1.5), (482, 272));
+        // A pinned tile keeps its screen size whatever the canvas zoom.
+        preview.viewport_pin = Some(crate::preview::ViewportPin::from_rect(
+            Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(400.0, 225.0)),
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0)),
+        ));
+        assert_eq!(browser_capture_target(&preview, 0.3, 1.0), (402, 227));
+        // Screenshots take full frames.
+        preview.screenshot_wants_native_frame = true;
+        assert_eq!(
+            browser_capture_target(&preview, 0.3, 1.0),
+            (
+                crate::capture::MAX_CAPTURE_WIDTH,
+                crate::capture::MAX_CAPTURE_HEIGHT
+            )
         );
     }
 
@@ -6114,6 +6257,9 @@ impl eframe::App for PluriviewApp {
             for (id, navigation) in std::mem::take(&mut self.canvas.pending_browser_navigations) {
                 self.handle_browser_navigation(id, navigation);
                 self.refocus_interactive_browser(id);
+            }
+            for detach in std::mem::take(&mut self.canvas.pending_tab_detaches) {
+                self.detach_browser_tab(detach);
             }
             for (id, u, v, delta) in std::mem::take(&mut self.canvas.pending_browser_scrolls) {
                 if let Some(host) = self.browser.get(id) {

@@ -81,6 +81,99 @@ const BADGE_COLORS: [Color32; 8] = [
     Color32::from_rgb(150, 128, 70),
 ];
 
+/// A tab being dragged in a browser tile's strip.
+#[derive(Clone, Copy)]
+pub(super) struct TabDrag {
+    id: PreviewId,
+    from: usize,
+}
+
+/// How far a tile's tab list is scrolled, in tile units, and which tab it
+/// last kept in view.
+#[derive(Clone)]
+pub(super) struct TabScroll {
+    offset: f32,
+    active: usize,
+    count: usize,
+}
+
+/// A tab dragged out of its tile (or moved with its menu) to open as a new
+/// tile, consumed by the app.
+#[derive(Clone, Copy, Debug)]
+pub struct TabDetach {
+    pub id: PreviewId,
+    pub index: usize,
+    /// Where it was dropped on the canvas, or None to place it beside.
+    pub position: Option<Pos2>,
+}
+
+/// The scrolling list of tabs and the New tab row, above the collapse button.
+struct TabList {
+    area: Rect,
+    row_height: f32,
+    gap: f32,
+    pitch: f32,
+    /// How far the list can scroll, in screen points.
+    max_scroll: f32,
+    scale: f32,
+}
+
+impl TabList {
+    fn new(layout: &ChromeLayout, tab_count: usize) -> Self {
+        let s = layout.scale;
+        let strip = layout.tabs.shrink(PAD * s);
+        let row_height = TAB_HEIGHT * s;
+        let gap = TAB_GAP * s;
+        let bottom = (strip.bottom() - row_height - gap).max(strip.top());
+        let area = Rect::from_min_max(strip.min, Pos2::new(strip.right(), bottom));
+        let pitch = row_height + gap;
+        let content = (tab_count + 1) as f32 * pitch - gap;
+        Self {
+            area,
+            row_height,
+            gap,
+            pitch,
+            max_scroll: (content - area.height()).max(0.0),
+            scale: s,
+        }
+    }
+
+    /// Row `index` (the New tab row after the tabs) at scroll `scroll`.
+    fn row(&self, index: usize, scroll: f32) -> Rect {
+        Rect::from_min_size(
+            Pos2::new(
+                self.area.left(),
+                self.area.top() + index as f32 * self.pitch - scroll,
+            ),
+            Vec2::new(self.area.width(), self.row_height),
+        )
+    }
+
+    /// The gap (0..=count) a tab dropped at height `y` goes into.
+    fn slot_at(&self, y: f32, scroll: f32, count: usize) -> usize {
+        let position = (y - self.area.top() + scroll) / self.pitch;
+        ((position + 0.5).floor().max(0.0) as usize).min(count)
+    }
+
+    fn paint_scrollbar(&self, painter: &egui::Painter, scroll: f32, s: f32) {
+        if self.max_scroll <= 0.0 {
+            return;
+        }
+        let track = self.area.height();
+        let thumb = (track * track / (track + self.max_scroll)).max(12.0 * s);
+        let top = self.area.top() + (track - thumb) * (scroll / self.max_scroll);
+        let x = self.area.right() + PAD * s / 2.0;
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x - 1.5 * s, top),
+                Pos2::new(x + 1.5 * s, top + thumb),
+            ),
+            1.5 * s,
+            Color32::from_gray(96),
+        );
+    }
+}
+
 impl CanvasState {
     /// Draw `preview`'s toolbar and tabs and queue what the user clicked.
     /// `enabled` is false while the page is starting or frozen.
@@ -467,13 +560,11 @@ impl CanvasState {
         let collapsed = preview.browser_tabs_collapsed;
         let strip = layout.tabs.shrink(PAD * s);
         let row_height = TAB_HEIGHT * s;
-        let gap = TAB_GAP * s;
         let painter = painter.with_clip_rect(layout.tabs.intersect(painter.clip_rect()));
         let footer = Rect::from_min_max(
             Pos2::new(strip.left(), strip.bottom() - row_height),
             strip.max,
         );
-        let list_bottom = footer.top() - gap;
 
         let fallback;
         let (tabs, active_tab) = if preview.browser_tabs.is_empty() {
@@ -481,6 +572,7 @@ impl CanvasState {
                 url: preview.browser_url.clone().unwrap_or_default(),
                 title: preview.title.clone(),
                 playing_audio: preview.browser_playing_audio,
+                ..BrowserTab::default()
             }];
             (&fallback[..], 0)
         } else {
@@ -491,32 +583,38 @@ impl CanvasState {
                     .min(preview.browser_tabs.len() - 1),
             )
         };
+        let list = TabList::new(&layout, tabs.len());
+        let scroll = self.tab_list_scroll(id, &list, active_tab, tabs.len());
+        let list_painter = painter.with_clip_rect(list.area.intersect(painter.clip_rect()));
         let font = egui::FontId::proportional(12.0 * s);
         let can_close = tabs.len() > 1;
-        let mut top = strip.top();
+        let dragging = self
+            .browser_tab_drag
+            .filter(|drag| drag.id == id)
+            .map(|drag| drag.from);
         for (index, tab) in tabs.iter().enumerate() {
-            let row = Rect::from_min_size(
-                Pos2::new(strip.left(), top),
-                Vec2::new(strip.width(), row_height),
-            );
-            if row.bottom() > list_bottom {
-                break;
+            let row = list.row(index, scroll);
+            let hit = row.intersect(list.area);
+            if hit.height() <= 0.0 {
+                continue;
             }
-            top = row.bottom() + gap;
             let active = index == active_tab;
             let response = ui.interact(
-                row,
+                hit,
                 ui.id().with(("browser_tab", id.0, index)),
                 if enabled {
-                    Sense::click()
+                    Sense::click_and_drag()
                 } else {
                     Sense::hover()
                 },
             );
-            let hovered = response.hovered();
+            if response.drag_started() {
+                self.browser_tab_drag = Some(TabDrag { id, from: index });
+            }
+            let hovered = response.hovered() && dragging.is_none();
             if active {
-                painter.rect_filled(row, 6.0 * s, ui_theme::GOLD_DARK);
-                painter.rect_filled(
+                list_painter.rect_filled(row, 6.0 * s, ui_theme::GOLD_DARK);
+                list_painter.rect_filled(
                     Rect::from_min_size(
                         row.left_top() + Vec2::new(0.0, 6.0 * s),
                         Vec2::new(2.5 * s, row.height() - 12.0 * s),
@@ -524,9 +622,11 @@ impl CanvasState {
                     1.5 * s,
                     ui_theme::GOLD,
                 );
-            } else if hovered {
-                painter.rect_filled(row, 6.0 * s, ui_theme::HOVER);
+            } else if hovered || dragging == Some(index) {
+                list_painter.rect_filled(row, 6.0 * s, ui_theme::HOVER);
             }
+            // Sleeping tabs fade until they are shown again.
+            let faded = tab.sleeping && !active;
             let badge = Rect::from_center_size(
                 if collapsed {
                     row.center()
@@ -535,7 +635,7 @@ impl CanvasState {
                 },
                 Vec2::splat(BADGE * s),
             );
-            paint_site_badge(&painter, badge, &tab.url, s);
+            self.paint_tab_icon(ui.ctx(), &list_painter, badge, tab, faded, s);
 
             let mut closed = false;
             if !collapsed {
@@ -546,12 +646,14 @@ impl CanvasState {
                 );
                 let color = if active {
                     ui_theme::TEXT
+                } else if faded {
+                    DISABLED
                 } else {
                     ui_theme::SECONDARY
                 };
                 let galley =
                     painter.layout_job(single_line(tab.label(), &font, color, label_rect.width()));
-                painter.galley(
+                list_painter.galley(
                     Pos2::new(label_rect.left(), row.center().y - galley.size().y / 2.0),
                     galley,
                     color,
@@ -560,10 +662,10 @@ impl CanvasState {
                     Pos2::new(row.right() - trailing / 2.0, row.center().y),
                     Vec2::splat(18.0 * s),
                 );
-                if can_close && enabled && hovered {
+                if can_close && enabled && hovered && list.area.contains_rect(trailing_rect) {
                     closed = icon_button(
                         ui,
-                        &painter,
+                        &list_painter,
                         trailing_rect,
                         ("browser_tab_close", id.0, index),
                         egui_phosphor::regular::X,
@@ -573,24 +675,36 @@ impl CanvasState {
                         s * 0.8,
                     );
                 } else if tab.playing_audio {
-                    painter.text(
+                    list_painter.text(
                         trailing_rect.center(),
                         egui::Align2::CENTER_CENTER,
                         egui_phosphor::regular::SPEAKER_HIGH,
                         egui::FontId::proportional(12.0 * s),
                         ui_theme::SECONDARY,
                     );
+                } else if faded {
+                    list_painter.text(
+                        trailing_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        egui_phosphor::regular::MOON,
+                        egui::FontId::proportional(11.0 * s),
+                        DISABLED,
+                    );
                 }
             } else if tab.playing_audio {
-                painter.circle_filled(
+                list_painter.circle_filled(
                     badge.right_top() + Vec2::new(-1.0, 1.0) * s,
                     3.0 * s,
                     ui_theme::GOLD,
                 );
             }
 
-            let response = if collapsed {
-                response.on_hover_text(tab.label())
+            let response = if collapsed || faded {
+                response.on_hover_text(if faded {
+                    format!("{}\nSleeping. Opens again when you show it.", tab.label())
+                } else {
+                    tab.label().to_owned()
+                })
             } else {
                 response
             };
@@ -604,6 +718,13 @@ impl CanvasState {
                 }
                 if ui.button("New Tab").clicked() {
                     self.browser_address_edit = Some(AddressEdit::new(id, String::new(), true));
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(can_close, egui::Button::new("Move to New Tile"))
+                    .clicked()
+                {
+                    self.detach_tab(id, index, None);
                     ui.close_menu();
                 }
                 ui.separator();
@@ -625,13 +746,11 @@ impl CanvasState {
             }
         }
 
-        let new_tab_row = Rect::from_min_size(
-            Pos2::new(strip.left(), top),
-            Vec2::new(strip.width(), row_height),
-        );
-        if new_tab_row.bottom() <= list_bottom {
+        let new_tab_row = list.row(tabs.len(), scroll);
+        let new_tab_hit = new_tab_row.intersect(list.area);
+        if new_tab_hit.height() > 0.0 {
             let response = ui.interact(
-                new_tab_row,
+                new_tab_hit,
                 ui.id().with(("browser_new_tab", id.0)),
                 if enabled {
                     Sense::click()
@@ -639,8 +758,8 @@ impl CanvasState {
                     Sense::hover()
                 },
             );
-            if response.hovered() && enabled {
-                painter.rect_filled(new_tab_row, 6.0 * s, ui_theme::HOVER);
+            if response.hovered() && enabled && dragging.is_none() {
+                list_painter.rect_filled(new_tab_row, 6.0 * s, ui_theme::HOVER);
             }
             let icon_center = if collapsed {
                 new_tab_row.center()
@@ -655,7 +774,7 @@ impl CanvasState {
             } else {
                 DISABLED
             };
-            painter.text(
+            list_painter.text(
                 icon_center,
                 egui::Align2::CENTER_CENTER,
                 egui_phosphor::regular::PLUS,
@@ -663,7 +782,7 @@ impl CanvasState {
                 color,
             );
             if !collapsed {
-                painter.text(
+                list_painter.text(
                     Pos2::new(icon_center.x + BADGE * s / 2.0 + 8.0 * s, icon_center.y),
                     egui::Align2::LEFT_CENTER,
                     "New tab",
@@ -674,6 +793,11 @@ impl CanvasState {
             if response.on_hover_text("New tab").clicked() {
                 self.browser_address_edit = Some(AddressEdit::new(id, String::new(), true));
             }
+        }
+        list.paint_scrollbar(&painter, scroll, s);
+
+        if let Some(from) = dragging {
+            self.drag_tab(ui, &list_painter, &layout, &list, scroll, from, tabs);
         }
 
         let toggle = Rect::from_min_size(footer.min, Vec2::splat(row_height));
@@ -694,6 +818,234 @@ impl CanvasState {
         ) {
             output.toggle_tabs_collapsed = true;
         }
+    }
+
+    /// The tab list's scroll offset in screen points, kept in range and
+    /// moved so a newly shown or opened tab is in view.
+    fn tab_list_scroll(
+        &mut self,
+        id: PreviewId,
+        list: &TabList,
+        active_tab: usize,
+        tab_count: usize,
+    ) -> f32 {
+        let s = list.scale;
+        let state = self.browser_tab_scroll.entry(id).or_insert(TabScroll {
+            offset: 0.0,
+            active: usize::MAX,
+            count: 0,
+        });
+        if state.active != active_tab || state.count != tab_count {
+            state.active = active_tab;
+            state.count = tab_count;
+            let top = active_tab as f32 * list.pitch / s;
+            let bottom = top + list.row_height / s;
+            let view = list.area.height() / s;
+            if top < state.offset {
+                state.offset = top;
+            } else if bottom > state.offset + view {
+                state.offset = bottom - view;
+            }
+        }
+        state.offset = state.offset.clamp(0.0, list.max_scroll / s);
+        state.offset * s
+    }
+
+    /// Scroll the tab strip under `pointer` by a wheel `delta` (points).
+    /// Returns false when there is no overflowing tab strip there, so the
+    /// wheel zooms the canvas as usual.
+    pub(super) fn scroll_tab_strip_at(
+        &mut self,
+        pointer: Pos2,
+        delta: f32,
+        canvas_rect: Rect,
+        preview_manager: &PreviewManager,
+    ) -> bool {
+        let Some(preview) = self
+            .left_click_preview_at_screen(pointer, canvas_rect, preview_manager)
+            .and_then(|id| preview_manager.get(id))
+        else {
+            return false;
+        };
+        let rect = self.preview_screen_rect(preview, canvas_rect);
+        let Some(layout) = chrome_geometry::layout_for(preview, rect) else {
+            return false;
+        };
+        let list = TabList::new(&layout, preview.browser_tabs.len().max(1));
+        if !shows_controls(&layout) || list.max_scroll <= 0.0 || !list.area.contains(pointer) {
+            return false;
+        }
+        if let Some(state) = self.browser_tab_scroll.get_mut(&preview.id) {
+            state.offset =
+                (state.offset - delta / layout.scale).clamp(0.0, list.max_scroll / layout.scale);
+        }
+        true
+    }
+
+    /// Whether `pointer` is on the tab list of `preview` drawn at `rect`.
+    pub(super) fn over_tab_list(&self, preview: &Preview, rect: Rect, pointer: Pos2) -> bool {
+        chrome_geometry::layout_for(preview, rect).is_some_and(|layout| {
+            shows_controls(&layout)
+                && TabList::new(&layout, preview.browser_tabs.len().max(1))
+                    .area
+                    .contains(pointer)
+        })
+    }
+
+    /// Follow a tab being dragged: show where it will land in the strip, or
+    /// that it will become its own tile when dropped outside this one.
+    #[allow(clippy::too_many_arguments)]
+    fn drag_tab(
+        &mut self,
+        ui: &egui::Ui,
+        painter: &egui::Painter,
+        layout: &ChromeLayout,
+        list: &TabList,
+        scroll: f32,
+        from: usize,
+        tabs: &[BrowserTab],
+    ) {
+        let s = layout.scale;
+        let Some(drag) = self.browser_tab_drag else {
+            return;
+        };
+        let Some(pointer) = ui.ctx().pointer_latest_pos() else {
+            self.browser_tab_drag = None;
+            return;
+        };
+        let tile = layout.toolbar.union(layout.page);
+        let inside = tile.contains(pointer);
+        let slot = list.slot_at(pointer.y, scroll, tabs.len());
+        if !ui.input(|input| input.pointer.primary_down()) {
+            self.browser_tab_drag = None;
+            // A drop counts only on the frame the button comes up; a drag
+            // left over from a tile that went off screen just ends.
+            if !ui.input(|input| input.pointer.primary_released()) {
+                return;
+            }
+            if inside {
+                let to = if slot > from { slot - 1 } else { slot };
+                if to != from && to < tabs.len() {
+                    self.pending_browser_actions
+                        .push((drag.id, BrowserAction::MoveTab { from, to }));
+                }
+            } else if tabs.len() > 1 {
+                self.detach_tab(drag.id, from, Some(pointer));
+            }
+            return;
+        }
+
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        ui.ctx().request_repaint();
+        self.browser_chrome_holds_interaction |= self.interactive_browser == Some(drag.id);
+        if inside {
+            let y = list.area.top() + slot as f32 * list.pitch - scroll - list.gap / 2.0;
+            painter.hline(
+                list.area.x_range(),
+                y.clamp(list.area.top() + 1.0, list.area.bottom() - 1.0),
+                Stroke::new(2.0 * s.max(0.5), ui_theme::GOLD),
+            );
+            // Near the ends of an overflowing list, scroll to reach the rest.
+            let edge = list.row_height / 2.0;
+            let step = if pointer.y < list.area.top() + edge {
+                -6.0
+            } else if pointer.y > list.area.bottom() - edge {
+                6.0
+            } else {
+                0.0
+            };
+            if let Some(state) = self.browser_tab_scroll.get_mut(&drag.id) {
+                state.offset = (state.offset + step).clamp(0.0, list.max_scroll / s);
+            }
+            return;
+        }
+        if tabs.len() < 2 {
+            return;
+        }
+        // Outside the tile: a ghost of the new tile it will become.
+        let Some(tab) = tabs.get(from) else {
+            return;
+        };
+        let ghost_painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("browser_tab_drag_ghost"),
+        ));
+        let ghost = Rect::from_min_size(pointer + Vec2::new(14.0, 10.0), Vec2::new(200.0, 52.0));
+        ghost_painter.rect_filled(ghost, 8.0, ui_theme::SURFACE);
+        ghost_painter.rect_stroke(ghost, 8.0, Stroke::new(1.5, ui_theme::GOLD));
+        let badge = Rect::from_center_size(
+            Pos2::new(ghost.left() + 20.0, ghost.top() + 18.0),
+            Vec2::splat(BADGE),
+        );
+        self.paint_tab_icon(ui.ctx(), &ghost_painter, badge, tab, false, 1.0);
+        let font = egui::FontId::proportional(12.0);
+        let galley = ghost_painter.layout_job(single_line(
+            tab.label(),
+            &font,
+            ui_theme::TEXT,
+            ghost.width() - 44.0,
+        ));
+        ghost_painter.galley(
+            Pos2::new(
+                badge.right() + 8.0,
+                badge.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            ui_theme::TEXT,
+        );
+        ghost_painter.text(
+            Pos2::new(ghost.left() + 12.0, ghost.bottom() - 12.0),
+            egui::Align2::LEFT_CENTER,
+            "Drop to open as a new tile",
+            egui::FontId::proportional(11.0),
+            ui_theme::SECONDARY,
+        );
+    }
+
+    /// Queue moving tab `index` of `id` to a new tile, dropped at `pointer`
+    /// (screen points) or beside the tile.
+    fn detach_tab(&mut self, id: PreviewId, index: usize, pointer: Option<Pos2>) {
+        let position = pointer
+            .zip(self.last_screen_rect)
+            .map(|(pointer, canvas_rect)| self.screen_to_canvas(pointer, canvas_rect));
+        self.pending_tab_detaches.push(TabDetach {
+            id,
+            index,
+            position,
+        });
+    }
+
+    /// A tab's site icon, or a lettered badge while it has none.
+    fn paint_tab_icon(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        rect: Rect,
+        tab: &BrowserTab,
+        faded: bool,
+        s: f32,
+    ) {
+        let alpha = if faded { 0.45 } else { 1.0 };
+        let Some(favicon) = &tab.favicon else {
+            paint_site_badge(painter, rect, &tab.url, alpha, s);
+            return;
+        };
+        let texture = self
+            .favicon_textures
+            .entry(favicon.uri.clone())
+            .or_insert_with(|| {
+                ctx.load_texture(
+                    format!("favicon:{}", favicon.uri),
+                    (*favicon.image).clone(),
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+        painter.image(
+            texture.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE.gamma_multiply(alpha),
+        );
     }
 }
 
@@ -879,7 +1231,7 @@ fn single_line(text: &str, font: &egui::FontId, color: Color32, max_width: f32) 
 }
 
 /// The host part of `url`, without a leading `www.`.
-fn site_of(url: &str) -> &str {
+pub(super) fn site_of(url: &str) -> &str {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let host = after_scheme
         .split(['/', '?', '#', ':'])
@@ -908,13 +1260,13 @@ fn site_name(host: &str) -> &str {
 }
 
 /// A colored square with the site's initial, standing in for its icon.
-fn paint_site_badge(painter: &egui::Painter, rect: Rect, url: &str, s: f32) {
+fn paint_site_badge(painter: &egui::Painter, rect: Rect, url: &str, alpha: f32, s: f32) {
     let site = site_name(site_of(url));
     let hash = site.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     });
     let color = BADGE_COLORS[hash as usize % BADGE_COLORS.len()];
-    painter.rect_filled(rect, 4.0 * s, color);
+    painter.rect_filled(rect, 4.0 * s, color.gamma_multiply(alpha));
     let initial = site
         .chars()
         .find(|character| character.is_alphanumeric())
@@ -925,7 +1277,7 @@ fn paint_site_badge(painter: &egui::Painter, rect: Rect, url: &str, s: f32) {
         egui::Align2::CENTER_CENTER,
         initial,
         egui::FontId::proportional(10.5 * s),
-        Color32::from_rgb(240, 240, 244),
+        Color32::from_rgb(240, 240, 244).gamma_multiply(alpha),
     );
 }
 
@@ -933,7 +1285,36 @@ fn paint_site_badge(painter: &egui::Painter, rect: Rect, url: &str, s: f32) {
 mod tests {
     use super::{
         address_job, char_slice, ordered, replace_chars, single_line_text, site_name, site_of,
+        TabList, TAB_GAP, TAB_HEIGHT,
     };
+    use crate::preview::browser_chrome::ChromeLayout;
+
+    fn list_for(tab_count: usize, tile_height: f32) -> TabList {
+        let tile = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, tile_height));
+        TabList::new(&ChromeLayout::new(tile, 1.0, false), tab_count)
+    }
+
+    #[test]
+    fn tab_lists_scroll_only_when_they_overflow() {
+        assert_eq!(list_for(3, 560.0).max_scroll, 0.0);
+        let list = list_for(40, 560.0);
+        let content = 41.0 * (TAB_HEIGHT + TAB_GAP) - TAB_GAP;
+        assert!((list.max_scroll - (content - list.area.height())).abs() < 1e-3);
+        // Scrolling moves the rows up by the same amount.
+        assert!((list.row(5, 0.0).top() - list.row(5, 40.0).top() - 40.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn dropped_tabs_land_in_the_nearest_gap() {
+        let list = list_for(4, 560.0);
+        let top = list.area.top();
+        assert_eq!(list.slot_at(top + 2.0, 0.0, 4), 0);
+        assert_eq!(list.slot_at(top + list.pitch * 1.6, 0.0, 4), 2);
+        assert_eq!(list.slot_at(top + 10_000.0, 0.0, 4), 4);
+        assert_eq!(list.slot_at(top - 50.0, 0.0, 4), 0);
+        // With the list scrolled by a row, the same height is one gap later.
+        assert_eq!(list.slot_at(top + 2.0, list.pitch, 4), 1);
+    }
     use eframe::egui;
 
     #[test]
