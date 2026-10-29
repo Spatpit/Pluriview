@@ -33,6 +33,10 @@ pub struct RemovedPreviewInfo {
     /// Reapplied when undo recreates the browser tile.
     pub browser_muted: bool,
     pub browser_page_zoom: f32,
+    pub browser_tabs: Vec<super::BrowserTab>,
+    pub browser_active_tab: usize,
+    pub browser_chrome: bool,
+    pub browser_tabs_collapsed: bool,
     /// Reapplied when undo recreates a window-capture tile.
     pub stream_audio: bool,
     /// Set when this tile receives a Spout2 sender.
@@ -300,6 +304,10 @@ impl PreviewManager {
                         browser_url: preview.browser_url,
                         browser_muted: preview.browser_muted,
                         browser_page_zoom: preview.browser_page_zoom,
+                        browser_tabs: preview.browser_tabs,
+                        browser_active_tab: preview.browser_active_tab,
+                        browser_chrome: preview.browser_chrome,
+                        browser_tabs_collapsed: preview.browser_tabs_collapsed,
                         stream_audio: preview.stream_audio,
                         spout_sender: preview.spout_sender,
                         viewport_pin: preview.viewport_pin,

@@ -265,6 +265,30 @@ Hover over the tile for **back, forward, reload, and mute**. Each tile has its
 own page and mute control. One browser tile can receive direct interaction at
 a time.
 
+#### Toolbar and tabs
+
+New browser tiles open with a toolbar and vertical tabs around the page:
+
+- **Toolbar:** back, forward, reload, an address bar, mute, open in your
+  default browser, and close. Click the address bar to type a web address, or
+  anything else to search the web.
+- **Tabs:** click a tab to show it and **New tab** to open another. Hover a
+  tab for its close button, or middle-click it. Links that open a new window
+  become tabs. Background tabs keep running (and playing sound) hidden, and
+  every tab shares the tile's sign-ins and mute state.
+- **Collapse** the strip to site badges with the button at its bottom.
+- **Right-click** the address bar for **Cut**, **Copy**, **Paste**, **Paste
+  and Go** and **Select All** (or **Copy Address** when you are not typing),
+  and a tab for **Copy Address**, **New Tab** and **Close Tab**. The tile's
+  own menu opens from the page.
+- Turn the frame on or off with right-click → **Show Toolbar and Tabs**. Tiles
+  from earlier versions start without it. Hiding it shows only the current
+  tab; the others stay open.
+
+Tabs are saved with the workspace. When it reopens, only each tile's visible
+tab loads; the others load when you open them. Cropped tiles and tiles smaller
+than 360 × 200 show just the page.
+
 - **Scroll without interacting:** hold `Shift` and scroll over a browser tile to
   scroll the page (or the chat or list under the pointer) while the canvas stays
   put.

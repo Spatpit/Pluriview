@@ -1,10 +1,12 @@
 #[cfg(windows)]
 use crate::browser::{
-    self, normalize_url, scrub_url_for_storage, BrowserManager, ExtensionPreparationStatus,
+    self, normalize_url, scrub_tabs_for_storage, scrub_url_for_storage, BrowserManager,
+    ExtensionPreparationStatus,
 };
 use crate::canvas::{
-    BrowserAction, CanvasKeyboardInput, CanvasState, CanvasWallpaper, MediaAction, PlaylistAction,
-    TileActivityAction, VideoAction, WallpaperSource, WALLPAPER_VIDEO_ID,
+    BrowserAction, BrowserNavigation, CanvasKeyboardInput, CanvasState, CanvasWallpaper,
+    MediaAction, PlaylistAction, TileActivityAction, VideoAction, WallpaperSource,
+    WALLPAPER_VIDEO_ID,
 };
 use crate::capture::CaptureCoordinator;
 use crate::external_tools::{self, ExternalTools, ToolKind, ToolStatus};
@@ -18,9 +20,9 @@ use crate::persistence::{
 };
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout, ThumbnailState};
 use crate::preview::{
-    is_usable_media_title, video_tile_title, BrowserTileStatus, FpsPreset, Preview, PreviewId,
-    PreviewLayout, PreviewManager, RemovedPreviewInfo, VideoPlaybackState, VideoSource,
-    VideoTileStatus, WindowHandle,
+    browser_chrome, is_usable_media_title, video_tile_title, BrowserTab, BrowserTileStatus,
+    FpsPreset, Preview, PreviewId, PreviewLayout, PreviewManager, RemovedPreviewInfo,
+    VideoPlaybackState, VideoSource, VideoTileStatus, WindowHandle,
 };
 #[cfg(debug_assertions)]
 use crate::privacy;
@@ -42,13 +44,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows::core::HSTRING;
 #[cfg(windows)]
-use windows::Win32::Foundation::{HGLOBAL, HWND};
-#[cfg(windows)]
-use windows::Win32::System::DataExchange::{
-    CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-};
-#[cfg(windows)]
-use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::Foundation::HWND;
 #[cfg(windows)]
 use windows::Win32::UI::Shell::ShellExecuteW;
 #[cfg(windows)]
@@ -101,41 +97,6 @@ const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
 /// Recoverable deletion window for a named canvas view.
 const CANVAS_VIEW_UNDO_SECS: f32 = 4.0;
 const CANVAS_NOTICE_SECS: f32 = 4.0;
-
-#[cfg(windows)]
-fn clipboard_text() -> Result<String, &'static str> {
-    // CF_UNICODETEXT is always UTF-16 and avoids lossy ANSI URL conversion.
-    const CF_UNICODETEXT: u32 = 13;
-
-    unsafe {
-        IsClipboardFormatAvailable(CF_UNICODETEXT)
-            .map_err(|_| "The clipboard does not contain text.")?;
-        OpenClipboard(None).map_err(|_| "The clipboard is temporarily unavailable.")?;
-
-        let result = (|| {
-            let handle = GetClipboardData(CF_UNICODETEXT)
-                .map_err(|_| "The clipboard text could not be read.")?;
-            let memory = HGLOBAL(handle.0);
-            let data = GlobalLock(memory);
-            if data.is_null() {
-                return Err("The clipboard text could not be read.");
-            }
-
-            let text = {
-                let len = GlobalSize(memory) / std::mem::size_of::<u16>();
-                let utf16 = std::slice::from_raw_parts(data.cast::<u16>(), len);
-                let nul = utf16.iter().position(|unit| *unit == 0).unwrap_or(len);
-                String::from_utf16(&utf16[..nul])
-                    .map_err(|_| "The clipboard contains invalid text.")
-            };
-            let _ = GlobalUnlock(memory);
-            text
-        })();
-
-        let _ = CloseClipboard();
-        result
-    }
-}
 
 /// Custom title bar height when fully visible (also the window-control hit size).
 const TITLE_BAR_HEIGHT: f32 = 40.0;
@@ -244,8 +205,9 @@ fn browser_page_screen_rect(
     preview: &Preview,
     canvas_rect: egui::Rect,
 ) -> egui::Rect {
+    let tile_rect = browser_tile_screen_rect(canvas, preview, canvas_rect);
     uncropped_rect(
-        browser_tile_screen_rect(canvas, preview, canvas_rect),
+        browser_chrome::page_rect_for(preview, tile_rect),
         preview.crop_uv,
     )
 }
@@ -256,8 +218,9 @@ fn browser_capture_display_size(preview: &Preview) -> Vec2 {
         .viewport_pin
         .map(|pin| pin.size_vec2())
         .unwrap_or(preview.size);
+    let tile_rect = egui::Rect::from_min_size(Pos2::ZERO, visible_size);
     uncropped_rect(
-        egui::Rect::from_min_size(Pos2::ZERO, visible_size),
+        browser_chrome::page_rect_for(preview, tile_rect),
         preview.crop_uv,
     )
     .size()
@@ -272,6 +235,10 @@ fn restore_layout_tile_state(preview: &mut Preview, saved: &PreviewLayout) {
     preview.lock_aspect_ratio = saved.lock_aspect_ratio;
     preview.crop_uv = saved.crop_uv;
     preview.browser_page_zoom = saved.browser_page_zoom;
+    preview.browser_tabs = saved.browser_tabs.clone();
+    preview.browser_active_tab = saved.browser_active_tab;
+    preview.browser_chrome = saved.browser_chrome;
+    preview.browser_tabs_collapsed = saved.browser_tabs_collapsed;
     preview.stream_audio = saved.stream_audio;
     preview.playlist_group = saved.playlist_group;
     preview.viewport_pin = saved.viewport_pin;
@@ -295,6 +262,10 @@ fn restore_removed_tile_state(preview: &mut Preview, removed: &RemovedPreviewInf
     preview.set_fps_preset(removed.fps_preset);
     preview.crop_uv = removed.crop_uv;
     preview.browser_page_zoom = removed.browser_page_zoom;
+    preview.browser_tabs = removed.browser_tabs.clone();
+    preview.browser_active_tab = removed.browser_active_tab;
+    preview.browser_chrome = removed.browser_chrome;
+    preview.browser_tabs_collapsed = removed.browser_tabs_collapsed;
     preview.stream_audio = removed.stream_audio;
     preview.viewport_pin = removed.viewport_pin;
     preview.left_click_disabled = removed.left_click_disabled;
@@ -2509,10 +2480,22 @@ impl PluriviewApp {
         url: &str,
         fps: FpsPreset,
     ) -> Result<(), String> {
-        if let Some(preview) = self.preview_manager.get_mut(id) {
-            preview.browser_status = BrowserTileStatus::Starting;
+        // The pending URL wins over a saved tab list: Change URL may have
+        // retargeted the tile before its host started.
+        let (mut tabs, active) = self
+            .preview_manager
+            .get_mut(id)
+            .map(|preview| {
+                preview.browser_status = BrowserTileStatus::Starting;
+                preview.browser_startup_tabs()
+            })
+            .unwrap_or_else(|| (vec![BrowserTab::new(url)], 0));
+        if let Some(tab) = tabs.get_mut(active) {
+            if tab.url != url {
+                *tab = BrowserTab::new(url);
+            }
         }
-        let hwnd = self.browser.create(id, url)?;
+        let hwnd = self.browser.create(id, &tabs, active)?;
         if let Some(preview) = self.preview_manager.get_mut(id) {
             preview.window_handle = Some(WindowHandle {
                 hwnd,
@@ -2709,7 +2692,7 @@ impl PluriviewApp {
                     response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
 
                 if paste_requested {
-                    match clipboard_text() {
+                    match crate::clipboard::text() {
                         Ok(text) if !text.trim().is_empty() => {
                             dialog.url = text.trim().to_owned();
                             dialog.error = None;
@@ -2768,9 +2751,20 @@ impl PluriviewApp {
                     }
                     self.remember_recent_url(&url);
                 }),
+                // New tiles open with the browser toolbar and tabs, sized so
+                // the page keeps a familiar 16:10-ish view inside them.
                 None => self
-                    .create_browser_tile(&url, position, Vec2::new(640.0, 360.0), FpsPreset::Medium)
-                    .map(|_| ()),
+                    .create_browser_tile(
+                        &url,
+                        position,
+                        Vec2::new(1000.0, 620.0),
+                        FpsPreset::Medium,
+                    )
+                    .map(|id| {
+                        if let Some(preview) = self.preview_manager.get_mut(id) {
+                            preview.browser_chrome = true;
+                        }
+                    }),
             };
             match result {
                 Ok(()) => self.add_browser = None,
@@ -2894,7 +2888,7 @@ impl PluriviewApp {
                 cancel |= cancelled;
 
                 if paste_requested {
-                    match clipboard_text() {
+                    match crate::clipboard::text() {
                         Ok(text) if !text.trim().is_empty() => {
                             dialog.url = text.trim().to_owned();
                             dialog.error = None;
@@ -3011,6 +3005,20 @@ impl PluriviewApp {
                     ));
                 }
             },
+            BrowserAction::SelectTab(index) => {
+                if let Err(error) = self.browser.select_tab(id, index) {
+                    self.canvas_notice =
+                        Some((format!("Could not open this tab: {error}"), Instant::now()));
+                }
+            }
+            BrowserAction::CloseTab(index) => {
+                if let Err(error) = self.browser.close_tab(id, index) {
+                    self.canvas_notice = Some((
+                        format!("Could not open the next tab: {error}"),
+                        Instant::now(),
+                    ));
+                }
+            }
             BrowserAction::EditUrl => {
                 let current = self
                     .browser
@@ -3033,6 +3041,46 @@ impl PluriviewApp {
         }
     }
 
+    /// Go to an address typed into a browser tile's address bar.
+    #[cfg(windows)]
+    fn handle_browser_navigation(&mut self, id: PreviewId, navigation: BrowserNavigation) {
+        let url = match browser::address_bar_target(&navigation.input) {
+            Ok(url) => url,
+            Err(error) => {
+                self.canvas_notice = Some((error.to_owned(), Instant::now()));
+                return;
+            }
+        };
+        if navigation.new_tab {
+            if let Err(error) = self.browser.open_tab(id, &url, true) {
+                self.canvas_notice =
+                    Some((format!("Could not open a tab: {error}"), Instant::now()));
+                return;
+            }
+        } else if let Some(host) = self.browser.get(id) {
+            host.load(&url);
+        } else if let Some(pending) = self.pending_browser_tiles.get_mut(&id) {
+            pending.url = url.clone();
+            if let Some(preview) = self.preview_manager.get_mut(id) {
+                preview.browser_url = Some(url.clone());
+                preview.title = url.clone();
+            }
+        }
+        if !browser::is_search_url(&url) {
+            self.remember_recent_url(&url);
+        }
+    }
+
+    /// Clicking an interactive tile's toolbar or tabs focused the canvas;
+    /// hand the keyboard back to its page.
+    #[cfg(windows)]
+    fn refocus_interactive_browser(&mut self, id: PreviewId) {
+        if let Some(host) = self.browser.get(id).filter(|host| host.is_active()) {
+            host.refocus();
+            self.browser_activated_at = Some(Instant::now());
+        }
+    }
+
     /// Full and canvas-clipped browser geometry for tile `id`, in egui points
     /// (window client coordinates). The page uses the exact tile rect so live
     /// interaction does not introduce an inset/size change.
@@ -3048,7 +3096,7 @@ impl PluriviewApp {
             return None;
         }
         let page_rect = browser_page_screen_rect(&self.canvas, preview, canvas_rect);
-        let visible_rect = tile_rect.intersect(canvas_rect);
+        let visible_rect = browser_chrome::page_rect_for(preview, tile_rect).intersect(canvas_rect);
         (visible_rect.width() >= 1.0 && visible_rect.height() >= 1.0).then_some(
             BrowserTilePlacement {
                 page_rect,
@@ -3327,24 +3375,54 @@ impl PluriviewApp {
                     Instant::now(),
                 ));
             }
-            if update.title.is_some() || update.url.is_some() {
+            if update.changed {
                 updates.push((*id, update));
             }
         }
         let mut video_fits = Vec::new();
-        for (id, update) in updates {
+        let mut new_windows = Vec::new();
+        for (id, mut update) in updates {
             if let Some(found) = update.video_rect {
                 video_fits.push((id, found));
             }
+            if !update.new_window_requests.is_empty() {
+                new_windows.push((id, std::mem::take(&mut update.new_window_requests)));
+            }
             if let Some(preview) = self.preview_manager.get_mut(id) {
                 preview.browser_playing_audio = update.playing_audio;
-                if let Some(title) = update.title {
-                    if !title.is_empty() {
-                        preview.title = title;
+                match update.title {
+                    Some(title) => preview.title = title,
+                    // A tab that has not named itself yet shows its address.
+                    None => {
+                        if let Some(url) = &update.url {
+                            preview.title.clone_from(url);
+                        }
                     }
                 }
                 if let Some(url) = update.url {
                     preview.browser_url = Some(url);
+                }
+                preview.browser_tabs = update.tabs;
+                preview.browser_active_tab = update.active_tab;
+                preview.browser_can_go_back = update.can_go_back;
+                preview.browser_can_go_forward = update.can_go_forward;
+                preview.browser_loading = update.loading;
+            }
+        }
+        // Links that open a new window become tabs where the tile shows its
+        // tabs; elsewhere they replace the page, as before tabs existed.
+        for (id, urls) in new_windows {
+            let as_tabs = self
+                .preview_manager
+                .get(id)
+                .is_some_and(browser_chrome::shows_chrome);
+            for url in urls {
+                if as_tabs {
+                    if let Err(error) = self.browser.open_tab(id, &url, true) {
+                        log::warn!("Could not open a browser tab: {error}");
+                    }
+                } else if let Some(host) = self.browser.get(id) {
+                    host.load(&url);
                 }
             }
         }
@@ -3414,14 +3492,21 @@ impl PluriviewApp {
                 .last_screen_rect
                 .and_then(|canvas_rect| self.browser_tile_placement(active_id, canvas_rect));
 
-            let should_park =
-                escape || minimized || tile_rect.is_none() || (!owns_focus && !in_grace);
+            // Clicking the tile's own toolbar or tabs focuses the canvas but
+            // keeps the page interactive.
+            let held_by_chrome = self.canvas.browser_chrome_holds_interaction;
+            let should_park = escape
+                || minimized
+                || tile_rect.is_none()
+                || (!owns_focus && !in_grace && !held_by_chrome);
 
             if should_park {
                 if let Some(host) = self.browser.get_mut(active_id) {
                     host.park();
                 }
-                self.capture_coordinator.resume_capture(active_id);
+                // Hold the last interactive frame until the parked page has
+                // redrawn at capture resolution (see the settle loop below).
+                self.capture_coordinator.pause_capture(active_id);
                 self.browser_activated_at = None;
                 if escape {
                     self.canvas.exit_focus();
@@ -3458,6 +3543,15 @@ impl PluriviewApp {
                     self.capture_coordinator.resume_capture(active_id);
                 }
             }
+        }
+
+        // Tiles that left interaction resume capturing once their page has
+        // redrawn at capture resolution.
+        for id in self.browser.take_settled_captures() {
+            self.capture_coordinator.resume_capture(id);
+        }
+        if self.browser.any_settling_capture() {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         // Let the canvas outline the interactive tile in the accent color.
@@ -3519,10 +3613,10 @@ impl PluriviewApp {
             {
                 // The live WebView is a separate native window. Park it before
                 // making the canvas pass clicks through, including during its
-                // delayed reveal, and keep the captured tile playing normally.
+                // delayed reveal. Its capture resumes once the page settles.
                 if let Some(id) = self.browser.active_id() {
                     self.browser.park_all();
-                    self.capture_coordinator.resume_capture(id);
+                    self.capture_coordinator.pause_capture(id);
                 }
                 self.browser_activated_at = None;
             }
@@ -5168,6 +5262,43 @@ mod tests {
     }
 
     #[test]
+    fn browser_toolbar_and_tabs_are_left_out_of_capture_and_interaction() {
+        let canvas = CanvasState::default();
+        let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "browser".to_owned(),
+            Pos2::new(100.0, 100.0),
+            Vec2::new(1000.0, 620.0),
+        );
+        preview.browser_url = Some("https://example.com".to_owned());
+        preview.browser_chrome = true;
+        let page_size = Vec2::new(
+            1000.0 - crate::preview::browser_chrome::TAB_STRIP_WIDTH,
+            620.0 - crate::preview::browser_chrome::TOOLBAR_HEIGHT,
+        );
+
+        assert_eq!(browser_capture_display_size(&preview), page_size);
+        assert_eq!(
+            browser_page_screen_rect(&canvas, &preview, canvas_rect),
+            Rect::from_min_size(
+                Pos2::new(
+                    100.0 + crate::preview::browser_chrome::TAB_STRIP_WIDTH,
+                    100.0 + crate::preview::browser_chrome::TOOLBAR_HEIGHT
+                ),
+                page_size
+            )
+        );
+
+        // A cropped tile shows only the page, so the frame steps aside.
+        preview.crop_uv = Some((0.0, 0.0, 0.5, 0.5));
+        assert_eq!(
+            browser_capture_display_size(&preview),
+            Vec2::new(2000.0, 1240.0)
+        );
+    }
+
+    #[test]
     fn cropped_browser_keeps_the_full_page_geometry_for_capture_and_interaction() {
         let canvas = CanvasState::default();
         let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0));
@@ -5865,7 +5996,7 @@ impl eframe::App for PluriviewApp {
                     if let Some(host) = self.browser.get_mut(id) {
                         host.park();
                     }
-                    self.capture_coordinator.resume_capture(id);
+                    self.capture_coordinator.pause_capture(id);
                     self.browser_activated_at = None;
                     // The parked WebView still holds keyboard focus; hand it
                     // back so the next shortcut reaches us.
@@ -5879,7 +6010,7 @@ impl eframe::App for PluriviewApp {
                 {
                     if let Some(placement) = self.browser_tile_placement(id, canvas_rect) {
                         if let Some(active_id) = self.browser.active_id() {
-                            self.capture_coordinator.resume_capture(active_id);
+                            self.capture_coordinator.pause_capture(active_id);
                         }
                         self.browser.park_all();
                         // Hold the last correct captured frame onscreen while
@@ -5976,6 +6107,13 @@ impl eframe::App for PluriviewApp {
             // Actions queued by browser tile hover controls / context menus.
             for (id, action) in std::mem::take(&mut self.canvas.pending_browser_actions) {
                 self.handle_browser_action(ctx, id, action);
+                if action != BrowserAction::EditUrl {
+                    self.refocus_interactive_browser(id);
+                }
+            }
+            for (id, navigation) in std::mem::take(&mut self.canvas.pending_browser_navigations) {
+                self.handle_browser_navigation(id, navigation);
+                self.refocus_interactive_browser(id);
             }
             for (id, u, v, delta) in std::mem::take(&mut self.canvas.pending_browser_scrolls) {
                 if let Some(host) = self.browser.get(id) {

@@ -1,5 +1,7 @@
 use super::animation::{AnimationState, CameraTransition, DragTracker};
 use super::wallpaper::CanvasWallpaper;
+#[path = "browser_chrome.rs"]
+mod browser_chrome;
 #[path = "groups.rs"]
 mod groups;
 #[path = "navigation.rs"]
@@ -9,12 +11,17 @@ use crate::capture::{
     MAX_CAPTURE_WIDTH,
 };
 use crate::hotkeys::{HotkeyBindings, HotkeySlot};
+use crate::preview::browser_chrome::{
+    self as chrome_geometry, layout_for as browser_chrome_layout,
+};
 use crate::preview::{
     compact_title, BrowserTileStatus, FpsPreset, Preview, PreviewId, PreviewManager,
     RemovedPreviewInfo, VideoPlaybackState, VideoTileStatus, ViewportPin,
 };
 #[cfg(debug_assertions)]
 use crate::privacy;
+use browser_chrome::AddressEdit;
+pub use browser_chrome::BrowserNavigation;
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
 use groups::GroupState;
 use std::path::PathBuf;
@@ -128,6 +135,8 @@ pub enum BrowserAction {
     EditUrl,
     /// Crop the tile to the page's main video.
     FitToVideo,
+    SelectTab(usize),
+    CloseTab(usize),
 }
 
 /// CSS pixels a browser page scrolls per egui point of Shift+wheel, so one
@@ -198,6 +207,19 @@ fn show_context_menu_if(
                 .max_height((ui.ctx().screen_rect().height() - 32.0).max(100.0))
                 .show(ui, add_contents);
         });
+    }
+}
+
+/// Close `response`'s context menu if it is the one open.
+fn close_context_menu_of(response: &egui::Response) {
+    let menu_id = egui::Id::new(EGUI_CONTEXT_MENU_ID);
+    let mut bar_state = egui::menu::BarState::load(&response.ctx, menu_id);
+    if bar_state
+        .as_ref()
+        .is_some_and(|root| root.id == response.id)
+    {
+        egui::menu::MenuRoot::handle_menu_response(&mut bar_state, egui::menu::MenuResponse::Close);
+        bar_state.store(&response.ctx, menu_id);
     }
 }
 
@@ -1266,6 +1288,17 @@ pub struct CanvasState {
     /// Shift+wheel page scrolls: tile, normalized page point and CSS pixels.
     pub pending_browser_scrolls: Vec<(PreviewId, f32, f32, f32)>,
 
+    /// Addresses typed into a browser tile's address bar.
+    pub pending_browser_navigations: Vec<(PreviewId, BrowserNavigation)>,
+
+    /// The address bar being edited, if any.
+    browser_address_edit: Option<AddressEdit>,
+
+    /// The pointer is on the interactive browser tile's toolbar or tabs, or
+    /// its address bar has focus. Clicking there focuses the canvas, which
+    /// must not end the interaction.
+    pub browser_chrome_holds_interaction: bool,
+
     /// Video tile actions queued by hover controls / context menus.
     pub pending_video_actions: Vec<(PreviewId, VideoAction)>,
 
@@ -1348,6 +1381,9 @@ impl Default for CanvasState {
             pending_stream_add: None,
             pending_browser_actions: Vec::new(),
             pending_browser_scrolls: Vec::new(),
+            pending_browser_navigations: Vec::new(),
+            browser_address_edit: None,
+            browser_chrome_holds_interaction: false,
             pending_video_actions: Vec::new(),
             video_volume_hover: None,
             pending_tile_activity_actions: Vec::new(),
@@ -2317,6 +2353,7 @@ impl CanvasState {
         let mut any_spawn_or_remove_animating = false;
         let mut window_capture_connecting = false;
         let mut transparent_browser_waiting = false;
+        self.browser_chrome_holds_interaction = false;
 
         for info in &preview_info {
             let id = info.id;
@@ -2490,6 +2527,16 @@ impl CanvasState {
                 false
             };
 
+            // A browser tile with its toolbar and tabs shows the page inside them.
+            let chrome_layout = if is_browser && !in_picture_in_picture {
+                preview_manager
+                    .get(id)
+                    .and_then(|preview| browser_chrome_layout(preview, anim_rect))
+            } else {
+                None
+            };
+            let content_rect = chrome_layout.map_or(anim_rect, |layout| layout.page);
+
             // A transparent WebView frame is valid for overlay pages, but the
             // first completely transparent frames look like the tile vanished.
             // Keep the loading card underneath until capture sees content.
@@ -2498,7 +2545,12 @@ impl CanvasState {
                 && !manually_frozen
                 && !in_picture_in_picture;
             if browser_loading_placeholder {
-                paint_browser_placeholder(&painter, anim_rect, browser_status, input.time as f32);
+                paint_browser_placeholder(
+                    &painter,
+                    content_rect,
+                    browser_status,
+                    input.time as f32,
+                );
                 transparent_browser_waiting |=
                     !matches!(browser_status, BrowserTileStatus::Failed(_));
             }
@@ -2512,7 +2564,7 @@ impl CanvasState {
                     // Minimal Void: content fills entire rect
                     painter.image(
                         texture.id(),
-                        anim_rect,
+                        content_rect,
                         uv_rect,
                         Color32::from_white_alpha(alpha_u8),
                     );
@@ -2536,9 +2588,9 @@ impl CanvasState {
                         Color32::GRAY,
                     );
                 } else if manually_frozen {
-                    painter.rect_filled(anim_rect, 8.0, Color32::from_rgb(22, 26, 32));
+                    painter.rect_filled(content_rect, 8.0, Color32::from_rgb(22, 26, 32));
                     painter.text(
-                        anim_rect.center(),
+                        content_rect.center(),
                         egui::Align2::CENTER_CENTER,
                         "Frozen",
                         egui::FontId::proportional(12.0),
@@ -2547,7 +2599,7 @@ impl CanvasState {
                 } else if is_browser && !browser_loading_placeholder {
                     paint_browser_placeholder(
                         &painter,
-                        anim_rect,
+                        content_rect,
                         browser_status,
                         input.time as f32,
                     );
@@ -2589,7 +2641,41 @@ impl CanvasState {
                             preview_manager,
                         ) == Some(id)
                 });
+            // Where the frame shows its own right-click menus.
+            let mut chrome_menu_area = None;
+            if let Some(layout) = chrome_layout {
+                let enabled = *browser_status == BrowserTileStatus::Ready && !manually_frozen;
+                if enabled && browser_chrome::shows_controls(&layout) {
+                    chrome_menu_area = Some(layout);
+                }
+                let output = preview_manager
+                    .get(id)
+                    .map(|preview| {
+                        self.paint_browser_chrome(
+                            ui, &painter, preview, layout, enabled, input.time,
+                        )
+                    })
+                    .unwrap_or_default();
+                if output.toggle_tabs_collapsed {
+                    if let Some(preview) = preview_manager.get_mut(id) {
+                        preview.browser_tabs_collapsed = !preview.browser_tabs_collapsed;
+                    }
+                }
+                if output.close_tile {
+                    capture_coordinator.stop_capture(id);
+                    preview_manager.start_removal(id);
+                    self.selection.retain(|&x| x != id);
+                }
+                if self.interactive_browser == Some(id)
+                    && input.hover_pos.is_some_and(|pointer| {
+                        anim_rect.contains(pointer) && !layout.page.contains(pointer)
+                    })
+                {
+                    self.browser_chrome_holds_interaction = true;
+                }
+            }
             if is_browser
+                && chrome_layout.is_none()
                 && !manually_frozen
                 && !(show_overlays && pointer_over_tile)
                 && screen_rect.width() >= 90.0
@@ -2603,7 +2689,8 @@ impl CanvasState {
                     muted,
                 );
             }
-            if show_overlays && pointer_over_tile {
+            // A browser toolbar already holds the title, close and page controls.
+            if show_overlays && pointer_over_tile && chrome_layout.is_none() {
                 // Playlist tiles already have a designed header; a second title
                 // bar would cover the folder name and transport controls.
                 if !is_playlist && !is_spout_capture {
@@ -3179,7 +3266,9 @@ impl CanvasState {
 
             // Muted badge stays visible even without hover so silent tiles
             // are recognizable at a glance.
-            if show_overlays && ((is_browser && muted && !pointer_over_tile) || (is_video && muted))
+            if show_overlays
+                && ((is_browser && muted && !pointer_over_tile && chrome_layout.is_none())
+                    || (is_video && muted))
             {
                 let badge_rect = Rect::from_min_size(
                     screen_rect.right_top()
@@ -3284,7 +3373,15 @@ impl CanvasState {
             // Handle double-click: browsers enter interaction mode (the app
             // consumes last_double_clicked); other previews focus their
             // source window.
+            // The toolbar and tabs are for arranging and clicking; only the
+            // page enters interaction.
+            let on_page = chrome_layout.is_none_or(|layout| {
+                preview_response
+                    .interact_pointer_pos
+                    .is_some_and(|pointer| layout.page.contains(pointer))
+            });
             if preview_response.double_clicked()
+                && on_page
                 && !self.is_spotlighting()
                 && !manually_frozen
                 && self.crop_mode != Some(id)
@@ -3392,9 +3489,20 @@ impl CanvasState {
                 self.pinned_drag_origins.clear();
             }
 
-            // Context menu for preview
-            let context_menu_interaction_active =
-                context_response.context_menu_opened() || secondary_target;
+            // Context menu for preview. The toolbar and tabs have their own
+            // small menus instead (see browser_chrome.rs).
+            let secondary_on_chrome = secondary_target
+                && chrome_menu_area.is_some_and(|layout| {
+                    input
+                        .interact_pos
+                        .or(input.hover_pos)
+                        .is_some_and(|pointer| !layout.page.contains(pointer))
+                });
+            if secondary_on_chrome {
+                close_context_menu_of(&context_response);
+            }
+            let context_menu_interaction_active = !secondary_on_chrome
+                && (context_response.context_menu_opened() || secondary_target);
             show_context_menu_if(&context_response, context_menu_interaction_active, |ui| {
                 crate::ui_theme::menu(ui);
                 ui.set_max_width(280.0);
@@ -3689,6 +3797,24 @@ impl CanvasState {
                         if let Some(preview) = preview_manager.get_mut(id) {
                             preview.browser_page_zoom = zoom;
                         }
+                    }
+                    let (show_frame, has_tabs) = preview_manager
+                        .get(id)
+                        .map(|preview| (preview.browser_chrome, preview.browser_tabs.len() > 1))
+                        .unwrap_or_default();
+                    if ui
+                        .selectable_label(show_frame, "Show Toolbar and Tabs")
+                        .on_hover_text(if has_tabs && show_frame {
+                            "Hiding them shows only the current tab; the others stay open"
+                        } else {
+                            "Back, forward, an address bar and vertical tabs around the page"
+                        })
+                        .clicked()
+                    {
+                        if let Some(preview) = preview_manager.get_mut(id) {
+                            preview.browser_chrome = !preview.browser_chrome;
+                        }
+                        ui.close_menu();
                     }
                     if ui
                         .add_enabled(browser_ready, egui::Button::new("Change URL..."))
@@ -4645,15 +4771,21 @@ impl CanvasState {
                     if cropping {
                         // Start crop mode
                         let current_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
-                        self.drag_state = Some(DragState::Cropping {
+                        let start_rect = self.drop_browser_frame_for_crop(
                             id,
-                            handle: handle_type,
-                            start_mouse: input.interact_pos.unwrap_or(handle_pos),
-                            start_rect: if viewport_pin.is_some() {
+                            if viewport_pin.is_some() {
                                 screen_rect
                             } else {
                                 preview_rect
                             },
+                            canvas_rect,
+                            preview_manager,
+                        );
+                        self.drag_state = Some(DragState::Cropping {
+                            id,
+                            handle: handle_type,
+                            start_mouse: input.interact_pos.unwrap_or(handle_pos),
+                            start_rect,
                             screen_space: viewport_pin.is_some(),
                             start_crop_uv: current_crop,
                         });

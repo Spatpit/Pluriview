@@ -7,6 +7,8 @@ mod audio;
 mod browser;
 mod canvas;
 mod capture;
+#[cfg(windows)]
+mod clipboard;
 mod external_tools;
 mod hotkeys;
 #[cfg(windows)]

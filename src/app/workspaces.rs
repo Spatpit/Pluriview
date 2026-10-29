@@ -458,13 +458,22 @@ impl PluriviewApp {
                     // reopens on the last page browsed rather than the one it
                     // was created with. Falls back to the mirrored URL for
                     // tiles whose host is gone.
-                    saved.browser_url = self
-                        .browser
-                        .get(p.id)
+                    let host = self.browser.get(p.id);
+                    saved.browser_url = host
                         .and_then(|host| host.live_url())
                         .or(saved.browser_url)
                         .as_deref()
                         .and_then(scrub_url_for_storage);
+                    if let Some(host) = host {
+                        let urls = host.tab_urls();
+                        if urls.len() == saved.browser_tabs.len() {
+                            for (tab, url) in saved.browser_tabs.iter_mut().zip(urls) {
+                                tab.url = url;
+                            }
+                        }
+                    }
+                    (saved.browser_tabs, saved.browser_active_tab) =
+                        scrub_tabs_for_storage(&saved.browser_tabs, saved.browser_active_tab);
                 }
                 saved
             })

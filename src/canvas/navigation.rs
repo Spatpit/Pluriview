@@ -395,7 +395,32 @@ impl CanvasState {
             return;
         };
         let target_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
+        // A browser's toolbar and tabs are not part of its page: crop from
+        // the page alone, and frame the page again once the crop is cleared.
+        let (framed, collapsed) = preview_manager
+            .get(id)
+            .map(|preview| {
+                (
+                    chrome_geometry::shows_chrome(preview),
+                    preview.browser_tabs_collapsed,
+                )
+            })
+            .unwrap_or_default();
+        let current_rect = if framed && crop_uv.is_some() {
+            chrome_geometry::strip_chrome(current_rect, collapsed)
+        } else {
+            current_rect
+        };
         let new_rect = rect_for_crop_change(current_crop, target_crop, current_rect);
+        let wants_frame = crop_uv.is_none()
+            && preview_manager
+                .get(id)
+                .is_some_and(|preview| preview.is_browser() && preview.browser_chrome);
+        let new_rect = if wants_frame && !framed {
+            chrome_geometry::wrap_with_chrome(new_rect, collapsed)
+        } else {
+            new_rect
+        };
         if let Some(preview) = preview_manager.get_mut(id) {
             preview.crop_uv = crop_uv;
             if screen_space {
@@ -414,6 +439,32 @@ impl CanvasState {
                 preview.source_aspect_ratio = new_rect.width() / new_rect.height();
             }
         }
+    }
+
+    /// Shrink a browser tile showing its toolbar and tabs to just its page,
+    /// so a crop gesture starting at `rect` (tile units) acts on the page.
+    /// Returns the rect the gesture should start from.
+    pub(super) fn drop_browser_frame_for_crop(
+        &self,
+        id: PreviewId,
+        rect: Rect,
+        canvas_rect: Rect,
+        preview_manager: &mut PreviewManager,
+    ) -> Rect {
+        let Some(preview) = preview_manager
+            .get_mut(id)
+            .filter(|preview| chrome_geometry::shows_chrome(preview))
+        else {
+            return rect;
+        };
+        let page = chrome_geometry::strip_chrome(rect, preview.browser_tabs_collapsed);
+        if preview.viewport_pin.is_some() {
+            preview.viewport_pin = Some(groups::pin_for_tile(preview, page, canvas_rect));
+        } else {
+            preview.position = page.min;
+            preview.size = page.size();
+        }
+        page
     }
 
     pub(super) fn toggle_single_viewport_pin(
@@ -637,8 +688,9 @@ impl CanvasState {
         {
             return None;
         }
-        let rect = self.preview_screen_rect(preview, canvas_rect);
-        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        let rect =
+            chrome_geometry::page_rect_for(preview, self.preview_screen_rect(preview, canvas_rect));
+        if rect.width() <= 0.0 || rect.height() <= 0.0 || !rect.contains(screen_pos) {
             return None;
         }
         let (min_u, min_v, max_u, max_v) = preview.crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));

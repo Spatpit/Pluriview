@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::VideoPlaybackPreferences;
+use super::{BrowserTab, VideoPlaybackPreferences};
 use crate::media::MediaFrame;
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout};
 
@@ -340,6 +340,20 @@ pub struct Preview {
     /// The browser tile's page is playing sound (runtime only).
     pub browser_playing_audio: bool,
 
+    /// Every page open in a browser tile, mirrored from its host. The active
+    /// one is also `browser_url`. Empty until the tile has a host or a saved
+    /// tab list, which means a single tab at `browser_url`.
+    pub browser_tabs: Vec<BrowserTab>,
+    pub browser_active_tab: usize,
+    /// Draw the browser toolbar and vertical tabs around the page.
+    pub browser_chrome: bool,
+    /// Show the tab strip as icons only.
+    pub browser_tabs_collapsed: bool,
+    /// Navigation state of the active tab (runtime only).
+    pub browser_can_go_back: bool,
+    pub browser_can_go_forward: bool,
+    pub browser_loading: bool,
+
     /// Replay this window-capture tile's process audio through the stream
     /// audio monitor (Discord/OBS). Ignored for browser, video, and image tiles.
     pub stream_audio: bool,
@@ -454,6 +468,13 @@ impl Preview {
             browser_muted: false,
             browser_page_zoom: 1.0,
             browser_playing_audio: false,
+            browser_tabs: Vec::new(),
+            browser_active_tab: 0,
+            browser_chrome: false,
+            browser_tabs_collapsed: false,
+            browser_can_go_back: false,
+            browser_can_go_forward: false,
+            browser_loading: false,
             stream_audio: false,
             capture_error: None,
             browser_status: BrowserTileStatus::Ready,
@@ -486,6 +507,17 @@ impl Preview {
     /// Is this preview an app-owned browser tile?
     pub fn is_browser(&self) -> bool {
         self.browser_url.is_some()
+    }
+
+    /// The tabs a browser host should open with and the one to show. A tile
+    /// without a tab list opens a single tab at its URL.
+    pub fn browser_startup_tabs(&self) -> (Vec<BrowserTab>, usize) {
+        if self.browser_tabs.is_empty() {
+            let url = self.browser_url.clone().unwrap_or_default();
+            return (vec![BrowserTab::new(url)], 0);
+        }
+        let active = self.browser_active_tab.min(self.browser_tabs.len() - 1);
+        (self.browser_tabs.clone(), active)
     }
 
     /// Is this preview backed by a managed image or GIF?
@@ -929,6 +961,16 @@ pub struct PreviewLayout {
     /// Per-tile page zoom for browser tiles.
     #[serde(default = "default_browser_page_zoom")]
     pub browser_page_zoom: f32,
+    /// Every tab of a browser tile. Older layouts have only `browser_url`.
+    #[serde(default)]
+    pub browser_tabs: Vec<BrowserTab>,
+    #[serde(default)]
+    pub browser_active_tab: usize,
+    /// Tiles saved before the browser toolbar existed keep a plain page.
+    #[serde(default)]
+    pub browser_chrome: bool,
+    #[serde(default)]
+    pub browser_tabs_collapsed: bool,
     /// Replay this captured window's audio through the stream monitor.
     #[serde(default)]
     pub stream_audio: bool,
@@ -978,6 +1020,10 @@ impl From<&Preview> for PreviewLayout {
             browser_url: preview.browser_url.clone(),
             browser_muted: preview.browser_muted,
             browser_page_zoom: preview.browser_page_zoom,
+            browser_tabs: preview.browser_tabs.clone(),
+            browser_active_tab: preview.browser_active_tab,
+            browser_chrome: preview.browser_chrome,
+            browser_tabs_collapsed: preview.browser_tabs_collapsed,
             stream_audio: preview.stream_audio,
             media_path: preview.media_path.clone(),
             video_source: preview.video_source.as_ref().map(scrub_video_source),
@@ -1185,7 +1231,8 @@ fn twitch_label(parsed: &url::Url) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Preview, PreviewId, PreviewLayout, VideoSource, ViewportAnchor, ViewportPin, WindowHandle,
+        BrowserTab, Preview, PreviewId, PreviewLayout, VideoSource, ViewportAnchor, ViewportPin,
+        WindowHandle,
     };
     use crate::media::MediaFrame;
     use eframe::egui::{Context, Pos2, Rect, Vec2};
@@ -1246,6 +1293,53 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("browser_page_zoom");
         let saved: PreviewLayout = serde_json::from_value(legacy).unwrap();
         assert_eq!(saved.browser_page_zoom, 1.0);
+    }
+
+    #[test]
+    fn browser_tabs_round_trip_and_older_layouts_open_one_plain_tab() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "page".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        preview.browser_url = Some("https://example.com/b".to_owned());
+        let mut playing = BrowserTab::new("https://example.com/b");
+        playing.playing_audio = true;
+        preview.browser_tabs = vec![BrowserTab::new("https://example.com/a"), playing];
+        preview.browser_active_tab = 1;
+        preview.browser_chrome = true;
+        preview.browser_tabs_collapsed = true;
+        let json = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert!(json["browser_tabs"][1].get("playing_audio").is_none());
+        let saved: PreviewLayout = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(saved.browser_tabs.len(), 2);
+        assert_eq!(saved.browser_active_tab, 1);
+        assert!(saved.browser_chrome && saved.browser_tabs_collapsed);
+
+        let mut legacy = json;
+        for field in [
+            "browser_tabs",
+            "browser_active_tab",
+            "browser_chrome",
+            "browser_tabs_collapsed",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let saved: PreviewLayout = serde_json::from_value(legacy).unwrap();
+        assert!(saved.browser_tabs.is_empty());
+        assert!(!saved.browser_chrome);
+
+        let mut restored = Preview::new(
+            PreviewId(2),
+            "page".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        restored.browser_url = saved.browser_url;
+        let (tabs, active) = restored.browser_startup_tabs();
+        assert_eq!(tabs, vec![BrowserTab::new("https://example.com/b")]);
+        assert_eq!(active, 0);
     }
 
     #[test]
