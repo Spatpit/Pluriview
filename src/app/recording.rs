@@ -52,7 +52,12 @@ struct ActiveRecording {
     last_places: Vec<Option<egui::Rect>>,
     /// Small copy of a recent frame that flies into the panel on stop.
     thumbnail: Option<(egui::ColorImage, Instant)>,
+    started: Instant,
 }
+
+/// How long a browser tile recorded alone waits for its first full-size
+/// frame (see `feed_recording`).
+const FULL_FRAME_WAIT: Duration = Duration::from_millis(500);
 
 /// Elapsed recording time as `m:ss`, or `h:mm:ss` past an hour.
 fn format_elapsed(elapsed: Duration) -> String {
@@ -238,6 +243,7 @@ impl PluriviewApp {
             clock: Clock::new(started),
             last_sent: None,
             thumbnail: None,
+            started,
         });
         ctx.request_repaint();
     }
@@ -436,7 +442,20 @@ impl PluriviewApp {
                 }
             } else if let Some(frame) = preview.latest_capture_frame() {
                 let source = Arc::as_ptr(&frame) as usize;
-                if source != tile.last_source {
+                // A tile recorded alone sets the video's size with its first
+                // frame. A browser's frames are only as big as the page on
+                // screen until the recording's full-size ones arrive, a frame
+                // or two later, so wait for those.
+                let full_size = preview.source_frame_size.is_some_and(|(width, height)| {
+                    (frame.size[0] as u32, frame.size[1] as u32)
+                        == crate::capture::screenshot_capture_size(width, height)
+                });
+                let waiting = preview.is_browser()
+                    && preview.recording_full_size
+                    && tile.latest.is_none()
+                    && !full_size
+                    && now.duration_since(active.started) < FULL_FRAME_WAIT;
+                if source != tile.last_source && !waiting {
                     tile.last_source = source;
                     pixels = Some(CapturedPixels::Premultiplied(frame));
                 }

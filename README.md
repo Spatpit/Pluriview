@@ -282,8 +282,11 @@ New browser tiles open with a toolbar and vertical tabs around the page:
   become tabs. Every tab shares the tile's sign-ins and mute state, and shows
   its site's icon once the page has loaded.
 - **Scroll** the strip with the mouse wheel when it holds more tabs than fit.
-- **Drag** a tab up or down to reorder it, or drop it outside the tile to open
-  it as a tile of its own there. The page reloads in the new tile.
+- **Drag** a tab up or down to reorder it. Drop it on another browser tile to
+  add it to that tile's tabs (on its tab strip, where you drop it; anywhere
+  else on the tile, at the end), or on empty canvas to open it as a tile of
+  its own there. The page moves as it is, without reloading, so a video keeps
+  playing. A tile whose only tab you move into another tile closes.
 - **Sleeping tabs:** a background tab that has not been shown or played sound
   for 10 minutes unloads to free memory. It fades with a moon icon and
   reloads when you open it.

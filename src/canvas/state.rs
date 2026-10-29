@@ -22,8 +22,8 @@ use crate::preview::{
 };
 #[cfg(debug_assertions)]
 use crate::privacy;
-use browser_chrome::{AddressEdit, TabDrag, TabScroll};
-pub use browser_chrome::{BrowserNavigation, TabDetach};
+use browser_chrome::{AddressEdit, TabDrag, TabDrop, TabScroll};
+pub use browser_chrome::{BrowserNavigation, TabDetach, TabTransfer};
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
 use groups::GroupState;
 use std::collections::HashMap;
@@ -1352,6 +1352,13 @@ pub struct CanvasState {
     /// Tabs dragged out of their tile to open as a tile of their own.
     pub pending_tab_detaches: Vec<TabDetach>,
 
+    /// Tabs dragged onto another browser tile to join its tabs.
+    pub pending_tab_transfers: Vec<TabTransfer>,
+
+    /// A tab released outside its tile this frame, resolved after every
+    /// tile is drawn.
+    browser_tab_drop: Option<TabDrop>,
+
     /// The browser tab being dragged, if any.
     browser_tab_drag: Option<TabDrag>,
 
@@ -1451,6 +1458,8 @@ impl Default for CanvasState {
             pending_browser_navigations: Vec::new(),
             browser_address_edit: None,
             pending_tab_detaches: Vec::new(),
+            pending_tab_transfers: Vec::new(),
+            browser_tab_drop: None,
             browser_tab_drag: None,
             browser_tab_scroll: HashMap::new(),
             favicon_textures: HashMap::new(),
@@ -3606,6 +3615,7 @@ impl CanvasState {
                 );
             });
         }
+        self.follow_tab_drag(ctx, canvas_rect, preview_manager);
         self.tile_scratch = preview_info;
 
         // Keep repainting while any preview is spawning in, fading out, or

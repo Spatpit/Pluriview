@@ -5,7 +5,7 @@ use super::{
 use crate::media::MediaFrame;
 use crate::playlist::FolderPlaylist;
 use eframe::egui::{Pos2, Vec2};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,8 @@ pub struct PreviewManager {
     /// Highest z-order
     max_z_order: u32,
     removal_batches: Vec<Vec<PreviewId>>,
+    /// Tiles being removed without offering Undo.
+    removals_without_undo: HashSet<PreviewId>,
 }
 
 impl PreviewManager {
@@ -73,6 +75,7 @@ impl PreviewManager {
             next_id: 1,
             max_z_order: 0,
             removal_batches: Vec::new(),
+            removals_without_undo: HashSet::new(),
         }
     }
 
@@ -254,6 +257,15 @@ impl PreviewManager {
         self.start_removal_batch(&[id]);
     }
 
+    /// Like [`Self::start_removal`], without offering Undo: for a tile whose
+    /// content moved to another tile, which Undo would duplicate.
+    pub fn start_removal_without_undo(&mut self, id: PreviewId) {
+        if self.previews.get(&id).is_some_and(|p| p.removing.is_none()) {
+            self.removals_without_undo.insert(id);
+        }
+        self.start_removal(id);
+    }
+
     pub fn start_removal_batch(&mut self, ids: &[PreviewId]) {
         let mut batch = Vec::new();
         for id in ids {
@@ -286,7 +298,8 @@ impl PreviewManager {
             let done = self.removal_batches.remove(index);
             let mut removed = Vec::with_capacity(done.len());
             for id in done {
-                if let Some(preview) = self.previews.remove(&id) {
+                let undoable = !self.removals_without_undo.remove(&id);
+                if let Some(preview) = self.previews.remove(&id).filter(|_| undoable) {
                     removed.push(RemovedPreviewInfo {
                         title: preview.title,
                         window_handle: preview.window_handle,
@@ -331,6 +344,7 @@ impl PreviewManager {
     pub fn clear(&mut self) {
         self.previews.clear();
         self.removal_batches.clear();
+        self.removals_without_undo.clear();
         self.next_id = 1;
         self.max_z_order = 0;
     }
@@ -519,6 +533,23 @@ mod tests {
         assert_eq!(first.z_order, 1);
         assert_eq!(first.playlist_group, Some(7));
         assert_eq!(first.video_playback.volume, 37.0);
+        assert_eq!(previews.all().count(), 0);
+    }
+
+    #[test]
+    fn a_tile_removed_without_undo_is_not_offered_back() {
+        let mut previews = PreviewManager::new();
+        let moved = previews.add("moved".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        let deleted = previews.add("deleted".to_owned(), Pos2::ZERO, Vec2::splat(100.0));
+        previews.start_removal_without_undo(moved);
+        previews.start_removal(deleted);
+        let finished = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        for id in [moved, deleted] {
+            previews.get_mut(id).unwrap().removing = Some(finished);
+        }
+        let batches = previews.finalize_removals();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0][0].title, "deleted");
         assert_eq!(previews.all().count(), 0);
     }
 

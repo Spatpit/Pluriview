@@ -932,6 +932,9 @@ pub fn capture_size_for_tile(width: i32, height: i32) -> (i32, i32) {
 struct TabView {
     webview: WebView,
     shared: Arc<Mutex<SharedState>>,
+    /// Whether the tile showing this page is interactive, for its popup and
+    /// permission handlers. Per page, so a page can move to another tile.
+    interactive: Arc<std::sync::atomic::AtomicBool>,
     /// When the live address was last read from WebView2 (see [`BrowserHost::poll`]).
     last_url_check: Option<Instant>,
     /// Ad-block activation may request navigation while a tile sleeps. Keep
@@ -1164,8 +1167,6 @@ pub struct BrowserHost {
     tabs_dirty: bool,
     window: NativeWindow,
     active: bool,
-    /// Mirrors `active` for the WebView2 permission handler.
-    interactive: Arc<std::sync::atomic::AtomicBool>,
     muted: bool,
     /// Last host/page geometry applied while active (physical px), to skip
     /// redundant positioning calls while glued to the tile.
@@ -1193,6 +1194,15 @@ enum AfterResume {
 
 impl BrowserHost {
     fn new(context: &mut WebContext, url: &str, signals: &EngineSignals) -> Result<Self, String> {
+        let mut host = Self::empty()?;
+        let view = host.build_view(context, url, signals, true)?;
+        host.tabs.push(HostTab::loaded(view, url, true));
+        Ok(host)
+    }
+
+    /// A parked host window without tabs yet. It must get one before it is
+    /// used: see [`Self::adopt_tab`].
+    fn empty() -> Result<Self, String> {
         static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
         REGISTERED.get_or_init(register_window_class).clone()?;
 
@@ -1217,13 +1227,12 @@ impl BrowserHost {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
 
-        let mut host = Self {
+        Ok(Self {
             tabs: Vec::new(),
             active_tab: 0,
             tabs_dirty: true,
             window: NativeWindow(hwnd),
             active: false,
-            interactive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             muted: false,
             last_geometry: None,
             reveal_at: None,
@@ -1231,10 +1240,7 @@ impl BrowserHost {
             capture_size: (WIDTH, HEIGHT),
             suspended: false,
             page_zoom: 1.0,
-        };
-        let view = host.build_view(context, url, signals, true)?;
-        host.tabs.push(HostTab::loaded(view, url, true));
-        Ok(host)
+        })
     }
 
     /// Create a WebView for one tab inside this host's window.
@@ -1255,7 +1261,8 @@ impl BrowserHost {
         let new_window_shared = shared.clone();
         let download_shared = shared.clone();
         let load_shared = shared.clone();
-        let popup_interactive = self.interactive.clone();
+        let interactive = Arc::new(std::sync::atomic::AtomicBool::new(self.active));
+        let popup_interactive = interactive.clone();
 
         let webview = WebViewBuilder::new_with_web_context(context)
             // All tiles share one WebView2 environment/profile, so this must
@@ -1323,7 +1330,7 @@ impl BrowserHost {
             })
             .build_as_child(&self.window)
             .map_err(|error| error.to_string())?;
-        if let Err(error) = register_permission_policy(&webview, self.interactive.clone()) {
+        if let Err(error) = register_permission_policy(&webview, interactive.clone()) {
             log::warn!("Browser permission requests use WebView2 defaults: {error}");
         }
         if let Err(error) =
@@ -1350,6 +1357,7 @@ impl BrowserHost {
         let view = TabView {
             webview,
             shared,
+            interactive,
             last_url_check: None,
             after_resume: None,
             last_crash_reload: None,
@@ -1515,22 +1523,89 @@ impl BrowserHost {
         if self.tabs.len() < 2 || index >= self.tabs.len() {
             return Ok(());
         }
-        let closing_active = index == self.active_tab;
-        self.tabs.remove(index);
+        self.take_tab(context, signals, index).map(drop)
+    }
+
+    /// Remove tab `index` with its page still loaded, for another host to
+    /// adopt. If it was shown, the tab that takes its place is shown. Taking
+    /// the last tab leaves the host empty, and the caller then drops it.
+    fn take_tab(
+        &mut self,
+        context: &mut WebContext,
+        signals: &EngineSignals,
+        index: usize,
+    ) -> Result<HostTab, String> {
+        if index >= self.tabs.len() {
+            return Err("That tab is no longer open".to_owned());
+        }
+        let taking_active = index == self.active_tab;
+        let tab = self.tabs.remove(index);
         self.tabs_dirty = true;
-        if index < self.active_tab {
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+        } else if index < self.active_tab {
             self.active_tab -= 1;
-        } else if closing_active {
-            // Like a browser, move to the tab that took the closed one's place.
+        } else if taking_active {
+            // Like a browser, move to the tab that took this one's place.
             let next = index.min(self.tabs.len() - 1);
-            if self.tabs[next].view.is_none() {
-                let url = self.tabs[next].url.clone();
-                let view = self.build_view(context, &url, signals, false)?;
-                self.tabs[next].view = Some(view);
-            }
             self.active_tab = next;
             self.tabs[next].hidden_since = None;
+            if self.tabs[next].view.is_none() {
+                let url = self.tabs[next].url.clone();
+                match self.build_view(context, &url, signals, false) {
+                    Ok(view) => self.tabs[next].view = Some(view),
+                    Err(error) => log::warn!("Could not load the next browser tab: {error}"),
+                }
+            }
             self.show_active_view();
+        }
+        Ok(tab)
+    }
+
+    /// Add `tab`, taken from another host with its page loaded, at `slot` and
+    /// show it. On failure the tab is handed back with the reason.
+    fn adopt_tab(
+        &mut self,
+        context: &mut WebContext,
+        signals: &EngineSignals,
+        mut tab: HostTab,
+        slot: usize,
+    ) -> Result<(), Box<(HostTab, String)>> {
+        if self.suspended {
+            return Err(Box::new((
+                tab,
+                "Unfreeze this browser tile to add tabs".to_owned(),
+            )));
+        }
+        if let Some(view) = tab.view.as_ref() {
+            // Hidden until shown at this host's size, so it never flashes at
+            // the old one.
+            let _ = view.webview.set_visible(false);
+            if let Err(error) = view.webview.reparent(self.hwnd()) {
+                return Err(Box::new((tab, error.to_string())));
+            }
+            // Its pop-ups and input follow the new window from here on.
+            unsafe {
+                let _ = view
+                    .webview
+                    .controller()
+                    .NotifyParentWindowPositionChanged();
+            }
+            view.interactive
+                .store(self.active, std::sync::atomic::Ordering::Relaxed);
+            if let Err(error) = view.set_muted(self.muted) {
+                log::warn!("A moved browser tab kept its old mute state: {error}");
+            }
+        }
+        tab.hidden_since = None;
+        let index = slot.min(self.tabs.len());
+        if !self.tabs.is_empty() && index <= self.active_tab {
+            self.active_tab += 1;
+        }
+        self.tabs.insert(index, tab);
+        self.tabs_dirty = true;
+        if let Err(error) = self.select_tab(context, signals, index) {
+            log::warn!("Could not show a moved browser tab: {error}");
         }
         Ok(())
     }
@@ -1914,8 +1989,10 @@ impl BrowserHost {
 
     fn set_active(&mut self, active: bool) {
         self.active = active;
-        self.interactive
-            .store(active, std::sync::atomic::Ordering::Relaxed);
+        for view in self.loaded_views() {
+            view.interactive
+                .store(active, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Give keyboard focus back to an interactive page after the user
@@ -2561,6 +2638,115 @@ impl BrowserManager {
         }
     }
 
+    /// Move tab `index` of tile `from` to position `slot` of tile `to` with
+    /// its page still loaded, and show it there. Returns true when it was
+    /// `from`'s only tab: that host is then gone, and the caller removes the
+    /// tile.
+    pub fn transfer_tab(
+        &mut self,
+        from: PreviewId,
+        index: usize,
+        to: PreviewId,
+        slot: usize,
+    ) -> Result<bool, String> {
+        if from == to {
+            return Err("The tab is already in this tile".to_owned());
+        }
+        let Self {
+            hosts,
+            context,
+            signals,
+            ..
+        } = self;
+        let target = hosts
+            .get(&to)
+            .ok_or("That browser tile is still starting")?;
+        if target.suspended {
+            return Err("Unfreeze that browser tile to add tabs to it".to_owned());
+        }
+        let source = hosts
+            .get_mut(&from)
+            .ok_or("This browser tile is still starting")?;
+        if source.suspended {
+            return Err("Unfreeze this browser tile to move its tabs".to_owned());
+        }
+        let tab = source.take_tab(context, signals, index)?;
+        let target = hosts.get_mut(&to).expect("checked above");
+        if let Err(rejected) = target.adopt_tab(context, signals, tab, slot) {
+            let (tab, error) = *rejected;
+            Self::give_back(hosts, context, signals, from, tab, index);
+            return Err(error);
+        }
+        Ok(self.drop_if_empty(from))
+    }
+
+    /// Open tab `index` of tile `from` as the only tab of a new tile `id`,
+    /// with its page still loaded. Returns the new host's HWND for capture.
+    /// `from` never loses its last tab this way.
+    pub fn create_from_tab(
+        &mut self,
+        id: PreviewId,
+        from: PreviewId,
+        index: usize,
+    ) -> Result<isize, String> {
+        let Self {
+            hosts,
+            context,
+            signals,
+            ..
+        } = self;
+        let source = hosts
+            .get(&from)
+            .ok_or("This browser tile is still starting")?;
+        if source.tabs.len() < 2 {
+            return Err("A tile keeps its last tab".to_owned());
+        }
+        if source.suspended {
+            return Err("Unfreeze this browser tile to move its tabs".to_owned());
+        }
+        let (muted, page_zoom) = (source.muted, source.page_zoom);
+        let mut host = BrowserHost::empty()?;
+        host.muted = muted;
+        host.page_zoom = page_zoom;
+        let source = hosts.get_mut(&from).expect("checked above");
+        let tab = source.take_tab(context, signals, index)?;
+        if let Err(rejected) = host.adopt_tab(context, signals, tab, 0) {
+            let (tab, error) = *rejected;
+            Self::give_back(hosts, context, signals, from, tab, index);
+            return Err(error);
+        }
+        let hwnd = host.hwnd();
+        hosts.insert(id, host);
+        Ok(hwnd)
+    }
+
+    /// Return a tab that could not move to the tile it came from.
+    fn give_back(
+        hosts: &mut HashMap<PreviewId, BrowserHost>,
+        context: &mut WebContext,
+        signals: &EngineSignals,
+        from: PreviewId,
+        tab: HostTab,
+        index: usize,
+    ) {
+        if let Some(source) = hosts.get_mut(&from) {
+            if let Err(rejected) = source.adopt_tab(context, signals, tab, index) {
+                let error = &rejected.1;
+                log::warn!("A browser tab could not return to its tile: {error}");
+            }
+        }
+    }
+
+    /// Drop `id`'s host if it has no tabs left. Returns whether it did.
+    fn drop_if_empty(&mut self, id: PreviewId) -> bool {
+        if self.hosts.get(&id).is_some_and(|host| host.tabs.is_empty()) {
+            self.hosts.remove(&id);
+            self.deferred_loads.remove(&id);
+            return true;
+        }
+        false
+    }
+
     /// Put idle background tabs of every tile to sleep.
     pub fn sleep_idle_tabs(&mut self) {
         let now = Instant::now();
@@ -3200,6 +3386,82 @@ mod tests {
         verify_ubol_archive, write_profile_install_marker, write_ubol_verification_marker,
         NativeWindow, FAVICON_SIZE, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE_NAME, UBOL_VERSION,
     };
+
+    /// Run this thread's WebView2 callbacks until `done`.
+    fn pump_until(mut done: impl FnMut() -> bool) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "WebView2 did not answer in time"
+            );
+            unsafe {
+                let mut message = MSG::default();
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// `script`'s result as JSON.
+    fn evaluate(webview: &wry::WebView, script: &str) -> String {
+        let result = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let slot = result.clone();
+        webview
+            .evaluate_script_with_callback(script, move |value| *slot.lock() = Some(value))
+            .unwrap();
+        pump_until(|| result.lock().is_some());
+        let value = result.lock().take();
+        value.unwrap()
+    }
+
+    #[test]
+    #[ignore = "starts WebView2 offscreen with a throwaway profile"]
+    fn a_tab_moved_to_another_tile_keeps_its_live_page() {
+        use wry::WebViewExtWindows;
+        let profile =
+            std::env::temp_dir().join(format!("pluriview-tab-move-test-{}", std::process::id()));
+        let signals = super::EngineSignals::default();
+        {
+            let mut context = wry::WebContext::new(Some(profile.clone()));
+            let mut source =
+                super::BrowserHost::new(&mut context, "about:blank", &signals).unwrap();
+            let second = source
+                .build_view(&mut context, "about:blank", &signals, false)
+                .unwrap();
+            source
+                .tabs
+                .push(super::HostTab::loaded(second, "about:blank", false));
+            let page = &source.tabs[0].view.as_ref().unwrap().webview;
+            pump_until(|| evaluate(page, "document.readyState") == "\"complete\"");
+            assert_eq!(evaluate(page, "window.pluriviewMarker = 42"), "42");
+
+            let tab = source.take_tab(&mut context, &signals, 0).unwrap();
+            assert_eq!(source.tabs.len(), 1);
+            assert_eq!(source.active_tab, 0);
+            let mut target = super::BrowserHost::empty().unwrap();
+            assert!(target.adopt_tab(&mut context, &signals, tab, 0).is_ok());
+
+            // The same document, not a reload: the marker is still there.
+            let moved = &target.tabs[0].view.as_ref().unwrap().webview;
+            assert_eq!(evaluate(moved, "String(window.pluriviewMarker)"), "\"42\"");
+            // And it now lives in the other tile's window.
+            let mut container = webview2_windows::Win32::Foundation::HWND::default();
+            unsafe { moved.controller().ParentWindow(&mut container).unwrap() };
+            let parent = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetParent(super::HWND(container.0))
+            }
+            .unwrap();
+            assert_eq!(parent, target.window.0);
+        }
+        let _ = std::fs::remove_dir_all(profile);
+    }
 
     #[test]
     fn moving_a_tab_keeps_track_of_every_other_tab() {

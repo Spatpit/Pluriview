@@ -97,6 +97,34 @@ pub(super) struct TabScroll {
     count: usize,
 }
 
+/// A tab dropped outside its tile, resolved once every tile is drawn.
+#[derive(Clone, Copy)]
+pub(super) struct TabDrop {
+    drag: TabDrag,
+    pointer: Pos2,
+}
+
+/// A tab dragged onto another browser tile to join its tabs, consumed by the
+/// app.
+#[derive(Clone, Copy, Debug)]
+pub struct TabTransfer {
+    pub from: PreviewId,
+    pub index: usize,
+    pub to: PreviewId,
+    /// Where it goes among `to`'s tabs.
+    pub slot: usize,
+}
+
+/// Another browser tile a dragged tab would join.
+struct TabDropTarget {
+    id: PreviewId,
+    slot: usize,
+    tile: Rect,
+    /// The insertion line in its tab strip, when it shows one: x range, y
+    /// and the strip's scale.
+    line: Option<(egui::Rangef, f32, f32)>,
+}
+
 /// A tab dragged out of its tile (or moved with its menu) to open as a new
 /// tile, consumed by the app.
 #[derive(Clone, Copy, Debug)]
@@ -892,8 +920,9 @@ impl CanvasState {
         })
     }
 
-    /// Follow a tab being dragged: show where it will land in the strip, or
-    /// that it will become its own tile when dropped outside this one.
+    /// Follow a tab being dragged within its own tile and show where it will
+    /// land in the strip. Outside the tile, [`Self::follow_tab_drag`] takes
+    /// over.
     #[allow(clippy::too_many_arguments)]
     fn drag_tab(
         &mut self,
@@ -929,8 +958,8 @@ impl CanvasState {
                     self.pending_browser_actions
                         .push((drag.id, BrowserAction::MoveTab { from, to }));
                 }
-            } else if tabs.len() > 1 {
-                self.detach_tab(drag.id, from, Some(pointer));
+            } else {
+                self.browser_tab_drop = Some(TabDrop { drag, pointer });
             }
             return;
         }
@@ -957,19 +986,81 @@ impl CanvasState {
             if let Some(state) = self.browser_tab_scroll.get_mut(&drag.id) {
                 state.offset = (state.offset + step).clamp(0.0, list.max_scroll / s);
             }
+        }
+    }
+
+    /// After every tile is drawn: resolve a tab dropped outside its tile,
+    /// or show where a tab being dragged there would go. On another browser
+    /// tile it joins that tile's tabs, elsewhere it opens as a new tile.
+    pub(super) fn follow_tab_drag(
+        &mut self,
+        ctx: &egui::Context,
+        canvas_rect: Rect,
+        preview_manager: &PreviewManager,
+    ) {
+        if let Some(drop) = self.browser_tab_drop.take() {
+            let drag = drop.drag;
+            let tab_count = preview_manager
+                .get(drag.id)
+                .map_or(0, |preview| preview.browser_tabs.len().max(1));
+            match self.tab_drop_target(drag, drop.pointer, canvas_rect, preview_manager) {
+                Some(target) => self.pending_tab_transfers.push(TabTransfer {
+                    from: drag.id,
+                    index: drag.from,
+                    to: target.id,
+                    slot: target.slot,
+                }),
+                // The last tab only moves to another tile; alone it would
+                // just be this tile again.
+                None if tab_count > 1 => self.detach_tab(drag.id, drag.from, Some(drop.pointer)),
+                None => {}
+            }
             return;
         }
-        if tabs.len() < 2 {
-            return;
-        }
-        // Outside the tile: a ghost of the new tile it will become.
-        let Some(tab) = tabs.get(from) else {
+        let Some(drag) = self.browser_tab_drag else {
             return;
         };
-        let ghost_painter = ui.ctx().layer_painter(egui::LayerId::new(
+        let (Some(pointer), Some(source)) =
+            (ctx.pointer_latest_pos(), preview_manager.get(drag.id))
+        else {
+            return;
+        };
+        let source_rect = self.preview_screen_rect(source, canvas_rect);
+        let source_tile = chrome_geometry::layout_for(source, source_rect)
+            .map_or(source_rect, |layout| layout.toolbar.union(layout.page));
+        if source_tile.contains(pointer) {
+            return;
+        }
+        let fallback;
+        let tabs = if source.browser_tabs.is_empty() {
+            fallback = [BrowserTab {
+                url: source.browser_url.clone().unwrap_or_default(),
+                title: source.title.clone(),
+                ..BrowserTab::default()
+            }];
+            &fallback[..]
+        } else {
+            &source.browser_tabs[..]
+        };
+        let Some(tab) = tabs.get(drag.from) else {
+            return;
+        };
+        let target = self.tab_drop_target(drag, pointer, canvas_rect, preview_manager);
+        let ghost_painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
             egui::Id::new("browser_tab_drag_ghost"),
         ));
+        if let Some(target) = &target {
+            ghost_painter.rect_stroke(target.tile, 6.0, Stroke::new(2.0, ui_theme::GOLD));
+            if let Some((x, y, s)) = target.line {
+                ghost_painter.hline(x, y, Stroke::new(2.0 * s.max(0.5), ui_theme::GOLD));
+            }
+        }
+        let hint = match (&target, tabs.len() > 1) {
+            (Some(_), _) => "Drop to add to this tile's tabs",
+            (None, true) => "Drop to open as a new tile",
+            (None, false) => "Drop on a browser tile to move it there",
+        };
         let ghost = Rect::from_min_size(pointer + Vec2::new(14.0, 10.0), Vec2::new(200.0, 52.0));
         ghost_painter.rect_filled(ghost, 8.0, ui_theme::SURFACE);
         ghost_painter.rect_stroke(ghost, 8.0, Stroke::new(1.5, ui_theme::GOLD));
@@ -977,7 +1068,7 @@ impl CanvasState {
             Pos2::new(ghost.left() + 20.0, ghost.top() + 18.0),
             Vec2::splat(BADGE),
         );
-        self.paint_tab_icon(ui.ctx(), &ghost_painter, badge, tab, false, 1.0);
+        self.paint_tab_icon(ctx, &ghost_painter, badge, tab, false, 1.0);
         let font = egui::FontId::proportional(12.0);
         let galley = ghost_painter.layout_job(single_line(
             tab.label(),
@@ -996,10 +1087,58 @@ impl CanvasState {
         ghost_painter.text(
             Pos2::new(ghost.left() + 12.0, ghost.bottom() - 12.0),
             egui::Align2::LEFT_CENTER,
-            "Drop to open as a new tile",
+            hint,
             egui::FontId::proportional(11.0),
             ui_theme::SECONDARY,
         );
+    }
+
+    /// The browser tile under `pointer` that a tab dragged out of its own
+    /// tile would join, and where among its tabs.
+    fn tab_drop_target(
+        &self,
+        drag: TabDrag,
+        pointer: Pos2,
+        canvas_rect: Rect,
+        preview_manager: &PreviewManager,
+    ) -> Option<TabDropTarget> {
+        let id = self
+            .left_click_preview_at_screen(pointer, canvas_rect, preview_manager)
+            .filter(|id| *id != drag.id)?;
+        let preview = preview_manager.get(id).filter(|preview| {
+            preview.is_browser()
+                && preview.removing.is_none()
+                && !preview.manually_frozen
+                && preview.picture_in_picture.is_none()
+                && preview.browser_status == BrowserTileStatus::Ready
+        })?;
+        let tile = self.preview_screen_rect(preview, canvas_rect);
+        let count = preview.browser_tabs.len().max(1);
+        let mut target = TabDropTarget {
+            id,
+            // Anywhere else on the tile, it goes after the last tab.
+            slot: count,
+            tile,
+            line: None,
+        };
+        if let Some(layout) = chrome_geometry::layout_for(preview, tile).filter(shows_controls) {
+            let list = TabList::new(&layout, count);
+            let scroll = self
+                .browser_tab_scroll
+                .get(&id)
+                .map_or(0.0, |state| state.offset * layout.scale)
+                .clamp(0.0, list.max_scroll);
+            if list.area.contains(pointer) {
+                target.slot = list.slot_at(pointer.y, scroll, count);
+            }
+            let y = list.area.top() + target.slot as f32 * list.pitch - scroll - list.gap / 2.0;
+            target.line = Some((
+                list.area.x_range(),
+                y.clamp(list.area.top() + 1.0, list.area.bottom() - 1.0),
+                layout.scale,
+            ));
+        }
+        Some(target)
     }
 
     /// Queue moving tab `index` of `id` to a new tile, dropped at `pointer`
@@ -1285,9 +1424,11 @@ fn paint_site_badge(painter: &egui::Painter, rect: Rect, url: &str, alpha: f32, 
 mod tests {
     use super::{
         address_job, char_slice, ordered, replace_chars, single_line_text, site_name, site_of,
-        TabList, TAB_GAP, TAB_HEIGHT,
+        TabDrag, TabDrop, TabList, TAB_GAP, TAB_HEIGHT,
     };
-    use crate::preview::browser_chrome::ChromeLayout;
+    use crate::canvas::CanvasState;
+    use crate::preview::browser_chrome::{self as chrome_geometry, ChromeLayout};
+    use crate::preview::{BrowserTab, BrowserTileStatus, FpsPreset, PreviewId, PreviewManager};
 
     fn list_for(tab_count: usize, tile_height: f32) -> TabList {
         let tile = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, tile_height));
@@ -1316,6 +1457,84 @@ mod tests {
         assert_eq!(list.slot_at(top + 2.0, list.pitch, 4), 1);
     }
     use eframe::egui;
+
+    /// Two framed browser tiles side by side, with `tab_counts` tabs.
+    fn two_browsers(tab_counts: [usize; 2]) -> (PreviewManager, [PreviewId; 2]) {
+        let mut previews = PreviewManager::new();
+        let ids = [0.0, 700.0].map(|x| {
+            previews.add_browser_placeholder(
+                "https://example.com".to_owned(),
+                egui::pos2(x, 0.0),
+                egui::vec2(600.0, 400.0),
+                FpsPreset::Medium,
+            )
+        });
+        for (id, count) in ids.iter().zip(tab_counts) {
+            let preview = previews.get_mut(*id).unwrap();
+            preview.browser_status = BrowserTileStatus::Ready;
+            preview.browser_chrome = true;
+            preview.browser_tabs = (0..count)
+                .map(|n| BrowserTab::new(format!("https://example.com/{n}")))
+                .collect();
+        }
+        (previews, ids)
+    }
+
+    /// Release tab 0 of `from` at `pointer` and return what the canvas queued.
+    fn drop_tab(previews: &PreviewManager, from: PreviewId, pointer: egui::Pos2) -> CanvasState {
+        let mut canvas = CanvasState::default();
+        let canvas_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        canvas.last_screen_rect = Some(canvas_rect);
+        canvas.browser_tab_drop = Some(TabDrop {
+            drag: TabDrag { id: from, from: 0 },
+            pointer,
+        });
+        canvas.follow_tab_drag(&egui::Context::default(), canvas_rect, previews);
+        canvas
+    }
+
+    #[test]
+    fn tabs_dropped_on_another_browser_join_its_tabs() {
+        let (previews, [first, second]) = two_browsers([2, 3]);
+        let target = previews.get(second).unwrap();
+        let layout = chrome_geometry::layout_for(target, target.rect()).unwrap();
+        let list = TabList::new(&layout, 3);
+
+        // Over its tab strip, into the gap under the pointer.
+        let canvas = drop_tab(&previews, first, list.row(1, 0.0).center());
+        let transfer = canvas.pending_tab_transfers[0];
+        assert_eq!((transfer.from, transfer.index), (first, 0));
+        assert_eq!((transfer.to, transfer.slot), (second, 1));
+        assert!(canvas.pending_tab_detaches.is_empty());
+
+        // Anywhere else on it, after its last tab. A tile's only tab can go too.
+        let (previews, [first, second]) = two_browsers([1, 3]);
+        let canvas = drop_tab(&previews, first, layout.page.center());
+        let transfer = canvas.pending_tab_transfers[0];
+        assert_eq!((transfer.to, transfer.slot), (second, 3));
+    }
+
+    #[test]
+    fn tabs_dropped_elsewhere_open_a_tile_but_a_last_tab_stays() {
+        let empty_canvas = egui::pos2(1000.0, 700.0);
+        let (previews, [first, _]) = two_browsers([2, 1]);
+        let canvas = drop_tab(&previews, first, empty_canvas);
+        assert!(canvas.pending_tab_transfers.is_empty());
+        assert_eq!(canvas.pending_tab_detaches[0].index, 0);
+
+        let (previews, [first, _]) = two_browsers([1, 1]);
+        let canvas = drop_tab(&previews, first, empty_canvas);
+        assert!(canvas.pending_tab_transfers.is_empty());
+        assert!(canvas.pending_tab_detaches.is_empty());
+
+        // A frozen browser tile cannot take tabs, so it is like empty canvas.
+        let (mut previews, [first, second]) = two_browsers([2, 1]);
+        previews.get_mut(second).unwrap().manually_frozen = true;
+        let page = previews.get(second).unwrap().rect().center();
+        let canvas = drop_tab(&previews, first, page);
+        assert!(canvas.pending_tab_transfers.is_empty());
+        assert_eq!(canvas.pending_tab_detaches.len(), 1);
+    }
 
     #[test]
     fn menu_edits_replace_the_selection_by_character() {

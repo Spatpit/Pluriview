@@ -5,8 +5,8 @@ use crate::browser::{
 };
 use crate::canvas::{
     BrowserAction, BrowserNavigation, CanvasKeyboardInput, CanvasState, CanvasWallpaper,
-    MediaAction, PlaylistAction, TabDetach, TileActivityAction, VideoAction, WallpaperSource,
-    WALLPAPER_VIDEO_ID,
+    MediaAction, PlaylistAction, TabDetach, TabTransfer, TileActivityAction, VideoAction,
+    WallpaperSource, WALLPAPER_VIDEO_ID,
 };
 use crate::capture::CaptureCoordinator;
 use crate::external_tools::{self, ExternalTools, ToolKind, ToolStatus};
@@ -224,6 +224,30 @@ fn browser_capture_display_size(preview: &Preview) -> Vec2 {
         preview.crop_uv,
     )
     .size()
+}
+
+/// Size, default position (just right of `source`), frame rate and frame of
+/// a browser tile opened from `source`.
+#[cfg(windows)]
+fn new_tile_shape(source: Option<&Preview>) -> (Vec2, Pos2, FpsPreset, bool) {
+    const DEFAULT_SIZE: Vec2 = Vec2::new(1000.0, 620.0);
+    const GAP: f32 = 24.0;
+    match source {
+        Some(preview) => {
+            let size = if preview.viewport_pin.is_some() {
+                DEFAULT_SIZE
+            } else {
+                preview.size
+            };
+            (
+                size,
+                preview.position + Vec2::new(preview.size.x + GAP, 0.0),
+                preview.fps_preset,
+                preview.browser_chrome,
+            )
+        }
+        None => (DEFAULT_SIZE, Pos2::ZERO, FpsPreset::Medium, true),
+    }
 }
 
 /// The pixel size a parked browser's frames are shrunk to: its whole page as
@@ -3106,8 +3130,8 @@ impl PluriviewApp {
         }
     }
 
-    /// Open tab `detach.index` of a tile as a tile of its own, then close it
-    /// in the original tile.
+    /// Move tab `detach.index` of a tile into a tile of its own, with its page
+    /// still loaded so nothing reloads.
     #[cfg(windows)]
     fn detach_browser_tab(&mut self, detach: TabDetach) {
         let Some(url) = self
@@ -3117,12 +3141,92 @@ impl PluriviewApp {
         else {
             return;
         };
+        let Some(source) = self.preview_manager.get(detach.id) else {
+            return;
+        };
+        let title = source
+            .browser_tabs
+            .get(detach.index)
+            .map(|tab| tab.title.clone())
+            .filter(|title| !title.is_empty());
+        let (muted, page_zoom) = (source.browser_muted, source.browser_page_zoom);
+        let (size, beside, fps, framed) = new_tile_shape(Some(source));
         // Drop the new tile under the pointer, its toolbar where the tab was.
-        let position = detach.position.map(|point| point - Vec2::new(60.0, 18.0));
-        if self.open_url_in_new_tile(detach.id, &url, position) {
-            if let Err(error) = self.browser.close_tab(detach.id, detach.index) {
-                log::warn!("Could not close a tab moved to a new tile: {error}");
+        let position = detach
+            .position
+            .map_or(beside, |point| point - Vec2::new(60.0, 18.0));
+
+        self.park_for_tab_move(&[detach.id]);
+        let id = self
+            .preview_manager
+            .add_browser_placeholder(url.clone(), position, size, fps);
+        match self.browser.create_from_tab(id, detach.id, detach.index) {
+            Ok(hwnd) => {
+                if let Some(preview) = self.preview_manager.get_mut(id) {
+                    preview.window_handle = Some(WindowHandle {
+                        hwnd,
+                        process_id: std::process::id(),
+                    });
+                    preview.browser_status = BrowserTileStatus::Ready;
+                    preview.browser_chrome = framed;
+                    preview.browser_muted = muted;
+                    preview.browser_page_zoom = page_zoom;
+                    if let Some(title) = title {
+                        preview.title = title;
+                    }
+                }
+                self.capture_coordinator
+                    .start_browser_capture(id, hwnd, url, fps.as_u32());
+                self.canvas.selection = vec![id];
             }
+            Err(error) => {
+                // Fall back to opening the address in a new tile.
+                log::warn!("Could not move a live tab to a new tile: {error}");
+                self.preview_manager.start_removal_without_undo(id);
+                if self.open_url_in_new_tile(detach.id, &url, Some(position)) {
+                    if let Err(error) = self.browser.close_tab(detach.id, detach.index) {
+                        log::warn!("Could not close a tab moved to a new tile: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move a tab into another browser tile's tabs with its page still
+    /// loaded. A tile whose only tab left is removed, without Undo, since
+    /// the tab lives on in the other tile.
+    #[cfg(windows)]
+    fn transfer_browser_tab(&mut self, transfer: TabTransfer) {
+        self.park_for_tab_move(&[transfer.from, transfer.to]);
+        match self
+            .browser
+            .transfer_tab(transfer.from, transfer.index, transfer.to, transfer.slot)
+        {
+            Ok(emptied) => {
+                if emptied {
+                    self.capture_coordinator.stop_capture(transfer.from);
+                    self.preview_manager
+                        .start_removal_without_undo(transfer.from);
+                }
+                self.canvas.selection = vec![transfer.to];
+            }
+            Err(error) => {
+                self.canvas_notice =
+                    Some((format!("Could not move the tab: {error}"), Instant::now()));
+            }
+        }
+    }
+
+    /// Leave interaction before a tab moves out of or into that tile. Its
+    /// capture resumes once the parked page has redrawn.
+    #[cfg(windows)]
+    fn park_for_tab_move(&mut self, ids: &[PreviewId]) {
+        if let Some(active) = self.browser.active_id().filter(|id| ids.contains(id)) {
+            if let Some(host) = self.browser.get_mut(active) {
+                host.park();
+            }
+            self.capture_coordinator.pause_capture(active);
+            self.browser_activated_at = None;
         }
     }
 
@@ -3135,24 +3239,7 @@ impl PluriviewApp {
         url: &str,
         position: Option<Pos2>,
     ) -> bool {
-        const DEFAULT_SIZE: Vec2 = Vec2::new(1000.0, 620.0);
-        const GAP: f32 = 24.0;
-        let (size, beside, fps, framed) = match self.preview_manager.get(source) {
-            Some(preview) => {
-                let size = if preview.viewport_pin.is_some() {
-                    DEFAULT_SIZE
-                } else {
-                    preview.size
-                };
-                (
-                    size,
-                    preview.position + Vec2::new(preview.size.x + GAP, 0.0),
-                    preview.fps_preset,
-                    preview.browser_chrome,
-                )
-            }
-            None => (DEFAULT_SIZE, Pos2::ZERO, FpsPreset::Medium, true),
-        };
+        let (size, beside, fps, framed) = new_tile_shape(self.preview_manager.get(source));
         match self.create_browser_tile(url, position.unwrap_or(beside), size, fps) {
             Ok(id) => {
                 if let Some(preview) = self.preview_manager.get_mut(id) {
@@ -6260,6 +6347,9 @@ impl eframe::App for PluriviewApp {
             }
             for detach in std::mem::take(&mut self.canvas.pending_tab_detaches) {
                 self.detach_browser_tab(detach);
+            }
+            for transfer in std::mem::take(&mut self.canvas.pending_tab_transfers) {
+                self.transfer_browser_tab(transfer);
             }
             for (id, u, v, delta) in std::mem::take(&mut self.canvas.pending_browser_scrolls) {
                 if let Some(host) = self.browser.get(id) {
