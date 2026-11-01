@@ -433,9 +433,10 @@ impl PluriviewApp {
         let mut layout = SavedLayout::new();
 
         // Save canvas state
+        let (pan, zoom) = self.canvas.layout_camera();
         layout.canvas = CanvasLayout {
-            pan: (self.canvas.pan.x, self.canvas.pan.y),
-            zoom: self.canvas.zoom,
+            pan: (pan.x, pan.y),
+            zoom,
             show_grid: self.canvas.show_grid,
             wallpaper: self
                 .canvas
@@ -493,6 +494,8 @@ impl PluriviewApp {
 
     /// Apply a SavedLayout to restore state
     pub(super) fn apply_layout(&mut self, layout: &SavedLayout) {
+        #[cfg(windows)]
+        self.drop_live_window();
         self.close_picture_in_picture();
         self.source_loads.clear();
         self.canvas_view_dialog = None;

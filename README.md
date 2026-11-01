@@ -163,7 +163,7 @@ its canvas available. An independent phone camera remains future work.
 
 | Source | What it does |
 |---|---|
-| **App windows** | Displays a live preview of an open application window. |
+| **App windows** | Displays a live preview of an open application window, which you can use in place. |
 | **Browser tiles** | Opens a web page inside Pluriview, with navigation, interaction, and audio. |
 | **Images and GIFs** | Displays local images and plays animated GIFs. |
 | **Videos** | Plays local video files with playback, seeking, volume, and track controls. |
@@ -189,6 +189,42 @@ Menu shortcuts appear on the right and follow your bindings in **Settings**.
 
 Live Spout2 senders appear in the same picker. Select one to display its shared
 output on the canvas.
+
+#### Use an app from its tile
+
+**Double-click a window tile** (or right-click it → **Interact**) to use the
+app without leaving the canvas: click its buttons, pick a song, type. The canvas
+zooms so the tile shows the window at its real size, then Pluriview moves the
+app's own window exactly over the tile. Only its position changes, never its
+size, so the app looks the same as in the tile.
+
+A gold outline and a bar above the window mark the app in use. Drag the bar to
+move the tile without clicking into the app; the window follows when you let
+go. Dragging the app's own title bar moves the tile along with it.
+
+While you use the app, its tile also shows your mouse pointer, so people
+watching Pluriview through Discord or OBS screen sharing still see where you
+point. The tile updates at least 60 times a second meanwhile, so the pointer
+moves smoothly, and goes back to its own frame rate when you finish. On
+Windows 11 24H2 and later the tile also shows the app's menus and dialogs, such
+as the menu from right-clicking a song; a menu reaching past the window's edge
+is cut off there. Earlier Windows versions show the pointer but not the menus.
+
+If Pluriview closes unexpectedly while you use an app, the next launch puts the
+app's window back where it was, unless you have moved, minimized or closed it
+since.
+
+Click anywhere outside the app, or **Done** on the bar, to finish. The window
+goes back where it was (minimized again if it was minimized), behind the same
+windows that covered it before. Pluriview covers it again if it did before, and
+the canvas returns to your previous view. Zooming the canvas also finishes. If you resize, maximize or snap the app
+yourself, Pluriview leaves the window where you put it.
+
+Tiles already at **Native Size (1:1)** skip the zoom. A pinned tile keeps its
+size, so the window is centered over it instead. Pluriview cannot move windows
+of apps running as administrator, or windows on another virtual desktop.
+Right-click a tile → **Show Original Window** brings the app's own window to
+the front where it is, as double-clicking did before.
 
 ### Groups, layouts, and Spotlight
 
@@ -620,6 +656,7 @@ your installation still uses `Numpad 2`.
 | Toggle group Spotlight | `Shift+F` |
 | Previous / next Spotlight tile | `Shift+Left` / `Shift+Right` |
 | Interact with browser tile | Double-click, `Ctrl+B`, or `Numpad 1` |
+| Use an app from its window tile | Double-click |
 | Exit focus or browser interaction | `Esc` |
 | Open saved viewpoints 1–9 | `Ctrl+1` through `Ctrl+9` |
 | Previous/next viewpoint | `Ctrl+Page Up` / `Ctrl+Page Down` |

@@ -478,7 +478,10 @@ impl CanvasState {
         self.groups
             .motions
             .retain(|m| now - m.started < LAYOUT_DURATION);
-        if self.interactive_browser.is_some() || self.is_focusing_tile() {
+        if self.interactive_browser.is_some()
+            || self.live_window.id.is_some()
+            || self.is_focusing_tile()
+        {
             self.groups.motions.clear();
             self.groups.spotlight_drag = None;
         }

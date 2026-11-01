@@ -4,6 +4,8 @@ use super::wallpaper::CanvasWallpaper;
 mod browser_chrome;
 #[path = "groups.rs"]
 mod groups;
+#[path = "live_window.rs"]
+mod live_window;
 #[path = "navigation.rs"]
 mod navigation;
 #[path = "tile_menu.rs"]
@@ -26,6 +28,7 @@ use browser_chrome::{AddressEdit, TabDrag, TabDrop, TabScroll};
 pub use browser_chrome::{BrowserNavigation, TabDetach, TabTransfer};
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
 use groups::GroupState;
+use live_window::LiveWindow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -53,11 +56,6 @@ const WINDOW_CONNECTING_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 /// Browser overlays may stay transparent until their external data arrives.
 /// Their loading card needs motion, but not an uncapped canvas repaint loop.
 const TRANSPARENT_BROWSER_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
-
-#[cfg(windows)]
-use windows::Win32::Foundation::HWND;
-#[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE};
 
 /// Represents the current drag operation
 #[derive(Clone, Debug)]
@@ -1394,6 +1392,12 @@ pub struct CanvasState {
     /// frame so the canvas can outline it in the accent color.
     pub interactive_browser: Option<PreviewId>,
 
+    /// The window tile whose real window is in use over it.
+    pub live_window: LiveWindow,
+
+    /// "Show Original Window" was chosen for this window tile.
+    pub pending_show_window: Option<PreviewId>,
+
     /// App-global window state mirrored for the empty-canvas menu.
     pub always_on_top: bool,
     pub pending_always_on_top: Option<bool>,
@@ -1471,6 +1475,8 @@ impl Default for CanvasState {
             pending_removed_restore: None,
             pending_media_actions: Vec::new(),
             interactive_browser: None,
+            live_window: LiveWindow::default(),
+            pending_show_window: None,
             always_on_top: false,
             pending_always_on_top: None,
             pending_picture_in_picture: None,
@@ -1724,6 +1730,9 @@ impl CanvasState {
                 );
             }
         }
+
+        // The grab bar of a window in use stays usable in canvas-only mode.
+        self.live_window_bar(ui, canvas_rect, preview_manager, &input);
 
         if show_overlays {
             self.draw_marquee(&painter, canvas_rect);
@@ -2026,7 +2035,10 @@ impl CanvasState {
             && !input.middle_down
             && self.drag_state.is_none()
         {
-            if let Some(pointer) = input.interact_pos.filter(|pos| canvas_rect.contains(*pos)) {
+            if let Some(pointer) = input
+                .interact_pos
+                .filter(|pos| canvas_rect.contains(*pos) && !self.live_window.covers(*pos))
+            {
                 let over_resize_handle = self
                     .get_handle_at(pointer, canvas_rect, preview_manager, input.alt)
                     .is_some();
@@ -2790,7 +2802,13 @@ impl CanvasState {
                 );
             }
             // A browser toolbar already holds the title, close and page controls.
-            if show_overlays && pointer_over_tile && chrome_layout.is_none() {
+            // A window in use covers its tile, so hover chrome would only
+            // flash before the window arrives.
+            if show_overlays
+                && pointer_over_tile
+                && chrome_layout.is_none()
+                && self.live_window.id != Some(id)
+            {
                 // Playlist tiles already have a designed header; a second title
                 // bar would cover the folder name and transport controls.
                 if !is_playlist && !is_spout_capture {
@@ -3470,9 +3488,8 @@ impl CanvasState {
                 self.remember_current_tile(id);
             }
 
-            // Handle double-click: browsers enter interaction mode (the app
-            // consumes last_double_clicked); other previews focus their
-            // source window.
+            // Handle double-click: browser and window tiles enter interaction
+            // mode (the app consumes last_double_clicked); videos play/pause.
             // The toolbar and tabs are for arranging and clicking; only the
             // page enters interaction.
             let on_page = chrome_layout.is_none_or(|layout| {
@@ -3491,18 +3508,6 @@ impl CanvasState {
                         .push((id, VideoAction::SetPaused(!video_playback.paused)));
                 } else if !is_playlist {
                     self.last_double_clicked = Some(id);
-                }
-                if !is_browser && !is_video && !is_playlist {
-                    if let Some(preview) = preview_manager.get(id) {
-                        if let Some(ref handle) = preview.window_handle {
-                            #[cfg(windows)]
-                            unsafe {
-                                let hwnd = HWND(handle.hwnd as *mut _);
-                                let _ = ShowWindow(hwnd, SW_RESTORE);
-                                let _ = SetForegroundWindow(hwnd);
-                            }
-                        }
-                    }
                 }
             }
 

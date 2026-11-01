@@ -71,6 +71,12 @@ impl Storage {
         self.data_dir.join("autosave.json")
     }
 
+    /// Where an app used from its tile came from. It exists only while the
+    /// app is in use, so the next launch can put it back after a crash.
+    pub fn window_in_use_path(&self) -> PathBuf {
+        self.data_dir.join("window_in_use.json")
+    }
+
     /// App-global settings path (independent of the active workspace).
     pub fn config_path(&self) -> PathBuf {
         self.data_dir.join("config.json")

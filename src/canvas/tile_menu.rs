@@ -411,6 +411,36 @@ impl CanvasState {
         pixels_per_point: f32,
         preview_manager: &mut PreviewManager,
     ) {
+        let connected = !info.is_inactive_window && !info.manually_frozen;
+        if ui
+            .add_enabled(
+                connected && !info.left_click_disabled,
+                egui::Button::new("Interact"),
+            )
+            .on_hover_text(
+                "Use the app from this tile (or double-click it). Its window moves over the tile until you click elsewhere.",
+            )
+            .on_disabled_hover_text(if info.left_click_disabled {
+                "Turn off Disable Left Click in Tile Settings first"
+            } else {
+                "Available while the app's window is connected"
+            })
+            .clicked()
+        {
+            self.last_double_clicked = Some(info.id);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                !info.is_inactive_window,
+                egui::Button::new("Show Original Window"),
+            )
+            .on_hover_text("Bring the app's own window to the front where it is")
+            .clicked()
+        {
+            self.pending_show_window = Some(info.id);
+            ui.close_menu();
+        }
         if ui
             .add_enabled(
                 info.source_frame_size.is_some(),

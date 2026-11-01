@@ -9,7 +9,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows_capture::capture::GraphicsCaptureApiError;
 use windows_capture::graphics_capture_api::GraphicsCaptureApi;
-use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
+use windows_capture::settings::{
+    CursorCaptureSettings, DrawBorderSettings, SecondaryWindowSettings,
+};
 
 use super::downsample::{exact_capture_size, fitted_capture_size, RgbaDownsampler};
 
@@ -126,6 +128,13 @@ struct CaptureSession {
     /// repaint request because they are polled continuously.
     window_hwnd: Option<isize>,
 
+    /// Window title, kept so the session can be restarted with other settings.
+    window_title: String,
+
+    /// The tile's app is in use from the tile: frames include the mouse
+    /// pointer and, where Windows can, the app's menus and dialogs.
+    in_use: bool,
+
     /// Browser sessions keep their newest frame on the GPU and resize that
     /// copy when the target changes, instead of asking the source to repaint.
     retains_source: bool,
@@ -189,7 +198,7 @@ impl CaptureCoordinator {
         window_title: String,
         target_fps: u32,
     ) {
-        self.start_window_capture(preview_id, hwnd, window_title, target_fps, false);
+        self.start_window_capture(preview_id, hwnd, window_title, target_fps, false, false);
     }
 
     /// Capture a parked browser tile. Its output follows the size the page is
@@ -202,7 +211,7 @@ impl CaptureCoordinator {
         url: String,
         target_fps: u32,
     ) {
-        self.start_window_capture(preview_id, hwnd, url, target_fps, true);
+        self.start_window_capture(preview_id, hwnd, url, target_fps, true, false);
     }
 
     fn start_window_capture(
@@ -212,6 +221,7 @@ impl CaptureCoordinator {
         window_title: String,
         target_fps: u32,
         retain_source: bool,
+        in_use: bool,
     ) {
         // Windows Graphics Capture rejects a second session on the same HWND
         // while the previous one is still shutting down. Replacing a live
@@ -245,15 +255,17 @@ impl CaptureCoordinator {
         // Start capture in a new thread
         let closed = Arc::new(AtomicBool::new(false));
         let worker_closed = closed.clone();
+        let title = window_title.clone();
         let worker = std::thread::spawn(move || {
             capture_window_loop(
                 preview_id,
                 hwnd,
-                window_title,
+                title,
                 worker_state,
                 stop_receiver,
                 worker_closed,
                 retain_source,
+                in_use,
             );
         });
 
@@ -263,6 +275,8 @@ impl CaptureCoordinator {
             target_height,
             target_generation,
             window_hwnd: Some(hwnd),
+            window_title,
+            in_use,
             retains_source: retain_source,
             active,
             paused,
@@ -321,6 +335,8 @@ impl CaptureCoordinator {
                 target_height,
                 target_generation,
                 window_hwnd: None,
+                window_title: String::new(),
+                in_use: false,
                 retains_source: false,
                 active,
                 paused,
@@ -363,6 +379,40 @@ impl CaptureCoordinator {
             }
         }
         self.reap_finished_workers();
+    }
+
+    /// Capture a window tile for using its app from the tile: the mouse
+    /// pointer and the app's menus and dialogs show on the canvas wherever
+    /// the tile is. Windows only applies these when a session starts, so a
+    /// change restarts the capture; the tile keeps its last frame meanwhile,
+    /// and its frame rate, size and pause carry over.
+    pub fn set_in_use(&mut self, preview_id: PreviewId, in_use: bool) {
+        let Some(session) = self.sessions.get(&preview_id).filter(|session| {
+            session.in_use != in_use && !session.retains_source && session.is_live()
+        }) else {
+            return;
+        };
+        let Some(hwnd) = session.window_hwnd else {
+            return;
+        };
+        let title = session.window_title.clone();
+        let fps = session.target_fps.load(Ordering::Relaxed);
+        let width = session.target_width.load(Ordering::Relaxed);
+        let height = session.target_height.load(Ordering::Relaxed);
+        let paused = session.paused.load(Ordering::Relaxed);
+        self.start_window_capture(preview_id, hwnd, title, fps, false, in_use);
+        if let Some(session) = self.sessions.get(&preview_id) {
+            session.target_width.store(width, Ordering::Relaxed);
+            session.target_height.store(height, Ordering::Relaxed);
+            session.paused.store(paused, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_in_use(&self, preview_id: PreviewId) -> bool {
+        self.sessions
+            .get(&preview_id)
+            .is_some_and(|session| session.in_use)
     }
 
     /// Update target FPS for a capture session; applies live on the
@@ -551,6 +601,7 @@ fn capture_frame_due(
 }
 
 /// Capture loop running in a separate thread
+#[allow(clippy::too_many_arguments)]
 fn capture_window_loop(
     preview_id: PreviewId,
     hwnd: isize,
@@ -559,6 +610,7 @@ fn capture_window_loop(
     stop_receiver: Receiver<()>,
     closed: Arc<AtomicBool>,
     retain_source: bool,
+    in_use: bool,
 ) {
     use windows_capture::{
         capture::{Context, GraphicsCaptureApiHandler},
@@ -843,15 +895,17 @@ fn capture_window_loop(
     // Request WithoutCursor / WithoutBorder only when those Graphics Capture
     // properties exist. Windows 10 1903 has capture but not IsBorderRequired
     // (Win11) or, on 1903, IsCursorCaptureEnabled (2004+). The crate refuses to
-    // start if those settings are not Default and the API is missing.
-    let cursor = probed_cursor_capture_setting();
+    // start if those settings are not Default and the API is missing. The same
+    // goes for an app's menus and dialogs, which Windows 11 24H2 added.
+    let cursor = probed_cursor_capture_setting(in_use);
     let border = probed_draw_border_setting();
-    let try_start = |cursor, border, min_interval, flags| {
+    let popups = probed_secondary_window_setting(in_use);
+    let try_start = |cursor, border, popups, min_interval, flags| {
         let settings = Settings::new(
             capture_target_from_hwnd(hwnd),
             cursor,
             border,
-            SecondaryWindowSettings::Default,
+            popups,
             min_interval,
             DirtyRegionSettings::Default,
             ColorFormat::Rgba8,
@@ -860,17 +914,19 @@ fn capture_window_loop(
         Capture::start_free_threaded(settings)
     };
 
-    let start_result = match try_start(cursor, border, min_interval, flags.clone()) {
+    let start_result = match try_start(cursor, border, popups, min_interval, flags.clone()) {
         Err(error)
             if capture_settings_unsupported(&error)
                 && (cursor != CursorCaptureSettings::Default
                     || border != DrawBorderSettings::Default
+                    || popups != SecondaryWindowSettings::Default
                     || min_interval != MinimumUpdateIntervalSettings::Default) =>
         {
             log::warn!("Retrying capture with default capture settings: {error}");
             try_start(
                 CursorCaptureSettings::Default,
                 DrawBorderSettings::Default,
+                SecondaryWindowSettings::Default,
                 MinimumUpdateIntervalSettings::Default,
                 flags,
             )
@@ -908,11 +964,11 @@ fn capture_window_loop(
     completion_active.store(false, Ordering::Relaxed);
 }
 
-fn cursor_capture_setting(supported: bool) -> CursorCaptureSettings {
-    if supported {
-        CursorCaptureSettings::WithoutCursor
-    } else {
-        CursorCaptureSettings::Default
+fn cursor_capture_setting(supported: bool, with_cursor: bool) -> CursorCaptureSettings {
+    match (supported, with_cursor) {
+        (false, _) => CursorCaptureSettings::Default,
+        (true, true) => CursorCaptureSettings::WithCursor,
+        (true, false) => CursorCaptureSettings::WithoutCursor,
     }
 }
 
@@ -924,12 +980,14 @@ fn draw_border_setting(supported: bool) -> DrawBorderSettings {
     }
 }
 
-fn probed_cursor_capture_setting() -> CursorCaptureSettings {
+fn probed_cursor_capture_setting(with_cursor: bool) -> CursorCaptureSettings {
     match GraphicsCaptureApi::is_cursor_settings_supported() {
-        Ok(supported) => cursor_capture_setting(supported),
+        Ok(supported) => cursor_capture_setting(supported, with_cursor),
         Err(error) => {
             log::debug!("Could not probe cursor capture support: {error}");
-            CursorCaptureSettings::WithoutCursor
+            // windows-capture repeats this probe before starting, and a
+            // failure there is not retried; only Default can start.
+            cursor_capture_setting(false, with_cursor)
         }
     }
 }
@@ -939,7 +997,31 @@ fn probed_draw_border_setting() -> DrawBorderSettings {
         Ok(supported) => draw_border_setting(supported),
         Err(error) => {
             log::debug!("Could not probe border capture support: {error}");
-            DrawBorderSettings::WithoutBorder
+            // As for the cursor: only Default can start.
+            draw_border_setting(false)
+        }
+    }
+}
+
+/// An app's menus and dialogs are separate windows; include them only while
+/// the app is used from its tile, so its pop-ups otherwise stay its own.
+fn secondary_window_setting(supported: bool, in_use: bool) -> SecondaryWindowSettings {
+    if supported && in_use {
+        SecondaryWindowSettings::Include
+    } else {
+        SecondaryWindowSettings::Default
+    }
+}
+
+fn probed_secondary_window_setting(in_use: bool) -> SecondaryWindowSettings {
+    if !in_use {
+        return SecondaryWindowSettings::Default;
+    }
+    match GraphicsCaptureApi::is_secondary_windows_supported() {
+        Ok(supported) => secondary_window_setting(supported, in_use),
+        Err(error) => {
+            log::debug!("Could not probe secondary window capture support: {error}");
+            SecondaryWindowSettings::Default
         }
     }
 }
@@ -950,6 +1032,7 @@ fn capture_settings_unsupported<E>(error: &GraphicsCaptureApiError<E>) -> bool {
         GraphicsCaptureApiError::GraphicsCaptureApiError(
             windows_capture::graphics_capture_api::Error::BorderConfigUnsupported
                 | windows_capture::graphics_capture_api::Error::CursorConfigUnsupported
+                | windows_capture::graphics_capture_api::Error::SecondaryWindowsUnsupported
                 | windows_capture::graphics_capture_api::Error::MinimumUpdateIntervalUnsupported
         )
     )
@@ -1001,6 +1084,8 @@ mod tests {
             target_height: Arc::new(AtomicU32::new(0)),
             target_generation: Arc::new(AtomicU32::new(0)),
             window_hwnd: None,
+            window_title: String::new(),
+            in_use: false,
             retains_source: false,
             active: Arc::new(AtomicBool::new(active)),
             paused: Arc::new(AtomicBool::new(paused)),
@@ -1291,6 +1376,8 @@ mod tests {
                 target_height: Arc::new(AtomicU32::new(0)),
                 target_generation: Arc::new(AtomicU32::new(0)),
                 window_hwnd: None,
+                window_title: String::new(),
+                in_use: false,
                 retains_source: false,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
@@ -1323,6 +1410,8 @@ mod tests {
                 target_height: Arc::new(AtomicU32::new(0)),
                 target_generation: Arc::new(AtomicU32::new(0)),
                 window_hwnd: None,
+                window_title: String::new(),
+                in_use: false,
                 retains_source: false,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
@@ -1343,19 +1432,43 @@ mod tests {
 
     #[test]
     fn capture_settings_use_defaults_when_unsupported() {
-        use super::{cursor_capture_setting, draw_border_setting};
-        use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
+        use super::{cursor_capture_setting, draw_border_setting, secondary_window_setting};
+        use windows_capture::settings::{
+            CursorCaptureSettings, DrawBorderSettings, SecondaryWindowSettings,
+        };
 
         assert_eq!(
-            cursor_capture_setting(true),
+            cursor_capture_setting(true, false),
             CursorCaptureSettings::WithoutCursor
         );
         assert_eq!(
-            cursor_capture_setting(false),
+            cursor_capture_setting(true, true),
+            CursorCaptureSettings::WithCursor
+        );
+        // Windows 10 1903 always draws the pointer and cannot change that.
+        assert_eq!(
+            cursor_capture_setting(false, false),
+            CursorCaptureSettings::Default
+        );
+        assert_eq!(
+            cursor_capture_setting(false, true),
             CursorCaptureSettings::Default
         );
         assert_eq!(draw_border_setting(true), DrawBorderSettings::WithoutBorder);
         assert_eq!(draw_border_setting(false), DrawBorderSettings::Default);
+        // Menus and dialogs only while in use, and only on Windows 11 24H2+.
+        assert_eq!(
+            secondary_window_setting(true, true),
+            SecondaryWindowSettings::Include
+        );
+        assert_eq!(
+            secondary_window_setting(true, false),
+            SecondaryWindowSettings::Default
+        );
+        assert_eq!(
+            secondary_window_setting(false, true),
+            SecondaryWindowSettings::Default
+        );
         use windows_capture::settings::MinimumUpdateIntervalSettings;
         assert_eq!(
             super::minimum_update_interval(false),
@@ -1410,6 +1523,8 @@ mod tests {
                 target_height: Arc::new(AtomicU32::new(0)),
                 target_generation: Arc::new(AtomicU32::new(0)),
                 window_hwnd: None,
+                window_title: String::new(),
+                in_use: false,
                 retains_source: false,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),

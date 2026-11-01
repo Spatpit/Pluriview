@@ -2525,3 +2525,195 @@ fn shift_wheel_over_a_browser_tile_scrolls_its_page_instead_of_zooming() {
     assert!(canvas.pending_browser_scrolls.is_empty());
     assert_ne!(canvas.zoom, zoom);
 }
+
+fn press(pos: Pos2, pressed: bool) -> Event {
+    Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    }
+}
+
+#[test]
+fn double_clicking_a_window_tile_asks_the_app_to_use_it_in_place() {
+    let (mut test, id) = CropUiTest::new(0, false);
+    test.frame(vec![]);
+    let center = test
+        .canvas
+        .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport)
+        .center();
+    test.frame(vec![Event::PointerMoved(center)]);
+    for pressed in [true, false, true, false] {
+        test.frame(vec![press(center, pressed)]);
+    }
+    assert_eq!(test.canvas.last_double_clicked, Some(id));
+}
+
+#[test]
+fn window_tile_menu_offers_interact_and_the_original_window() {
+    for (label, interact) in [("Interact", true), ("Show Original Window", false)] {
+        let (mut test, id) = CropUiTest::new(0, false);
+        test.frame(vec![]);
+        let rect = test
+            .canvas
+            .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+        test.click(rect.center(), PointerButton::Secondary);
+        test.frame(vec![]);
+        let output = test.frame(vec![]);
+        let top = |label: &str| CropUiTest::label_pos(&output, label).y;
+        assert!(top("Interact") < top("Show Original Window"));
+        assert!(top("Show Original Window") < top("Native Size (1:1)"));
+        test.click(
+            CropUiTest::label_pos(&output, label),
+            PointerButton::Primary,
+        );
+        if interact {
+            assert_eq!(test.canvas.last_double_clicked, Some(id));
+            assert!(test.canvas.pending_show_window.is_none());
+        } else {
+            assert_eq!(test.canvas.pending_show_window, Some(id));
+        }
+    }
+}
+
+#[test]
+fn grab_bar_moves_the_tile_without_reaching_the_canvas_or_tiles_underneath() {
+    for pinned in [false, true] {
+        let (mut test, id) = CropUiTest::new(0, pinned);
+        test.frame(vec![]);
+        let tile = test
+            .canvas
+            .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+        test.canvas.live_window.id = Some(id);
+        test.canvas.live_window.window_rect = Some(tile);
+        test.frame(vec![]);
+        let bar = crate::window_interaction::grab_bar_rect(tile, test.viewport);
+        assert_eq!(bar.bottom(), tile.top());
+        let start = bar.left_center() + Vec2::new(60.0, 0.0);
+        let delta = Vec2::new(80.0, 40.0);
+
+        test.frame(vec![Event::PointerMoved(start)]);
+        test.frame(vec![press(start, true)]);
+        assert!(test.canvas.live_window.held, "pinned {pinned}");
+        test.frame(vec![Event::PointerMoved(start + delta * 0.5)]);
+        test.frame(vec![Event::PointerMoved(start + delta)]);
+        assert!(test.canvas.live_window.held);
+        assert!(!test.canvas.live_window.released);
+        test.frame(vec![press(start + delta, false)]);
+        assert!(test.canvas.live_window.released, "pinned {pinned}");
+        assert!(!test.canvas.live_window.held);
+
+        let moved = test
+            .canvas
+            .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+        assert!(
+            (moved.min - (tile.min + delta)).length() < 0.5,
+            "pinned {pinned}: {moved:?} vs {tile:?}"
+        );
+        // The press never began a marquee or selected anything.
+        assert!(test.canvas.selection.is_empty());
+        assert!(test.canvas.marquee.is_none());
+    }
+}
+
+#[test]
+fn grab_bar_done_asks_to_put_the_window_back() {
+    let (mut test, id) = CropUiTest::new(0, false);
+    test.frame(vec![]);
+    let tile = test
+        .canvas
+        .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+    test.canvas.live_window.id = Some(id);
+    test.canvas.live_window.window_rect = Some(tile);
+    let output = test.frame(vec![]);
+    let done = CropUiTest::label_pos(&output, "Done");
+    test.frame(vec![Event::PointerMoved(done)]);
+    test.frame(vec![press(done, true)]);
+    assert!(test.canvas.live_window.held);
+    test.frame(vec![press(done, false)]);
+    assert!(test.canvas.live_window.done);
+    assert!(!test.canvas.live_window.released);
+}
+
+#[test]
+fn framing_a_window_tile_shows_it_at_real_size_and_restores_the_view() {
+    let mut canvas = CanvasState {
+        pan: Vec2::new(30.0, -20.0),
+        zoom: 0.5,
+        ..Default::default()
+    };
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0));
+    canvas.last_screen_rect = Some(viewport);
+    let mut previews = PreviewManager::new();
+    let id = previews.add_for_window(
+        1,
+        42,
+        "window".into(),
+        Pos2::new(600.0, 400.0),
+        Vec2::new(400.0, 300.0),
+    );
+
+    assert!(canvas.frame_live_window(id, 2.0, &previews, 10.0));
+    assert_eq!(canvas.layout_camera(), (Vec2::new(30.0, -20.0), 0.5));
+    canvas.update_camera_transition(viewport, 20.0);
+    canvas.settle_live_window_camera();
+    assert_eq!(canvas.zoom, 2.0);
+    let shown = canvas.preview_screen_rect(previews.get(id).unwrap(), viewport);
+    assert!((shown.width() - 800.0).abs() < 0.01);
+    assert!(viewport.contains_rect(shown));
+
+    canvas.restore_live_window_camera(30.0, false);
+    canvas.update_camera_transition(viewport, 40.0);
+    assert!((canvas.zoom - 0.5).abs() < 1e-4);
+    assert!((canvas.pan - Vec2::new(30.0, -20.0)).length() < 0.01);
+    assert_eq!(canvas.layout_camera(), (canvas.pan, canvas.zoom));
+}
+
+#[test]
+fn a_view_changed_while_using_a_window_is_kept() {
+    let mut canvas = CanvasState::default();
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0));
+    canvas.last_screen_rect = Some(viewport);
+    let mut previews = PreviewManager::new();
+    let id = previews.add_for_window(1, 42, "w".into(), Pos2::ZERO, Vec2::new(400.0, 300.0));
+    assert!(canvas.frame_live_window(id, 2.0, &previews, 0.0));
+    canvas.update_camera_transition(viewport, 5.0);
+    canvas.settle_live_window_camera();
+    // A wheel zoom ends the interaction; that new view stays.
+    canvas.zoom = 3.0;
+    canvas.restore_live_window_camera(6.0, false);
+    assert!(!canvas.is_camera_transitioning());
+    assert_eq!(canvas.zoom, 3.0);
+
+    // Out-of-range zooms and pinned tiles leave the camera alone.
+    assert!(!canvas.frame_live_window(id, 50.0, &previews, 7.0));
+    previews.get_mut(id).unwrap().viewport_pin = Some(crate::preview::ViewportPin::from_rect(
+        Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
+        viewport,
+    ));
+    assert!(!canvas.frame_live_window(id, 2.0, &previews, 7.0));
+}
+
+#[test]
+fn a_dragged_window_carries_its_tile_along() {
+    let mut canvas = CanvasState {
+        zoom: 2.0,
+        ..Default::default()
+    };
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0));
+    canvas.last_screen_rect = Some(viewport);
+    let mut previews = PreviewManager::new();
+    let id = previews.add_for_window(1, 42, "w".into(), Pos2::ZERO, Vec2::new(400.0, 300.0));
+    canvas.follow_live_window(id, Vec2::new(40.0, -20.0), &mut previews);
+    assert_eq!(previews.get(id).unwrap().position, Pos2::new(20.0, -10.0));
+
+    let pinned = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::splat(200.0));
+    previews.get_mut(id).unwrap().viewport_pin =
+        Some(crate::preview::ViewportPin::from_rect(pinned, viewport));
+    canvas.follow_live_window(id, Vec2::new(40.0, -20.0), &mut previews);
+    assert_eq!(
+        canvas.preview_screen_rect(previews.get(id).unwrap(), viewport),
+        pinned.translate(Vec2::new(40.0, -20.0))
+    );
+}

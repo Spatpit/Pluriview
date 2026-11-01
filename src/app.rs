@@ -49,12 +49,15 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::ShellExecuteW;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, SW_SHOWNORMAL,
+    GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    SW_SHOWNORMAL,
 };
 use wry::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 
 #[cfg(windows)]
 mod browser_maintenance;
+#[cfg(windows)]
+mod live_window;
 mod media_sources;
 mod picture_in_picture;
 mod recording;
@@ -1086,6 +1089,9 @@ pub struct PluriviewApp {
     /// When the current browser interaction mode started (focus grace period).
     #[cfg(windows)]
     browser_activated_at: Option<Instant>,
+    /// The window tile whose app is being used over it.
+    #[cfg(windows)]
+    live_window: Option<live_window::LiveWindowSession>,
 
     /// OBS-style stream audio monitor target: `(device id, friendly name)`.
     /// None = off (default). When set, browser-tile audio is replayed from
@@ -1175,6 +1181,11 @@ impl PluriviewApp {
         };
         let window_controls = WindowControls::new(app_config.always_on_top);
         let tray_manager = TrayManager::new(_cc.egui_ctx.clone(), app_config.always_on_top);
+        // An app left over its tile by a crash goes back where it came from.
+        #[cfg(windows)]
+        if let Some(storage) = &storage {
+            live_window::recover_window_in_use(&storage.window_in_use_path());
+        }
 
         #[cfg(debug_assertions)]
         if tray_manager.is_some() {
@@ -1279,6 +1290,8 @@ impl PluriviewApp {
             add_stream: None,
             #[cfg(windows)]
             browser_activated_at: None,
+            #[cfg(windows)]
+            live_window: None,
             #[cfg(windows)]
             monitor_device: None,
             #[cfg(windows)]
@@ -5862,6 +5875,8 @@ impl eframe::App for PluriviewApp {
         if let Err(error) = self.save_active_workspace() {
             eprintln!("{error}");
         }
+        #[cfg(windows)]
+        self.drop_live_window();
         self.capture_coordinator.stop_all();
         #[cfg(windows)]
         self.seek_preview_manager.clear();
@@ -6123,6 +6138,9 @@ impl eframe::App for PluriviewApp {
         let mut viewer_blocked = self.viewer_is_blocked(ctx);
         let viewer_navigation_blocked =
             viewer_blocked || self.window_controls.click_through || self.canvas.is_spotlighting();
+        // A window in use sits at its tile's scale; phone zooming would end it.
+        #[cfg(windows)]
+        let viewer_navigation_blocked = viewer_navigation_blocked || self.live_window.is_some();
         self.remote_view.apply_camera_commands(
             ctx,
             &mut self.canvas,
@@ -6221,6 +6239,8 @@ impl eframe::App for PluriviewApp {
             .flatten();
 
             if let Some(id) = browser_double_clicked.or(browser_shortcut) {
+                // Only one native window may sit over the canvas.
+                self.end_live_window(ctx);
                 let active = self.browser.get(id).is_some_and(|host| host.is_active());
                 if active {
                     if let Some(host) = self.browser.get_mut(id) {
@@ -6262,6 +6282,21 @@ impl eframe::App for PluriviewApp {
                     }
                 }
             }
+            let window_double_clicked = self
+                .canvas
+                .last_double_clicked
+                .filter(|_| !self.window_controls.click_through)
+                .filter(|id| {
+                    self.preview_manager
+                        .get(*id)
+                        .is_some_and(|preview| preview.is_window_capture())
+                });
+            if let Some(id) = window_double_clicked {
+                self.toggle_live_window(ctx, id);
+            }
+            if let Some(id) = self.canvas.pending_show_window.take() {
+                self.show_original_window(ctx, id);
+            }
             self.canvas.last_double_clicked = None;
 
             // Fit the current tile to the canvas, or restore the pre-focus
@@ -6275,6 +6310,7 @@ impl eframe::App for PluriviewApp {
             // and keep the live host glued to its tile through pan/zoom
             // and window moves.
             self.browser_frame(ctx, shortcut_presses.pressed(HotkeySlot::ExitTileOrBrowser));
+            self.live_window_frame(ctx, shortcut_presses.pressed(HotkeySlot::ExitTileOrBrowser));
         }
 
         // Canvas right-click "Add Window..." was selected: open the

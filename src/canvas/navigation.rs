@@ -16,6 +16,7 @@ impl CanvasState {
         self.last_secondary_click = None;
         self.last_double_clicked = None;
         self.interactive_browser = None;
+        self.live_window.drag_cancelled();
     }
 
     pub fn set_keyboard_input(&mut self, input: CanvasKeyboardInput) {
@@ -48,6 +49,7 @@ impl CanvasState {
         self.pinned_drag_origins.clear();
         self.pinned_pointer_drag = None;
         self.video_volume_hover = None;
+        self.live_window = LiveWindow::default();
     }
 
     pub(super) fn prune_preview_interactions(&mut self, preview_manager: &PreviewManager) {
@@ -767,6 +769,7 @@ impl CanvasState {
                 && !input.alt
                 && !input.middle_down
                 && screen_rect.contains(*pointer)
+                && !self.live_window.covers(*pointer)
         }) else {
             return false;
         };
