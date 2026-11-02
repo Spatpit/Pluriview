@@ -1403,6 +1403,8 @@ pub struct CanvasState {
     pub pending_always_on_top: Option<bool>,
     /// Tile whose picture-in-picture window the context menu toggled.
     pub pending_picture_in_picture: Option<PreviewId>,
+    /// The empty-canvas menu asked to open or close the Control Tile Center.
+    pub pending_tile_control: bool,
 
     /// True when Tools → Stream Audio Monitor has a target device.
     pub stream_monitor_ready: bool,
@@ -1480,6 +1482,7 @@ impl Default for CanvasState {
             always_on_top: false,
             pending_always_on_top: None,
             pending_picture_in_picture: None,
+            pending_tile_control: false,
             stream_monitor_ready: false,
             last_screen_rect: None,
             last_double_clicked: None,
@@ -1833,17 +1836,20 @@ impl CanvasState {
         for preview in preview_manager.all_mut() {
             let id = preview.id;
             let preview_rect = preview.rect();
-            let is_visible = preview.recording
-                || preview.picture_in_picture.is_some()
-                || preview.viewport_pin.is_some()
-                || viewport.intersects(preview_rect)
-                || (self.layout_is_animating()
-                    && self
-                        .preview_screen_rect(preview, canvas_rect)
-                        .intersects(canvas_rect));
+            // A hidden tile is captured like one far off screen, except for
+            // the windows that still show it.
+            let on_canvas = !preview.hidden
+                && (preview.viewport_pin.is_some()
+                    || viewport.intersects(preview_rect)
+                    || (self.layout_is_animating()
+                        && self
+                            .preview_screen_rect(preview, canvas_rect)
+                            .intersects(canvas_rect)));
+            let is_visible = preview.recording || preview.picture_in_picture.is_some() || on_canvas;
             let is_nearby = is_visible
-                || preview.viewport_pin.is_some()
-                || nearby_viewport.intersects(preview_rect);
+                || (!preview.hidden
+                    && (preview.viewport_pin.is_some()
+                        || nearby_viewport.intersects(preview_rect)));
 
             if preview.manually_frozen {
                 preview.capture_offscreen_since = None;
@@ -2004,10 +2010,9 @@ impl CanvasState {
 
         let selection_rect = marquee.rect().intersect(canvas_rect);
         let mut selected = marquee.base_selection.clone();
-        for preview in preview_manager
-            .all()
-            .filter(|preview| preview.removing.is_none() && !preview.left_click_disabled)
-        {
+        for preview in preview_manager.all().filter(|preview| {
+            preview.removing.is_none() && !preview.hidden && !preview.left_click_disabled
+        }) {
             let screen_rect = self.preview_screen_rect(preview, canvas_rect);
             if selection_rect.intersects(screen_rect) && !selected.contains(&preview.id) {
                 selected.push(preview.id);
@@ -2316,6 +2321,19 @@ impl CanvasState {
                     ui.close_menu();
                 }
                 ui.separator();
+                if ui
+                    .add(crate::ui_theme::shortcut_button(
+                        "Control Tile Center",
+                        keyboard_shortcuts.get(HotkeySlot::ToggleTileControl),
+                    ))
+                    .on_hover_text(
+                        "A separate window listing every tile, to focus, hide or show them",
+                    )
+                    .clicked()
+                {
+                    self.pending_tile_control = true;
+                    ui.close_menu();
+                }
                 saved_viewpoints_submenu(ui, |ui| canvas_views_menu(ui));
                 if ui.button("Reset View").clicked() {
                     self.reset();
@@ -2397,7 +2415,7 @@ impl CanvasState {
         if input.select_all {
             self.selection = preview_manager
                 .all()
-                .filter(|preview| !preview.left_click_disabled)
+                .filter(|preview| !preview.left_click_disabled && !preview.hidden)
                 .map(|preview| preview.id)
                 .collect();
         }
@@ -2425,11 +2443,12 @@ impl CanvasState {
         let mut preview_info = std::mem::take(&mut self.tile_scratch);
         let mut visible_count = 0;
         for preview in preview_manager.all().filter(|preview| {
-            preview.viewport_pin.is_some()
-                || preview.rect().intersects(viewport)
-                || self
-                    .preview_screen_rect(preview, canvas_rect)
-                    .intersects(canvas_rect)
+            !preview.hidden
+                && (preview.viewport_pin.is_some()
+                    || preview.rect().intersects(viewport)
+                    || self
+                        .preview_screen_rect(preview, canvas_rect)
+                        .intersects(canvas_rect))
         }) {
             if let Some(info) = preview_info.get_mut(visible_count) {
                 info.update_from(preview);

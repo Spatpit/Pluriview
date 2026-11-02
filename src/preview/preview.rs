@@ -269,6 +269,15 @@ pub struct Preview {
     /// Persisted through `PreviewLayout` so saved workspaces preserve intent.
     pub manually_frozen: bool,
 
+    /// Place in the Control Tile Center's custom order, lowest first. New
+    /// tiles go last; the user rearranges by dragging cards. Persisted.
+    pub list_order: u64,
+
+    /// Hidden from the canvas through the Control Tile Center: not drawn or
+    /// hit-tested, and captured like an off-screen tile. Playback and audio
+    /// continue. Persisted through `PreviewLayout`.
+    pub hidden: bool,
+
     /// Lock aspect ratio when resizing? (always true by default)
     pub lock_aspect_ratio: bool,
 
@@ -447,6 +456,8 @@ impl Preview {
             capture_hibernated: false,
             capture_offscreen_since: None,
             manually_frozen: false,
+            hidden: false,
+            list_order: 0,
             lock_aspect_ratio: true,
             source_aspect_ratio: aspect_ratio,
             z_order: 0,
@@ -946,6 +957,13 @@ pub struct PreviewLayout {
     /// still recreated only after the tile is resumed.
     #[serde(default)]
     pub manually_frozen: bool,
+    /// Hidden from the canvas; shown again from the Control Tile Center.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Place in the Control Tile Center's custom order. Zero for layouts
+    /// saved before it existed, which keep the order they are restored in.
+    #[serde(default)]
+    pub list_order: u64,
     /// Crop region in UV coordinates (optional)
     #[serde(default)]
     pub crop_uv: Option<(f32, f32, f32, f32)>,
@@ -1014,6 +1032,8 @@ impl From<&Preview> for PreviewLayout {
             z_order: preview.z_order,
             fps_preset: preview.fps_preset,
             manually_frozen: preview.manually_frozen,
+            hidden: preview.hidden,
+            list_order: preview.list_order,
             crop_uv: preview.crop_uv,
             browser_url: preview.browser_url.clone(),
             browser_muted: preview.browser_muted,
@@ -1582,6 +1602,39 @@ mod tests {
 
         let restored: PreviewLayout = serde_json::from_value(value).unwrap();
         assert!(!restored.manually_frozen);
+    }
+
+    #[test]
+    fn list_order_survives_a_round_trip_and_older_tiles_have_none() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.list_order = 7;
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert_eq!(value["list_order"], 7);
+        value.as_object_mut().unwrap().remove("list_order");
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.list_order, 0);
+    }
+
+    #[test]
+    fn older_saved_tiles_default_to_shown() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.hidden = true;
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert_eq!(value["hidden"], true);
+        value.as_object_mut().unwrap().remove("hidden");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(!restored.hidden);
     }
 
     #[test]

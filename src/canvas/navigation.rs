@@ -100,6 +100,148 @@ impl CanvasState {
         self.focus.is_some()
     }
 
+    pub fn focused_tile(&self) -> Option<PreviewId> {
+        self.focus.as_ref().map(|focus| focus.id)
+    }
+
+    /// Hide tiles from the canvas or show them again. Their sources keep
+    /// running; hidden tiles only leave the canvas, its selection and focus.
+    pub fn set_tiles_hidden(
+        &mut self,
+        ids: &[PreviewId],
+        hidden: bool,
+        previews: &mut PreviewManager,
+    ) {
+        if hidden && self.spotlight_includes(ids) {
+            self.exit_spotlight(previews);
+        }
+        for id in ids {
+            if let Some(preview) = previews.get_mut(*id) {
+                preview.hidden = hidden;
+            }
+        }
+        if !hidden {
+            return;
+        }
+        if self
+            .focus
+            .as_ref()
+            .is_some_and(|focus| ids.contains(&focus.id))
+        {
+            self.exit_focus();
+        }
+        if self.crop_mode.is_some_and(|id| ids.contains(&id)) {
+            self.finish_crop();
+        }
+        self.selection.retain(|id| !ids.contains(id));
+        if self
+            .groups_active_tile()
+            .is_some_and(|id| ids.contains(&id))
+        {
+            self.forget_current_tile();
+        }
+    }
+
+    /// Select `id` with its group, as a click on it would, showing it first
+    /// when hidden.
+    pub fn select_tile(&mut self, id: PreviewId, previews: &mut PreviewManager) {
+        if previews.get(id).is_none_or(|p| p.removing.is_some()) {
+            return;
+        }
+        let members = self.group_members(id, previews);
+        if previews.get(id).is_some_and(|p| p.hidden) {
+            self.set_tiles_hidden(&members, false, previews);
+        }
+        self.selection = members;
+        self.remember_current_tile(id);
+    }
+
+    /// Pin a tile (with its group) to the viewport, or put it back on the
+    /// canvas, as the tile menu does.
+    pub fn toggle_tile_pin(&mut self, id: PreviewId, previews: &mut PreviewManager) {
+        if let Some(viewport) = self.last_screen_rect {
+            self.toggle_viewport_pin(id, viewport, previews);
+        }
+    }
+
+    /// Move a tile, with its group, by `delta` canvas units. Pinned tiles
+    /// stay where they are on screen.
+    pub fn move_tile_by(&mut self, id: PreviewId, delta: Vec2, previews: &mut PreviewManager) {
+        if !delta.is_finite() || delta == Vec2::ZERO {
+            return;
+        }
+        let members = self.group_members(id, previews);
+        if self.spotlight_includes(&members) {
+            self.exit_spotlight(previews);
+        }
+        for member in members {
+            if let Some(preview) = previews
+                .get_mut(member)
+                .filter(|p| p.removing.is_none() && p.viewport_pin.is_none())
+            {
+                preview.position += delta;
+            }
+        }
+    }
+
+    /// Turn a window tile's Stream Audio on or off on the next canvas frame,
+    /// as its badge does.
+    pub fn toggle_stream_audio(&mut self, id: PreviewId) {
+        self.pending_stream_audio_toggles.push(id);
+    }
+
+    /// Change a tile's capture frame rate on the next canvas frame.
+    pub fn set_tile_fps(&mut self, id: PreviewId, fps: FpsPreset) {
+        self.pending_fps_changes.push(PendingFpsChange {
+            preview_id: id,
+            new_fps: fps,
+        });
+    }
+
+    /// Center the view on a canvas point at the current zoom.
+    pub fn look_at(&mut self, point: Pos2, animate: bool, now: f64) {
+        let Some(rect) = self.last_screen_rect else {
+            return;
+        };
+        if animate {
+            self.start_camera_transition(point, self.zoom, rect, now);
+            return;
+        }
+        self.focus = None;
+        self.cancel_camera_transition();
+        self.animation.momentum_active = false;
+        self.animation.momentum_velocity = Vec2::ZERO;
+        self.pan = (rect.center() - rect.min) / self.zoom - point.to_vec2();
+    }
+
+    /// Fit `id` in the canvas, or return from it when it is already focused.
+    /// A hidden tile is shown first; a pinned one is only selected.
+    pub fn toggle_tile_focus(&mut self, id: PreviewId, previews: &mut PreviewManager) {
+        if self.focused_tile() == Some(id) {
+            self.exit_focus();
+            return;
+        }
+        let Some(preview) = previews.get(id).filter(|p| p.removing.is_none()) else {
+            return;
+        };
+        let (pinned, rect) = (preview.viewport_pin.is_some(), preview.rect());
+        if preview.hidden {
+            let members = self.group_members(id, previews);
+            self.set_tiles_hidden(&members, false, previews);
+        }
+        if self.is_spotlighting() && !self.spotlight_includes(&[id]) {
+            self.exit_spotlight(previews);
+        }
+        match self.last_screen_rect {
+            Some(viewport) if !pinned => self.focus_on_tile(id, rect, viewport),
+            _ => {
+                self.exit_focus();
+                self.selection = vec![id];
+                self.remember_current_tile(id);
+            }
+        }
+    }
+
     /// Remote focus uses canvas hit testing, never tile clicks or source input.
     pub fn focus_viewer_at(&mut self, at: [f32; 2], previews: &PreviewManager) {
         if self.is_spotlighting() {
@@ -227,7 +369,9 @@ impl CanvasState {
         };
         if let Some(tile_rect) = preview_manager
             .get(id)
-            .filter(|preview| preview.removing.is_none() && preview.viewport_pin.is_none())
+            .filter(|preview| {
+                preview.removing.is_none() && !preview.hidden && preview.viewport_pin.is_none()
+            })
             .map(|preview| preview.rect())
         {
             self.focus_on_tile(id, tile_rect, canvas_rect);
@@ -657,6 +801,7 @@ impl CanvasState {
             .all()
             .filter(|preview| {
                 preview.removing.is_none()
+                    && !preview.hidden
                     && self
                         .preview_screen_rect(preview, canvas_rect)
                         .contains(screen_pos)
@@ -705,6 +850,7 @@ impl CanvasState {
             .all()
             .filter(|preview| {
                 preview.removing.is_none()
+                    && !preview.hidden
                     && !preview.left_click_disabled
                     && self
                         .preview_screen_rect(preview, canvas_rect)

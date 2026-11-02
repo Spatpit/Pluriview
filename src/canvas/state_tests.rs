@@ -2717,3 +2717,37 @@ fn a_dragged_window_carries_its_tile_along() {
         pinned.translate(Vec2::new(40.0, -20.0))
     );
 }
+
+#[test]
+fn hidden_tiles_leave_the_selection_and_a_grouped_tile_moves_its_group() {
+    let mut canvas = CanvasState::default();
+    let mut previews = PreviewManager::new();
+    let first = previews.add("first".to_owned(), Pos2::ZERO, Vec2::splat(50.0));
+    let second = previews.add("second".to_owned(), Pos2::new(60.0, 0.0), Vec2::splat(50.0));
+    let loose = previews.add("loose".to_owned(), Pos2::new(200.0, 0.0), Vec2::splat(50.0));
+    for (order, id) in [first, second].into_iter().enumerate() {
+        previews.get_mut(id).unwrap().tile_group = Some(crate::preview::TileGroup {
+            id: 7,
+            name: "Group".to_owned(),
+            order: order as u32,
+        });
+    }
+
+    canvas.move_tile_by(second, Vec2::new(10.0, 20.0), &mut previews);
+    assert_eq!(previews.get(first).unwrap().position, Pos2::new(10.0, 20.0));
+    assert_eq!(
+        previews.get(second).unwrap().position,
+        Pos2::new(70.0, 20.0)
+    );
+    assert_eq!(previews.get(loose).unwrap().position, Pos2::new(200.0, 0.0));
+
+    canvas.selection = vec![first, second, loose];
+    canvas.set_tiles_hidden(&[first, second], true, &mut previews);
+    assert!(previews.get(first).unwrap().hidden && previews.get(second).unwrap().hidden);
+    assert_eq!(canvas.selection, vec![loose]);
+
+    // Selecting a hidden tile from the Control Tile Center shows its group.
+    canvas.select_tile(first, &mut previews);
+    assert!(!previews.get(first).unwrap().hidden && !previews.get(second).unwrap().hidden);
+    assert_eq!(canvas.selection, vec![first, second]);
+}

@@ -66,6 +66,7 @@ mod screenshot_panel;
 mod screenshots;
 mod settings;
 mod source_loading;
+mod tile_control;
 mod workspaces;
 use source_loading::{PreparedSource, SourceLoads, SourceTarget};
 
@@ -305,6 +306,12 @@ fn restore_layout_tile_state(preview: &mut Preview, saved: &PreviewLayout) {
     preview.created_at = Instant::now() - Duration::from_secs(1);
     preview.left_click_disabled = saved.left_click_disabled;
     preview.manually_frozen = saved.manually_frozen;
+    preview.hidden = saved.hidden;
+    // Layouts from before the custom order keep the order they are restored
+    // in, which creating each tile already gave them.
+    if saved.list_order != 0 {
+        preview.list_order = saved.list_order;
+    }
     preview.capture_paused = saved.manually_frozen;
     preview.capture_hibernated = false;
     preview.capture_offscreen_since = None;
@@ -333,6 +340,7 @@ fn restore_removed_tile_state(preview: &mut Preview, removed: &RemovedPreviewInf
     preview.lock_aspect_ratio = removed.lock_aspect_ratio;
     preview.manually_frozen = removed.manually_frozen;
     preview.capture_paused = removed.manually_frozen;
+    preview.list_order = removed.list_order;
     preview.playlist_group = removed.playlist_group;
 }
 
@@ -888,9 +896,10 @@ fn restored_browser_ready(
 fn video_tile_needs_canvas_repaint(preview: &Preview, viewport: Option<egui::Rect>) -> bool {
     preview.is_video()
         && !preview.manually_frozen
-        && (preview.viewport_pin.is_some()
-            || preview.picture_in_picture.is_some()
-            || viewport.is_none_or(|viewport| viewport.intersects(preview.rect())))
+        && (preview.picture_in_picture.is_some()
+            || (!preview.hidden
+                && (preview.viewport_pin.is_some()
+                    || viewport.is_none_or(|viewport| viewport.intersects(preview.rect())))))
 }
 
 /// Main application state
@@ -1051,6 +1060,7 @@ pub struct PluriviewApp {
     screenshots: screenshots::ScreenshotState,
     recording: recording::RecordingState,
     picture_in_picture: picture_in_picture::PictureInPicture,
+    tile_control: tile_control::TileControl,
     source_loads: SourceLoads,
 
     /// Missing optional tools encountered by a video creation action.
@@ -1269,6 +1279,7 @@ impl PluriviewApp {
             screenshots: Default::default(),
             recording: Default::default(),
             picture_in_picture: Default::default(),
+            tile_control: Default::default(),
             source_loads: SourceLoads::new(_cc.egui_ctx.clone()),
             external_tool_error: None,
             video_action_error: None,
@@ -1631,6 +1642,7 @@ impl PluriviewApp {
                     let preview = self.preview_manager.get(*id);
                     let eligible = preview.is_some_and(|preview| {
                         !preview.manually_frozen
+                            && !preview.hidden
                             && !matches!(preview.video_status, VideoTileStatus::Failed(_))
                     });
                     restored_video_ready(
@@ -1657,6 +1669,7 @@ impl PluriviewApp {
             let preview = self.preview_manager.get(*id);
             preview.is_some_and(|preview| {
                 !preview.manually_frozen
+                    && !preview.hidden
                     && !matches!(preview.video_status, VideoTileStatus::Failed(_))
                     && restored_video_ready(
                         pending,
@@ -2627,7 +2640,7 @@ impl PluriviewApp {
                     self.pending_browser_tiles.iter().find_map(|(id, pending)| {
                         let preview = self.preview_manager.get(*id);
                         let tile_rect = preview.map(|preview| preview.rect());
-                        (preview.is_some_and(|preview| !preview.manually_frozen)
+                        (preview.is_some_and(|preview| !preview.manually_frozen && !preview.hidden)
                             && restored_browser_ready(
                                 pending,
                                 tile_rect,
@@ -2667,7 +2680,7 @@ impl PluriviewApp {
                 self.pending_browser_tiles.iter().any(|(id, pending)| {
                     let preview = self.preview_manager.get(*id);
                     let tile_rect = preview.map(|preview| preview.rect());
-                    preview.is_some_and(|preview| !preview.manually_frozen)
+                    preview.is_some_and(|preview| !preview.manually_frozen && !preview.hidden)
                         && restored_browser_ready(
                             pending,
                             tile_rect,
@@ -3708,8 +3721,13 @@ impl PluriviewApp {
             // Clicking the tile's own toolbar or tabs focuses the canvas but
             // keeps the page interactive.
             let held_by_chrome = self.canvas.browser_chrome_holds_interaction;
+            let hidden = self
+                .preview_manager
+                .get(active_id)
+                .is_some_and(|preview| preview.hidden);
             let should_park = escape
                 || minimized
+                || hidden
                 || tile_rect.is_none()
                 || (!owns_focus && !in_grace && !held_by_chrome);
 
@@ -6001,6 +6019,9 @@ impl eframe::App for PluriviewApp {
         if shortcut_presses.pressed(HotkeySlot::PictureInPicture) {
             self.picture_in_picture_shortcut(ctx);
         }
+        if shortcut_presses.pressed(HotkeySlot::ToggleTileControl) {
+            self.toggle_tile_control(ctx);
+        }
         let numbered_canvas_view = HotkeySlot::CANVAS_VIEWS
             .iter()
             .position(|slot| shortcut_presses.pressed(*slot));
@@ -6183,6 +6204,10 @@ impl eframe::App for PluriviewApp {
             self.toggle_picture_in_picture(id, ctx);
         }
         self.picture_in_picture_ui(ctx);
+        if std::mem::take(&mut self.canvas.pending_tile_control) {
+            self.toggle_tile_control(ctx);
+        }
+        self.tile_control_ui(ctx);
 
         #[cfg(windows)]
         self.sync_wallpaper_under_tile_focus();
@@ -6729,6 +6754,7 @@ impl eframe::App for PluriviewApp {
                                 ("Record a GIF", HotkeySlot::RecordGif),
                                 ("Pause/resume recording", HotkeySlot::PauseRecording),
                                 ("Picture in picture", HotkeySlot::PictureInPicture),
+                                ("Control Tile Center", HotkeySlot::ToggleTileControl),
                             ] {
                                 ui.label(label);
                                 ui.label(

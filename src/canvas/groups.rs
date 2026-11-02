@@ -734,6 +734,14 @@ impl CanvasState {
         self.groups.active_tile = Some(id);
     }
 
+    pub(super) fn groups_active_tile(&self) -> Option<PreviewId> {
+        self.groups.active_tile
+    }
+
+    pub(super) fn forget_current_tile(&mut self) {
+        self.groups.active_tile = None;
+    }
+
     /// Group membership and the tile targeted by focus are independent.
     pub fn current_tile(&self, previews: &PreviewManager) -> Option<PreviewId> {
         self.groups
@@ -1114,6 +1122,13 @@ impl CanvasState {
 
     pub fn is_spotlighting(&self) -> bool {
         self.groups.spotlight.is_some()
+    }
+
+    pub(super) fn spotlight_includes(&self, ids: &[PreviewId]) -> bool {
+        self.groups
+            .spotlight
+            .as_ref()
+            .is_some_and(|spotlight| spotlight.order.iter().any(|id| ids.contains(id)))
     }
 
     fn resize_selection(&mut self, width: f32, viewport: Rect, previews: &mut PreviewManager) {

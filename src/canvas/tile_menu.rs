@@ -515,6 +515,22 @@ impl CanvasState {
             self.toggle_viewport_pin(id, canvas_rect, preview_manager);
             ui.close_menu();
         }
+        let members = self.group_members(id, preview_manager);
+        let label = if members.len() > 1 {
+            "Hide Group"
+        } else {
+            "Hide Tile"
+        };
+        if ui
+            .button(label)
+            .on_hover_text(
+                "Take it off the canvas while it keeps running. Show it again from the Control Tile Center",
+            )
+            .clicked()
+        {
+            self.set_tiles_hidden(&members, true, preview_manager);
+            ui.close_menu();
+        }
     }
 
     /// Options set once and rarely changed.

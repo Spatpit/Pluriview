@@ -190,7 +190,7 @@ fn saved_window_geometry(storage: &Storage) -> Option<WindowLayout> {
 /// reopen off-screen — and with the OS decorations off there is no title bar
 /// to drag it back with.
 #[cfg(windows)]
-fn is_on_screen(position: &(f32, f32)) -> bool {
+pub(crate) fn is_on_screen(position: &(f32, f32)) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN,
@@ -212,7 +212,7 @@ fn is_on_screen(position: &(f32, f32)) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_on_screen(_position: &(f32, f32)) -> bool {
+pub(crate) fn is_on_screen(_position: &(f32, f32)) -> bool {
     true
 }
 

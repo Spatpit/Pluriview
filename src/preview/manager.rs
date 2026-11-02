@@ -23,6 +23,7 @@ pub struct RemovedPreviewInfo {
     pub z_order: u32,
     pub lock_aspect_ratio: bool,
     pub manually_frozen: bool,
+    pub list_order: u64,
     pub video_playback: VideoPlaybackState,
     pub video_preferences: super::VideoPlaybackPreferences,
     pub fps_preset: FpsPreset,
@@ -79,6 +80,29 @@ impl PreviewManager {
         }
     }
 
+    /// Store a newly created tile, last in the Control Tile Center's custom
+    /// order. Restoring a saved tile replaces the order afterwards.
+    fn insert_new(&mut self, id: PreviewId, mut preview: Preview) {
+        preview.list_order = self
+            .previews
+            .values()
+            .map(|preview| preview.list_order)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.previews.insert(id, preview);
+    }
+
+    /// Put the Control Tile Center's custom order to `ids`, first to last.
+    /// Tiles not listed keep their places after them.
+    pub fn set_list_order(&mut self, ids: &[PreviewId]) {
+        for (index, id) in ids.iter().enumerate() {
+            if let Some(preview) = self.previews.get_mut(id) {
+                preview.list_order = index as u64 + 1;
+            }
+        }
+    }
+
     /// Generate a new unique ID
     fn generate_id(&mut self) -> PreviewId {
         let id = PreviewId(self.next_id);
@@ -95,7 +119,7 @@ impl PreviewManager {
         let mut preview = Preview::new(id, title, position, size);
         preview.z_order = self.max_z_order;
 
-        self.previews.insert(id, preview);
+        self.insert_new(id, preview);
         id
     }
 
@@ -114,7 +138,7 @@ impl PreviewManager {
         let mut preview = Preview::for_window(id, hwnd, process_id, title, position, size);
         preview.z_order = self.max_z_order;
 
-        self.previews.insert(id, preview);
+        self.insert_new(id, preview);
         id
     }
 
@@ -139,7 +163,7 @@ impl PreviewManager {
         preview.window_waiting_for_match = true;
         preview.set_fps_preset(fps_preset);
         preview.created_at = Instant::now() - Duration::from_secs(1);
-        self.previews.insert(id, preview);
+        self.insert_new(id, preview);
         id
     }
 
@@ -157,7 +181,7 @@ impl PreviewManager {
         let mut preview = Preview::for_spout(id, sender_name, position, size);
         preview.z_order = self.max_z_order;
         preview.set_fps_preset(fps);
-        self.previews.insert(id, preview);
+        self.insert_new(id, preview);
         id
     }
 
@@ -178,7 +202,7 @@ impl PreviewManager {
         preview.browser_waiting_for_content = true;
         preview.browser_status = BrowserTileStatus::PreparingAdblock { progress: 0.0 };
         preview.set_fps_preset(fps);
-        self.previews.insert(id, preview);
+        self.insert_new(id, preview);
         id
     }
 
@@ -197,7 +221,7 @@ impl PreviewManager {
         let mut preview = Preview::new(id, title, position, size);
         preview.z_order = self.max_z_order;
         preview.set_media(path, frames);
-        self.previews.insert(id, preview);
+        self.insert_new(id, preview);
         id
     }
 
@@ -223,7 +247,7 @@ impl PreviewManager {
             VideoTileStatus::Starting
         };
         preview.set_fps_preset(fps);
-        self.previews.insert(id, preview);
+        self.insert_new(id, preview);
         id
     }
 
@@ -246,7 +270,7 @@ impl PreviewManager {
         preview.folder_playlist = Some(playlist);
         preview.playlist_group = Some(group);
         preview.playlist_linked_video = linked_video;
-        self.previews.insert(id, preview);
+        self.insert_new(id, preview);
         id
     }
 
@@ -310,6 +334,7 @@ impl PreviewManager {
                         z_order: preview.z_order,
                         lock_aspect_ratio: preview.lock_aspect_ratio,
                         manually_frozen: preview.manually_frozen,
+                        list_order: preview.list_order,
                         video_playback: preview.video_playback,
                         video_preferences: preview.video_preferences,
                         fps_preset: preview.fps_preset,
@@ -377,7 +402,7 @@ impl PreviewManager {
         // Restored layouts should appear instantly, not all spawn-animate at once.
         preview.created_at = Instant::now() - Duration::from_secs(1);
 
-        self.previews.insert(id, preview);
+        self.insert_new(id, preview);
         id
     }
 
@@ -473,6 +498,18 @@ mod tests {
     use super::{FpsPreset, PreviewManager, VideoSource, VideoTileStatus};
     use eframe::egui::{Pos2, Vec2};
     use std::path::PathBuf;
+
+    #[test]
+    fn new_tiles_go_last_in_the_list_order() {
+        let mut previews = PreviewManager::new();
+        let first = previews.add("first".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
+        let second = previews.add("second".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
+        previews.set_list_order(&[second, first]);
+        let third = previews.add("third".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
+        let order = |id| previews.get(id).unwrap().list_order;
+        assert!(order(second) < order(first));
+        assert!(order(first) < order(third));
+    }
 
     #[test]
     fn hit_testing_returns_the_topmost_preview_without_sorting() {

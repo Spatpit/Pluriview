@@ -80,6 +80,7 @@ pub enum HotkeySlot {
     PauseRecording,
     PictureInPicture,
     RecordGif,
+    ToggleTileControl,
 }
 
 impl HotkeySlot {
@@ -95,7 +96,7 @@ impl HotkeySlot {
         Self::CanvasView9,
     ];
 
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::ToggleWindowPicker,
         Self::ToggleGrid,
         Self::ToggleCanvasOnly,
@@ -135,6 +136,7 @@ impl HotkeySlot {
         Self::PauseRecording,
         Self::PictureInPicture,
         Self::RecordGif,
+        Self::ToggleTileControl,
     ];
 
     pub fn label(self) -> &'static str {
@@ -178,6 +180,7 @@ impl HotkeySlot {
             Self::PauseRecording => "Pause/resume recording",
             Self::PictureInPicture => "Picture in picture",
             Self::RecordGif => "Start/stop GIF of selected tiles",
+            Self::ToggleTileControl => "Toggle Control Tile Center",
         }
     }
 }
@@ -224,6 +227,7 @@ pub struct HotkeyBindings {
     pub pause_recording: Hotkey,
     pub picture_in_picture: Hotkey,
     pub record_gif: Hotkey,
+    pub toggle_tile_control: Hotkey,
 }
 
 impl Default for HotkeyBindings {
@@ -268,6 +272,7 @@ impl Default for HotkeyBindings {
             pause_recording: Hotkey::key(0x50),        // P
             picture_in_picture: Hotkey::pair(0x10, 0x50), // Shift+P
             record_gif: Hotkey::pair(0x10, 0x47),      // Shift+G
+            toggle_tile_control: Hotkey::key(0x43),    // C
         }
     }
 }
@@ -314,6 +319,7 @@ impl HotkeyBindings {
             HotkeySlot::PauseRecording => self.pause_recording,
             HotkeySlot::PictureInPicture => self.picture_in_picture,
             HotkeySlot::RecordGif => self.record_gif,
+            HotkeySlot::ToggleTileControl => self.toggle_tile_control,
         }
     }
 
@@ -358,6 +364,7 @@ impl HotkeyBindings {
             HotkeySlot::PauseRecording => self.pause_recording = hotkey,
             HotkeySlot::PictureInPicture => self.picture_in_picture = hotkey,
             HotkeySlot::RecordGif => self.record_gif = hotkey,
+            HotkeySlot::ToggleTileControl => self.toggle_tile_control = hotkey,
         }
     }
 
@@ -824,6 +831,18 @@ mod tests {
     }
 
     #[test]
+    fn tile_control_defaults_to_c_for_older_settings() {
+        let mut value = serde_json::to_value(HotkeyBindings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("toggle_tile_control");
+        let restored: HotkeyBindings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.get(HotkeySlot::ToggleTileControl).display(), "C");
+        assert_eq!(
+            restored.conflict(HotkeySlot::ToggleTileControl, restored.toggle_tile_control),
+            None
+        );
+    }
+
+    #[test]
     fn focus_defaults_to_f_when_missing_from_saved_settings() {
         let mut value = serde_json::to_value(HotkeyBindings::default()).unwrap();
         value.as_object_mut().unwrap().remove("focus_current_tile");
@@ -924,7 +943,7 @@ mod tests {
         let configured = shortcuts.configured_keys();
         assert_eq!(
             configured.into_iter().filter(|enabled| *enabled).count(),
-            31
+            32
         );
         assert!(configured[0x11]); // Ctrl
         assert!(configured[0x31]); // 1

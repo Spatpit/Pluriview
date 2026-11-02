@@ -337,6 +337,7 @@ impl PluriviewApp {
             preview.is_window_capture()
                 && preview.removing.is_none()
                 && !preview.manually_frozen
+                && !preview.hidden
                 && !preview.left_click_disabled
                 && preview.picture_in_picture.is_none()
                 && preview

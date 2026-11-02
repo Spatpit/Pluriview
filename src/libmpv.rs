@@ -1058,8 +1058,41 @@ impl MpvCore {
             video_render_target_size(viewport_width, viewport_height, crop_uv);
 
         self.render_to_fbo(gl, target_width, target_height)?;
+        self.blit_target(&info, gl, crop_uv, destination);
+        Ok(())
+    }
+
+    /// Draw the frame last rendered for the canvas, scaled, without asking
+    /// libmpv for a new one. Rendering at a second size every frame would
+    /// reallocate the render target back and forth.
+    unsafe fn paint_last_frame(
+        &self,
+        info: egui::PaintCallbackInfo,
+        gl: &glow::Context,
+        crop_uv: Option<(f32, f32, f32, f32)>,
+    ) {
+        if self.destroyed || !self.has_rendered_frame {
+            return;
+        }
+        let destination = video_blit_destination(
+            info.viewport,
+            info.pixels_per_point,
+            info.screen_size_px[1] as i32,
+        );
+        if destination.right > destination.left && destination.top > destination.bottom {
+            self.blit_target(&info, gl, crop_uv, destination);
+        }
+    }
+
+    unsafe fn blit_target(
+        &self,
+        info: &egui::PaintCallbackInfo,
+        gl: &glow::Context,
+        crop_uv: Option<(f32, f32, f32, f32)>,
+        destination: BlitDestination,
+    ) {
         let Some(target) = self.target.as_ref() else {
-            return Ok(());
+            return;
         };
         let source = video_blit_source(target.width, target.height, crop_uv);
         let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
@@ -1099,7 +1132,6 @@ impl MpvCore {
         }
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
-        Ok(())
     }
 
     unsafe fn snapshot(&self, gl: &glow::Context) -> Option<VideoSnapshot> {
@@ -1206,6 +1238,17 @@ impl VideoRenderer {
             }
             core.error = Some(error);
         }
+    }
+
+    /// Thumbnail drawing: reuse the canvas's last frame at any size.
+    pub fn paint_last_frame(
+        &self,
+        info: egui::PaintCallbackInfo,
+        gl: &glow::Context,
+        crop_uv: Option<(f32, f32, f32, f32)>,
+    ) {
+        let core = self.core.lock();
+        unsafe { core.paint_last_frame(info, gl, crop_uv) };
     }
 
     pub fn snapshot(&self, gl: &glow::Context) -> Option<VideoSnapshot> {
