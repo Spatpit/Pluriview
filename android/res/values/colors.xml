@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Matches the desktop palette in src/ui_theme.rs. -->
+<resources>
+    <color name="panel">#FF16171B</color>
+    <color name="surface">#FF1E1F24</color>
+    <color name="border">#FF3D3D42</color>
+    <color name="text">#FFEBE9E3</color>
+    <color name="secondary">#FFAAACB4</color>
+    <color name="gold">#FFE0B553</color>
+    <color name="icon_background">#FF3D2B28</color>
+</resources>

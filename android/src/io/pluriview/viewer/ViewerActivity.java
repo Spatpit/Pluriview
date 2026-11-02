@@ -1,70 +1,95 @@
 package io.pluriview.viewer;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Intent;
+import android.content.res.ColorStateList;
+import android.content.res.Configuration;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Matrix;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.graphics.SurfaceTexture;
+import android.graphics.Typeface;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
-import android.content.Intent;
-import android.graphics.Canvas;
-import android.graphics.Color;
-import android.graphics.RectF;
-import android.graphics.SurfaceTexture;
-import android.graphics.Matrix;
 import android.net.Uri;
-import android.os.Bundle;
 import android.os.Build;
+import android.os.Bundle;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextWatcher;
+import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
-import android.view.View;
-import android.view.TextureView;
 import android.view.Surface;
+import android.view.TextureView;
+import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
-import android.view.ViewConfiguration;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageButton;
 import android.widget.LinearLayout;
-import android.widget.TextView;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
-import java.io.DataInputStream;
-import java.io.BufferedInputStream;
+import android.widget.TextView;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class ViewerActivity extends Activity {
-    private static final int GOLD = Color.rgb(226, 186, 105);
+    private static final String HINT_SHOWN = "gestureHintShown";
+    private static final String AUDIO_PLAYING = "Audio: on · stereo";
+    /** What the viewer is doing; the status chip and centre panel are drawn from it. */
+    enum State { CONNECTING, LIVE, RECOVERING, WAITING, ERROR }
+
     private Session session;
     private PairingScreen nearby;
     private final DecoderSlot decoderSlot = new DecoderSlot();
     private final DecoderSlot audioNetworkSlot = new DecoderSlot(), audioCodecSlot = new DecoderSlot();
-    private TextView status;
-    private CanvasView canvas;
-    private EditText pairing;
     private boolean foreground;
     private boolean fullscreen;
     private boolean fill;
-    private LinearLayout viewerRoot, viewerBar, overlay;
-    private TextView viewerHint;
-    private TextView viewerStats;
-    private Button fitButton, overlayFit;
-    private Button audioButton, overlayAudio;
-    private TextView audioStatus, overlayAudioStatus;
-    private final Runnable hideControls = () -> { if (fullscreen && overlay != null) overlay.setVisibility(View.GONE); };
+    private boolean controlsShown, statsOpen;
+    private Object backCallback;
+    private int density;
+    // Pairing screen.
+    private EditText pairing;
+    private TextView linkStatus;
+    private Button connectLink;
+    // Viewer screen. Both windowed and fullscreen viewing use these same controls.
+    private FrameLayout surface, chrome;
+    private CanvasView canvas;
+    private LinearLayout topLeft, bottom, statsCard, statePanel, hint;
+    private View chipDot;
+    private LinearLayout chip;
+    private TextView chipText, statsText, audioNote, stateTitle, stateDetail;
+    private ProgressBar stateSpinner;
+    private Button stateAction;
+    private ImageButton fitButton, audioButton, statsButton, fullscreenButton;
+    private final Runnable hideControls = () -> { if (fullscreen && !statsOpen) setControls(false); };
+    private final Runnable hideHint = () -> { if (hint != null) fade(hint, false); };
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         fill = getPreferences(MODE_PRIVATE).getBoolean("fill", true);
+        density = getResources().getConfiguration().densityDpi;
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
-        showPairing(null);
+        showPairing(null, null);
         acceptIntent(getIntent());
     }
 
@@ -76,82 +101,134 @@ public final class ViewerActivity extends Activity {
     private void acceptIntent(Intent intent) {
         if (intent != null && intent.getData() != null) {
             // External QR links prefill pairing; they never start a connection silently.
-            showPairing(intent.getData().toString());
+            showPairing(intent.getData().toString(), null);
             intent.setData(null);
         }
     }
 
-    private int dp(int value) { return (int) (value * getResources().getDisplayMetrics().density + .5f); }
-
-    private TextView text(String value, int size) {
-        TextView view = new TextView(this);
-        view.setText(value); view.setTextColor(Color.WHITE); view.setTextSize(size);
-        view.setPadding(0, dp(8), 0, dp(8));
-        return view;
-    }
+    private int dp(float value) { return Ui.dp(this, value); }
 
     private LinearLayout column() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.rgb(19, 19, 22));
+        root.setBackgroundColor(Ui.PANEL);
         root.setPadding(dp(20), dp(24), dp(20), dp(16));
         root.setOnApplyWindowInsetsListener((v, insets) -> {
-            if (fullscreen) { v.setPadding(0, 0, 0, 0); return insets; }
-            v.setPadding(dp(20) + insets.getSystemWindowInsetLeft(), dp(16) + insets.getSystemWindowInsetTop(),
-                dp(20) + insets.getSystemWindowInsetRight(), dp(12) + insets.getSystemWindowInsetBottom());
+            int[] edge = Ui.insets(insets);
+            v.setPadding(dp(20) + edge[0], dp(24) + edge[1], dp(20) + edge[2], dp(16) + edge[3]);
             return insets;
         });
         return root;
     }
 
-    private void showPairing(String invite) {
+    private void showPairing(String invite, String notice) {
         if (nearby != null) nearby.stop();
-        if (viewerRoot != null) viewerRoot.removeCallbacks(hideControls);
-        fullscreen = false;
+        if (surface != null) { surface.removeCallbacks(hideControls); surface.removeCallbacks(hideHint); }
+        fullscreen = false; statsOpen = false;
         stopSession();
+        updateBackCallback();
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         LinearLayout root = column();
-        TextView title = text("Pluriview Viewer", 28); title.setTextColor(GOLD); root.addView(title);
-        root.addView(text("Your canvas, on your phone", 18));
-        root.addView(text("On your PC, open View → Phone Viewer and start sharing. Choose it below and approve the request on the PC.", 16));
+        TextView title = Ui.text(this, "Pluriview Viewer", 26, Ui.GOLD);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        root.addView(title);
+        root.addView(Ui.text(this, "See and steer your PC canvas from your phone.", 15, Ui.SECONDARY), Ui.spaced(this, 4));
+        if (notice != null) {
+            LinearLayout card = Ui.card(this, LinearLayout.VERTICAL);
+            card.setBackground(Ui.rounded(Ui.SURFACE, 16, Ui.DANGER, this));
+            card.addView(Ui.text(this, notice, 15, Ui.TEXT));
+            root.addView(card, Ui.spaced(this, 20));
+        }
         nearby = new PairingScreen(this, root, this::openViewer);
-        root.addView(text("Or use a QR / pairing link", 16));
+
+        root.addView(Ui.label(this, "Pairing link"), Ui.spaced(this, 28));
+        root.addView(Ui.text(this, "Scan the QR code in Tools → Phone Viewer on the PC with your camera, or copy its link and paste it here. A link works for one phone.", 14, Ui.SECONDARY), Ui.spaced(this, 6));
+        LinearLayout linkRow = new LinearLayout(this); linkRow.setGravity(Gravity.CENTER_VERTICAL);
         pairing = new EditText(this);
-        pairing.setHint("Pairing link"); pairing.setTextColor(Color.WHITE); pairing.setHintTextColor(Color.GRAY);
-        pairing.setSingleLine(true);
-        pairing.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        pairing.setHint("pluriview://viewer?…"); pairing.setTextColor(Ui.TEXT); pairing.setHintTextColor(Ui.SECONDARY);
+        pairing.setSingleLine(true); pairing.setTextSize(15);
+        pairing.setBackground(Ui.rounded(Ui.SURFACE, 12, Ui.BORDER, this));
+        pairing.setPadding(dp(14), 0, dp(14), 0);
+        // The link contains the pairing secret; keep it masked like a password.
+        pairing.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         pairing.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        pairing.setContentDescription("Pairing link");
+        linkRow.addView(pairing, new LinearLayout.LayoutParams(0, dp(48), 1));
+        Button paste = Ui.button(this, "Paste", Ui.Kind.SECONDARY);
+        LinearLayout.LayoutParams pasteParams = new LinearLayout.LayoutParams(-2, dp(48));
+        pasteParams.leftMargin = dp(8);
+        linkRow.addView(paste, pasteParams);
+        root.addView(linkRow, Ui.spaced(this, 12));
+        linkStatus = Ui.text(this, "", 14, Ui.SECONDARY);
+        root.addView(linkStatus, Ui.spaced(this, 8));
+        connectLink = Ui.button(this, "Connect", Ui.Kind.PRIMARY);
+        root.addView(connectLink, Ui.spaced(this, 12));
+        root.addView(Ui.text(this, "Use only trusted private Wi-Fi: the stream isn't encrypted. Phone audio starts off.", 13, Ui.SECONDARY), Ui.spaced(this, 28));
+
+        pairing.addTextChangedListener(new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            public void afterTextChanged(Editable s) { describeLink(); }
+        });
+        paste.setOnClickListener(v -> pasteLink());
+        connectLink.setOnClickListener(v -> {
+            Link link = Link.parse(pairing.getText().toString().trim());
+            if (link != null) openViewer(link.ip, link.port, link.token, UUID.randomUUID().toString().replace("-", ""), null);
+        });
         if (invite != null) pairing.setText(invite);
-        root.addView(pairing);
-        Button connect = new Button(this); connect.setText("Connect to PC"); root.addView(connect);
-        status = text("Use the same trusted private Wi-Fi as your PC. Streaming is unencrypted. Optional tile audio starts off.", 14);
-        root.addView(status);
-        connect.setOnClickListener(v -> connect(pairing.getText().toString().trim()));
+        describeLink();
+
         ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.addView(root);
+        scroll.setBackgroundColor(Ui.PANEL);
         setContentView(scroll);
         applySystemBars();
         if (foreground) nearby.start();
     }
 
-    private void connect(String invite) {
-        try {
-            Uri uri = Uri.parse(invite);
-            String ip = uri.getQueryParameter("host");
-            String token = uri.getQueryParameter("token");
-            int port = Integer.parseInt(uri.getQueryParameter("port"));
-            if (!"pluriview".equals(uri.getScheme()) || !"viewer".equals(uri.getHost())
-                    || !privateIpv4(ip) || port < 1 || port > 65535 || token == null || !token.matches("[0-9a-f]{32}"))
-                throw new IllegalArgumentException();
-            openViewer(ip, port, token, UUID.randomUUID().toString().replace("-", ""));
-        } catch (Exception e) {
-            status.setText("That pairing link is not valid. Copy a fresh link from Phone Viewer on the PC.");
+    /** A validated pairing link. Only literal private IPv4 hosts are accepted. */
+    static final class Link {
+        final String ip, token; final int port;
+        private Link(String ip, int port, String token) { this.ip = ip; this.port = port; this.token = token; }
+        static Link parse(String invite) {
+            try {
+                Uri uri = Uri.parse(invite);
+                String ip = uri.getQueryParameter("host");
+                String token = uri.getQueryParameter("token");
+                int port = Integer.parseInt(uri.getQueryParameter("port"));
+                if (!"pluriview".equals(uri.getScheme()) || !"viewer".equals(uri.getHost())
+                        || !privateIpv4(ip) || port < 1 || port > 65535 || token == null || !token.matches("[0-9a-f]{32}"))
+                    return null;
+                return new Link(ip, port, token);
+            } catch (RuntimeException invalid) { return null; }
         }
     }
 
-    private void openViewer(String ip, int port, String token, String client) {
+    private void describeLink() {
+        String text = pairing.getText().toString().trim();
+        Link link = Link.parse(text);
+        Ui.enable(connectLink, link != null);
+        if (text.isEmpty()) { linkStatus.setVisibility(View.GONE); return; }
+        linkStatus.setVisibility(View.VISIBLE);
+        linkStatus.setTextColor(link != null ? Ui.LIVE : Ui.DANGER);
+        linkStatus.setText(link != null ? "Ready to connect to the PC at " + link.ip + "." : "That isn't a valid pairing link. Copy a fresh one from Phone Viewer on the PC.");
+    }
+
+    private void pasteLink() {
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        ClipData clip = clipboard == null ? null : clipboard.getPrimaryClip();
+        CharSequence text = clip == null || clip.getItemCount() == 0 ? null : clip.getItemAt(0).coerceToText(this);
+        if (text == null || text.toString().trim().isEmpty()) {
+            linkStatus.setVisibility(View.VISIBLE); linkStatus.setTextColor(Ui.DANGER);
+            linkStatus.setText("The clipboard is empty. Copy the link from Phone Viewer on the PC first.");
+            return;
+        }
+        pairing.setText(text.toString().trim());
+    }
+
+    private void openViewer(String ip, int port, String token, String client, String name) {
         if (nearby != null) nearby.stop();
         stopSession();
-        Session next = new Session(ip, port, token, client);
+        Session next = new Session(ip, port, token, client, name != null ? name : ip);
         session = next;
         showViewer(next);
         if (foreground) next.start();
@@ -171,68 +248,173 @@ public final class ViewerActivity extends Activity {
     }
 
     private void showViewer(Session next) {
-        FrameLayout surface = new FrameLayout(this);
-        LinearLayout root = column();
-        viewerRoot = root;
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.VERTICAL);
-        viewerBar = bar;
-        status = text("Connecting…", 14);
-        bar.addView(status, new LinearLayout.LayoutParams(-1, -2));
-        LinearLayout actions = new LinearLayout(this);
-        bar.addView(actions, new LinearLayout.LayoutParams(-1, -2));
-        Button disconnect = new Button(this); disconnect.setText("Disconnect");
-        disconnect.setOnClickListener(v -> showPairing(null)); actions.addView(disconnect, new LinearLayout.LayoutParams(0, -2, 1));
-        Button expand = new Button(this); expand.setText("Full screen"); actions.addView(expand, new LinearLayout.LayoutParams(0, -2, 1));
-        fitButton = new Button(this); actions.addView(fitButton, new LinearLayout.LayoutParams(0, -2, 1));
-        fitButton.setOnClickListener(v -> toggleFit());
-        LinearLayout sound = new LinearLayout(this); bar.addView(sound);
-        audioButton = new Button(this); sound.addView(audioButton);
-        audioButton.setOnClickListener(v -> next.toggleAudio());
-        audioStatus = text("Audio: off", 12); sound.addView(audioStatus, new LinearLayout.LayoutParams(0, -2, 1));
-        root.addView(bar);
+        surface = new FrameLayout(this);
+        surface.setBackgroundColor(Color.BLACK);
         canvas = new CanvasView(next);
-        root.addView(canvas, new LinearLayout.LayoutParams(-1, 0, 1));
-        TextView hint = text("Drag to pan · Pinch to zoom · Double-tap a tile to focus", 12);
-        viewerHint = hint;
-        root.addView(hint);
-        surface.addView(root, new FrameLayout.LayoutParams(-1, -1));
-        overlay = new LinearLayout(this);
-        overlay.setOrientation(LinearLayout.VERTICAL);
-        overlay.setBackgroundColor(0xCC131316);
-        viewerStats = text("Connecting…", 12); overlay.addView(viewerStats);
-        LinearLayout overlayActions = new LinearLayout(this); overlay.addView(overlayActions);
-        Button restore = new Button(this); restore.setText("Exit full screen"); overlayActions.addView(restore);
-        overlayFit = new Button(this); overlayActions.addView(overlayFit); overlayFit.setOnClickListener(v -> toggleFit());
-        LinearLayout overlaySound = new LinearLayout(this); overlay.addView(overlaySound);
-        overlayAudio = new Button(this); overlaySound.addView(overlayAudio);
-        overlayAudio.setOnClickListener(v -> next.toggleAudio());
-        overlayAudioStatus = text("Audio: off", 12); overlaySound.addView(overlayAudioStatus, new LinearLayout.LayoutParams(0, -2, 1));
-        FrameLayout.LayoutParams corner = new FrameLayout.LayoutParams(-2, -2, android.view.Gravity.TOP | android.view.Gravity.RIGHT);
-        corner.setMargins(dp(8), dp(8), dp(8), dp(8));
-        surface.addView(overlay, corner);
+        surface.addView(canvas, new FrameLayout.LayoutParams(-1, -1));
+        buildChrome(next);
         surface.setOnApplyWindowInsetsListener((v, insets) -> {
-            int left = insets.getSystemWindowInsetLeft(), top = insets.getSystemWindowInsetTop(), right = insets.getSystemWindowInsetRight();
-            if (Build.VERSION.SDK_INT >= 28 && insets.getDisplayCutout() != null) {
-                left = Math.max(left, insets.getDisplayCutout().getSafeInsetLeft());
-                top = Math.max(top, insets.getDisplayCutout().getSafeInsetTop());
-                right = Math.max(right, insets.getDisplayCutout().getSafeInsetRight());
+            int[] edge = Ui.insets(insets);
+            // Windowed viewing keeps the picture clear of the system bars;
+            // fullscreen uses the whole panel, including cutout space.
+            FrameLayout.LayoutParams picture = (FrameLayout.LayoutParams) canvas.getLayoutParams();
+            int[] margin = fullscreen ? new int[4] : edge;
+            if (picture.leftMargin != margin[0] || picture.topMargin != margin[1] || picture.rightMargin != margin[2] || picture.bottomMargin != margin[3]) {
+                picture.setMargins(margin[0], margin[1], margin[2], margin[3]); canvas.setLayoutParams(picture);
             }
-            FrameLayout.LayoutParams safe = (FrameLayout.LayoutParams) overlay.getLayoutParams();
-            safe.setMargins(dp(8) + left, dp(8) + top, dp(8) + right, dp(8)); overlay.setLayoutParams(safe);
+            chrome.setPadding(dp(12) + edge[0], dp(12) + edge[1], dp(12) + edge[2], dp(16) + edge[3]);
             return insets;
         });
-        expand.setOnClickListener(v -> setFullscreen(true)); restore.setOnClickListener(v -> setFullscreen(false));
-        updateFitLabels();
-        next.updateAudioLabels();
         setContentView(surface);
         setFullscreen(true);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        updateBackCallback();
+    }
+
+    /** The control layer over the canvas. Rebuilt without touching the video if display density changes. */
+    private void buildChrome(Session next) {
+        if (chrome != null && chrome.getParent() == surface) surface.removeView(chrome);
+        chrome = new FrameLayout(this);
+        surface.addView(chrome, new FrameLayout.LayoutParams(-1, -1));
+
+        // Top left: connection chip, with the optional stats card below it.
+        topLeft = new LinearLayout(this); topLeft.setOrientation(LinearLayout.VERTICAL);
+        chip = new LinearLayout(this); chip.setGravity(Gravity.CENTER_VERTICAL);
+        chip.setBackground(Ui.pressable(this, Ui.SCRIM, 18, Ui.BORDER));
+        chip.setPadding(dp(12), dp(8), dp(14), dp(8));
+        chipDot = new View(this);
+        chip.addView(chipDot, new LinearLayout.LayoutParams(dp(9), dp(9)));
+        chipText = Ui.text(this, "", 14, Ui.TEXT);
+        LinearLayout.LayoutParams chipLabel = new LinearLayout.LayoutParams(-2, -2);
+        chipLabel.leftMargin = dp(8);
+        chip.addView(chipText, chipLabel);
+        chip.setOnClickListener(v -> toggleStats());
+        topLeft.addView(chip, new LinearLayout.LayoutParams(-2, -2));
+        statsCard = Ui.card(this, LinearLayout.VERTICAL);
+        statsCard.setBackground(Ui.rounded(Ui.SCRIM, 14, Ui.BORDER, this));
+        statsCard.setPadding(dp(14), dp(10), dp(14), dp(10));
+        statsText = Ui.text(this, "", 13, Ui.TEXT);
+        statsText.setTypeface(Typeface.MONOSPACE);
+        statsCard.addView(statsText);
+        statsCard.setVisibility(View.GONE);
+        LinearLayout.LayoutParams statsParams = new LinearLayout.LayoutParams(-2, -2);
+        statsParams.topMargin = dp(8);
+        topLeft.addView(statsCard, statsParams);
+        chrome.addView(topLeft, new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START));
+
+        // Bottom centre: audio status above one pill of icon controls.
+        bottom = new LinearLayout(this); bottom.setOrientation(LinearLayout.VERTICAL); bottom.setGravity(Gravity.CENTER_HORIZONTAL);
+        audioNote = Ui.text(this, "", 13, Ui.TEXT);
+        audioNote.setBackground(Ui.rounded(Ui.SCRIM, 14, Ui.BORDER, this));
+        audioNote.setPadding(dp(12), dp(6), dp(12), dp(6));
+        LinearLayout.LayoutParams noteParams = new LinearLayout.LayoutParams(-2, -2);
+        noteParams.bottomMargin = dp(8);
+        bottom.addView(audioNote, noteParams);
+        LinearLayout pill = new LinearLayout(this); pill.setGravity(Gravity.CENTER_VERTICAL);
+        pill.setBackground(Ui.rounded(Ui.SCRIM, 28, Ui.BORDER, this));
+        pill.setPadding(dp(4), dp(2), dp(4), dp(2));
+        fitButton = Ui.icon(this, R.drawable.ic_fill, "");
+        fitButton.setOnClickListener(v -> toggleFit());
+        audioButton = Ui.icon(this, R.drawable.ic_volume_off, "");
+        audioButton.setOnClickListener(v -> next.toggleAudio());
+        statsButton = Ui.icon(this, R.drawable.ic_info, "Connection details");
+        statsButton.setOnClickListener(v -> toggleStats());
+        fullscreenButton = Ui.icon(this, R.drawable.ic_fullscreen, "");
+        fullscreenButton.setOnClickListener(v -> setFullscreen(!fullscreen));
+        ImageButton disconnect = Ui.icon(this, R.drawable.ic_disconnect, "Disconnect");
+        disconnect.setOnClickListener(v -> confirmDisconnect());
+        for (ImageButton button : new ImageButton[] {fitButton, audioButton, statsButton, fullscreenButton, disconnect})
+            pill.addView(button, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        bottom.addView(pill, new LinearLayout.LayoutParams(-2, -2));
+        chrome.addView(bottom, new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
+
+        // Centre: shown whenever there is no picture, so status is never hidden with the controls.
+        statePanel = Ui.card(this, LinearLayout.VERTICAL);
+        statePanel.setBackground(Ui.rounded(Ui.SCRIM, 18, Ui.BORDER, this));
+        statePanel.setGravity(Gravity.CENTER_HORIZONTAL);
+        statePanel.setPadding(dp(24), dp(20), dp(24), dp(20));
+        stateSpinner = Ui.spinner(this, 28);
+        statePanel.addView(stateSpinner);
+        stateTitle = Ui.text(this, "", 17, Ui.TEXT); stateTitle.setGravity(Gravity.CENTER);
+        stateTitle.setTypeface(Typeface.DEFAULT_BOLD); stateTitle.setMaxWidth(dp(300));
+        statePanel.addView(stateTitle, Ui.spaced(this, 12));
+        stateDetail = Ui.text(this, "", 14, Ui.SECONDARY); stateDetail.setGravity(Gravity.CENTER); stateDetail.setMaxWidth(dp(300));
+        statePanel.addView(stateDetail, Ui.spaced(this, 6));
+        stateAction = Ui.button(this, "Back to pairing", Ui.Kind.SECONDARY);
+        stateAction.setOnClickListener(v -> showPairing(null, null));
+        statePanel.addView(stateAction, Ui.spaced(this, 16));
+        // Wrap content: the text's maximum width keeps the panel within narrow screens after rotation.
+        chrome.addView(statePanel, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
+
+        hint = Ui.card(this, LinearLayout.VERTICAL);
+        hint.setBackground(Ui.rounded(Ui.SCRIM, 18, Ui.GOLD, this));
+        TextView hintText = Ui.text(this, "Drag to pan · Pinch to zoom\nDouble-tap a tile to focus it", 15, Ui.TEXT);
+        hintText.setGravity(Gravity.CENTER);
+        hint.addView(hintText);
+        hint.setVisibility(View.GONE);
+        chrome.addView(hint, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
+
+        statsButton.setImageTintList(ColorStateList.valueOf(statsOpen ? Ui.GOLD : Ui.TEXT));
+        fullscreenButton.setImageResource(fullscreen ? R.drawable.ic_fullscreen_exit : R.drawable.ic_fullscreen);
+        Ui.describe(fullscreenButton, fullscreen ? "Exit full screen" : "Full screen");
+        updateFitLabels();
+        next.updateAudioLabels();
+        next.updateStats();
+        renderState();
+        if (!controlsShown) { bottom.setVisibility(View.GONE); statsCard.setVisibility(View.GONE); }
+    }
+
+    @Override public void onConfigurationChanged(Configuration config) {
+        super.onConfigurationChanged(config);
+        if (config.densityDpi == density) return;
+        density = config.densityDpi;
+        // Views were sized in pixels for the old density. Rebuild them, keeping the session.
+        if (session != null && surface != null) { buildChrome(session); surface.requestApplyInsets(); }
+        else if (pairing != null) showPairing(pairing.getText().toString(), null);
+    }
+
+    private void fade(View view, boolean show) {
+        if (show) {
+            if (view.getVisibility() != View.VISIBLE) { view.setAlpha(0); view.setVisibility(View.VISIBLE); }
+            view.animate().alpha(1).setDuration(150).start();
+        } else if (view.getVisibility() == View.VISIBLE) {
+            // A cancelled fade-out never runs its end action, so showing again wins.
+            view.animate().alpha(0).setDuration(200).withEndAction(() -> view.setVisibility(View.GONE)).start();
+        }
+    }
+
+    private void setControls(boolean show) {
+        controlsShown = show;
+        fade(bottom, show);
+        fade(topLeft, show || (session != null && session.state != State.LIVE));
+        fade(statsCard, show && statsOpen);
+    }
+
+    /** Show controls; in fullscreen they hide again after a few seconds without use. */
+    private void revealControls() {
+        if (surface == null || session == null) return;
+        setControls(true);
+        surface.removeCallbacks(hideControls);
+        if (fullscreen) surface.postDelayed(hideControls, 3500);
+    }
+
+    /** A tap on the picture shows or hides the controls, in fullscreen and windowed viewing. */
+    private void toggleControls() {
+        if (controlsShown) { surface.removeCallbacks(hideControls); setControls(false); }
+        else revealControls();
+    }
+
+    private void toggleStats() {
+        statsOpen = !statsOpen;
+        statsButton.setImageTintList(ColorStateList.valueOf(statsOpen ? Ui.GOLD : Ui.TEXT));
+        if (session != null) session.updateStats();
+        revealControls();
     }
 
     private void updateFitLabels() {
-        if (fitButton != null) fitButton.setText(fill ? "Fit whole canvas" : "Fill screen");
-        if (overlayFit != null) overlayFit.setText(fill ? "Fit whole canvas" : "Fill screen");
+        if (fitButton == null) return;
+        fitButton.setImageResource(fill ? R.drawable.ic_fill : R.drawable.ic_fit);
+        Ui.describe(fitButton, fill ? "Filling the screen. Tap to fit the whole canvas" : "Fitting the whole canvas. Tap to fill the screen");
     }
     private void toggleFit() {
         fill = !fill; getPreferences(MODE_PRIVATE).edit().putBoolean("fill", fill).apply();
@@ -240,18 +422,51 @@ public final class ViewerActivity extends Activity {
     }
     private void setFullscreen(boolean value) {
         fullscreen = value;
-        viewerBar.setVisibility(value ? View.GONE : View.VISIBLE);
-        viewerHint.setVisibility(value ? View.GONE : View.VISIBLE);
-        overlay.setVisibility(value ? View.VISIBLE : View.GONE);
-        if (value) viewerRoot.setPadding(0, 0, 0, 0);
-        applySystemBars(); viewerRoot.requestApplyInsets(); canvas.resetGesture();
-        if (value) revealControls();
+        fullscreenButton.setImageResource(value ? R.drawable.ic_fullscreen_exit : R.drawable.ic_fullscreen);
+        Ui.describe(fullscreenButton, value ? "Exit full screen" : "Full screen");
+        applySystemBars(); surface.requestApplyInsets(); canvas.resetGesture();
+        revealControls();
     }
-    private void revealControls() {
-        if (!fullscreen || overlay == null) return;
-        overlay.setVisibility(View.VISIBLE); viewerRoot.removeCallbacks(hideControls);
-        viewerRoot.postDelayed(hideControls, 3500);
+
+    private void confirmDisconnect() {
+        Session current = session;
+        if (current == null) return;
+        new AlertDialog.Builder(this)
+            .setTitle("Disconnect from " + current.name + "?")
+            .setMessage("To view again, you'll need to request access and approve it on the PC.")
+            .setPositiveButton("Disconnect", (dialog, which) -> { if (session == current) showPairing(null, null); })
+            .setNegativeButton("Keep viewing", null)
+            .show();
     }
+
+    /** Back leaves fullscreen first, then asks before disconnecting. */
+    private boolean handleBack() {
+        if (session == null) return false;
+        if (fullscreen) setFullscreen(false); else confirmDisconnect();
+        return true;
+    }
+
+    @Override public void onBackPressed() { if (!handleBack()) super.onBackPressed(); }
+
+    /** Android 13+ predictive back: intercept only while viewing, so the pairing screen keeps the system animation. */
+    private void updateBackCallback() {
+        if (Build.VERSION.SDK_INT < 33) return;
+        boolean wanted = session != null;
+        if (wanted && backCallback == null) backCallback = BackCallback.register(this, this::handleBack);
+        else if (!wanted && backCallback != null) { BackCallback.unregister(this, backCallback); backCallback = null; }
+    }
+
+    private static final class BackCallback {
+        static Object register(Activity activity, Runnable action) {
+            android.window.OnBackInvokedCallback callback = action::run;
+            activity.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback);
+            return callback;
+        }
+        static void unregister(Activity activity, Object callback) {
+            activity.getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback((android.window.OnBackInvokedCallback) callback);
+        }
+    }
+
     private void applySystemBars() {
         if (Build.VERSION.SDK_INT >= 28) {
             WindowManager.LayoutParams attributes = getWindow().getAttributes();
@@ -280,6 +495,35 @@ public final class ViewerActivity extends Activity {
         super.onWindowFocusChanged(focused); if (focused) applySystemBars();
     }
 
+    /** Draw the chip and centre panel from the session state. */
+    private void renderState() {
+        Session current = session;
+        if (current == null || canvas == null || canvas.owner != current) return;
+        State state = current.state;
+        int color = state == State.LIVE ? Ui.LIVE : state == State.ERROR ? Ui.DANGER : Ui.GOLD;
+        chipDot.setBackground(Ui.rounded(color, 5, 0, this));
+        String label = state == State.LIVE ? "Live" : state == State.CONNECTING ? "Connecting"
+            : state == State.RECOVERING ? "Reconnecting" : state == State.WAITING ? "Paused" : "Not connected";
+        chipText.setText(label + " · " + current.name);
+        Ui.describe(chip, label + ", " + current.name + ". Tap for connection details");
+        fade(topLeft, controlsShown || state != State.LIVE);
+        boolean picture = canvas.hasPicture();
+        statePanel.setVisibility(picture ? View.GONE : View.VISIBLE);
+        stateTitle.setText(current.stateTitle);
+        stateDetail.setText(current.stateDetail);
+        stateDetail.setVisibility(current.stateDetail.isEmpty() ? View.GONE : View.VISIBLE);
+        stateSpinner.setVisibility(state == State.ERROR ? View.GONE : View.VISIBLE);
+        stateAction.setVisibility(state == State.ERROR ? View.VISIBLE : View.GONE);
+    }
+
+    private void maybeShowHint() {
+        if (getPreferences(MODE_PRIVATE).getBoolean(HINT_SHOWN, false) || hint == null) return;
+        getPreferences(MODE_PRIVATE).edit().putBoolean(HINT_SHOWN, true).apply();
+        fade(hint, true);
+        surface.removeCallbacks(hideHint);
+        surface.postDelayed(hideHint, 5000);
+    }
+
     @Override protected void onStart() {
         super.onStart(); foreground = true;
         if (session != null) session.start();
@@ -293,23 +537,26 @@ public final class ViewerActivity extends Activity {
         super.onStop();
     }
 
-    @Override public void onBackPressed() {
-        if (session != null && fullscreen) setFullscreen(false);
-        else if (session != null) showPairing(null); else super.onBackPressed();
+    @Override protected void onDestroy() {
+        if (nearby != null) nearby.stop();
+        stopSession();
+        if (backCallback != null) { BackCallback.unregister(this, backCallback); backCallback = null; }
+        super.onDestroy();
     }
-
-    @Override protected void onDestroy() { if (nearby != null) nearby.stop(); stopSession(); super.onDestroy(); }
     private void stopSession() { if (session != null) session.pause(); session = null; }
 
     private final class Session {
-        final String base, token, client;
+        static final String MISSING_FRAMES = "Missing video frames", DRIVER_STUCK = "Video driver did not stop";
+        final String base, token, client, name;
         final CameraTransform camera = new CameraTransform();
         final AtomicReference<float[]> pendingFocus = new AtomicReference<>();
         final AtomicBoolean running = new AtomicBoolean(false);
+        /** Wakes the control worker when a gesture or focus command is waiting. */
+        final Object commands = new Object();
         volatile boolean ready;
         volatile float width, height;
         volatile int generation;
-        ScheduledExecutorService workers;
+        ExecutorService workers;
         volatile VideoConnection videoConnection;
         volatile ControlConnection controlConnection;
         boolean legacyControl;
@@ -325,6 +572,9 @@ public final class ViewerActivity extends Activity {
         volatile String lastRecovery = "";
         /** Video is briefly recovering (Wi-Fi hiccup), not paused or stopped. */
         volatile boolean videoHeld;
+        // Read on the UI thread only.
+        State state = State.CONNECTING;
+        String stateTitle = "", stateDetail = "";
         boolean audioEnabled;
         AudioStream audioStream;
         AudioFocusRequest audioFocus;
@@ -332,18 +582,33 @@ public final class ViewerActivity extends Activity {
         int audioFocusRevision;
         String audioText = "Audio: off";
 
+        Session(String ip, int port, String token, String client, String name) {
+            base = "http://" + ip + ":" + port; this.token = token; this.client = client; this.name = name;
+            stateTitle = "Connecting to " + name;
+        }
+
         void updateAudioLabels() {
-            if (session != this) return;
-            if (audioButton != null) audioButton.setText(audioEnabled ? "Audio on" : "Audio off");
-            if (overlayAudio != null) overlayAudio.setText(audioEnabled ? "Audio on" : "Audio off");
-            if (audioStatus != null) audioStatus.setText(audioText);
-            if (overlayAudioStatus != null) overlayAudioStatus.setText(audioText);
+            if (session != this || audioButton == null) return;
+            audioButton.setImageResource(audioEnabled ? R.drawable.ic_volume_on : R.drawable.ic_volume_off);
+            audioButton.setImageTintList(ColorStateList.valueOf(audioEnabled ? Ui.GOLD : Ui.TEXT));
+            Ui.describe(audioButton, audioEnabled ? "Phone audio is on. Tap to turn it off" : "Phone audio is off. Tap to turn it on");
+            boolean note = (audioEnabled && !AUDIO_PLAYING.equals(audioText)) || audioText.startsWith("Audio off:");
+            audioNote.setText(audioText);
+            audioNote.setVisibility(note ? View.VISIBLE : View.GONE);
         }
 
         void toggleAudio() {
             audioEnabled = !audioEnabled;
             audioText = audioEnabled ? "Audio: waiting for canvas" : "Audio: off";
             updateAudio(); updateAudioLabels(); revealControls();
+        }
+
+        /** Explain why audio switched itself off, then clear the note. */
+        void audioOff(String reason) {
+            audioEnabled = false; stopAudio(); audioText = reason; updateAudioLabels(); revealControls();
+            canvas.postDelayed(() -> {
+                if (session == this && !audioEnabled && reason.equals(audioText)) { audioText = "Audio: off"; updateAudioLabels(); }
+            }, 6000);
         }
 
         void stopAudio() {
@@ -375,26 +640,22 @@ public final class ViewerActivity extends Activity {
                     .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
                     .setWillPauseWhenDucked(true)
                     .setOnAudioFocusChangeListener(change -> {
-                        if (change < 0 && session == this && audioFocusRevision == focusRevision) {
-                            audioEnabled = false; stopAudio(); audioText = "Audio off: another app needs sound"; updateAudioLabels();
-                        }
+                        if (change < 0 && session == this && audioFocusRevision == focusRevision) audioOff("Audio off: another app is playing sound");
                     }).build();
                 if (manager.requestAudioFocus(audioFocus) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-                    audioEnabled = false; stopAudio(); audioText = "Audio off: sound is in use"; updateAudioLabels(); return;
+                    audioOff("Audio off: sound is in use by another app"); return;
                 }
             }
             final int revision = ++audioRevision;
             try {
                 audioStream = new AudioStream(base, token, client, audioNetworkSlot, audioCodecSlot, value -> runOnUiThread(() -> {
                     if (session == this && audioRevision == revision && audioEnabled && running.get() && !value.equals(audioText)) {
-                        audioText = value; updateAudioLabels();
+                        audioText = value; updateAudioLabels(); updateStats();
                     }
                 }));
             } catch (java.io.IOException error) { stopAudio(); audioText = "Audio: waiting for previous playback to stop"; }
             updateAudioLabels();
         }
-
-        Session(String ip, int port, String token, String client) { base = "http://" + ip + ":" + port; this.token = token; this.client = client; }
 
         void start() {
             if (!running.compareAndSet(false, true)) return;
@@ -402,10 +663,10 @@ public final class ViewerActivity extends Activity {
             ready = false; camera.clear(); latestVideo = null;
             recovery.reset(); reconnects = 0; lastRecovery = "";
             receivedRate.clear(); shownRate.clear();
-            message(run, "Connecting to 720p video…", true);
-            workers = Executors.newScheduledThreadPool(2);
+            message(run, State.CONNECTING, "Connecting to " + name, "Starting 720p video…", true);
+            workers = Executors.newFixedThreadPool(2);
             workers.execute(() -> streamVideo(run));
-            workers.scheduleWithFixedDelay(() -> sendCamera(run), 0, 8, TimeUnit.MILLISECONDS);
+            workers.execute(() -> sendCommands(run));
             statsTask = new Runnable() { public void run() {
                 if (!current(run) || session != Session.this) return;
                 updateAudio(); updateStats(); canvas.postDelayed(this, 500);
@@ -418,7 +679,7 @@ public final class ViewerActivity extends Activity {
             stopAudio();
             recovery.reset();
             latestVideo = null;
-            if (canvas != null && canvas.owner == this) { canvas.video.setAlpha(0); canvas.resetGesture(); canvas.invalidate(); }
+            if (canvas != null && canvas.owner == this) { canvas.hidePicture(); canvas.resetGesture(); }
             decoderRevision++;
             if (statsTask != null) canvas.removeCallbacks(statsTask);
             VideoConnection connection = videoConnection;
@@ -440,15 +701,22 @@ public final class ViewerActivity extends Activity {
             return c;
         }
 
-        void message(int run, String message, boolean clear) {
+        void message(int run, State next, String title, String detail, boolean clear) {
             if (!current(run)) return;
             if (clear) { recovery.reset(); ready = false; videoHeld = false; camera.clear(); pendingFocus.set(null); latestVideo = null; }
             runOnUiThread(() -> {
                 if (!current(run) || session != this) return;
-                status.setText(message);
-                if (viewerStats != null) viewerStats.setText(message);
-                if (clear) { canvas.video.setAlpha(0); canvas.resetGesture(); canvas.invalidate(); }
-                if (clear) updateAudio();
+                state = next; stateTitle = title; stateDetail = detail;
+                if (clear) { canvas.hidePicture(); canvas.resetGesture(); updateAudio(); }
+                renderState(); updateStats();
+            });
+        }
+
+        /** The PC no longer accepts this phone's credentials; retrying cannot help. */
+        void accessEnded(int run) {
+            runOnUiThread(() -> {
+                if (current(run) && session == this)
+                    showPairing(null, "This phone's access to " + name + " has ended, for example because sharing stopped or a new pairing link was made. Request access again.");
             });
         }
 
@@ -459,21 +727,19 @@ public final class ViewerActivity extends Activity {
             decoderRevision++;
             reconnects++;
             lastRecovery = recoveryReason(error);
-            holdVideo(run, "Reconnecting video · " + lastRecovery + " · " + reconnects);
+            holdVideo(run, "Reconnecting video", lastRecovery + " · reconnect " + reconnects);
         }
 
-        void holdVideo(int run, String text) {
+        void holdVideo(int run, String title, String detail) {
             if (!current(run)) return;
             ready = false; videoHeld = true; camera.clear(); pendingFocus.set(null); latestVideo = null;
-            message(run, text, false);
+            message(run, State.RECOVERING, title, detail, false);
             if (recovery.begin(System.nanoTime())) {
                 runOnUiThread(() -> {
                     if (!current(run) || session != this) return;
                     canvas.resetGesture();
                     canvas.postDelayed(() -> {
-                        if (current(run) && session == this && recovery.expired(System.nanoTime())) {
-                            canvas.video.setAlpha(0); canvas.invalidate();
-                        }
+                        if (current(run) && session == this && recovery.expired(System.nanoTime())) canvas.hidePicture();
                     }, 1000);
                 });
             }
@@ -483,14 +749,14 @@ public final class ViewerActivity extends Activity {
             // Only fixed labels enter the UI; never echo URLs, credentials or
             // arbitrary server/driver error text.
             if (error instanceof java.net.SocketTimeoutException)
-                return "Video response timeout".equals(error.getMessage()) ? "Connection response timeout" : "Video data timeout";
+                return VideoConnection.RESPONSE_TIMEOUT.equals(error.getMessage()) ? "Connection response timeout" : "Video data timeout";
             if (error instanceof java.io.EOFException) return "PC stream ended";
             String detail = error.getMessage();
-            if ("Video decoder backlog".equals(detail)) return "Decoder queue full";
-            if ("Video decoder stalled".equals(detail)) return "Decoder stalled";
-            if ("Restart video decoder".equals(detail)) return "Decoder reset";
-            if ("Missing video frames".equals(detail)) return "Missing video frames";
-            if ("Video driver did not stop".equals(detail)) return "Decoder stopping";
+            if (VideoDecoder.BACKLOG.equals(detail)) return "Decoder queue full";
+            if (VideoDecoder.STALLED.equals(detail)) return "Decoder stalled";
+            if (VideoDecoder.RESTART.equals(detail)) return "Decoder reset";
+            if (MISSING_FRAMES.equals(detail)) return "Missing video frames";
+            if (DRIVER_STUCK.equals(detail)) return "Decoder stopping";
             if (error instanceof java.net.SocketException) return "Connection interrupted";
             return "Video stream interrupted";
         }
@@ -510,24 +776,34 @@ public final class ViewerActivity extends Activity {
                 recovery.reset();
                 if (width != newest.viewportWidth || height != newest.viewportHeight) canvas.resetGesture();
                 width = newest.viewportWidth; height = newest.viewportHeight; ready = true; videoHeld = false;
+                boolean wasLive = state == State.LIVE;
+                state = State.LIVE;
                 canvas.showVideo(newest.width, newest.height);
+                if (!wasLive) { renderState(); maybeShowHint(); }
             });
         }
 
         void updateStats() {
+            if (session != this || statsText == null) return;
+            StringBuilder text = new StringBuilder();
             VideoPacket newest = latestVideo;
-            if (!ready || newest == null) return;
-            long now = System.nanoTime();
-            String rate = "Received " + receivedRate.fps(now) + " · Shown " + shownRate.fps(now) + " FPS";
-            if (reconnects > 0) rate += " · Reconnects " + reconnects + " · " + lastRecovery;
-            status.setText("Live · " + newest.width + "×" + newest.height + " · " + rate);
-            viewerStats.setText(rate);
+            if (ready && newest != null) {
+                long now = System.nanoTime();
+                text.append("Video    ").append(newest.width).append('×').append(newest.height)
+                    .append("\nReceived ").append(receivedRate.fps(now)).append(" FPS")
+                    .append("\nShown    ").append(shownRate.fps(now)).append(" FPS");
+            } else text.append("Video    not playing");
+            if (reconnects > 0) text.append("\nReconnects ").append(reconnects).append(" · ").append(lastRecovery);
+            text.append('\n').append(audioText);
+            statsText.setText(text);
+            if (controlsShown && statsOpen && statsCard.getVisibility() != View.VISIBLE) fade(statsCard, true);
+            if (!statsOpen && statsCard.getVisibility() == View.VISIBLE) fade(statsCard, false);
         }
 
         void streamVideo(int run) {
             while (current(run)) {
                 if (!decoderSlot.available()) {
-                    message(run, "Waiting for the previous video decoder to stop…", true);
+                    message(run, State.CONNECTING, "Getting ready", "Waiting for the previous video decoder to stop…", true);
                     if (!delay(run, 250)) return;
                     continue;
                 }
@@ -538,13 +814,13 @@ public final class ViewerActivity extends Activity {
                 Surface surface = null;
                 int retryMillis = 150;
                 try {
-                    connection = new VideoConnection(base, token, client, () -> holdVideo(run, "Waiting for video data…"));
+                    connection = new VideoConnection(base, token, client, () -> holdVideo(run, "Waiting for video data", ""));
                     if (!current(run)) return;
                     videoConnection = connection;
                     int code = connection.status;
-                    if (code == 404) { message(run, "Update Pluriview on the PC to use video streaming.", true); return; }
-                    if (code == 401) { message(run, "Pairing expired. Disconnect and scan a fresh PC code.", true); if (!delay(run, 1000)) return; continue; }
-                    if (code == 409) { message(run, "Waiting for the previous viewer connection to close…", false); if (!delay(run, 500)) return; continue; }
+                    if (code == 404) { message(run, State.ERROR, "Update Pluriview on the PC", "This PC version can't stream video to the phone.", true); return; }
+                    if (code == 401) { accessEnded(run); return; }
+                    if (code == 409) { message(run, State.CONNECTING, "Waiting for the PC", "The previous viewer connection is still closing…", false); if (!delay(run, 500)) return; continue; }
                     if (code != 200) throw new java.io.IOException();
                     surface = new Surface(texture);
                     long sequence = 0;
@@ -556,11 +832,11 @@ public final class ViewerActivity extends Activity {
                                 decoderRevision++;
                                 if (decoder != null) { closeDecoder(decoder); decoder = null; }
                                 sequence = 0;
-                                if (packet.kind == 3) { message(run, "PC video encoder unavailable. Restart Phone Viewer sharing on the PC.", true); retryMillis = 2000; break; }
-                                message(run, "Waiting for canvas — close PC dialogs and exit browser interaction.", true);
+                                if (packet.kind == 3) { message(run, State.WAITING, "PC video encoder unavailable", "Restart Phone Viewer sharing on the PC. Retrying…", true); retryMillis = 2000; break; }
+                                message(run, State.WAITING, "Paused on the PC", "Close dialogs and menus on the PC, or leave browser interaction, to resume.", true);
                                 continue;
                             }
-                            if (sequence != 0 && packet.sequence != sequence + 1) throw new java.io.IOException("Missing video frames");
+                            if (sequence != 0 && packet.sequence != sequence + 1) throw new java.io.IOException(MISSING_FRAMES);
                             sequence = packet.sequence;
                             receivedRate.record(System.nanoTime());
                             if (decoder == null || decoder.width != packet.width || decoder.height != packet.height) {
@@ -575,7 +851,7 @@ public final class ViewerActivity extends Activity {
                     }
                 } catch (VideoDecoder.Unavailable error) {
                     retryMillis = 2000;
-                    message(run, "Video decoder unavailable. Retrying video…", true);
+                    message(run, State.WAITING, "Video decoder unavailable", "This phone couldn't start its video decoder. Retrying…", true);
                 } catch (Exception error) {
                     recoverVideo(run, error);
                 } finally {
@@ -600,9 +876,24 @@ public final class ViewerActivity extends Activity {
             decoder.close();
             // A stuck vendor driver must not accumulate another worker on every
             // resize or pause. Ordinary stream stalls still reconnect as H.264.
-            if (!decoder.terminated()) throw new java.io.IOException("Video driver did not stop");
+            if (!decoder.terminated()) throw new java.io.IOException(DRIVER_STUCK);
         }
 
+        void wake() { synchronized (commands) { commands.notifyAll(); } }
+
+        boolean commandWaiting() { return ready && (pendingFocus.get() != null || camera.pending()); }
+
+        /** Sleeps until a gesture arrives, instead of polling; wakes each second to keep the control connection alive. */
+        void sendCommands(int run) {
+            try {
+                while (current(run)) {
+                    sendCamera(run);
+                    // Coalesce gesture updates arriving within one send interval.
+                    Thread.sleep(8);
+                    synchronized (commands) { if (current(run) && !commandWaiting()) commands.wait(1000); }
+                }
+            } catch (InterruptedException stopped) { Thread.currentThread().interrupt(); }
+        }
 
         void sendCamera(int run) {
             if (!current(run)) return;
@@ -669,13 +960,18 @@ public final class ViewerActivity extends Activity {
         boolean moved;
         float downX, downY;
         final DoubleTap taps = new DoubleTap(ViewConfiguration.getDoubleTapTimeout(), ViewConfiguration.getLongPressTimeout(), ViewConfiguration.get(ViewerActivity.this).getScaledDoubleTapSlop());
-        final Runnable tapControls = () -> revealControls();
+        final Runnable tapControls = () -> toggleControls();
+        /** Expanding ring that confirms a double-tap focus request. */
+        final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
+        float ringX, ringY;
+        long ringStart;
 
         CanvasView(Session owner) {
             super(ViewerActivity.this); this.owner = owner; setWillNotDraw(false);
             setContentDescription("Live PC canvas. Drag to pan, pinch to zoom, double-tap a tile to toggle focus.");
+            ring.setStyle(Paint.Style.STROKE); ring.setStrokeWidth(dp(3)); ring.setColor(Ui.GOLD);
             video = new TextureView(ViewerActivity.this); video.setAlpha(0);
-            addView(video, new FrameLayout.LayoutParams(-1, -1, android.view.Gravity.CENTER));
+            addView(video, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
             video.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
                 @Override public void onSurfaceTextureAvailable(SurfaceTexture value, int w, int h) { texture = value; }
                 @Override public void onSurfaceTextureSizeChanged(SurfaceTexture value, int w, int h) {}
@@ -684,10 +980,19 @@ public final class ViewerActivity extends Activity {
             });
         }
 
+        boolean hasPicture() { return video.getAlpha() != 0; }
+
         void showVideo(int w, int h) {
             if (videoWidth != w || videoHeight != h || video.getAlpha() == 0) {
+                boolean appeared = video.getAlpha() == 0;
                 videoWidth = w; videoHeight = h; layoutVideo(); video.setAlpha(1); invalidate();
+                if (appeared) renderState();
             }
+        }
+
+        void hidePicture() {
+            if (video.getAlpha() == 0) return;
+            video.setAlpha(0); invalidate(); renderState();
         }
 
         void layoutVideo() {
@@ -702,6 +1007,20 @@ public final class ViewerActivity extends Activity {
         @Override protected void onDraw(Canvas c) {
             c.drawColor(Color.BLACK);
             if (video.getAlpha() == 0) display.setEmpty();
+        }
+
+        @Override protected void dispatchDraw(Canvas c) {
+            super.dispatchDraw(c);
+            float progress = (System.nanoTime() - ringStart) / 350_000_000f;
+            if (ringStart == 0 || progress >= 1) return;
+            ring.setAlpha((int) (255 * (1 - progress)));
+            c.drawCircle(ringX, ringY, dp(14) + dp(26) * progress, ring);
+            postInvalidateOnAnimation();
+        }
+
+        void confirmFocus(float x, float y) {
+            ringX = x; ringY = y; ringStart = System.nanoTime(); postInvalidateOnAnimation();
+            performHapticFeedback(Build.VERSION.SDK_INT >= 30 ? HapticFeedbackConstants.CONFIRM : HapticFeedbackConstants.VIRTUAL_KEY);
         }
 
         void resetGesture() { gesture = false; pointers = 0; owner.camera.clear(); owner.pendingFocus.set(null); taps.clear(); removeCallbacks(tapControls); }
@@ -721,7 +1040,7 @@ public final class ViewerActivity extends Activity {
             }
             if (!gesture) {
                 taps.clear();
-                if (action == MotionEvent.ACTION_UP) revealControls();
+                if (action == MotionEvent.ACTION_UP) toggleControls();
                 return true;
             }
             if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
@@ -730,6 +1049,8 @@ public final class ViewerActivity extends Activity {
                     if (taps.up(event.getDownTime(), event.getEventTime(), event.getX(), event.getY())) {
                         owner.camera.clear();
                         owner.pendingFocus.set(new float[]{(event.getX() - display.left) / display.width(), (event.getY() - display.top) / display.height(), owner.width, owner.height});
+                        owner.wake();
+                        confirmFocus(event.getX(), event.getY());
                     } else postDelayed(tapControls, ViewConfiguration.getDoubleTapTimeout());
                 } else { taps.clear(); removeCallbacks(tapControls); }
                 gesture = false; pointers = 0;
@@ -751,6 +1072,7 @@ public final class ViewerActivity extends Activity {
                 float factor = count == 2 && previousSpan > dp(8) ? span / previousSpan : 1;
                 owner.camera.append(factor, CameraTransform.anchoredTranslation(previousX, x, factor),
                     CameraTransform.anchoredTranslation(previousY, y, factor), previousX, previousY);
+                owner.wake();
             }
             previousX = x; previousY = y; previousSpan = span; pointers = count;
             return true;

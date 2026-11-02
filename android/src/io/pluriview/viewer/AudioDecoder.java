@@ -14,6 +14,9 @@ import java.util.concurrent.TimeUnit;
 final class AudioDecoder implements AutoCloseable {
     /** About 128 ms of 48 kHz stereo PCM: absorbs Wi-Fi scheduling jitter. */
     static final int JITTER_BUFFER_BYTES = 6 * 4096;
+    // Fixed failure messages; AudioStream maps them to safe status labels.
+    static final String DECODER_UNAVAILABLE = "Audio decoder unavailable", OUTPUT_UNAVAILABLE = "Audio output unavailable",
+        OUTPUT_STALLED = "Audio output stalled", DECODER_STALLED = "Audio decoder stalled", UNSUPPORTED_OUTPUT = "Unsupported decoded audio";
     private final ArrayBlockingQueue<AudioPacket> packets = new ArrayBlockingQueue<>(6);
     private final AudioStartup startup = new AudioStartup();
     private final Thread worker;
@@ -51,16 +54,16 @@ final class AudioDecoder implements AutoCloseable {
     private void decode() {
         MediaCodec codec = null;
         AudioTrack output = null;
-        String stage = "Audio decoder unavailable";
+        String stage = DECODER_UNAVAILABLE;
         try {
             MediaFormat format = MediaFormat.createAudioFormat("audio/mp4a-latm", 48000, 2);
             format.setByteBuffer("csd-0", ByteBuffer.wrap(new byte[] {0x11, (byte) 0x90}));
             format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 8192);
             codec = MediaCodec.createDecoderByType("audio/mp4a-latm");
             codec.configure(format, null, null, 0); codec.start();
-            stage = "Audio output unavailable";
+            stage = OUTPUT_UNAVAILABLE;
             int minimum = AudioTrack.getMinBufferSize(48000, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
-            if (minimum < 0 || minimum > 38400) throw new IOException("Audio output unavailable");
+            if (minimum < 0 || minimum > 38400) throw new IOException(OUTPUT_UNAVAILABLE);
             output = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
                 .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(48000).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
@@ -97,7 +100,7 @@ final class AudioDecoder implements AutoCloseable {
                     MediaFormat actual = codec.getOutputFormat();
                     if (actual.getInteger(MediaFormat.KEY_SAMPLE_RATE) != 48000 || actual.getInteger(MediaFormat.KEY_CHANNEL_COUNT) != 2
                         || (actual.containsKey(MediaFormat.KEY_PCM_ENCODING) && actual.getInteger(MediaFormat.KEY_PCM_ENCODING) != AudioFormat.ENCODING_PCM_16BIT))
-                        throw new IOException("Unsupported decoded audio");
+                        throw new IOException(UNSUPPORTED_OUTPUT);
                     worked = true;
                 } else if (index >= 0) {
                     outputIndex = index;
@@ -111,7 +114,7 @@ final class AudioDecoder implements AutoCloseable {
                 if (outputIndex >= 0 && !closed) {
                     if (pcm.hasRemaining()) {
                         int n = output.write(pcm, pcm.remaining(), AudioTrack.WRITE_NON_BLOCKING);
-                        if (n < 0 || System.nanoTime() >= outputDeadline) throw new IOException("Audio output stalled");
+                        if (n < 0 || System.nanoTime() >= outputDeadline) throw new IOException(OUTPUT_STALLED);
                         worked |= n > 0;
                     }
                     if (!pcm.hasRemaining()) {
@@ -121,7 +124,7 @@ final class AudioDecoder implements AutoCloseable {
                     // A short/zero speaker write must return to input pumping.
                     // Retain only this one codec-owned output until it is drained.
                 }
-                if (watchdog.stalled(System.nanoTime(), !packets.isEmpty(), worked)) throw new IOException("Audio decoder stalled");
+                if (watchdog.stalled(System.nanoTime(), !packets.isEmpty(), worked)) throw new IOException(DECODER_STALLED);
                 if (!worked) Thread.sleep(2);
             }
         } catch (Exception error) { failure = error instanceof IOException ? (IOException) error : new IOException(stage); }
