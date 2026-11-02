@@ -14,707 +14,249 @@
   <img src="https://img.shields.io/github/v/release/Spatpit/Pluriview?include_prereleases" alt="Latest release">
 </p>
 
-Pluriview gives you a flexible space to arrange live app windows, browser pages,
-videos, images, and overlays. Move and resize tiles, crop out distractions, and
-save different layouts for different activities.
-
-Watch streams alongside chat, keep reference material nearby, or build a canvas
-with transparent widgets and a moving wallpaper.
+Arrange live app windows, web pages, videos, and images on one canvas. Move,
+resize, and crop them, and save different layouts for different activities:
+watch a stream next to its chat, keep reference material nearby, or build an
+overlay of transparent widgets.
 
 <p align="center">
   <img src="assets/pluriview-preview.gif" alt="Live windows, browser pages, and images arranged on the Pluriview canvas">
 </p>
 
-## Download and start
+## Download
 
-Get the latest version from **[Releases](https://github.com/Spatpit/Pluriview/releases)**.
+1. Download the ZIP from **[Releases](https://github.com/Spatpit/Pluriview/releases)** and extract it.
+2. Keep the `lib` folder beside `pluriview.exe`.
+3. Run `pluriview.exe`.
 
-Starting with v0.7.0, Pluriview is available as a single **Full** download with
-all features, including local videos, folder playlists, and video wallpapers.
-The Lite package is no longer offered for new releases.
+**Requirements:** Windows 10 (1903 or newer) or Windows 11 with a DirectX 11
+graphics card. Browser tiles need the
+[Microsoft WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/),
+which most Windows PCs already have.
 
-1. Download and extract the ZIP.
-2. Keep the included `lib` folder beside `pluriview.exe`.
-3. Launch `pluriview.exe` and start adding content.
+**Updating:** close Pluriview, then replace `pluriview.exe` and the `lib`
+folder. Your workspaces, settings, and sign-ins live in the `pluriview_data`
+folder, so keep it. See the [changelog](CHANGELOG.md) for what's new.
 
-**Updating:** close Pluriview before replacing `pluriview.exe` and the included
-`lib` folder. Keep your existing `pluriview_data` folder to preserve workspaces,
-settings, and browser data. See the [changelog](CHANGELOG.md) for changes.
+## Getting started
 
-Only one Pluriview instance can use a data folder at a time. If a second launch
-reports that the folder is already in use, close the existing instance, including
-one minimized to the tray. Separate portable folders can run independently.
-
-**Requirements:** Windows 10 version 1903 or newer, or Windows 11, with a
-DirectX 11-compatible GPU.
-
-Browser tiles require the [Microsoft WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/).
-If browser tiles cannot start because the runtime is missing, install it and
-reopen Pluriview. Built-in ad blocking requires WebView2 Runtime 122 or newer.
-
-## Your first canvas
-
-- **Add an app window:** choose it from the Window Picker on the left.
+- **Add an app window:** pick it from the Window Picker on the left (`W`).
 - **Add a web page:** right-click the canvas → **Add Browser...**
-- **Add images, GIFs, or videos:** drag files from Explorer onto the canvas.
-- **Add a video playlist:** drag a folder of videos onto the canvas.
-- **Arrange your tiles:** drag to move them and use their edges or corners to resize.
-- **Explore the canvas:** use the middle mouse button to pan and the scroll wheel to zoom.
+- **Add images, GIFs, or videos:** drag files onto the canvas. Drag a folder of videos to make a playlist.
+- **Arrange:** drag tiles to move them, and drag their edges or corners to resize.
+- **Move around:** drag with the middle mouse button to pan, and scroll to zoom.
 
-Hover over tiles for controls, or right-click a tile for more options. Every
-tile's menu has the same order: its own actions first (such as **Interact**,
-**Reload** and **Page** for a browser, or **Play** and **Playback** for a
-video), then **Focus on This Tile**, **Picture in Picture** and **Pin to
-Viewport**, then **Hide Tile**, **Arrange** and **Group**, then **Tile
-Settings** (crop, frame rate, aspect ratio and click-through), **Freeze Tile**
-and **Remove**. Press `F1` to see shortcuts.
-
-## Android phone viewer (development preview)
-
-The companion **Pluriview Viewer** app shows the PC's visible canvas on Android
-8.0 or newer. Drag anywhere in the streamed canvas to pan, and pinch to zoom;
-both actions change the PC's view too. Double-tap a tile to enter its temporary
-focus mode; double-tap it again to restore the previous view. Pinned tiles keep
-their existing position and do not enter focus. A short camera interpolation
-smooths uneven network updates while preserving the full pinch/pan movement.
-The phone cannot interact with sources,
-edit tiles, or add/remove content. Portrait and landscape preserve the PC
-canvas's aspect ratio. Viewing starts fullscreen in **Fill screen** mode, which
-crops the edges to remove aspect-ratio borders without stretching. Tap the
-canvas to reveal controls, then choose **Fit whole canvas** to see every edge.
-Controls hide after a few seconds; Back exits fullscreen. The Fit/Fill choice
-is remembered, and gestures remain mapped to the shared PC camera in either mode.
-
-1. Build/install the test APK using [the Android build instructions](android/README.md).
-2. Connect the PC and phone to the same trusted private Wi-Fi.
-3. In Pluriview, choose **Tools → Phone Viewer...**, check the PC's Wi-Fi IPv4
-   address, and choose **Start sharing**.
-4. Open Pluriview Viewer and tap **Request connection** on the nearby PC
-   matching the name shown in the PC's Phone Viewer dialog.
-5. Compare the six-digit number on both screens, then choose **Allow connection**
-   on the PC. Viewing starts automatically. Open Phone Viewer again to stop sharing.
-
-Nearby discovery requires preview 0.3.6 on both devices. QR/link pairing remains
-a backup: scan the QR or paste **Copy pairing link** into Android, tap **Connect
-to PC**, then close the PC pairing dialog. That link already grants access;
-only share it with the intended viewer. If discovery is blocked by a router,
-try the link on the same LAN. Guest networks may block both methods.
-
-Sharing is opt-in, accepts one phone at a time, and starts disabled on every
-launch. Nearby requests expire after one minute and require explicit PC approval.
-The number is a visual match check, not a password or encryption. Restarting
-sharing invalidates all approvals and the old pairing link. Pairing credentials
-are not saved. If the phone cannot connect, check that Windows Firewall allows
-  this Pluriview build on your private network; the app does not change firewall rules.
-
-The viewer streams H.264 video up to 1280×720 with a 30 FPS capture target,
-using a Windows hardware encoder when available and Android's native video
-decoder. Video uses a fixed 720p profile (1280×720 cap, 30 FPS and 4 Mbps
-targets); it never automatically drops to 540p or 360p. Canvas proportions are
-preserved, so actual encoded dimensions depend on the PC canvas shape and size.
-Actual cadence depends on PC load and Wi-Fi. A software encoder is tried if
-hardware initialization or encoding fails. Android 0.3.5 removes the 10 FPS JPEG
-fallback: unavailable video shows a status and retries H.264. Older PC builds
-without video streaming need updating.
-The stream receives and decodes independently, with a small 50 ms playback
-cushion to absorb delivery jitter. Brief decoder stalls reconnect H.264 at the
-same quality. Backgrounding the Android app pauses streaming; returning starts
-a fresh 720p video connection. Gesture commands use
-a separate persistent connection. Tap to reveal **Received / Shown FPS**:
-these count received video frames and Android texture updates, rather than
-repeating the requested 30 FPS. Update both the PC executable and APK.
-APK 0.3.7 also retains the last reconnect reason/count in this status and fixes
-idle network time being counted as a decoder stall. Brief reconnects can retain
-the last picture for roughly one second with gestures disabled. Explicit sharing
-pauses and backgrounding still clear it immediately. This APK works with the
-Windows 0.3.6 preview. APK 0.3.8 adds a dedicated video socket that resumes partial
-records after short receive timeouts without resetting the decoder. Long stalls
-still have bounded deadlines, and backgrounding cancels the socket immediately.
-Preview 0.3.9 adds **Audio on/off** in the phone controls (off by default).
-APK 0.3.10 prepares phone audio playback before requesting the live stream,
-fixes idle time being counted as an audio decoder stall, and shows a specific
-reconnect reason. Use it with the updated PC 0.7.1 build; desktop audio routing
-and Discord/OBS monitoring are unchanged.
-APK 0.3.11 fixes immediate “Audio queue full” reconnects during packet bursts
-and speaker-buffer pressure. It keeps the same bounded audio queue, services
-decoder input between partial speaker writes, and lets the phone's audio output
-manage playback startup. Install it over the previous APK; PC 0.7.1 is unchanged.
-Update both the PC executable and APK for audio. It sends AAC stereo at a
-128 kbps target; switching it off stops audio capture and transmission.
-Browser/video tile audio is included, plus window tiles with **Stream Audio**
-enabled. Capture is per application, so other sounds from the same source app
-may also be heard. It does not capture all PC sound. Windows 11 (or build 20348+)
-is required for process audio capture. **Stream Audio Monitor** can stay enabled
-for Discord/OBS while the phone receives Pluriview's same application audio mix.
-In this mode, the phone captures that mix once instead of adding separate window
-audio copies. Your selected monitor output, desktop volume and routing stay unchanged.
-With monitoring off, phone audio still captures the tile sources directly.
-Phone backgrounding and sharing
-pauses stop audio; it resumes with video if still enabled. Losing Android audio
-focus switches it off. A new connection starts with audio off. Audio and video
-use bounded buffering but do not yet share a synchronization clock.
-There is no encryption; use trusted private networks without port forwarding.
-PC dialogs, menus, minimized windows and interactive browser mode pause sharing;
-close dialogs/menus, restore the PC window or exit browser interaction to resume.
-Click Through also disables phone navigation. The PC must remain running with
-its canvas available. An independent phone camera remains future work.
+Hover a tile for its controls, or right-click it for everything else. Press
+`F1` to see all shortcuts.
 
 ## What you can add
 
-| Source | What it does |
+| Source | What it is |
 |---|---|
-| **App windows** | Displays a live preview of an open application window, which you can use in place. |
-| **Browser tiles** | Opens a web page inside Pluriview, with navigation, interaction, and audio. |
-| **Images and GIFs** | Displays local images and plays animated GIFs. |
-| **Videos** | Plays local video files with playback, seeking, volume, and track controls. |
-| **Folder playlists** | Creates a video player linked to a playlist of files from a folder. |
-| **Stream URLs** | Uses optional Streamlink support to play supported streams in a video tile. |
-| **Spout2 sources** | Receives live output from compatible applications such as VTube Studio. |
-
-### App windows and Spout2
-
-Use the **Window Picker** to add an open application as a live tile. You can
-resize, crop, freeze, or pin its preview.
-
-Choose **Tile Settings → Edit Crop** from a tile's right-click menu, then drag the
-highlighted edge or corner handles directly on the tile. Click empty canvas,
-press **Esc**, or choose **Finish Cropping** to finish. **Clear Crop** restores
-the full source. This also works for browser, image/GIF, video, and Spout tiles,
-including tiles pinned to the viewport. The **Alt+drag** shortcut remains available.
-
-Search by window title or application name, then use **+** to add the source.
-Clear the search with **×**; hover a shortened name to read it in full.
-Right-click a tile → **Tile Settings** to change its **Frame Rate**.
-Menu shortcuts appear on the right and follow your bindings in **Settings**.
-
-Live Spout2 senders appear in the same picker. Select one to display its shared
-output on the canvas.
-
-#### Use an app from its tile
-
-**Double-click a window tile** (or right-click it → **Interact**) to use the
-app without leaving the canvas: click its buttons, pick a song, type. The canvas
-zooms so the tile shows the window at its real size, then Pluriview moves the
-app's own window exactly over the tile. Only its position changes, never its
-size, so the app looks the same as in the tile.
-
-A window bigger than Pluriview can reach past Pluriview's edges, but it is kept
-on the screen: if centering it on the canvas would push part of it off the
-monitor, it slides back just far enough and the canvas follows, so the tile stays
-underneath. A window bigger than the screen itself keeps its top-left corner,
-where the title bar and menus usually are, on the screen.
-
-A gold outline and a bar above the window mark the app in use. Drag the bar to
-move the tile without clicking into the app; the window follows when you let
-go. Dragging the app's own title bar moves the tile along with it.
-
-While you use the app, its tile also shows your mouse pointer, so people
-watching Pluriview through Discord or OBS screen sharing still see where you
-point. The tile updates at least 60 times a second meanwhile, so the pointer
-moves smoothly, and goes back to its own frame rate when you finish. On
-Windows 11 24H2 and later the tile also shows the app's menus and dialogs, such
-as the menu from right-clicking a song; a menu reaching past the window's edge
-is cut off there. Earlier Windows versions show the pointer but not the menus.
-
-If Pluriview closes unexpectedly while you use an app, the next launch puts the
-app's window back where it was, unless you have moved, minimized or closed it
-since.
-
-Click anywhere outside the app, or **Done** on the bar, to finish. The window
-goes back where it was (minimized again if it was minimized), behind the same
-windows that covered it before. Pluriview covers it again if it did before, and
-the canvas returns to your previous view. Zooming the canvas also finishes. If you resize, maximize or snap the app
-yourself, Pluriview leaves the window where you put it.
-
-Tiles already at **Native Size (1:1)** skip the zoom. A pinned tile keeps its
-size, so the window is centered over it instead. Pluriview cannot move windows
-of apps running as administrator, or windows on another virtual desktop.
-Right-click a tile → **Show Original Window** brings the app's own window to
-the front where it is, as double-clicking did before.
-
-### Groups, layouts, and Spotlight
-
-Select tiles with **Ctrl+click** or a selection box, then press **Ctrl+G**
-or choose **Group → Group Selected** from a tile's context menu. Click any
-member to select the group and drag it to move everything together. Drag the
-group's bottom-right handle to resize it proportionally.
-
-The **Group** menu lets you name the group, add selected tiles to an existing
-group, remove a member, or ungroup with **Ctrl+U**. **Select This Tile Only**
-lets you adjust one member; click another member or choose **Select Whole
-Group** to return to group editing. Groups are saved with the workspace and
-survive deletion undo. Groups have one level and each tile belongs to at most
-one group.
-
-Use **Arrange** or **Alt+1–4** to arrange the group without entering Spotlight:
-
-- **Alt+1:** one large tile.
-- **Alt+2:** two large tiles.
-- **Alt+3:** three large tiles.
-- **Alt+4:** all tiles have equal visible area, preserving their proportions.
-
-The large tiles sit together with a compact companion stack beside them. With
-fewer tiles than the requested number, all available tiles receive equal size.
-**Alt+5** is unassigned. **Arrange → Size**, **Alt+6**, and **Alt+7** still set
-the selection's width to **960** or **1440** canvas units (screen points when pinned).
-
-Select a group member and press **Shift+F**, or choose **Spotlight This
-Tile** to enter Spotlight. Every tile keeps its existing position and size,
-including manually arranged layouts; membership order does not rearrange them.
-Moving the group in normal mode simply moves it without entering Spotlight.
-In Spotlight, drag any tile onto another and release to exchange their exact
-positions and sizes. Only those two tiles change. Swap a small tile
-with a large one to choose which sources are prominent, or swap peers to reorder
-them. A gold outline marks the drop target; dropping outside a tile returns it
-to its place. Layout changes and swaps animate in about 180 ms and can be
-interrupted by another layout change. Playback continues.
-Clicking selects a tile for **F** without rearranging it. **Shift+Left / Shift+Right**
-and **Previous / Next** change the selection without moving any tiles.
-Panning and zooming keep Spotlight open and remember the active tile. Press
-**F** to fill the view with that tile, including when it belongs to a group;
-press **F** or **Esc** again to return to the Spotlight arrangement.
-Use **Shift+F**, **Esc**, or **Exit** to leave Spotlight and keep its current
-arrangement and tile order. These are saved with the workspace. Exiting keeps the current canvas position and zoom;
-jumping to a saved viewpoint also leaves Spotlight. While Spotlight is still open,
-autosave retains the arrangement from before entry.
-Use **Ctrl+B** to interact with a browser in Spotlight; double-click source
-activation is disabled there so rearranging tiles cannot activate the wrong source.
-
-**Pin to Viewport** applies to the whole group. Pinned members keep their
-positions relative to one another when the canvas or window changes. Grouping
-a mixture of pinned and unpinned tiles places the group on the canvas without
-changing its visible placement. All group shortcuts can be changed in Settings.
-Android viewers can watch Spotlight; remote camera navigation is suspended
-until Spotlight ends.
-
-### Browser tiles
-
-Browser tiles let you place live web pages on the canvas, including streams,
-chats, dashboards, and overlay widgets.
-
-Right-click the canvas → **Add Browser...**, then paste a web address.
-Use **Paste** beside the URL field or select a recent website. Press **Enter**
-to add the page, or **Esc** to cancel.
-
-#### Arrange the tile or use the website
-
-While working on the canvas, you can move, resize, layer, crop, and pin a
-browser tile.
-
-To interact with the website, **double-click the tile** or press **`Ctrl+B`**.
-You can then click links, type, sign in, and use the page's controls.
-Press **`Esc`** or click outside to return to arranging your canvas.
-
-Canvas shortcuts, including `F` for tile focus, stay inactive while you interact
-with a page. The browser interaction and exit shortcuts remain available.
-
-Hover over the tile for **back, forward, reload, and mute**. Each tile has its
-own page and mute control. One browser tile can receive direct interaction at
-a time.
-
-#### Toolbar and tabs
-
-New browser tiles open with a toolbar and vertical tabs around the page:
-
-- **Toolbar:** back, forward, reload, an address bar, mute, open in your
-  default browser, and close. Click the address bar to type a web address, or
-  anything else to search the web.
-- **Tabs:** click a tab to show it and **New tab** to open another. Hover a
-  tab for its close button, or middle-click it. Links that open a new window
-  become tabs. Every tab shares the tile's sign-ins and mute state, and shows
-  its site's icon once the page has loaded.
-- **Scroll** the strip with the mouse wheel when it holds more tabs than fit.
-- **Drag** a tab up or down to reorder it. Drop it on another browser tile to
-  add it to that tile's tabs (on its tab strip, where you drop it; anywhere
-  else on the tile, at the end), or on empty canvas to open it as a tile of
-  its own there. The page moves as it is, without reloading, so a video keeps
-  playing. A tile whose only tab you move into another tile closes.
-- **Sleeping tabs:** a background tab that has not been shown or played sound
-  for 10 minutes unloads to free memory. It fades with a moon icon and
-  reloads when you open it.
-- **Collapse** the strip to site badges with the button at its bottom.
-- **Right-click** the address bar for **Cut**, **Copy**, **Paste**, **Paste
-  and Go** and **Select All** (or **Copy Address** when you are not typing),
-  and a tab for **Copy Address**, **New Tab**, **Move to New Tile** and **Close
-  Tab**. The tile's own menu opens from the page.
-- **Open Link in New Tile:** while using a page, right-click a link to open it
-  in a new browser tile beside this one.
-- Turn the frame on or off with right-click → **Page → Show Toolbar and Tabs**. Tiles
-  from earlier versions start without it. Hiding it shows only the current
-  tab; the others stay open.
-
-Tabs are saved with the workspace. When it reopens, only each tile's visible
-tab loads; the others load when you open them. Cropped tiles and tiles smaller
-than 360 × 200 show just the page.
-
-- **Scroll without interacting:** hold `Shift` and scroll over a browser tile to
-  scroll the page (or the chat or list under the pointer) while the canvas stays
-  put.
-- **Unread badges and sound:** a red badge shows the unread count a site puts in
-  its title, such as "(3) Discord" or Gmail's "Inbox (12)", and a speaker badge
-  marks tiles that are playing sound once you turn on **View → Show Sound
-  Badges** (off by default). Hover the tile to mute it.
-- **Page Zoom:** right-click → **Page Zoom** `−` / `+` makes a page's text and
-  layout larger or smaller without resizing the tile. Click the percentage to
-  return to 100%. Each tile remembers its zoom.
-- **Fit to Video:** right-click → **Page → Fit to Video** crops the tile to the page's
-  video player, such as a YouTube, Twitch or Netflix video. **Tile Settings → Clear Crop**
-  shows the whole page again. Videos inside embedded players from another site
-  cannot be found.
-
-#### How browser tiles work
-
-Pluriview uses **Microsoft WebView2** to run web pages inside browser instances
-managed by the app. You do not need to keep a separate browser window open for
-each tile.
-
-Browser data is stored locally in a **dedicated Pluriview profile**, separate
-from your regular browser profile:
-
-- Your regular browser's tabs and sign-ins are not automatically imported.
-- All Pluriview browser tiles share cookies and login sessions, including across workspaces.
-- Signing into a website in one tile can also sign you into that website in other tiles.
-- Login sessions can remain available when you close and reopen Pluriview.
-- **Tools → Clear Browser Data...** signs you out of every site and erases the
-  shared profile's cookies, site data, history and cache. uBlock Origin Lite
-  stays installed. It is available while at least one browser tile is open.
-
-Websites connect to their own services and handle account information as they
-normally would when you visit them.
-
-#### Security updates and crashed pages
-
-The WebView2 Runtime updates itself with Microsoft Edge. Running tiles keep the
-engine version they started with, so when an update is installed while
-Pluriview is open, a notice appears and the Tools menu shows **Restart Browser
-Tiles (update ready)**. Choosing it restarts every browser tile on the new
-engine, keeping each tile's address, mute state and position. Restarting
-Pluriview also applies it.
-
-Microsoft Defender SmartScreen is on in browser tiles, as in Edge, and warns
-before known phishing or malware sites open. Like in Edge, SmartScreen checks
-addresses you visit with Microsoft.
-
-If a page crashes, its tile reloads it automatically. A page that crashes again
-within a minute is left alone; reload it from the tile menu. If the shared
-browser engine stops, every browser tile restarts once on its own.
-
-#### Ad and tracker blocking
-
-**uBlock Origin Lite** is included and enabled by default for browser tiles.
-
-Toggle it under **Tools → Block Ads & Trackers (uBOL)**. The setting applies to
-all browser tiles. If blocking interferes with a page, you can turn it off from
-this menu.
-
-WebView2 does not provide an extension toolbar, so the usual uBlock popup is
-unavailable.
-
-#### Transparent overlays and custom sizes
-
-Pages designed with transparent backgrounds stay transparent. This allows
-widgets such as heart-rate monitors to blend into your canvas.
-
-- **Change the page shape:** right-click the tile and turn off **Tile Settings → Lock Aspect Ratio** to resize it into a portrait, square, or wide layout.
-- **Show part of a page:** hold `Alt` and drag a tile edge or corner to crop.
-- **Keep a widget in place:** right-click → **Pin to Viewport**.
-- **Click content underneath an overlay:** use the tile's **Tile Settings → Disable Left Click** option.
-
-Cropping keeps the page's proportions, and you can still interact with the
-visible region.
-
-### Images and GIFs
-
-Drag an image onto the canvas, or choose **File → Add Image...**.
-
-Supported formats include **PNG, JPEG, GIF, WebP, and BMP**. Animated GIFs
-retain their original timing and pause when the tile is frozen.
-
-Images and GIFs decode in the background. A loading placeholder appears immediately;
-the canvas stays usable while files load. Moving or editing a tile during loading
-preserves your changes, and unavailable files keep a recoverable tile.
-
-Pluriview uses the original file without creating a separate copy. Keep the
-file in its saved location, or use **Locate Image…** from the tile's right-click
-menu if you move it.
-
-### Videos and folder playlists
-
-The **Full** download includes the video runtime. No separate mpv installation
-is required for playback.
-
-Drag a video onto the canvas, or choose **File → Add Video...**. Controls
-include:
-
-- Play/pause, seek, mute, and volume.
-- Playback speed and looping.
-- Audio and subtitle track selection.
-- A seek-bar preview so you can inspect another moment without moving playback.
-
-Volume, mute, playback speed, looping, and your audio/subtitle track choices are
-saved per video tile with its workspace. These preferences also survive reload,
-freeze/resume, deletion undo, and playlist file changes. If a chosen track is
-unavailable in a different file, the player uses automatic selection; explicitly
-disabled subtitles stay off. Restored videos still start paused at the beginning.
-
-Hold `Alt` and drag an edge or corner to crop the video.
-
-Drag a **folder of videos** onto the canvas to create a linked player and
-playlist. Playlists include previous/next, shuffle, and repeat controls, and
-use files directly inside the selected folder.
-
-Folder scans and rescans run in the background. A newly dropped folder shows its
-playlist first and starts its linked player when the scan finishes.
-
-### Live streams
-
-You can watch a stream in a **browser tile** by opening its website.
-
-To open a supported stream URL in a **video tile**, install
-[Streamlink](https://streamlink.github.io/) and add the stream from the canvas
-menu. Configure Streamlink in **Settings** if Pluriview does not find it
-automatically.
-
-The Add Stream dialog lets you type a quality or use **Choose** for the best,
-lowest, or detected qualities. Custom quality values remain supported.
-
-Video-tile streams require the video runtime included in the Full download.
-Live streams do not provide seek-bar thumbnails.
-
-## Make the canvas yours
-
-| Option | What it does |
+| **App windows** | A live view of any open window, which you can also use in place. |
+| **Web pages** | A full browser inside the tile, with tabs, sign-ins, and sound. |
+| **Videos and playlists** | Local video files, or a whole folder played as a playlist. |
+| **Images and GIFs** | PNG, JPEG, GIF, WebP, and BMP files. |
+| **Live streams** | Any stream site in a web page tile, or stream links in a video tile with [Streamlink](https://streamlink.github.io/) installed. |
+| **Spout2** | Live output from apps such as VTube Studio, listed in the Window Picker. |
+
+## Features
+
+### Use an app from its tile
+
+Double-click a window tile (or right-click → **Interact**) to use the app right
+on the canvas. Pluriview zooms to the window's real size and moves the app's
+own window over the tile, so you can click, type, and pick songs as usual. The
+window is never resized, and a big one is kept on your screen.
+
+Drag the gold bar above it, or the app's own title bar, to move the tile. Click
+outside the app or **Done** to finish, and the window goes back where it was.
+While you use it, the tile shows your mouse pointer, so people watching through
+Discord or OBS see where you point.
+
+This doesn't work for apps running as administrator or windows on another
+virtual desktop.
+
+### Web pages
+
+Double-click a browser tile or press `Ctrl+B` to use the page. Press `Esc` or
+click outside to go back to arranging.
+
+- **Toolbar and tabs:** an address bar (type an address or a search), back,
+  forward, reload, and vertical tabs. Drag a tab to reorder it, drop it on
+  another browser tile to move it there, or drop it on the canvas to give it
+  its own tile. Moved tabs keep playing without reloading. Turn the frame off
+  under right-click → **Page → Show Toolbar and Tabs**.
+- **Your own browser profile:** all browser tiles share their sign-ins, kept
+  separate from your regular browser. **Tools → Clear Browser Data...** signs
+  you out everywhere.
+- **Ad blocking:** uBlock Origin Lite is built in and on by default. Toggle it
+  under **Tools → Block Ads & Trackers (uBOL)**.
+- **Handy extras:** `Shift`+scroll scrolls a page without clicking into it,
+  **Page Zoom** makes text bigger or smaller, **Page → Fit to Video** crops the
+  tile to the page's video player, and pages with transparent backgrounds stay
+  transparent, which is great for overlay widgets.
+
+Unused background tabs sleep after 10 minutes to save memory and wake when you
+open them. A crashed page reloads on its own, and when the browser engine
+updates, **Tools → Restart Browser Tiles** switches to the new version.
+
+### Videos, playlists, and streams
+
+Video tiles have play/pause, seeking with a preview, volume, speed, looping,
+and audio and subtitle track choices. Each tile remembers its settings. A
+folder playlist adds previous/next, shuffle, and repeat.
+
+For streams, open the stream site in a web page tile, or install
+[Streamlink](https://streamlink.github.io/) to play stream links in a video
+tile and pick their quality.
+
+Images, GIFs, and videos are used from where they are, not copied, so keep
+them in place. If you move an image, right-click its tile → **Locate Image…**.
+
+### Control Tile Center
+
+Press `C` to open a separate window that lists every tile.
+
+- **Grid** shows each tile as a card with a live thumbnail, grouped tiles under
+  their group's name. Drag cards into your own order, or switch to **A–Z**.
+- **Click** a card to focus that tile on the canvas, the **eye** to hide or
+  show it, and the **speaker** to mute it. Window tiles get a **Stream Audio**
+  button instead. Hidden tiles keep playing in the background.
+- **Map** shows the whole canvas in miniature. Use **Move camera** to look
+  around, or **Move tiles** to drag tiles to new places. Pinned tiles can also
+  be moved and resized there.
+
+### Groups and Spotlight
+
+Select tiles (`Ctrl`+click or drag a box) and press `Ctrl+G` to group them, so
+they move and resize together. `Alt+1`–`Alt+4` arrange a group with one, two,
+or three large tiles, or all equal.
+
+`Shift+F` opens **Spotlight** for a group: drag a tile onto another to swap
+them, press `F` to fill the view with one, and `Esc` to leave.
+
+### Tile tools
+
+| Tool | What it does |
 |---|---|
-| **Crop** | Shows only the part of a tile you need. Use **Tile Settings → Edit Crop** to drag its handles, or hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
-| **Pin to Viewport** | Keeps any tile fixed on screen while you pan or zoom the canvas. |
-| **Picture in Picture** | Pops a tile out into a small window that stays on top of other apps, including games in borderless or windowed mode. A grouped tile brings its whole group, and several selected tiles go together, laid out as on the canvas. Drag the window to move it, drag an edge to resize it, and double-click it or use its close button to send the tiles back. Clicking it does not take focus from the game. Right-click a tile → **Picture in Picture**, or press `Shift+P`. |
-| **Control Tile Center** | A separate window listing every tile, so you can find, focus, hide and show them without hunting across the canvas. **Grid** shows each tile as a card with a live thumbnail, ungrouped tiles first and then each group under its name. Cards are in your own order: new tiles go last, and you drag a card to move it within its section. The **A–Z** button lists them by name instead without losing your order. Moving tiles on the canvas never reshuffles the cards; **Map** shows the whole canvas in miniature with the main window's view outlined in gold. Click a tile to focus it on the canvas (click again to go back), use its eye button to hide or show it, or right-click it for Select on Canvas, Mute or Stream Audio, Picture in Picture, Pin to Viewport, Bring to Front, Send to Back and Frame Rate. Every video and browser card has a speaker: gold while it plays, crossed out when muted; click it to mute or unmute (right-click a video for its volume). Every window card has a Stream Audio button instead (gold while its audio is streamed to Discord/OBS), since Pluriview never changes another app's volume. On the map, choose **Move camera** to drag the canvas view around (or click empty space to jump there), or **Move tiles** to drag tiles to new places on the canvas; a group moves together. A single click on a tile focuses it in either mode. Pinned tiles show on the map where they sit in the main window, marked with a pin, and move along with the view; in **Move tiles** you can drag one to another spot in the window or drag its corner grip to resize it, and a click selects it. Search filters tiles by name. The window opens three cards wide, and its size and place are remembered across restarts. Hidden tiles leave the canvas but keep playing and keep their sound; hiding a grouped tile hides its whole group, and hidden tiles stay hidden after a restart until shown again. Press `C`, right-click empty canvas → **Control Tile Center**, or right-click a tile → **Hide Tile**. |
-| **Freeze** | Holds the current frame of selected tiles until you resume them. |
-| **Focus on This Tile** | Fits a tile to the canvas. Press `Esc` to return. |
-| **Canvas-only mode** | Hides the interface with `H`; right-click menus remain available. |
-| **Capture FPS** | Chooses 15, 30, or 60 FPS for live previews. |
-| **System tray** | Keeps Pluriview available while minimized to the tray. |
-| **Always on Top** | Keeps Pluriview above ordinary windows. Toggle it from the empty-canvas right-click menu or the tray menu; the setting is remembered across launches. |
-| **Click Through** | Passes mouse clicks to the apps underneath. Enable or disable it from the tray menu. Browser interaction ends while previews and playback continue. |
+| **Crop** | Shows only the part you need. Right-click → **Tile Settings → Edit Crop**, or hold `Alt` and drag an edge. |
+| **Focus** | `F` fills the view with the selected tile; `Esc` goes back. |
+| **Pin to Viewport** | Keeps a tile in place on screen while you pan and zoom. |
+| **Picture in Picture** | `Shift+P` pops tiles out into a small window that stays on top of other apps, including borderless or windowed games. |
+| **Freeze** | Holds a tile's current frame until you resume it. |
+| **Frame rate** | Right-click → **Tile Settings → Frame Rate** chooses 15, 30, or 60 FPS for a live tile. |
 
-For an overlay, enable **Always on Top**, then **Click Through** in the tray.
-To interact with Pluriview again, turn off **Click Through** or select
-**Show Pluriview** from the tray. Click-through starts disabled after a restart.
+### Screenshots and recording
 
-### Wallpapers
+- `Shift+S` saves a screenshot of the selected tiles. Several tiles become one
+  image laid out as on the canvas, or choose **Capture → Screenshot Each Tile
+  Separately**.
+- `Shift+R` records the selected tiles to an MP4 with sound; `P` pauses.
+- `S` opens the **Screenshots panel**: sort shots into folders, open them, or
+  drag them back onto the canvas.
 
-Choose **View → Set Wallpaper...**, or use the canvas right-click menu.
+### Workspaces, viewpoints, and wallpapers
 
-Images, GIFs, and local videos can fill the background. The wallpaper stays
-fixed to the window while you pan and zoom, and each workspace can have its
-own wallpaper.
+- The **Workspace** menu creates and switches between separate canvases. They
+  save automatically.
+- **View → Saved Viewpoints** bookmarks spots on the canvas; jump to them with
+  `Ctrl+1`–`Ctrl+9`.
+- **View → Set Wallpaper...** puts an image, GIF, or looping video behind the
+  canvas, per workspace.
 
-Video wallpapers require the Full download's video runtime. They loop without
-audio and pause while a tile is in focus mode.
+### Overlay mode
 
-Wallpaper files stay in their original locations, so keep them available after
-adding them. Missing videos and unreadable images retain their saved wallpaper
-path and show an error. Restore the original file and reopen the workspace, or
-use **Set Wallpaper...** to choose a replacement.
-
-### Workspaces and saved viewpoints
-
-Use the **Workspace** menu to create, duplicate, rename, and switch between
-canvas setups. Changes save automatically once per minute.
-
-**Saved viewpoints** bookmark places within a workspace. Arrange your camera,
-then choose **View → Saved Viewpoints → Save Current Viewpoint...**.
-
-Select a viewpoint to move smoothly back to it. You can rename, update, or
-delete viewpoints from the same menu. Pan, zoom, or press `Esc` to interrupt
-a transition.
-
-Use `Ctrl+1` through `Ctrl+9` to open a viewpoint directly, or
-`Ctrl+Page Up` / `Ctrl+Page Down` to cycle between them.
-
-### Screenshots
-
-Select a tile, or focus it with `F`, then click the camera in the top bar's
-**Capture** section or press `Shift+S`. With several tiles selected, they are
-saved together as one PNG laid out the way they sit on the canvas: each tile
-keeps its crop, a selected tile on top hides what it covers, and the space
-between tiles is transparent. The most detailed tile keeps its full resolution,
-up to 8K for the whole image. **Capture → Screenshot Each Tile Separately**
-saves one PNG per tile instead. The screenshot keeps the tile's crop and is taken from
-the source rather than the screen: window tiles briefly capture at their full
-size (up to 4K), images and GIFs use their original pixels, and videos use the
-frame as currently rendered, so focusing a video first gives a sharper shot.
-
-Screenshots are saved in the `screenshots` folder inside Pluriview's data
-folder. Choose **Capture → Open Screenshots Folder** to see them in Explorer.
-
-The **Screenshots panel** on the right lists them newest first. Open it with
-the gallery button next to the camera, **View → Screenshots Panel**, or `S`.
-Each new screenshot flies into the folder it is saved to.
-
-- Use the folder button at the top of the panel to create a folder; type its
-  name in the row that appears and press `Enter` (`Esc` cancels). New
-  screenshots go to the folder chosen under **Save new shots to**; creating a
-  folder selects it.
-- Click a screenshot to select it, `Ctrl`+click to add or remove one, and
-  `Shift`+click to select a range. Selected screenshots get a gold outline and
-  check mark, and a bar above the list shows how many are selected, with
-  buttons to move them to a folder, move them to the Recycle Bin, or clear the
-  selection. Clicking empty space in the panel also clears it.
-- Drag screenshots onto another folder to move them, or right-click for
-  **Move to**, **Open**, **Show in Explorer**, and **Move to Recycle Bin**.
-  Double-click opens a screenshot.
-- Right-click a folder to rename it in place, select everything in it, save new
-  screenshots there, or open it in Explorer. Click a folder's header to
-  collapse or expand it.
-- Drag screenshots from the panel onto the canvas to add them as image tiles,
-  or drag a folder by its header to add all of its screenshots. They fly in
-  from the panel and are arranged in a grid around the drop point, then
-  selected so you can move them or press `Ctrl+G` to group them. **Add to
-  Canvas** in the right-click menus and the selection bar does the same at the
-  center of the view. One drop adds at most 48 screenshots.
-- Folders made in Explorer inside the `screenshots` folder appear in the panel
-  too; folders inside folders are not shown. A frozen
-window or browser tile can be captured while it stays selected after freezing;
-otherwise resume it first. Playlist tiles cannot be captured.
-
-### Recording
-
-Select or focus one tile, then press `Shift+R` or click the record button next
-to the camera in the **Capture** section. While recording, the tile gets a
-pulsing red outline and a **REC** badge with the elapsed time; the record
-button shows the same timer. Press `P` to pause and again to resume: the
-outline and badge turn gold and read **PAUSED**, and the paused stretch is left
-out of the video. Press `Shift+R` or click the timer to stop and save; the
-recording flies into its folder like a screenshot. If the recorded tile is off
-screen, the badge shows at the top of the canvas. Both shortcuts can be changed
-in Settings, and `P` does nothing unless a recording is running.
-
-With several tiles selected, `Shift+R` records them into one video laid out as
-they sit on the canvas, like a combined screenshot. Any mix of tiles works:
-windows, browsers, images, GIFs and videos. The video shows the area around
-the selected tiles when recording starts and fits inside 1080p; tiles moved
-while recording appear where they are, cut off at the edge of that area. Upper
-tiles hide what they cover, and gaps between tiles are black. Panning or
-zooming the canvas does not change the video. Sound from all of the recorded
-tiles is mixed together.
-
-Recordings are MP4 files (H.264 video, AAC sound, up to 4K at 30 FPS) saved
-alongside your screenshots, in the folder chosen under **Save new shots to**.
-In the Screenshots panel they show a play mark and their length, and they can
-be moved, opened, or dragged onto the canvas as video tiles like screenshots.
-They keep the tile's crop and use Windows' own video encoder, preferring the
-graphics card, so nothing extra is installed.
-Window tiles record their app's sound. Browser and video tiles record
-Pluriview's sound, which includes any other browser or video tile playing at
-the same time. Recorded tiles keep capturing while they are off screen.
+Turn on **Always on Top** (right-click empty canvas), then **Click Through**
+from the tray icon so your clicks reach the apps underneath. Turn Click Through
+off from the tray to use Pluriview again. `H` hides the interface for a clean
+canvas.
 
 ## Sharing audio with Discord or OBS
 
-Browser audio plays normally while you use Pluriview. However, that sound
-belongs to WebView2, so sharing only the Pluriview window may leave browser
-audio out.
-
-**Stream Audio Monitor** lets Pluriview replay a copy of the audio through its
-own process so window sharing can capture it.
+Web page sound comes from a separate browser process, so sharing just the
+Pluriview window can leave it out. **Stream Audio Monitor** fixes that:
 
 1. Open **Tools → Stream Audio Monitor**.
-2. Choose an output you do not listen to, such as a virtual audio cable or an unused audio output.
-3. Share the Pluriview window in your streaming or calling application.
+2. Pick an output you don't listen to, such as a virtual audio cable.
+3. Share the Pluriview window in Discord or OBS.
 
-Using a separate output avoids hearing the replayed audio twice. Browser tiles
-are monitored automatically when the feature is enabled; captured app windows
-use their individual **Stream Audio** toggle.
+Web pages are included automatically. For app windows, turn on their **Stream
+Audio** button.
 
-This feature is off by default.
+## Phone viewer (preview)
 
-## Controls and shortcuts
+The **Pluriview Viewer** Android app (Android 8.0+) shows your canvas on your
+phone over Wi-Fi. Pan, pinch to zoom, and double-tap a tile to focus it; the PC
+follows along. Phone audio is optional. The app isn't on the Play Store yet:
+[build it yourself](android/README.md).
 
-Keyboard shortcuts can be changed under **Tools → Settings → Keyboard
-shortcuts**. Mouse controls are fixed.
+1. Connect the PC and phone to the same private Wi-Fi.
+2. In Pluriview, choose **Tools → Phone Viewer... → Start sharing**.
+3. In the app, tap **Request connection** on your PC.
+4. Check the six-digit number matches on both screens, then choose **Allow
+   connection** on the PC.
 
-Starting with v0.6.9, **Focus current tile** defaults to `F`. Existing saved
-shortcuts are preserved when updating; set this action to `F` in Settings if
-your installation still uses `Numpad 2`.
+Sharing is off every time Pluriview starts and allows one phone at a time. The
+connection isn't encrypted, so only use it on a network you trust.
 
-| Action | Default control |
+## Shortcuts
+
+All keyboard shortcuts can be changed in **Tools → Settings**. Press `F1` in the
+app for the full list.
+
+| Action | Shortcut |
 |---|---|
-| Pan canvas | Middle mouse drag or `Alt` + drag on empty canvas |
-| Zoom | Scroll wheel |
-| Show/hide Window Picker | `W` |
-| Show/hide grid | `G` |
-| Toggle canvas-only mode | `H` |
-| Select all tiles | `Ctrl+A` |
-| Select multiple tiles | `Ctrl` + click |
-| Box-select tiles | Left-drag on empty canvas |
-| Add to box selection | `Ctrl` + left-drag on empty canvas |
-| Crop a supported tile | `Alt` + drag an edge or corner |
-| Delete selected tiles | `Delete` |
-| Undo the latest tile deletion | `Ctrl+Z` |
-| Focus current tile | `F` |
-| Screenshot selected or focused tiles | `Shift+S` |
-| Show/hide Screenshots panel | `S` |
-| Start / stop recording the selected tile | `Shift+R` |
-| Pause / resume recording | `P` |
-| Picture in picture for the selected tile or its group | `Shift+P` |
-| Open / close the Control Tile Center | `C` |
-| Group / ungroup selected tiles | `Ctrl+G` / `Ctrl+U` |
-| One / two / three large tiles / equal tiles | `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
-| Medium / large selection size | `Alt+6` / `Alt+7` |
-| Toggle group Spotlight | `Shift+F` |
-| Previous / next Spotlight tile | `Shift+Left` / `Shift+Right` |
-| Interact with browser tile | Double-click, `Ctrl+B`, or `Numpad 1` |
-| Use an app from its window tile | Double-click |
-| Exit focus or browser interaction | `Esc` |
-| Open saved viewpoints 1–9 | `Ctrl+1` through `Ctrl+9` |
-| Previous/next viewpoint | `Ctrl+Page Up` / `Ctrl+Page Down` |
-| Show shortcuts | `F1` |
+| Pan / zoom | Middle mouse drag / scroll wheel |
+| Window Picker | `W` |
+| Select all / box-select | `Ctrl+A` / drag on empty canvas |
+| Crop | `Alt` + drag an edge |
+| Delete / undo delete | `Delete` / `Ctrl+Z` |
+| Focus tile | `F` |
+| Use a web page | Double-click or `Ctrl+B` |
+| Use an app window | Double-click |
+| Back / exit | `Esc` |
+| Control Tile Center | `C` |
+| Picture in Picture | `Shift+P` |
+| Group / ungroup | `Ctrl+G` / `Ctrl+U` |
+| Group layouts | `Alt+1`–`Alt+4` |
+| Spotlight | `Shift+F` |
+| Screenshot / Screenshots panel | `Shift+S` / `S` |
+| Record / pause | `Shift+R` / `P` |
+| Hide interface | `H` |
+| Saved viewpoints | `Ctrl+1`–`Ctrl+9` |
 
 ## Technical information
 
 <details>
-<summary><strong>Included components and optional tools</strong></summary>
+<summary><strong>What's in the download</strong></summary>
 
-The download includes the ANGLE rendering runtime in the `lib` folder:
+The `lib` folder holds the ANGLE graphics runtime (`libEGL.dll`,
+`libGLESv2.dll`), `libmpv-2.dll` for video, and the uBlock Origin Lite package
+for ad blocking. WebView2 and Streamlink are separate installs; Streamlink is
+optional.
 
-- `libEGL.dll`
-- `libGLESv2.dll`
-
-The **Full** download also includes `libmpv-2.dll` for video tiles, folder
-playlists, and video wallpapers, and `uBOLite_2026.714.1952.edge.zip`, the
-uBlock Origin Lite package used for ad and tracker blocking in browser tiles.
-
-**WebView2** is required for browser tiles. **Streamlink** is an optional
-separate installation for supported stream URLs opened in video tiles.
-
-Window capture, browser tiles, images, GIFs, and workspaces do not require
-libmpv or Streamlink.
+Only one Pluriview can use a `pluriview_data` folder at a time. Separate
+portable copies can run side by side.
 
 </details>
 
 <details>
-<summary><strong>Verify a release download</strong></summary>
+<summary><strong>Verify a download</strong></summary>
 
-Release downloads include a `SHA256SUMS.txt` file for checking archive integrity.
-
-Official tagged releases are built through the repository's public GitHub
-Actions workflow, which runs formatting checks, tests, dependency auditing,
-and the release build. Published archives include build-provenance attestations.
-
-With the GitHub CLI installed, verify an archive using:
+Each release includes `SHA256SUMS.txt`, and releases are built by the public
+GitHub Actions workflow with build-provenance attestations. With the GitHub CLI:
 
 ```powershell
 gh attestation verify .\Pluriview-vX.Y.Z-windows-x64-full.zip --repo Spatpit/Pluriview
 ```
-
-Replace the example filename with the archive you downloaded.
 
 </details>
 
 <details>
 <summary><strong>Build from source</strong></summary>
 
-Building requires **Rust 1.88 or newer** and a Windows development environment.
+Requires **Rust 1.88 or newer** on Windows.
 
 ```powershell
 git clone https://github.com/Spatpit/Pluriview.git
@@ -724,68 +266,40 @@ cd Pluriview
 .\scripts\build-release.ps1
 ```
 
-The release script builds with local path remapping, checks the executable for
-local-path and credential-like strings, and creates the packaged output in
-`dist`. Packaging verifies the pinned runtime checksums and rejects local
-performance builds; leave `PLURIVIEW_LOCAL_PERFORMANCE` unset for releases.
-
-Output includes the Full ZIP archive, runtime libraries, third-party
-notices, and `SHA256SUMS.txt`.
-
-Keep the `lib` folder beside the executable. Do not distribute `pluriview.pdb`,
-which can contain local paths.
-
-The capture resize shader is included as precompiled bytecode, so normal builds
-need no shader compiler. After editing `src/capture/shaders/area_average.hlsl`,
-run `.\scripts\compile-capture-shader.ps1` with the Windows SDK installed and
-include the regenerated `.cso` alongside the shader source.
-
-</details>
-
-<details>
-<summary><strong>Project structure</strong></summary>
+The package lands in `dist`. Don't share `pluriview.pdb`, which can contain
+local paths. After editing `src/capture/shaders/area_average.hlsl`, run
+`.\scripts\compile-capture-shader.ps1` (needs the Windows SDK).
 
 | Location | Purpose |
 |---|---|
-| `src/app.rs` | Application state, menus, and source orchestration |
-| `src/canvas/` | Canvas rendering, interaction, and wallpaper |
-| `src/preview/` | Tile models and lifecycle |
+| `src/app.rs` | Application state, menus, and sources |
+| `src/canvas/` | Canvas rendering and interaction |
+| `src/preview/` | Tile models |
 | `src/capture/` | Window and Spout2 capture |
-| `src/browser.rs` | WebView2 browser tiles |
-| `src/libmpv.rs` | In-process video rendering |
-| `src/media.rs` | Images and animated GIFs |
-| `src/playlist.rs` | Folder playlists |
-| `src/audio.rs` | Stream Audio Monitor |
-| `src/persistence/` | Workspaces, layouts, and settings |
-| `src/window_picker/` | Source enumeration and picker |
-| `assets/` | Branding and bundled third-party assets |
-| `scripts/` | Runtime preparation and release packaging |
-
-The editable logo is `assets/logo.svg`. Run `scripts/generate-icons.ps1` on
-Windows to regenerate the application's PNG and ICO assets.
+| `src/browser.rs` | Browser tiles |
+| `src/libmpv.rs` | Video playback |
+| `src/persistence/` | Workspaces and settings |
+| `scripts/` | Runtime preparation and packaging |
 
 </details>
 
 ## Support
 
-If you would like to support Pluriview's development, you can visit
-[Spatpit on Ko-fi](https://ko-fi.com/spatpit). The same link is available in the
-app's **About** dialog. Support is always optional.
+If you'd like to support Pluriview, you can visit
+[Spatpit on Ko-fi](https://ko-fi.com/spatpit). It's always optional.
 
 ## License
 
 Pluriview is licensed under the **MIT License**. See [LICENSE](LICENSE).
-
-Bundled components retain their own licenses. See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Full releases include
-libmpv/FFmpeg under GPLv2+; all releases include ANGLE and its applicable notices.
+Bundled components keep their own licenses, including libmpv/FFmpeg under
+GPLv2+; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Acknowledgments
 
-- [egui](https://github.com/emilk/egui) — application interface.
-- [windows-rs](https://github.com/microsoft/windows-rs) — Windows integration and capture.
-- [Spout](https://spout.zeal.co/) — shared GPU texture sources.
-- [wry](https://github.com/tauri-apps/wry) and Microsoft WebView2 — browser tiles.
-- [ANGLE](https://github.com/google/angle) — graphics rendering.
-- [libmpv](https://github.com/mpv-player/mpv) — video playback.
-- [uBlock Origin Lite](https://github.com/gorhill/uBlock) — ad and tracker blocking.
+- [egui](https://github.com/emilk/egui) — interface
+- [windows-rs](https://github.com/microsoft/windows-rs) — Windows integration and capture
+- [Spout](https://spout.zeal.co/) — shared GPU textures
+- [wry](https://github.com/tauri-apps/wry) and Microsoft WebView2 — browser tiles
+- [ANGLE](https://github.com/google/angle) — graphics rendering
+- [libmpv](https://github.com/mpv-player/mpv) — video playback
+- [uBlock Origin Lite](https://github.com/gorhill/uBlock) — ad and tracker blocking
