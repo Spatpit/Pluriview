@@ -117,6 +117,12 @@ It produces `target/android-viewer/pluriview-viewer-debug.apk`. The local test
 signing key and all outputs remain in ignored `target/`; this is not a Play
 Store release build. Production distribution needs a separately managed signing key.
 
+**Keep `target/android-viewer/debug.keystore`.** Android installs an update only
+when it is signed with the same key as the installed app. If the file is deleted
+(for example by cleaning `target/`), the script creates a new key, and phones
+must uninstall the old viewer before installing the next build. The key changed
+in 0.3.14 for this reason; back the file up somewhere outside the repository.
+
 Install the APK on a connected Android device:
 
 ```powershell

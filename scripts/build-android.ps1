@@ -72,6 +72,8 @@ Invoke-Checked jar @('uf', $unsigned, '-C', $dex, 'classes.dex')
 $aligned = Join-Path $build 'aligned.apk'
 Invoke-Checked "$tools\zipalign.exe" @('-f', '4', $unsigned, $aligned)
 # Local test signing only. Neither this key nor generated APKs enter Git.
+# Keep this file: updates must be signed with the installed app's key, so a new
+# key means uninstalling the viewer on every phone first.
 $key = Join-Path $output 'debug.keystore'
 if (-not (Test-Path -LiteralPath $key)) {
     Invoke-Checked keytool @('-genkeypair', '-keystore', $key, '-storepass', 'android', '-keypass', 'android', '-alias', 'androiddebugkey', '-keyalg', 'RSA', '-keysize', '2048', '-validity', '10000', '-dname', 'CN=Android Debug,O=Android,C=US')
