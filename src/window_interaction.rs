@@ -151,6 +151,11 @@ pub fn size_after_dpi_change(size: (i32, i32), from_dpi: u32, to_dpi: u32) -> (i
 /// where it is on screen when possible, then it slides just far enough to
 /// fit inside `canvas_rect` with room for the grab bar above it. A subject
 /// larger than the canvas is centered.
+///
+/// `screen` is the usable part of the monitor in the same points. The real
+/// window lands where the subject does and may hang past Pluriview's edges,
+/// so it then slides just far enough to be fully on that screen, or, when
+/// larger than it, to keep its top-left corner (title bar, menus) there.
 pub fn interaction_pan(
     canvas_rect: Rect,
     pan: Vec2,
@@ -158,6 +163,7 @@ pub fn interaction_pan(
     subject: Rect,
     new_zoom: f32,
     margin: f32,
+    screen: Option<Rect>,
 ) -> Vec2 {
     let screen_center = (subject.center().to_vec2() + pan) * zoom + canvas_rect.min.to_vec2();
     let mut new_pan =
@@ -178,10 +184,26 @@ pub fn interaction_pan(
             0.0
         }
     };
-    let offset = Vec2::new(
+    let mut offset = Vec2::new(
         shift(shown.min.x, shown.max.x, room.min.x, room.max.x),
         shift(shown.min.y, shown.max.y, room.min.y, room.max.y),
     );
+    if let Some(screen) = screen.filter(|screen| screen.is_positive()) {
+        let shown = shown.translate(offset);
+        let onto_screen = |low: f32, high: f32, screen_low: f32, screen_high: f32| {
+            if high - low > screen_high - screen_low || low < screen_low {
+                screen_low - low
+            } else if high > screen_high {
+                screen_high - high
+            } else {
+                0.0
+            }
+        };
+        offset += Vec2::new(
+            onto_screen(shown.min.x, shown.max.x, screen.min.x, screen.max.x),
+            onto_screen(shown.min.y, shown.max.y, screen.min.y, screen.max.y),
+        );
+    }
     new_pan += offset / new_zoom;
     new_pan
 }
@@ -215,7 +237,7 @@ mod native {
         DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
     };
     use windows::Win32::Graphics::Gdi::{
-        ClientToScreen, MonitorFromWindow, MONITOR_DEFAULTTONEAREST,
+        ClientToScreen, GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -313,6 +335,20 @@ mod native {
             Ok(()) => x,
             Err(_) => 96,
         }
+    }
+
+    /// The usable part (without the taskbar) of the monitor showing most of
+    /// the window, in physical pixels.
+    pub fn work_area(handle: isize) -> Option<PixelRect> {
+        let monitor = unsafe { MonitorFromWindow(hwnd(handle), MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe { GetMonitorInfoW(monitor, &mut info) }
+            .as_bool()
+            .then(|| pixel_rect(info.rcWork))
+            .filter(|rect| rect.width() > 0 && rect.height() > 0)
     }
 
     /// Screen position of `handle`'s client area, in physical pixels.
@@ -637,7 +673,7 @@ mod tests {
     fn interaction_keeps_the_tile_center_when_it_fits() {
         let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0));
         let tile = Rect::from_min_size(Pos2::new(700.0, 400.0), Vec2::new(200.0, 100.0));
-        let pan = interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0);
+        let pan = interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0, None);
         let center = (tile.center().to_vec2() + pan) * 2.0;
         assert!((center - Vec2::new(800.0, 450.0)).length() < 0.01);
     }
@@ -647,7 +683,7 @@ mod tests {
         let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0));
         // Near the top-left corner; at 2x it would spill past both edges.
         let tile = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(200.0, 100.0));
-        let pan = interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0);
+        let pan = interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0, None);
         let min = (tile.min.to_vec2() + pan) * 2.0;
         assert!((min.x - 16.0).abs() < 0.01);
         assert!((min.y - (16.0 + GRAB_BAR_HEIGHT)).abs() < 0.01);
@@ -657,10 +693,72 @@ mod tests {
     fn interaction_centers_a_window_larger_than_the_canvas() {
         let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
         let tile = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(500.0, 400.0));
-        let pan = interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0);
+        let pan = interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0, None);
         let center = (tile.center().to_vec2() + pan) * 2.0;
         assert!((center.x - 400.0).abs() < 0.01);
         assert!((center.y - (300.0 + GRAB_BAR_HEIGHT / 2.0)).abs() < 0.01);
+    }
+
+    /// Pluriview's 1000 x 700 canvas sits at the left of a 1920 x 1032
+    /// screen, 100 pixels down, so the screen starts at y = -100 in canvas
+    /// points.
+    const SCREEN: Rect = Rect {
+        min: Pos2::new(0.0, -100.0),
+        max: Pos2::new(1920.0, 932.0),
+    };
+
+    fn shown_at(pan: Vec2, tile: Rect, zoom: f32) -> Rect {
+        Rect::from_min_size(
+            ((tile.min.to_vec2() + pan) * zoom).to_pos2(),
+            tile.size() * zoom,
+        )
+    }
+
+    #[test]
+    fn interaction_slides_a_window_larger_than_pluriview_onto_the_screen() {
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0));
+        // A 1400 x 900 window: centered on the canvas, its left 200 points
+        // would be past the screen's left edge.
+        let tile = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(700.0, 450.0));
+        let centered = shown_at(
+            interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0, None),
+            tile,
+            2.0,
+        );
+        assert!((centered.min.x + 200.0).abs() < 0.01, "{centered:?}");
+
+        let shown = shown_at(
+            interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0, Some(SCREEN)),
+            tile,
+            2.0,
+        );
+        assert!(shown.min.x.abs() < 0.01, "{shown:?}");
+        // It already fit vertically, so only its left edge moved.
+        assert!((shown.min.y - centered.min.y).abs() < 0.01);
+        assert!(SCREEN.contains_rect(shown));
+    }
+
+    #[test]
+    fn interaction_keeps_the_top_left_of_a_window_larger_than_the_screen() {
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0));
+        let tile = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 600.0));
+        let shown = shown_at(
+            interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0, Some(SCREEN)),
+            tile,
+            2.0,
+        );
+        assert!((shown.min - SCREEN.min).length() < 0.01, "{shown:?}");
+    }
+
+    #[test]
+    fn interaction_leaves_a_window_that_fits_pluriview_where_it_was() {
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0));
+        let tile = Rect::from_min_size(Pos2::new(700.0, 400.0), Vec2::new(200.0, 100.0));
+        let screen = Rect::from_min_size(Pos2::new(-50.0, -50.0), Vec2::new(1920.0, 1080.0));
+        assert_eq!(
+            interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0, Some(screen)),
+            interaction_pan(canvas, Vec2::ZERO, 1.0, tile, 2.0, 16.0, None)
+        );
     }
 
     #[cfg(windows)]

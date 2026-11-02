@@ -66,12 +66,14 @@ struct SavedCamera {
 
 impl CanvasState {
     /// Glide to show tile `id` at `zoom`, the window's real size, keeping it
-    /// in view with room for the grab bar. Returns false, leaving the camera
-    /// alone, for pinned tiles and zooms outside the navigation range.
+    /// in view with room for the grab bar, and the window on `screen` (the
+    /// monitor's usable area, in canvas points). Returns false, leaving the
+    /// camera alone, for pinned tiles and zooms outside the navigation range.
     pub fn frame_live_window(
         &mut self,
         id: PreviewId,
         zoom: f32,
+        screen: Option<Rect>,
         preview_manager: &PreviewManager,
         now: f64,
     ) -> bool {
@@ -95,6 +97,7 @@ impl CanvasState {
             subject,
             zoom,
             FRAME_MARGIN,
+            screen,
         );
         let center = (canvas_rect.center() - canvas_rect.min) / zoom - pan;
         // Tile focus owns the zoom; set it aside and bring it back after.
@@ -127,6 +130,7 @@ impl CanvasState {
         &mut self,
         id: PreviewId,
         zoom: f32,
+        screen: Option<Rect>,
         preview_manager: &PreviewManager,
     ) -> bool {
         let (Some(canvas_rect), Some(preview)) = (self.last_screen_rect, preview_manager.get(id))
@@ -148,6 +152,7 @@ impl CanvasState {
             subject,
             zoom,
             FRAME_MARGIN,
+            screen,
         );
         self.zoom = zoom;
         if let Some(saved) = &mut self.live_window.camera {

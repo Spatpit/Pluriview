@@ -193,8 +193,13 @@ impl PluriviewApp {
         if !pinned {
             let zoom =
                 native::native_zoom(tile_width, crop, visible_size.0, ctx.pixels_per_point());
-            self.canvas
-                .frame_live_window(id, zoom, &self.preview_manager, ctx.input(|i| i.time));
+            self.canvas.frame_live_window(
+                id,
+                zoom,
+                screen_in_points(main, ctx.pixels_per_point()),
+                &self.preview_manager,
+                ctx.input(|i| i.time),
+            );
         }
         // Resize handles would poke out around the window.
         self.canvas.selection.clear();
@@ -399,10 +404,12 @@ impl PluriviewApp {
             if !pinned {
                 let zoom =
                     native::native_zoom(tile_width, crop, session.visible_size.0, pixels_per_point);
-                if self
-                    .canvas
-                    .refit_live_window(id, zoom, &self.preview_manager)
-                {
+                if self.canvas.refit_live_window(
+                    id,
+                    zoom,
+                    screen_in_points(main, pixels_per_point),
+                    &self.preview_manager,
+                ) {
                     session.placed_zoom = Some(self.canvas.zoom);
                 }
             }
@@ -722,6 +729,18 @@ pub(super) fn recover_window_in_use(path: &std::path::Path) {
     } else {
         native::move_window(record.hwnd, record.home);
     }
+}
+
+/// The usable part (without the taskbar) of the monitor Pluriview is on, in
+/// canvas points: an app window used in place is kept on it.
+fn screen_in_points(main: isize, pixels_per_point: f32) -> Option<egui::Rect> {
+    let work = native::work_area(main)?;
+    Some(native::visible_rect_in_points(
+        work.origin(),
+        work.size(),
+        pixels_per_point,
+        native::client_origin(main),
+    ))
 }
 
 #[cfg(test)]
