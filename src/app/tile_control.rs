@@ -109,6 +109,9 @@ enum Action {
     /// Move a tile, with its group, so its top-left corner lands here.
     /// Absolute, so a snapshot older than the last move cannot add twice.
     MoveTileTo(PreviewId, Pos2),
+    /// Resize a pinned tile to this many canvas units of the current view,
+    /// keeping its top-left corner. Absolute, like `MoveTileTo`.
+    ResizePinnedTo(PreviewId, Vec2),
     BringToFront(PreviewId),
     SendToBack(PreviewId),
     SetFps(PreviewId, FpsPreset),
@@ -157,7 +160,8 @@ struct TileView {
     icon: &'static str,
     /// Place in the custom order.
     list_order: u64,
-    /// Canvas rect (top-left is the tile's position).
+    /// Canvas rect (top-left is the tile's position). A pinned tile's is the
+    /// part of the canvas it covers in the current view.
     rect: Rect,
     /// Screen points when pinned, else canvas units.
     shown_size: Vec2,
@@ -616,7 +620,9 @@ impl PluriviewApp {
             if index == snapshot.tiles.len() {
                 snapshot.tiles.push(empty_tile_view(*id));
             }
-            fill_tile_view(&mut snapshot.tiles[index], ctx, preview);
+            let view = &mut snapshot.tiles[index];
+            fill_tile_view(view, ctx, preview);
+            view.rect = self.canvas.tile_canvas_rect(preview);
         }
 
         snapshot.focused = self.canvas.focused_tile();
@@ -743,10 +749,18 @@ impl PluriviewApp {
             Action::Select(id) => self.canvas.select_tile(id, &mut self.preview_manager),
             Action::PictureInPicture(id) => self.toggle_picture_in_picture(id, ctx),
             Action::MoveTileTo(id, target) => {
-                if let Some(position) = self.preview_manager.get(id).map(|p| p.position) {
+                if let Some(rect) = self
+                    .preview_manager
+                    .get(id)
+                    .map(|p| self.canvas.tile_canvas_rect(p))
+                {
                     self.canvas
-                        .move_tile_by(id, target - position, &mut self.preview_manager);
+                        .move_tile_by(id, target - rect.min, &mut self.preview_manager);
                 }
+            }
+            Action::ResizePinnedTo(id, size) => {
+                self.canvas
+                    .resize_pinned_tile(id, size, &mut self.preview_manager);
             }
             Action::TogglePin(id) => self.canvas.toggle_tile_pin(id, &mut self.preview_manager),
             Action::BringToFront(id) => self.preview_manager.bring_to_front(id),
@@ -1518,18 +1532,13 @@ fn map(
     snapshot: &Snapshot,
     actions: &mut Vec<Action>,
 ) {
-    // Pinned tiles float above the canvas rather than sitting on it.
+    // Pinned tiles float above the canvas, so they are drawn last, where
+    // they cover it in the current view.
     let mut tiles: Vec<&TileView> = sections
         .iter()
         .flat_map(|section| section.tiles.iter().copied())
-        .filter(|tile| !tile.pinned)
         .collect();
-    tiles.sort_by_key(|tile| (tile.z_order, tile.id.0));
-    let pinned = sections
-        .iter()
-        .map(|section| section.tiles.len())
-        .sum::<usize>()
-        - tiles.len();
+    tiles.sort_by_key(|tile| (tile.pinned, tile.z_order, tile.id.0));
 
     ui.horizontal(|ui| {
         for (mode, icon, label, hint) in [
@@ -1561,10 +1570,6 @@ fn map(
     let moving_tiles = ui_state.map_mode == MapMode::Tiles;
 
     let area = ui.available_rect_before_wrap();
-    let area = Rect::from_min_max(
-        area.min,
-        Pos2::new(area.max.x, area.max.y - if pinned > 0 { 22.0 } else { 0.0 }),
-    );
     let bounds = tiles
         .iter()
         .map(|tile| tile.rect)
@@ -1574,12 +1579,8 @@ fn map(
         return;
     };
     let transform = MapTransform::new(bounds, area);
-    // Claim the map and the note under it so the resizable panel keeps its
-    // height.
-    ui.allocate_rect(
-        area.with_max_y(area.max.y + if pinned > 0 { 22.0 } else { 0.0 }),
-        egui::Sense::hover(),
-    );
+    // Claim the map so the resizable panel keeps its height.
+    ui.allocate_rect(area, egui::Sense::hover());
 
     let background = ui.interact(
         area,
@@ -1693,6 +1694,18 @@ fn map(
                 ui_theme::GOLD,
             );
         }
+        if tile.pinned && rect.width() >= 16.0 && rect.height() >= 12.0 {
+            let mark =
+                Rect::from_min_size(rect.left_top() + Vec2::new(2.0, 2.0), Vec2::splat(13.0));
+            painter.rect_filled(mark, 3.0, Color32::from_black_alpha(190));
+            paint_icon(
+                &painter,
+                mark.center(),
+                icons::PUSH_PIN,
+                10.0,
+                ui_theme::GOLD,
+            );
+        }
         if focused || response.hovered() {
             painter.rect_stroke(rect, 2.0, Stroke::new(1.5, ui_theme::GOLD));
         } else if snapshot.selection.contains(&id) {
@@ -1702,13 +1715,67 @@ fn map(
                 Stroke::new(1.0, ui_theme::GOLD.gamma_multiply(0.6)),
             );
         }
+        // A pinned tile has no place on the canvas to resize it from when it
+        // is small there, so its map tile gets a corner grip. Grouped tiles
+        // resize with their group on the canvas.
+        let resizable = moving_tiles && tile.pinned && !tile.hidden && tile.group.is_none();
+        if resizable && rect.width() >= 24.0 && rect.height() >= 24.0 {
+            let grip =
+                Rect::from_min_size(rect.right_bottom() - Vec2::splat(14.0), Vec2::splat(14.0));
+            let handle = ui
+                .interact(
+                    grip,
+                    egui::Id::new(("tile_control_map_resize", id.0)),
+                    egui::Sense::drag(),
+                )
+                .on_hover_and_drag_cursor(egui::CursorIcon::ResizeNwSe);
+            over_tile |= handle.contains_pointer();
+            if handle.drag_started() {
+                ui_state.map_drag_bounds = Some(bounds);
+                ui_state.map_drag_origin = ui
+                    .input(|input| input.pointer.press_origin())
+                    .map(|press| (press, tile.rect.size().to_pos2()));
+                actions.push(Action::Select(id));
+            }
+            if let (true, Some((press, origin)), Some(pointer)) = (
+                handle.dragged(),
+                ui_state.map_drag_origin,
+                handle.interact_pointer_pos(),
+            ) {
+                let size = origin.to_vec2() + (pointer - press) / transform.scale();
+                actions.push(Action::ResizePinnedTo(id, size));
+            }
+            let color = if handle.hovered() || handle.dragged() {
+                ui_theme::GOLD
+            } else {
+                ui_theme::GOLD.gamma_multiply(0.75)
+            };
+            painter.rect_filled(grip, 3.0, Color32::from_black_alpha(190));
+            let corner = grip.right_bottom() - Vec2::splat(3.0);
+            for step in [3.0, 6.0, 9.0] {
+                painter.line_segment(
+                    [corner - Vec2::new(step, 0.0), corner - Vec2::new(0.0, step)],
+                    Stroke::new(1.2, color),
+                );
+            }
+        }
         let response = response.on_hover_ui(|ui| {
             ui.label(egui::RichText::new(&tile.title).strong());
-            ui.label(match (tile.hidden, moving_tiles) {
-                (true, false) => "Hidden · click to show and focus it",
-                (true, true) => "Hidden · drag to move it, click to show it",
-                (false, false) => "Click to focus it on the canvas",
-                (false, true) => "Drag to move it, click to focus it",
+            if tile.pinned {
+                ui.label("Pinned to the view, so it moves along with it");
+            }
+            // A pinned tile is always in view, so a click only selects it.
+            ui.label(match (tile.hidden, tile.pinned, moving_tiles) {
+                (true, false, false) => "Hidden · click to show and focus it",
+                (true, true, false) => "Hidden · click to show and select it",
+                (true, _, true) => "Hidden · drag to move it, click to show it",
+                (false, false, false) => "Click to focus it on the canvas",
+                (false, true, false) => "Click to select it on the canvas",
+                (false, false, true) => "Drag to move it, click to focus it",
+                (false, true, true) if resizable => {
+                    "Drag to move it within the view or its corner to resize it, click to select it"
+                }
+                (false, true, true) => "Drag to move it within the view, click to select it",
             });
         });
         if response.clicked() {
@@ -1742,21 +1809,6 @@ fn map(
     if !ui.input(|input| input.pointer.any_down()) {
         ui_state.map_drag_bounds = None;
         ui_state.map_drag_origin = None;
-    }
-
-    if pinned > 0 {
-        let note = if pinned == 1 {
-            "1 pinned tile floats above the map".to_owned()
-        } else {
-            format!("{pinned} pinned tiles float above the map")
-        };
-        painter.text(
-            Pos2::new(area.min.x, area.max.y + 6.0),
-            egui::Align2::LEFT_TOP,
-            format!("{}  {note}", icons::PUSH_PIN),
-            egui::FontId::proportional(12.0),
-            ui_theme::SECONDARY,
-        );
     }
 }
 
@@ -1996,8 +2048,16 @@ mod tests {
 
     /// Run the map with one tile filling it.
     fn run_map(mode: MapMode, frames: Vec<Vec<egui::Event>>) -> Vec<Action> {
+        run_map_with(vec![tile(1, rect(0.0, 0.0, 400.0, 300.0))], mode, frames)
+    }
+
+    fn run_map_with(
+        tiles: Vec<TileView>,
+        mode: MapMode,
+        frames: Vec<Vec<egui::Event>>,
+    ) -> Vec<Action> {
         let snapshot = Snapshot {
-            tiles: vec![tile(1, rect(0.0, 0.0, 400.0, 300.0))],
+            tiles,
             viewport: Some(rect(0.0, 0.0, 400.0, 300.0)),
             ..Default::default()
         };
@@ -2058,6 +2118,64 @@ mod tests {
             last.x > 200.0 && (last.y - 150.0).abs() < 1e-3,
             "{centers:?}"
         );
+    }
+
+    /// A tile pinned over the middle of the view, above one filling it.
+    fn pinned_over_another() -> Vec<TileView> {
+        let mut pinned = tile(2, rect(150.0, 100.0, 100.0, 100.0));
+        pinned.pinned = true;
+        // Lower in the z-order, yet pinned tiles float above the canvas.
+        pinned.z_order = 0;
+        let mut below = tile(1, rect(0.0, 0.0, 400.0, 300.0));
+        below.z_order = 5;
+        vec![pinned, below]
+    }
+
+    #[test]
+    fn a_pinned_tile_shows_on_the_map_above_the_canvas() {
+        for mode in [MapMode::Camera, MapMode::Tiles] {
+            let actions = run_map_with(pinned_over_another(), mode, click(MAP_CENTER));
+            assert_eq!(actions, vec![Action::Focus(PreviewId(2))], "{mode:?}");
+        }
+        let actions = run_map_with(
+            pinned_over_another(),
+            MapMode::Tiles,
+            drag(MAP_CENTER, Vec2::new(40.0, 0.0)),
+        );
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, Action::MoveTileTo(PreviewId(2), _))));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::MoveTileTo(PreviewId(1), _))));
+    }
+
+    #[test]
+    fn a_pinned_tile_resizes_from_its_corner_grip_on_the_map() {
+        // The grip sits inside the pinned tile's bottom-right corner.
+        let grip = Pos2::new(236.0, 220.0);
+        let actions = run_map_with(
+            pinned_over_another(),
+            MapMode::Tiles,
+            drag(grip, Vec2::new(20.0, 10.0)),
+        );
+        assert!(actions.contains(&Action::Select(PreviewId(2))));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::MoveTileTo(..))));
+        let sizes: Vec<Vec2> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::ResizePinnedTo(PreviewId(2), size) => Some(*size),
+                _ => None,
+            })
+            .collect();
+        let last = *sizes.last().expect("the drag should resize the tile");
+        assert!(last.x > 110.0 && last.y > 105.0, "{sizes:?}");
+
+        // Moving the camera leaves no grip to catch the pointer.
+        let actions = run_map_with(pinned_over_another(), MapMode::Camera, click(grip));
+        assert_eq!(actions, vec![Action::Focus(PreviewId(2))]);
     }
 
     #[test]
