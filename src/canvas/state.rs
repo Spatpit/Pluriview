@@ -37,6 +37,8 @@ use std::time::{Duration, Instant};
 const UNDO_TOAST_SECS: f32 = 4.0;
 /// Screen-space hit target shared by resize interaction and marquee exclusion.
 const RESIZE_HANDLE_HIT_SIZE: f32 = 14.0;
+/// Smallest width and height a resize handle leaves a tile at.
+const MIN_RESIZE_SIZE: f32 = 100.0;
 /// Playlist chrome is authored in canvas pixels so zoom keeps the same layout.
 const PLAYLIST_CORNER: f32 = 10.0;
 const PLAYLIST_HEADER_HEIGHT: f32 = 52.0;
@@ -4445,9 +4447,9 @@ impl CanvasState {
                                 };
                                 let new_rect = apply_resize(*handle, *start_rect, delta, *ar);
 
-                                // Apply minimum size
-                                let min_size = 100.0;
-                                if new_rect.width() >= min_size && new_rect.height() >= min_size {
+                                if new_rect.width() >= MIN_RESIZE_SIZE
+                                    && new_rect.height() >= MIN_RESIZE_SIZE
+                                {
                                     if let Some(preview) = preview_manager.get_mut(id) {
                                         if *screen_space {
                                             preview.viewport_pin = Some(groups::pin_for_tile(

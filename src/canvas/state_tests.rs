@@ -2719,6 +2719,83 @@ fn a_dragged_window_carries_its_tile_along() {
 }
 
 #[test]
+fn a_pinned_tile_maps_onto_the_view_and_moves_inside_the_window() {
+    let mut canvas = CanvasState {
+        zoom: 2.0,
+        pan: Vec2::new(-50.0, -25.0),
+        ..Default::default()
+    };
+    let screen = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(800.0, 600.0));
+    canvas.last_screen_rect = Some(screen);
+    let mut previews = PreviewManager::new();
+    let id = previews.add("pinned".to_owned(), Pos2::ZERO, Vec2::splat(50.0));
+    let pinned = Rect::from_min_size(Pos2::new(110.0, 120.0), Vec2::new(200.0, 100.0));
+    previews.get_mut(id).unwrap().viewport_pin =
+        Some(crate::preview::ViewportPin::from_rect(pinned, screen));
+
+    // 100 points into the view at zoom 2 is 50 canvas units past its corner.
+    assert_eq!(
+        canvas.tile_canvas_rect(previews.get(id).unwrap()),
+        Rect::from_min_size(Pos2::new(100.0, 75.0), Vec2::new(100.0, 50.0))
+    );
+
+    let pin_rect =
+        |previews: &PreviewManager| previews.get(id).unwrap().viewport_pin.unwrap().rect(screen);
+    canvas.move_tile_by(id, Vec2::new(10.0, 5.0), &mut previews);
+    assert_eq!(pin_rect(&previews), pinned.translate(Vec2::new(20.0, 10.0)));
+
+    // Dragged far past the window's edge, it stops at the edge, still pinned.
+    canvas.move_tile_by(id, Vec2::new(10_000.0, 0.0), &mut previews);
+    let moved = pin_rect(&previews);
+    assert_eq!((moved.right(), moved.top()), (screen.right(), 130.0));
+    assert_eq!(previews.get(id).unwrap().position, Pos2::ZERO);
+}
+
+#[test]
+fn a_pinned_tile_resizes_from_its_corner_inside_the_window() {
+    let mut canvas = CanvasState {
+        zoom: 2.0,
+        ..Default::default()
+    };
+    let screen = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(800.0, 600.0));
+    canvas.last_screen_rect = Some(screen);
+    let mut previews = PreviewManager::new();
+    let id = previews.add("pinned".to_owned(), Pos2::ZERO, Vec2::splat(50.0));
+    let start = Rect::from_min_size(Pos2::new(110.0, 120.0), Vec2::new(200.0, 100.0));
+    let preview = previews.get_mut(id).unwrap();
+    preview.viewport_pin = Some(crate::preview::ViewportPin::from_rect(start, screen));
+    preview.lock_aspect_ratio = false;
+    let pin_rect =
+        |previews: &PreviewManager| previews.get(id).unwrap().viewport_pin.unwrap().rect(screen);
+
+    // Canvas units of the view: twice as many screen points at zoom 2.
+    canvas.resize_pinned_tile(id, Vec2::new(150.0, 100.0), &mut previews);
+    assert_eq!(
+        pin_rect(&previews),
+        Rect::from_min_size(start.min, Vec2::new(300.0, 200.0))
+    );
+
+    // Below the handles' minimum it stays as it was.
+    canvas.resize_pinned_tile(id, Vec2::splat(10.0), &mut previews);
+    assert_eq!(pin_rect(&previews).size(), Vec2::new(300.0, 200.0));
+
+    // It stops at the window's edges.
+    canvas.resize_pinned_tile(id, Vec2::splat(10_000.0), &mut previews);
+    assert_eq!(
+        pin_rect(&previews),
+        Rect::from_min_max(start.min, screen.max)
+    );
+
+    // A locked aspect ratio holds.
+    let preview = previews.get_mut(id).unwrap();
+    preview.lock_aspect_ratio = true;
+    preview.source_aspect_ratio = 2.0;
+    canvas.resize_pinned_tile(id, Vec2::splat(200.0), &mut previews);
+    assert_eq!(pin_rect(&previews).size(), Vec2::new(400.0, 200.0));
+    assert!(previews.get(id).unwrap().viewport_pin.is_some());
+}
+
+#[test]
 fn hidden_tiles_leave_the_selection_and_a_grouped_tile_moves_its_group() {
     let mut canvas = CanvasState::default();
     let mut previews = PreviewManager::new();

@@ -164,8 +164,24 @@ impl CanvasState {
         }
     }
 
-    /// Move a tile, with its group, by `delta` canvas units. Pinned tiles
-    /// stay where they are on screen.
+    /// Where a tile is on the canvas right now. A pinned tile has no canvas
+    /// place of its own, so this is the part of the canvas it covers in the
+    /// current view.
+    pub fn tile_canvas_rect(&self, preview: &Preview) -> Rect {
+        match (preview.viewport_pin, self.last_screen_rect) {
+            (Some(pin), Some(screen)) => {
+                let rect = pin.rect(screen);
+                Rect::from_min_max(
+                    self.screen_to_canvas(rect.min, screen),
+                    self.screen_to_canvas(rect.max, screen),
+                )
+            }
+            _ => preview.rect(),
+        }
+    }
+
+    /// Move a tile, with its group, by `delta` canvas units. A pinned tile
+    /// moves to the matching place on screen, kept inside the window.
     pub fn move_tile_by(&mut self, id: PreviewId, delta: Vec2, previews: &mut PreviewManager) {
         if !delta.is_finite() || delta == Vec2::ZERO {
             return;
@@ -174,6 +190,41 @@ impl CanvasState {
         if self.spotlight_includes(&members) {
             self.exit_spotlight(previews);
         }
+        let screen = self.last_screen_rect;
+        let pinned: Vec<(PreviewId, ViewportPin)> = members
+            .iter()
+            .filter_map(|member| previews.get(*member))
+            .filter(|p| p.removing.is_none())
+            .filter_map(|p| p.viewport_pin.map(|pin| (p.id, pin)))
+            .collect();
+        if let (Some(screen), false) = (screen, pinned.is_empty()) {
+            // Pinned members move together, so clamp their shared bounds.
+            let bounds = pinned
+                .iter()
+                .map(|(_, pin)| pin.rect(screen))
+                .reduce(|a, b| a.union(b))
+                .expect("pinned is not empty");
+            let mut shift = delta * self.zoom;
+            for axis in 0..2 {
+                let (low, high) = (
+                    screen.min[axis] - bounds.min[axis],
+                    screen.max[axis] - bounds.max[axis],
+                );
+                // A block larger than the window keeps its top-left inside.
+                shift[axis] = if low <= high {
+                    shift[axis].clamp(low, high)
+                } else {
+                    low
+                };
+            }
+            for (member, pin) in pinned {
+                let moved =
+                    self.moved_pin(member, pin.rect(screen).translate(shift), screen, previews);
+                if let Some(preview) = previews.get_mut(member) {
+                    preview.viewport_pin = Some(moved);
+                }
+            }
+        }
         for member in members {
             if let Some(preview) = previews
                 .get_mut(member)
@@ -181,6 +232,41 @@ impl CanvasState {
             {
                 preview.position += delta;
             }
+        }
+    }
+
+    /// Resize an ungrouped pinned tile to `size` canvas units of the current
+    /// view, keeping its top-left corner, as its bottom-right handle does:
+    /// a locked aspect ratio is kept, as is the handles' minimum size, and
+    /// the tile stays inside the window.
+    pub fn resize_pinned_tile(&mut self, id: PreviewId, size: Vec2, previews: &mut PreviewManager) {
+        let Some(screen) = self.last_screen_rect else {
+            return;
+        };
+        let Some(preview) = previews
+            .get_mut(id)
+            .filter(|p| p.removing.is_none() && p.tile_group.is_none())
+        else {
+            return;
+        };
+        let Some(pin) = preview.viewport_pin.filter(|_| size.is_finite()) else {
+            return;
+        };
+        let start = pin.rect(screen);
+        let room = screen.max - start.min;
+        let target = (size * self.zoom).min(room);
+        let aspect_ratio = preview
+            .lock_aspect_ratio
+            .then_some(preview.source_aspect_ratio)
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+        let rect = apply_resize(
+            ResizeHandle::BottomRight,
+            start,
+            target - start.size(),
+            aspect_ratio,
+        );
+        if rect.width() >= MIN_RESIZE_SIZE && rect.height() >= MIN_RESIZE_SIZE {
+            preview.viewport_pin = Some(ViewportPin::from_rect(rect, screen));
         }
     }
 
