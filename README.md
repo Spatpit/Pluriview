@@ -198,6 +198,12 @@ zooms so the tile shows the window at its real size, then Pluriview moves the
 app's own window exactly over the tile. Only its position changes, never its
 size, so the app looks the same as in the tile.
 
+A window bigger than Pluriview can reach past Pluriview's edges, but it is kept
+on the screen: if centering it on the canvas would push part of it off the
+monitor, it slides back just far enough and the canvas follows, so the tile stays
+underneath. A window bigger than the screen itself keeps its top-left corner,
+where the title bar and menus usually are, on the screen.
+
 A gold outline and a bar above the window mark the app in use. Drag the bar to
 move the tile without clicking into the app; the window follows when you let
 go. Dragging the app's own title bar moves the tile along with it.

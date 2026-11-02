@@ -2654,7 +2654,7 @@ fn framing_a_window_tile_shows_it_at_real_size_and_restores_the_view() {
         Vec2::new(400.0, 300.0),
     );
 
-    assert!(canvas.frame_live_window(id, 2.0, &previews, 10.0));
+    assert!(canvas.frame_live_window(id, 2.0, None, &previews, 10.0));
     assert_eq!(canvas.layout_camera(), (Vec2::new(30.0, -20.0), 0.5));
     canvas.update_camera_transition(viewport, 20.0);
     canvas.settle_live_window_camera();
@@ -2677,7 +2677,7 @@ fn a_view_changed_while_using_a_window_is_kept() {
     canvas.last_screen_rect = Some(viewport);
     let mut previews = PreviewManager::new();
     let id = previews.add_for_window(1, 42, "w".into(), Pos2::ZERO, Vec2::new(400.0, 300.0));
-    assert!(canvas.frame_live_window(id, 2.0, &previews, 0.0));
+    assert!(canvas.frame_live_window(id, 2.0, None, &previews, 0.0));
     canvas.update_camera_transition(viewport, 5.0);
     canvas.settle_live_window_camera();
     // A wheel zoom ends the interaction; that new view stays.
@@ -2687,12 +2687,12 @@ fn a_view_changed_while_using_a_window_is_kept() {
     assert_eq!(canvas.zoom, 3.0);
 
     // Out-of-range zooms and pinned tiles leave the camera alone.
-    assert!(!canvas.frame_live_window(id, 50.0, &previews, 7.0));
+    assert!(!canvas.frame_live_window(id, 50.0, None, &previews, 7.0));
     previews.get_mut(id).unwrap().viewport_pin = Some(crate::preview::ViewportPin::from_rect(
         Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
         viewport,
     ));
-    assert!(!canvas.frame_live_window(id, 2.0, &previews, 7.0));
+    assert!(!canvas.frame_live_window(id, 2.0, None, &previews, 7.0));
 }
 
 #[test]
