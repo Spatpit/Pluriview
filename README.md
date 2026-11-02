@@ -61,8 +61,13 @@ reopen Pluriview. Built-in ad blocking requires WebView2 Runtime 122 or newer.
 - **Arrange your tiles:** drag to move them and use their edges or corners to resize.
 - **Explore the canvas:** use the middle mouse button to pan and the scroll wheel to zoom.
 
-Hover over tiles for controls, or right-click a tile for more options.
-Press `F1` to see shortcuts.
+Hover over tiles for controls, or right-click a tile for more options. Every
+tile's menu has the same order: its own actions first (such as **Interact**,
+**Reload** and **Page** for a browser, or **Play** and **Playback** for a
+video), then **Focus on This Tile**, **Picture in Picture** and **Pin to
+Viewport**, then **Hide Tile**, **Arrange** and **Group**, then **Tile
+Settings** (crop, frame rate, aspect ratio and click-through), **Freeze Tile**
+and **Remove**. Press `F1` to see shortcuts.
 
 ## Android phone viewer (development preview)
 
@@ -158,7 +163,7 @@ its canvas available. An independent phone camera remains future work.
 
 | Source | What it does |
 |---|---|
-| **App windows** | Displays a live preview of an open application window. |
+| **App windows** | Displays a live preview of an open application window, which you can use in place. |
 | **Browser tiles** | Opens a web page inside Pluriview, with navigation, interaction, and audio. |
 | **Images and GIFs** | Displays local images and plays animated GIFs. |
 | **Videos** | Plays local video files with playback, seeking, volume, and track controls. |
@@ -171,7 +176,7 @@ its canvas available. An independent phone camera remains future work.
 Use the **Window Picker** to add an open application as a live tile. You can
 resize, crop, freeze, or pin its preview.
 
-Choose **Crop → Edit Crop** from a tile's right-click menu, then drag the
+Choose **Tile Settings → Edit Crop** from a tile's right-click menu, then drag the
 highlighted edge or corner handles directly on the tile. Click empty canvas,
 press **Esc**, or choose **Finish Cropping** to finish. **Clear Crop** restores
 the full source. This also works for browser, image/GIF, video, and Spout tiles,
@@ -179,11 +184,47 @@ including tiles pinned to the viewport. The **Alt+drag** shortcut remains availa
 
 Search by window title or application name, then use **+** to add the source.
 Clear the search with **×**; hover a shortened name to read it in full.
-Right-click a tile for its settings, including the **Frame Rate** submenu.
+Right-click a tile → **Tile Settings** to change its **Frame Rate**.
 Menu shortcuts appear on the right and follow your bindings in **Settings**.
 
 Live Spout2 senders appear in the same picker. Select one to display its shared
 output on the canvas.
+
+#### Use an app from its tile
+
+**Double-click a window tile** (or right-click it → **Interact**) to use the
+app without leaving the canvas: click its buttons, pick a song, type. The canvas
+zooms so the tile shows the window at its real size, then Pluriview moves the
+app's own window exactly over the tile. Only its position changes, never its
+size, so the app looks the same as in the tile.
+
+A gold outline and a bar above the window mark the app in use. Drag the bar to
+move the tile without clicking into the app; the window follows when you let
+go. Dragging the app's own title bar moves the tile along with it.
+
+While you use the app, its tile also shows your mouse pointer, so people
+watching Pluriview through Discord or OBS screen sharing still see where you
+point. The tile updates at least 60 times a second meanwhile, so the pointer
+moves smoothly, and goes back to its own frame rate when you finish. On
+Windows 11 24H2 and later the tile also shows the app's menus and dialogs, such
+as the menu from right-clicking a song; a menu reaching past the window's edge
+is cut off there. Earlier Windows versions show the pointer but not the menus.
+
+If Pluriview closes unexpectedly while you use an app, the next launch puts the
+app's window back where it was, unless you have moved, minimized or closed it
+since.
+
+Click anywhere outside the app, or **Done** on the bar, to finish. The window
+goes back where it was (minimized again if it was minimized), behind the same
+windows that covered it before. Pluriview covers it again if it did before, and
+the canvas returns to your previous view. Zooming the canvas also finishes. If you resize, maximize or snap the app
+yourself, Pluriview leaves the window where you put it.
+
+Tiles already at **Native Size (1:1)** skip the zoom. A pinned tile keeps its
+size, so the window is centered over it instead. Pluriview cannot move windows
+of apps running as administrator, or windows on another virtual desktop.
+Right-click a tile → **Show Original Window** brings the app's own window to
+the front where it is, as double-clicking did before.
 
 ### Groups, layouts, and Spotlight
 
@@ -265,6 +306,41 @@ Hover over the tile for **back, forward, reload, and mute**. Each tile has its
 own page and mute control. One browser tile can receive direct interaction at
 a time.
 
+#### Toolbar and tabs
+
+New browser tiles open with a toolbar and vertical tabs around the page:
+
+- **Toolbar:** back, forward, reload, an address bar, mute, open in your
+  default browser, and close. Click the address bar to type a web address, or
+  anything else to search the web.
+- **Tabs:** click a tab to show it and **New tab** to open another. Hover a
+  tab for its close button, or middle-click it. Links that open a new window
+  become tabs. Every tab shares the tile's sign-ins and mute state, and shows
+  its site's icon once the page has loaded.
+- **Scroll** the strip with the mouse wheel when it holds more tabs than fit.
+- **Drag** a tab up or down to reorder it. Drop it on another browser tile to
+  add it to that tile's tabs (on its tab strip, where you drop it; anywhere
+  else on the tile, at the end), or on empty canvas to open it as a tile of
+  its own there. The page moves as it is, without reloading, so a video keeps
+  playing. A tile whose only tab you move into another tile closes.
+- **Sleeping tabs:** a background tab that has not been shown or played sound
+  for 10 minutes unloads to free memory. It fades with a moon icon and
+  reloads when you open it.
+- **Collapse** the strip to site badges with the button at its bottom.
+- **Right-click** the address bar for **Cut**, **Copy**, **Paste**, **Paste
+  and Go** and **Select All** (or **Copy Address** when you are not typing),
+  and a tab for **Copy Address**, **New Tab**, **Move to New Tile** and **Close
+  Tab**. The tile's own menu opens from the page.
+- **Open Link in New Tile:** while using a page, right-click a link to open it
+  in a new browser tile beside this one.
+- Turn the frame on or off with right-click → **Page → Show Toolbar and Tabs**. Tiles
+  from earlier versions start without it. Hiding it shows only the current
+  tab; the others stay open.
+
+Tabs are saved with the workspace. When it reopens, only each tile's visible
+tab loads; the others load when you open them. Cropped tiles and tiles smaller
+than 360 × 200 show just the page.
+
 - **Scroll without interacting:** hold `Shift` and scroll over a browser tile to
   scroll the page (or the chat or list under the pointer) while the canvas stays
   put.
@@ -275,8 +351,8 @@ a time.
 - **Page Zoom:** right-click → **Page Zoom** `−` / `+` makes a page's text and
   layout larger or smaller without resizing the tile. Click the percentage to
   return to 100%. Each tile remembers its zoom.
-- **Fit to Video:** right-click → **Fit to Video** crops the tile to the page's
-  video player, such as a YouTube, Twitch or Netflix video. **Crop → Clear Crop**
+- **Fit to Video:** right-click → **Page → Fit to Video** crops the tile to the page's
+  video player, such as a YouTube, Twitch or Netflix video. **Tile Settings → Clear Crop**
   shows the whole page again. Videos inside embedded players from another site
   cannot be found.
 
@@ -333,10 +409,10 @@ unavailable.
 Pages designed with transparent backgrounds stay transparent. This allows
 widgets such as heart-rate monitors to blend into your canvas.
 
-- **Change the page shape:** right-click the tile and turn off **Lock Aspect Ratio** to resize it into a portrait, square, or wide layout.
+- **Change the page shape:** right-click the tile and turn off **Tile Settings → Lock Aspect Ratio** to resize it into a portrait, square, or wide layout.
 - **Show part of a page:** hold `Alt` and drag a tile edge or corner to crop.
 - **Keep a widget in place:** right-click → **Pin to Viewport**.
-- **Click content underneath an overlay:** use the tile's **Disable Left Click** option.
+- **Click content underneath an overlay:** use the tile's **Tile Settings → Disable Left Click** option.
 
 Cropping keeps the page's proportions, and you can still interact with the
 visible region.
@@ -403,9 +479,10 @@ Live streams do not provide seek-bar thumbnails.
 
 | Option | What it does |
 |---|---|
-| **Crop** | Shows only the part of a tile you need. Use **Crop → Edit Crop** to drag its handles, or hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
+| **Crop** | Shows only the part of a tile you need. Use **Tile Settings → Edit Crop** to drag its handles, or hold `Alt` and drag an edge or corner. Available for windows, browsers, Spout2, images, GIFs, and videos. |
 | **Pin to Viewport** | Keeps any tile fixed on screen while you pan or zoom the canvas. |
 | **Picture in Picture** | Pops a tile out into a small window that stays on top of other apps, including games in borderless or windowed mode. A grouped tile brings its whole group, and several selected tiles go together, laid out as on the canvas. Drag the window to move it, drag an edge to resize it, and double-click it or use its close button to send the tiles back. Clicking it does not take focus from the game. Right-click a tile → **Picture in Picture**, or press `Shift+P`. |
+| **Control Tile Center** | A separate window listing every tile, so you can find, focus, hide and show them without hunting across the canvas. **Grid** shows each tile as a card with a live thumbnail, ungrouped tiles first and then each group under its name. Cards are in your own order: new tiles go last, and you drag a card to move it within its section. The **A–Z** button lists them by name instead without losing your order. Moving tiles on the canvas never reshuffles the cards; **Map** shows the whole canvas in miniature with the main window's view outlined in gold. Click a tile to focus it on the canvas (click again to go back), use its eye button to hide or show it, or right-click it for Select on Canvas, Mute or Stream Audio, Picture in Picture, Pin to Viewport, Bring to Front, Send to Back and Frame Rate. Every video and browser card has a speaker: gold while it plays, crossed out when muted; click it to mute or unmute (right-click a video for its volume). Every window card has a Stream Audio button instead (gold while its audio is streamed to Discord/OBS), since Pluriview never changes another app's volume. On the map, choose **Move camera** to drag the canvas view around (or click empty space to jump there), or **Move tiles** to drag tiles to new places on the canvas; a group moves together. A single click on a tile focuses it in either mode. Search filters tiles by name. The window opens three cards wide, and its size and place are remembered across restarts. Hidden tiles leave the canvas but keep playing and keep their sound; hiding a grouped tile hides its whole group, and hidden tiles stay hidden after a restart until shown again. Press `C`, right-click empty canvas → **Control Tile Center**, or right-click a tile → **Hide Tile**. |
 | **Freeze** | Holds the current frame of selected tiles until you resume them. |
 | **Focus on This Tile** | Fits a tile to the canvas. Press `Esc` to return. |
 | **Canvas-only mode** | Hides the interface with `H`; right-click menus remain available. |
@@ -574,12 +651,14 @@ your installation still uses `Numpad 2`.
 | Start / stop recording the selected tile | `Shift+R` |
 | Pause / resume recording | `P` |
 | Picture in picture for the selected tile or its group | `Shift+P` |
+| Open / close the Control Tile Center | `C` |
 | Group / ungroup selected tiles | `Ctrl+G` / `Ctrl+U` |
 | One / two / three large tiles / equal tiles | `Alt+1` / `Alt+2` / `Alt+3` / `Alt+4` |
 | Medium / large selection size | `Alt+6` / `Alt+7` |
 | Toggle group Spotlight | `Shift+F` |
 | Previous / next Spotlight tile | `Shift+Left` / `Shift+Right` |
 | Interact with browser tile | Double-click, `Ctrl+B`, or `Numpad 1` |
+| Use an app from its window tile | Double-click |
 | Exit focus or browser interaction | `Esc` |
 | Open saved viewpoints 1–9 | `Ctrl+1` through `Ctrl+9` |
 | Previous/next viewpoint | `Ctrl+Page Up` / `Ctrl+Page Down` |

@@ -65,6 +65,25 @@ pub fn fitted_capture_size(
     }
 }
 
+/// Output size of a browser capture: exactly the requested size while it fits
+/// inside the source, because the page's on-screen shape can differ from the
+/// source's by a rounding pixel. Otherwise as [`fitted_capture_size`].
+pub fn exact_capture_size(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> (u32, u32) {
+    let fits = |target: u32, source: u32, max: u32| target > 0 && target <= source && target <= max;
+    if fits(target_width, source_width, MAX_CAPTURE_WIDTH)
+        && fits(target_height, source_height, MAX_CAPTURE_HEIGHT)
+    {
+        (target_width, target_height)
+    } else {
+        fitted_capture_size(source_width, source_height, target_width, target_height)
+    }
+}
+
 /// Output size a capture delivers while a screenshot asks for the full
 /// source: native pixels, still bounded by the 4K cap.
 pub fn screenshot_capture_size(source_width: u32, source_height: u32) -> (u32, u32) {
@@ -209,8 +228,8 @@ impl RgbaDownsampler {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_lod_factor, fitted_capture_size, screenshot_capture_size, window_capture_target,
-        RgbaDownsampler, MAX_CAPTURE_HEIGHT, MAX_CAPTURE_WIDTH,
+        capture_lod_factor, exact_capture_size, fitted_capture_size, screenshot_capture_size,
+        window_capture_target, RgbaDownsampler, MAX_CAPTURE_HEIGHT, MAX_CAPTURE_WIDTH,
     };
 
     #[test]
@@ -252,6 +271,20 @@ mod tests {
             window_capture_target(400.0, 225.0, 1.0, Some((0.25, 0.25, 0.75, 0.75)));
         assert!(width >= 1600);
         assert!(height >= 896);
+    }
+
+    #[test]
+    fn browser_captures_take_the_exact_size_that_fits_and_never_grow() {
+        // One pixel off the source's shape is still honored exactly.
+        assert_eq!(exact_capture_size(2560, 1440, 1281, 720), (1281, 720));
+        assert_eq!(exact_capture_size(2560, 1440, 2560, 1440), (2560, 1440));
+        // Larger than the source, unset, or a screenshot's full-size request.
+        assert_eq!(exact_capture_size(2560, 1440, 2562, 1442), (2560, 1440));
+        assert_eq!(exact_capture_size(2560, 1440, 0, 0), (2560, 1440));
+        assert_eq!(
+            exact_capture_size(2560, 1440, MAX_CAPTURE_WIDTH, MAX_CAPTURE_HEIGHT),
+            screenshot_capture_size(2560, 1440)
+        );
     }
 
     #[test]

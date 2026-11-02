@@ -1,8 +1,8 @@
 use super::{
     apply_crop, apply_resize, browser_control_colors, capture_resolution_badge_rect, format_time,
     live_capture_display_size, media_placeholder_content, native_capture_canvas_size,
-    pixel_aligned_rect, playlist_first_row_center, rect_for_crop_change, stream_audio_badge_rect,
-    submenu_should_open_left, video_placeholder_content, video_time_style,
+    pixel_aligned_rect, pixel_exact_image, playlist_first_row_center, rect_for_crop_change,
+    stream_audio_badge_rect, submenu_should_open_left, video_placeholder_content, video_time_style,
     video_volume_popover_rect, video_volume_slider_rect, window_capture_placeholder_content,
     window_capture_target, BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle,
     TileActivityAction, VideoAction,
@@ -612,6 +612,46 @@ fn capture_rect_edges_align_to_physical_pixels() {
     ] {
         assert!((edge * 1.25 - (edge * 1.25).round()).abs() < 0.001);
     }
+}
+
+#[test]
+fn browser_frames_at_their_shown_size_are_drawn_pixel_for_pixel() {
+    let full = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    let close = |a: Vec2, b: Vec2| (a - b).length() < 0.001;
+    // A page at a fractional position, its frame two spare pixels larger.
+    let rect = Rect::from_min_size(Pos2::new(10.4, 20.6), Vec2::new(100.2, 50.0));
+    let (drawn, uv) = pixel_exact_image(rect, full, [102, 52], 1.0).unwrap();
+    assert_eq!(
+        drawn,
+        Rect::from_min_size(Pos2::new(10.0, 21.0), Vec2::new(101.0, 50.0))
+    );
+    assert_eq!(uv.min, Pos2::ZERO);
+    assert!(close(
+        uv.size() * Vec2::new(102.0, 52.0),
+        Vec2::new(101.0, 50.0)
+    ));
+
+    // At 150% display scale, edges land on physical pixels.
+    let rect = Rect::from_min_size(Pos2::new(10.1, 10.0), Vec2::new(100.0, 50.0));
+    let (drawn, uv) = pixel_exact_image(rect, full, [152, 77], 1.5).unwrap();
+    for edge in [drawn.left(), drawn.top(), drawn.right(), drawn.bottom()] {
+        assert!((edge * 1.5 - (edge * 1.5).round()).abs() < 0.001);
+    }
+    assert!(close(
+        uv.size() * Vec2::new(152.0, 77.0),
+        drawn.size() * 1.5
+    ));
+
+    // A crop starts on a whole texel and shows as many texels as pixels.
+    let crop = Rect::from_min_max(Pos2::new(0.25, 0.0), Pos2::new(0.75, 1.0));
+    let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(100.0, 50.0));
+    let (_, uv) = pixel_exact_image(rect, crop, [202, 52], 1.0).unwrap();
+    assert!((uv.min.x * 202.0 - (0.25_f32 * 202.0).round()).abs() < 0.001);
+    assert!((uv.width() * 202.0 - 100.0).abs() < 0.001);
+
+    // A frame for another zoom, or one smaller than the page, is scaled.
+    assert!(pixel_exact_image(rect, full, [200, 100], 1.0).is_none());
+    assert!(pixel_exact_image(rect, full, [99, 50], 1.0).is_none());
 }
 
 #[test]
@@ -1342,6 +1382,7 @@ impl CropUiTest {
             })
     }
 
+    /// Crop lives in the tile menu's Tile Settings submenu.
     fn open_crop_menu(&mut self, id: PreviewId) -> egui::FullOutput {
         let rect = self
             .canvas
@@ -1350,7 +1391,7 @@ impl CropUiTest {
         for _ in 0..12 {
             if output.shapes.iter().any(|shape| {
                 matches!(&shape.shape,
-                Shape::Text(text) if text.galley.text() == "Crop"
+                Shape::Text(text) if text.galley.text() == "Tile Settings"
                     && shape.clip_rect.contains(text.pos + text.galley.rect.center().to_vec2()))
             }) {
                 break;
@@ -1365,7 +1406,10 @@ impl CropUiTest {
             ]);
             output = self.frame(vec![]);
         }
-        self.click(Self::label_pos(&output, "Crop"), PointerButton::Primary)
+        self.click(
+            Self::label_pos(&output, "Tile Settings"),
+            PointerButton::Primary,
+        )
     }
 
     fn drag(&mut self, start: Pos2, end: Pos2) {
@@ -1448,6 +1492,72 @@ fn menu_crop_handles_work_for_all_sources_and_pinned_tiles() {
                 PointerButton::Primary,
             );
             assert!(test.canvas.crop_mode.is_none());
+        }
+    }
+}
+
+#[test]
+fn tile_menu_puts_the_tiles_own_actions_first_and_remove_last() {
+    for frozen in [false, true] {
+        let (mut test, id) = CropUiTest::new(1, false);
+        test.previews.get_mut(id).unwrap().manually_frozen = frozen;
+        test.frame(vec![]);
+        let rect = test
+            .canvas
+            .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+        test.click(rect.center(), PointerButton::Secondary);
+        // A popup takes a few frames to grow to its full height.
+        test.frame(vec![]);
+        let output = test.frame(vec![]);
+        let top = |label: &str| CropUiTest::label_pos(&output, label).y;
+        let mut order = vec![
+            "Browser · example.com",
+            "Interact",
+            "Reload",
+            "Page",
+            "Focus on This Tile",
+            "Picture in Picture",
+            "Pin to Viewport",
+            "Arrange",
+            "Group",
+            "Tile Settings",
+            "Remove",
+        ];
+        if frozen {
+            // Resuming comes first: the page's own actions wait for it.
+            order.insert(1, "Resume Tile");
+        } else {
+            order.insert(order.len() - 1, "Freeze Tile");
+        }
+        for pair in order.windows(2) {
+            assert!(
+                top(pair[0]) < top(pair[1]),
+                "frozen {frozen}: {} should come before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        // Group-only items stay out of a lone tile's menu, and settings stay
+        // in their submenu until it opens.
+        for hidden in [
+            "Spotlight This Tile",
+            "Fit Group to View",
+            "Edit Crop",
+            "Lock Aspect Ratio",
+            "Bring to Front",
+        ] {
+            assert!(
+                !labels.iter().any(|label| label == hidden),
+                "{hidden} should not be on the top level"
+            );
         }
     }
 }
@@ -2414,4 +2524,230 @@ fn shift_wheel_over_a_browser_tile_scrolls_its_page_instead_of_zooming() {
     wheel(&mut canvas, &mut previews, &mut captures, Modifiers::NONE);
     assert!(canvas.pending_browser_scrolls.is_empty());
     assert_ne!(canvas.zoom, zoom);
+}
+
+fn press(pos: Pos2, pressed: bool) -> Event {
+    Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    }
+}
+
+#[test]
+fn double_clicking_a_window_tile_asks_the_app_to_use_it_in_place() {
+    let (mut test, id) = CropUiTest::new(0, false);
+    test.frame(vec![]);
+    let center = test
+        .canvas
+        .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport)
+        .center();
+    test.frame(vec![Event::PointerMoved(center)]);
+    for pressed in [true, false, true, false] {
+        test.frame(vec![press(center, pressed)]);
+    }
+    assert_eq!(test.canvas.last_double_clicked, Some(id));
+}
+
+#[test]
+fn window_tile_menu_offers_interact_and_the_original_window() {
+    for (label, interact) in [("Interact", true), ("Show Original Window", false)] {
+        let (mut test, id) = CropUiTest::new(0, false);
+        test.frame(vec![]);
+        let rect = test
+            .canvas
+            .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+        test.click(rect.center(), PointerButton::Secondary);
+        test.frame(vec![]);
+        let output = test.frame(vec![]);
+        let top = |label: &str| CropUiTest::label_pos(&output, label).y;
+        assert!(top("Interact") < top("Show Original Window"));
+        assert!(top("Show Original Window") < top("Native Size (1:1)"));
+        test.click(
+            CropUiTest::label_pos(&output, label),
+            PointerButton::Primary,
+        );
+        if interact {
+            assert_eq!(test.canvas.last_double_clicked, Some(id));
+            assert!(test.canvas.pending_show_window.is_none());
+        } else {
+            assert_eq!(test.canvas.pending_show_window, Some(id));
+        }
+    }
+}
+
+#[test]
+fn grab_bar_moves_the_tile_without_reaching_the_canvas_or_tiles_underneath() {
+    for pinned in [false, true] {
+        let (mut test, id) = CropUiTest::new(0, pinned);
+        test.frame(vec![]);
+        let tile = test
+            .canvas
+            .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+        test.canvas.live_window.id = Some(id);
+        test.canvas.live_window.window_rect = Some(tile);
+        test.frame(vec![]);
+        let bar = crate::window_interaction::grab_bar_rect(tile, test.viewport);
+        assert_eq!(bar.bottom(), tile.top());
+        let start = bar.left_center() + Vec2::new(60.0, 0.0);
+        let delta = Vec2::new(80.0, 40.0);
+
+        test.frame(vec![Event::PointerMoved(start)]);
+        test.frame(vec![press(start, true)]);
+        assert!(test.canvas.live_window.held, "pinned {pinned}");
+        test.frame(vec![Event::PointerMoved(start + delta * 0.5)]);
+        test.frame(vec![Event::PointerMoved(start + delta)]);
+        assert!(test.canvas.live_window.held);
+        assert!(!test.canvas.live_window.released);
+        test.frame(vec![press(start + delta, false)]);
+        assert!(test.canvas.live_window.released, "pinned {pinned}");
+        assert!(!test.canvas.live_window.held);
+
+        let moved = test
+            .canvas
+            .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+        assert!(
+            (moved.min - (tile.min + delta)).length() < 0.5,
+            "pinned {pinned}: {moved:?} vs {tile:?}"
+        );
+        // The press never began a marquee or selected anything.
+        assert!(test.canvas.selection.is_empty());
+        assert!(test.canvas.marquee.is_none());
+    }
+}
+
+#[test]
+fn grab_bar_done_asks_to_put_the_window_back() {
+    let (mut test, id) = CropUiTest::new(0, false);
+    test.frame(vec![]);
+    let tile = test
+        .canvas
+        .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+    test.canvas.live_window.id = Some(id);
+    test.canvas.live_window.window_rect = Some(tile);
+    let output = test.frame(vec![]);
+    let done = CropUiTest::label_pos(&output, "Done");
+    test.frame(vec![Event::PointerMoved(done)]);
+    test.frame(vec![press(done, true)]);
+    assert!(test.canvas.live_window.held);
+    test.frame(vec![press(done, false)]);
+    assert!(test.canvas.live_window.done);
+    assert!(!test.canvas.live_window.released);
+}
+
+#[test]
+fn framing_a_window_tile_shows_it_at_real_size_and_restores_the_view() {
+    let mut canvas = CanvasState {
+        pan: Vec2::new(30.0, -20.0),
+        zoom: 0.5,
+        ..Default::default()
+    };
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0));
+    canvas.last_screen_rect = Some(viewport);
+    let mut previews = PreviewManager::new();
+    let id = previews.add_for_window(
+        1,
+        42,
+        "window".into(),
+        Pos2::new(600.0, 400.0),
+        Vec2::new(400.0, 300.0),
+    );
+
+    assert!(canvas.frame_live_window(id, 2.0, &previews, 10.0));
+    assert_eq!(canvas.layout_camera(), (Vec2::new(30.0, -20.0), 0.5));
+    canvas.update_camera_transition(viewport, 20.0);
+    canvas.settle_live_window_camera();
+    assert_eq!(canvas.zoom, 2.0);
+    let shown = canvas.preview_screen_rect(previews.get(id).unwrap(), viewport);
+    assert!((shown.width() - 800.0).abs() < 0.01);
+    assert!(viewport.contains_rect(shown));
+
+    canvas.restore_live_window_camera(30.0, false);
+    canvas.update_camera_transition(viewport, 40.0);
+    assert!((canvas.zoom - 0.5).abs() < 1e-4);
+    assert!((canvas.pan - Vec2::new(30.0, -20.0)).length() < 0.01);
+    assert_eq!(canvas.layout_camera(), (canvas.pan, canvas.zoom));
+}
+
+#[test]
+fn a_view_changed_while_using_a_window_is_kept() {
+    let mut canvas = CanvasState::default();
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0));
+    canvas.last_screen_rect = Some(viewport);
+    let mut previews = PreviewManager::new();
+    let id = previews.add_for_window(1, 42, "w".into(), Pos2::ZERO, Vec2::new(400.0, 300.0));
+    assert!(canvas.frame_live_window(id, 2.0, &previews, 0.0));
+    canvas.update_camera_transition(viewport, 5.0);
+    canvas.settle_live_window_camera();
+    // A wheel zoom ends the interaction; that new view stays.
+    canvas.zoom = 3.0;
+    canvas.restore_live_window_camera(6.0, false);
+    assert!(!canvas.is_camera_transitioning());
+    assert_eq!(canvas.zoom, 3.0);
+
+    // Out-of-range zooms and pinned tiles leave the camera alone.
+    assert!(!canvas.frame_live_window(id, 50.0, &previews, 7.0));
+    previews.get_mut(id).unwrap().viewport_pin = Some(crate::preview::ViewportPin::from_rect(
+        Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
+        viewport,
+    ));
+    assert!(!canvas.frame_live_window(id, 2.0, &previews, 7.0));
+}
+
+#[test]
+fn a_dragged_window_carries_its_tile_along() {
+    let mut canvas = CanvasState {
+        zoom: 2.0,
+        ..Default::default()
+    };
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0));
+    canvas.last_screen_rect = Some(viewport);
+    let mut previews = PreviewManager::new();
+    let id = previews.add_for_window(1, 42, "w".into(), Pos2::ZERO, Vec2::new(400.0, 300.0));
+    canvas.follow_live_window(id, Vec2::new(40.0, -20.0), &mut previews);
+    assert_eq!(previews.get(id).unwrap().position, Pos2::new(20.0, -10.0));
+
+    let pinned = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::splat(200.0));
+    previews.get_mut(id).unwrap().viewport_pin =
+        Some(crate::preview::ViewportPin::from_rect(pinned, viewport));
+    canvas.follow_live_window(id, Vec2::new(40.0, -20.0), &mut previews);
+    assert_eq!(
+        canvas.preview_screen_rect(previews.get(id).unwrap(), viewport),
+        pinned.translate(Vec2::new(40.0, -20.0))
+    );
+}
+
+#[test]
+fn hidden_tiles_leave_the_selection_and_a_grouped_tile_moves_its_group() {
+    let mut canvas = CanvasState::default();
+    let mut previews = PreviewManager::new();
+    let first = previews.add("first".to_owned(), Pos2::ZERO, Vec2::splat(50.0));
+    let second = previews.add("second".to_owned(), Pos2::new(60.0, 0.0), Vec2::splat(50.0));
+    let loose = previews.add("loose".to_owned(), Pos2::new(200.0, 0.0), Vec2::splat(50.0));
+    for (order, id) in [first, second].into_iter().enumerate() {
+        previews.get_mut(id).unwrap().tile_group = Some(crate::preview::TileGroup {
+            id: 7,
+            name: "Group".to_owned(),
+            order: order as u32,
+        });
+    }
+
+    canvas.move_tile_by(second, Vec2::new(10.0, 20.0), &mut previews);
+    assert_eq!(previews.get(first).unwrap().position, Pos2::new(10.0, 20.0));
+    assert_eq!(
+        previews.get(second).unwrap().position,
+        Pos2::new(70.0, 20.0)
+    );
+    assert_eq!(previews.get(loose).unwrap().position, Pos2::new(200.0, 0.0));
+
+    canvas.selection = vec![first, second, loose];
+    canvas.set_tiles_hidden(&[first, second], true, &mut previews);
+    assert!(previews.get(first).unwrap().hidden && previews.get(second).unwrap().hidden);
+    assert_eq!(canvas.selection, vec![loose]);
+
+    // Selecting a hidden tile from the Control Tile Center shows its group.
+    canvas.select_tile(first, &mut previews);
+    assert!(!previews.get(first).unwrap().hidden && !previews.get(second).unwrap().hidden);
+    assert_eq!(canvas.selection, vec![first, second]);
 }

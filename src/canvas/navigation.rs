@@ -16,6 +16,7 @@ impl CanvasState {
         self.last_secondary_click = None;
         self.last_double_clicked = None;
         self.interactive_browser = None;
+        self.live_window.drag_cancelled();
     }
 
     pub fn set_keyboard_input(&mut self, input: CanvasKeyboardInput) {
@@ -48,6 +49,7 @@ impl CanvasState {
         self.pinned_drag_origins.clear();
         self.pinned_pointer_drag = None;
         self.video_volume_hover = None;
+        self.live_window = LiveWindow::default();
     }
 
     pub(super) fn prune_preview_interactions(&mut self, preview_manager: &PreviewManager) {
@@ -96,6 +98,148 @@ impl CanvasState {
 
     pub fn is_focusing_tile(&self) -> bool {
         self.focus.is_some()
+    }
+
+    pub fn focused_tile(&self) -> Option<PreviewId> {
+        self.focus.as_ref().map(|focus| focus.id)
+    }
+
+    /// Hide tiles from the canvas or show them again. Their sources keep
+    /// running; hidden tiles only leave the canvas, its selection and focus.
+    pub fn set_tiles_hidden(
+        &mut self,
+        ids: &[PreviewId],
+        hidden: bool,
+        previews: &mut PreviewManager,
+    ) {
+        if hidden && self.spotlight_includes(ids) {
+            self.exit_spotlight(previews);
+        }
+        for id in ids {
+            if let Some(preview) = previews.get_mut(*id) {
+                preview.hidden = hidden;
+            }
+        }
+        if !hidden {
+            return;
+        }
+        if self
+            .focus
+            .as_ref()
+            .is_some_and(|focus| ids.contains(&focus.id))
+        {
+            self.exit_focus();
+        }
+        if self.crop_mode.is_some_and(|id| ids.contains(&id)) {
+            self.finish_crop();
+        }
+        self.selection.retain(|id| !ids.contains(id));
+        if self
+            .groups_active_tile()
+            .is_some_and(|id| ids.contains(&id))
+        {
+            self.forget_current_tile();
+        }
+    }
+
+    /// Select `id` with its group, as a click on it would, showing it first
+    /// when hidden.
+    pub fn select_tile(&mut self, id: PreviewId, previews: &mut PreviewManager) {
+        if previews.get(id).is_none_or(|p| p.removing.is_some()) {
+            return;
+        }
+        let members = self.group_members(id, previews);
+        if previews.get(id).is_some_and(|p| p.hidden) {
+            self.set_tiles_hidden(&members, false, previews);
+        }
+        self.selection = members;
+        self.remember_current_tile(id);
+    }
+
+    /// Pin a tile (with its group) to the viewport, or put it back on the
+    /// canvas, as the tile menu does.
+    pub fn toggle_tile_pin(&mut self, id: PreviewId, previews: &mut PreviewManager) {
+        if let Some(viewport) = self.last_screen_rect {
+            self.toggle_viewport_pin(id, viewport, previews);
+        }
+    }
+
+    /// Move a tile, with its group, by `delta` canvas units. Pinned tiles
+    /// stay where they are on screen.
+    pub fn move_tile_by(&mut self, id: PreviewId, delta: Vec2, previews: &mut PreviewManager) {
+        if !delta.is_finite() || delta == Vec2::ZERO {
+            return;
+        }
+        let members = self.group_members(id, previews);
+        if self.spotlight_includes(&members) {
+            self.exit_spotlight(previews);
+        }
+        for member in members {
+            if let Some(preview) = previews
+                .get_mut(member)
+                .filter(|p| p.removing.is_none() && p.viewport_pin.is_none())
+            {
+                preview.position += delta;
+            }
+        }
+    }
+
+    /// Turn a window tile's Stream Audio on or off on the next canvas frame,
+    /// as its badge does.
+    pub fn toggle_stream_audio(&mut self, id: PreviewId) {
+        self.pending_stream_audio_toggles.push(id);
+    }
+
+    /// Change a tile's capture frame rate on the next canvas frame.
+    pub fn set_tile_fps(&mut self, id: PreviewId, fps: FpsPreset) {
+        self.pending_fps_changes.push(PendingFpsChange {
+            preview_id: id,
+            new_fps: fps,
+        });
+    }
+
+    /// Center the view on a canvas point at the current zoom.
+    pub fn look_at(&mut self, point: Pos2, animate: bool, now: f64) {
+        let Some(rect) = self.last_screen_rect else {
+            return;
+        };
+        if animate {
+            self.start_camera_transition(point, self.zoom, rect, now);
+            return;
+        }
+        self.focus = None;
+        self.cancel_camera_transition();
+        self.animation.momentum_active = false;
+        self.animation.momentum_velocity = Vec2::ZERO;
+        self.pan = (rect.center() - rect.min) / self.zoom - point.to_vec2();
+    }
+
+    /// Fit `id` in the canvas, or return from it when it is already focused.
+    /// A hidden tile is shown first; a pinned one is only selected.
+    pub fn toggle_tile_focus(&mut self, id: PreviewId, previews: &mut PreviewManager) {
+        if self.focused_tile() == Some(id) {
+            self.exit_focus();
+            return;
+        }
+        let Some(preview) = previews.get(id).filter(|p| p.removing.is_none()) else {
+            return;
+        };
+        let (pinned, rect) = (preview.viewport_pin.is_some(), preview.rect());
+        if preview.hidden {
+            let members = self.group_members(id, previews);
+            self.set_tiles_hidden(&members, false, previews);
+        }
+        if self.is_spotlighting() && !self.spotlight_includes(&[id]) {
+            self.exit_spotlight(previews);
+        }
+        match self.last_screen_rect {
+            Some(viewport) if !pinned => self.focus_on_tile(id, rect, viewport),
+            _ => {
+                self.exit_focus();
+                self.selection = vec![id];
+                self.remember_current_tile(id);
+            }
+        }
     }
 
     /// Remote focus uses canvas hit testing, never tile clicks or source input.
@@ -225,7 +369,9 @@ impl CanvasState {
         };
         if let Some(tile_rect) = preview_manager
             .get(id)
-            .filter(|preview| preview.removing.is_none() && preview.viewport_pin.is_none())
+            .filter(|preview| {
+                preview.removing.is_none() && !preview.hidden && preview.viewport_pin.is_none()
+            })
             .map(|preview| preview.rect())
         {
             self.focus_on_tile(id, tile_rect, canvas_rect);
@@ -319,52 +465,44 @@ impl CanvasState {
         }
     }
 
-    pub(super) fn crop_menu(
+    pub(super) fn crop_items(
         &mut self,
         ui: &mut egui::Ui,
         id: PreviewId,
         canvas_rect: Rect,
         preview_manager: &mut PreviewManager,
     ) {
-        ui.menu_button("Crop", |ui| {
-            crate::ui_theme::menu(ui);
-            let editing = self.crop_mode == Some(id);
-            let can_crop = preview_manager.get(id).is_some_and(Self::can_edit_crop);
-            if ui
-                .add_enabled(
-                    can_crop,
-                    egui::Button::new(if editing {
-                        "Finish Cropping"
-                    } else {
-                        "Edit Crop"
-                    }),
-                )
-                .clicked()
-            {
-                if editing {
-                    self.finish_crop();
+        let editing = self.crop_mode == Some(id);
+        let can_crop = preview_manager.get(id).is_some_and(Self::can_edit_crop);
+        if ui
+            .add_enabled(
+                can_crop,
+                egui::Button::new(if editing {
+                    "Finish Cropping"
                 } else {
-                    self.begin_crop(id, preview_manager);
-                }
-                ui.close_menu();
+                    "Edit Crop"
+                }),
+            )
+            .on_hover_text("Alt+drag edges or corners also crops")
+            .clicked()
+        {
+            if editing {
+                self.finish_crop();
+            } else {
+                self.begin_crop(id, preview_manager);
             }
-            let has_crop = preview_manager
-                .get(id)
-                .is_some_and(|preview| preview.crop_uv.is_some());
-            if ui
-                .add_enabled(has_crop, egui::Button::new("Clear Crop"))
-                .clicked()
-            {
-                self.set_preview_crop(id, None, canvas_rect, preview_manager);
-                ui.close_menu();
-            }
-            ui.separator();
-            ui.label(
-                egui::RichText::new("Alt+drag edges or corners also crops")
-                    .weak()
-                    .small(),
-            );
-        });
+            ui.close_menu();
+        }
+        let has_crop = preview_manager
+            .get(id)
+            .is_some_and(|preview| preview.crop_uv.is_some());
+        if ui
+            .add_enabled(has_crop, egui::Button::new("Clear Crop"))
+            .clicked()
+        {
+            self.set_preview_crop(id, None, canvas_rect, preview_manager);
+            ui.close_menu();
+        }
     }
 
     /// Apply or clear crop UVs while changing the tile bounds by the same
@@ -395,7 +533,32 @@ impl CanvasState {
             return;
         };
         let target_crop = crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
+        // A browser's toolbar and tabs are not part of its page: crop from
+        // the page alone, and frame the page again once the crop is cleared.
+        let (framed, collapsed) = preview_manager
+            .get(id)
+            .map(|preview| {
+                (
+                    chrome_geometry::shows_chrome(preview),
+                    preview.browser_tabs_collapsed,
+                )
+            })
+            .unwrap_or_default();
+        let current_rect = if framed && crop_uv.is_some() {
+            chrome_geometry::strip_chrome(current_rect, collapsed)
+        } else {
+            current_rect
+        };
         let new_rect = rect_for_crop_change(current_crop, target_crop, current_rect);
+        let wants_frame = crop_uv.is_none()
+            && preview_manager
+                .get(id)
+                .is_some_and(|preview| preview.is_browser() && preview.browser_chrome);
+        let new_rect = if wants_frame && !framed {
+            chrome_geometry::wrap_with_chrome(new_rect, collapsed)
+        } else {
+            new_rect
+        };
         if let Some(preview) = preview_manager.get_mut(id) {
             preview.crop_uv = crop_uv;
             if screen_space {
@@ -414,6 +577,32 @@ impl CanvasState {
                 preview.source_aspect_ratio = new_rect.width() / new_rect.height();
             }
         }
+    }
+
+    /// Shrink a browser tile showing its toolbar and tabs to just its page,
+    /// so a crop gesture starting at `rect` (tile units) acts on the page.
+    /// Returns the rect the gesture should start from.
+    pub(super) fn drop_browser_frame_for_crop(
+        &self,
+        id: PreviewId,
+        rect: Rect,
+        canvas_rect: Rect,
+        preview_manager: &mut PreviewManager,
+    ) -> Rect {
+        let Some(preview) = preview_manager
+            .get_mut(id)
+            .filter(|preview| chrome_geometry::shows_chrome(preview))
+        else {
+            return rect;
+        };
+        let page = chrome_geometry::strip_chrome(rect, preview.browser_tabs_collapsed);
+        if preview.viewport_pin.is_some() {
+            preview.viewport_pin = Some(groups::pin_for_tile(preview, page, canvas_rect));
+        } else {
+            preview.position = page.min;
+            preview.size = page.size();
+        }
+        page
     }
 
     pub(super) fn toggle_single_viewport_pin(
@@ -612,6 +801,7 @@ impl CanvasState {
             .all()
             .filter(|preview| {
                 preview.removing.is_none()
+                    && !preview.hidden
                     && self
                         .preview_screen_rect(preview, canvas_rect)
                         .contains(screen_pos)
@@ -637,8 +827,9 @@ impl CanvasState {
         {
             return None;
         }
-        let rect = self.preview_screen_rect(preview, canvas_rect);
-        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        let rect =
+            chrome_geometry::page_rect_for(preview, self.preview_screen_rect(preview, canvas_rect));
+        if rect.width() <= 0.0 || rect.height() <= 0.0 || !rect.contains(screen_pos) {
             return None;
         }
         let (min_u, min_v, max_u, max_v) = preview.crop_uv.unwrap_or((0.0, 0.0, 1.0, 1.0));
@@ -659,6 +850,7 @@ impl CanvasState {
             .all()
             .filter(|preview| {
                 preview.removing.is_none()
+                    && !preview.hidden
                     && !preview.left_click_disabled
                     && self
                         .preview_screen_rect(preview, canvas_rect)
@@ -723,10 +915,18 @@ impl CanvasState {
                 && !input.alt
                 && !input.middle_down
                 && screen_rect.contains(*pointer)
+                && !self.live_window.covers(*pointer)
         }) else {
             return false;
         };
         if self.left_click_preview_at_screen(pointer, canvas_rect, preview_manager) != Some(id) {
+            return false;
+        }
+        // Tabs drag within their strip instead of moving the tile.
+        if preview_manager
+            .get(id)
+            .is_some_and(|preview| self.over_tab_list(preview, screen_rect, pointer))
+        {
             return false;
         }
         let over_resize_handle = show_overlays

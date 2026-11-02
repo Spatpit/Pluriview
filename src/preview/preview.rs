@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::VideoPlaybackPreferences;
+use super::{BrowserTab, VideoPlaybackPreferences};
 use crate::media::MediaFrame;
 use crate::playlist::{FolderPlaylist, FolderPlaylistLayout};
 
@@ -269,6 +269,15 @@ pub struct Preview {
     /// Persisted through `PreviewLayout` so saved workspaces preserve intent.
     pub manually_frozen: bool,
 
+    /// Place in the Control Tile Center's custom order, lowest first. New
+    /// tiles go last; the user rearranges by dragging cards. Persisted.
+    pub list_order: u64,
+
+    /// Hidden from the canvas through the Control Tile Center: not drawn or
+    /// hit-tested, and captured like an off-screen tile. Playback and audio
+    /// continue. Persisted through `PreviewLayout`.
+    pub hidden: bool,
+
     /// Lock aspect ratio when resizing? (always true by default)
     pub lock_aspect_ratio: bool,
 
@@ -339,6 +348,20 @@ pub struct Preview {
 
     /// The browser tile's page is playing sound (runtime only).
     pub browser_playing_audio: bool,
+
+    /// Every page open in a browser tile, mirrored from its host. The active
+    /// one is also `browser_url`. Empty until the tile has a host or a saved
+    /// tab list, which means a single tab at `browser_url`.
+    pub browser_tabs: Vec<BrowserTab>,
+    pub browser_active_tab: usize,
+    /// Draw the browser toolbar and vertical tabs around the page.
+    pub browser_chrome: bool,
+    /// Show the tab strip as icons only.
+    pub browser_tabs_collapsed: bool,
+    /// Navigation state of the active tab (runtime only).
+    pub browser_can_go_back: bool,
+    pub browser_can_go_forward: bool,
+    pub browser_loading: bool,
 
     /// Replay this window-capture tile's process audio through the stream
     /// audio monitor (Discord/OBS). Ignored for browser, video, and image tiles.
@@ -433,6 +456,8 @@ impl Preview {
             capture_hibernated: false,
             capture_offscreen_since: None,
             manually_frozen: false,
+            hidden: false,
+            list_order: 0,
             lock_aspect_ratio: true,
             source_aspect_ratio: aspect_ratio,
             z_order: 0,
@@ -454,6 +479,13 @@ impl Preview {
             browser_muted: false,
             browser_page_zoom: 1.0,
             browser_playing_audio: false,
+            browser_tabs: Vec::new(),
+            browser_active_tab: 0,
+            browser_chrome: false,
+            browser_tabs_collapsed: false,
+            browser_can_go_back: false,
+            browser_can_go_forward: false,
+            browser_loading: false,
             stream_audio: false,
             capture_error: None,
             browser_status: BrowserTileStatus::Ready,
@@ -486,6 +518,17 @@ impl Preview {
     /// Is this preview an app-owned browser tile?
     pub fn is_browser(&self) -> bool {
         self.browser_url.is_some()
+    }
+
+    /// The tabs a browser host should open with and the one to show. A tile
+    /// without a tab list opens a single tab at its URL.
+    pub fn browser_startup_tabs(&self) -> (Vec<BrowserTab>, usize) {
+        if self.browser_tabs.is_empty() {
+            let url = self.browser_url.clone().unwrap_or_default();
+            return (vec![BrowserTab::new(url)], 0);
+        }
+        let active = self.browser_active_tab.min(self.browser_tabs.len() - 1);
+        (self.browser_tabs.clone(), active)
     }
 
     /// Is this preview backed by a managed image or GIF?
@@ -711,11 +754,9 @@ impl Preview {
         }
 
         let image = Arc::new(image);
-        // Browser captures are not resized for screenshots; take their next frame.
         if self.screenshot_wants_native_frame
-            && (self.is_browser()
-                || (width, height)
-                    == crate::capture::screenshot_capture_size(source_width, source_height))
+            && (width, height)
+                == crate::capture::screenshot_capture_size(source_width, source_height)
         {
             self.screenshot_wants_native_frame = false;
             self.screenshot_native_frame = Some(Arc::clone(&image));
@@ -916,6 +957,13 @@ pub struct PreviewLayout {
     /// still recreated only after the tile is resumed.
     #[serde(default)]
     pub manually_frozen: bool,
+    /// Hidden from the canvas; shown again from the Control Tile Center.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Place in the Control Tile Center's custom order. Zero for layouts
+    /// saved before it existed, which keep the order they are restored in.
+    #[serde(default)]
+    pub list_order: u64,
     /// Crop region in UV coordinates (optional)
     #[serde(default)]
     pub crop_uv: Option<(f32, f32, f32, f32)>,
@@ -929,6 +977,16 @@ pub struct PreviewLayout {
     /// Per-tile page zoom for browser tiles.
     #[serde(default = "default_browser_page_zoom")]
     pub browser_page_zoom: f32,
+    /// Every tab of a browser tile. Older layouts have only `browser_url`.
+    #[serde(default)]
+    pub browser_tabs: Vec<BrowserTab>,
+    #[serde(default)]
+    pub browser_active_tab: usize,
+    /// Tiles saved before the browser toolbar existed keep a plain page.
+    #[serde(default)]
+    pub browser_chrome: bool,
+    #[serde(default)]
+    pub browser_tabs_collapsed: bool,
     /// Replay this captured window's audio through the stream monitor.
     #[serde(default)]
     pub stream_audio: bool,
@@ -974,10 +1032,16 @@ impl From<&Preview> for PreviewLayout {
             z_order: preview.z_order,
             fps_preset: preview.fps_preset,
             manually_frozen: preview.manually_frozen,
+            hidden: preview.hidden,
+            list_order: preview.list_order,
             crop_uv: preview.crop_uv,
             browser_url: preview.browser_url.clone(),
             browser_muted: preview.browser_muted,
             browser_page_zoom: preview.browser_page_zoom,
+            browser_tabs: preview.browser_tabs.clone(),
+            browser_active_tab: preview.browser_active_tab,
+            browser_chrome: preview.browser_chrome,
+            browser_tabs_collapsed: preview.browser_tabs_collapsed,
             stream_audio: preview.stream_audio,
             media_path: preview.media_path.clone(),
             video_source: preview.video_source.as_ref().map(scrub_video_source),
@@ -1185,7 +1249,8 @@ fn twitch_label(parsed: &url::Url) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Preview, PreviewId, PreviewLayout, VideoSource, ViewportAnchor, ViewportPin, WindowHandle,
+        BrowserTab, Preview, PreviewId, PreviewLayout, VideoSource, ViewportAnchor, ViewportPin,
+        WindowHandle,
     };
     use crate::media::MediaFrame;
     use eframe::egui::{Context, Pos2, Rect, Vec2};
@@ -1246,6 +1311,58 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("browser_page_zoom");
         let saved: PreviewLayout = serde_json::from_value(legacy).unwrap();
         assert_eq!(saved.browser_page_zoom, 1.0);
+    }
+
+    #[test]
+    fn browser_tabs_round_trip_and_older_layouts_open_one_plain_tab() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "page".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        preview.browser_url = Some("https://example.com/b".to_owned());
+        let mut playing = BrowserTab::new("https://example.com/b");
+        playing.playing_audio = true;
+        let mut sleeping = BrowserTab::new("https://example.com/a");
+        sleeping.sleeping = true;
+        preview.browser_tabs = vec![sleeping, playing];
+        preview.browser_active_tab = 1;
+        preview.browser_chrome = true;
+        preview.browser_tabs_collapsed = true;
+        let json = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert!(json["browser_tabs"][1].get("playing_audio").is_none());
+        // Sleep state and site icons belong to the running app only.
+        assert!(json["browser_tabs"][0].get("sleeping").is_none());
+        assert!(json["browser_tabs"][0].get("favicon").is_none());
+        let saved: PreviewLayout = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(saved.browser_tabs.len(), 2);
+        assert_eq!(saved.browser_active_tab, 1);
+        assert!(saved.browser_chrome && saved.browser_tabs_collapsed);
+
+        let mut legacy = json;
+        for field in [
+            "browser_tabs",
+            "browser_active_tab",
+            "browser_chrome",
+            "browser_tabs_collapsed",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let saved: PreviewLayout = serde_json::from_value(legacy).unwrap();
+        assert!(saved.browser_tabs.is_empty());
+        assert!(!saved.browser_chrome);
+
+        let mut restored = Preview::new(
+            PreviewId(2),
+            "page".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(100.0),
+        );
+        restored.browser_url = saved.browser_url;
+        let (tabs, active) = restored.browser_startup_tabs();
+        assert_eq!(tabs, vec![BrowserTab::new("https://example.com/b")]);
+        assert_eq!(active, 0);
     }
 
     #[test]
@@ -1485,6 +1602,39 @@ mod tests {
 
         let restored: PreviewLayout = serde_json::from_value(value).unwrap();
         assert!(!restored.manually_frozen);
+    }
+
+    #[test]
+    fn list_order_survives_a_round_trip_and_older_tiles_have_none() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.list_order = 7;
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert_eq!(value["list_order"], 7);
+        value.as_object_mut().unwrap().remove("list_order");
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.list_order, 0);
+    }
+
+    #[test]
+    fn older_saved_tiles_default_to_shown() {
+        let mut preview = Preview::new(
+            PreviewId(1),
+            "test".to_owned(),
+            Pos2::ZERO,
+            Vec2::splat(1.0),
+        );
+        preview.hidden = true;
+        let mut value = serde_json::to_value(PreviewLayout::from(&preview)).unwrap();
+        assert_eq!(value["hidden"], true);
+        value.as_object_mut().unwrap().remove("hidden");
+
+        let restored: PreviewLayout = serde_json::from_value(value).unwrap();
+        assert!(!restored.hidden);
     }
 
     #[test]

@@ -18,11 +18,16 @@ use eframe::egui;
 use parking_lot::Mutex;
 use webview2_com::{
     take_pwstr, BrowserExtensionEnableCompletedHandler, ClearBrowsingDataCompletedHandler,
+    ContextMenuRequestedEventHandler, CustomItemSelectedEventHandler, FaviconChangedEventHandler,
+    GetFaviconCompletedHandler, HistoryChangedEventHandler,
     IsDocumentPlayingAudioChangedEventHandler,
     Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2BrowserExtension, ICoreWebView2PermissionRequestedEventArgs3,
-        ICoreWebView2Profile2, ICoreWebView2Profile7, ICoreWebView2_13, ICoreWebView2_3,
-        ICoreWebView2_8, COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
+        ICoreWebView2BrowserExtension, ICoreWebView2ContextMenuItemCollection,
+        ICoreWebView2Environment9, ICoreWebView2PermissionRequestedEventArgs3,
+        ICoreWebView2Profile2, ICoreWebView2Profile7, ICoreWebView2_11, ICoreWebView2_13,
+        ICoreWebView2_15, ICoreWebView2_3, ICoreWebView2_8,
+        COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND, COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
+        COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY,
         COREWEBVIEW2_PERMISSION_STATE_DENY, COREWEBVIEW2_PROCESS_FAILED_KIND,
         COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
         COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
@@ -45,9 +50,9 @@ use windows::{
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindowLongW,
             IsChild, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-            HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-            SW_SHOWNOACTIVATE, WNDCLASSW, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-            WS_POPUP,
+            HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOZORDER,
+            SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WNDCLASSW, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST, WS_POPUP,
         },
     },
 };
@@ -56,11 +61,11 @@ use wry::{
     raw_window_handle::{
         HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
     },
-    NewWindowResponse, Rect, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows,
-    WebViewExtWindows,
+    NewWindowResponse, PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder,
+    WebViewBuilderExtWindows, WebViewExtWindows,
 };
 
-use crate::preview::PreviewId;
+use crate::preview::{BrowserTab, Favicon, PreviewId};
 
 const PARK_X: i32 = -30_000;
 const PARK_Y: i32 = -30_000;
@@ -81,6 +86,20 @@ const MAX_CAPTURE_HEIGHT: i32 = 2160;
 /// Give WebView2's compositor time to apply a new viewport and zoom before
 /// the native host replaces the frozen captured preview onscreen.
 const INTERACTION_PREP_DELAY: Duration = Duration::from_millis(80);
+/// The same settling time after a host parks: its capture stays paused, so
+/// the tile keeps showing the last interactive frame instead of the frames
+/// WebView2 renders while it grows back to capture resolution.
+const PARK_SETTLE_DELAY: Duration = Duration::from_millis(150);
+/// A background tab that has not been shown or played sound for this long
+/// unloads its page to free memory. It reloads when shown, like a browser's
+/// memory saver.
+const TAB_SLEEP_AFTER: Duration = Duration::from_secs(10 * 60);
+/// Site icons are drawn at most this many pixels across.
+const FAVICON_SIZE: u32 = 64;
+/// Larger downloads are not icons; ignore them.
+const MAX_FAVICON_BYTES: usize = 512 * 1024;
+/// WebView2's own context menu item after which "Open Link in New Tile" goes.
+const OPEN_LINK_IN_NEW_WINDOW_ITEM: &str = "openLinkInNewWindow";
 
 /// wry's default WebView2 arguments also disable `msSmartScreenProtection`,
 /// which turns off Microsoft Defender SmartScreen's phishing and malware site
@@ -88,6 +107,9 @@ const INTERACTION_PREP_DELAY: Duration = Duration::from_millis(80);
 /// two (Edge's text-selection mini menu and PDF mini menu). All tiles share
 /// one WebView2 environment, so every builder must pass this same string.
 const BROWSER_ARGUMENTS: &str = "--disable-features=msWebOOUI,msPdfOOUI";
+
+/// Address bar searches go here, as in a new browser profile.
+const SEARCH_URL: &str = "https://www.google.com/search";
 
 /// Page zoom limits offered per tile, before the tile-size zoom is applied.
 pub const MIN_PAGE_ZOOM: f32 = 0.5;
@@ -317,6 +339,56 @@ pub fn scrub_url_for_storage(input: &str) -> Option<String> {
     Some(url.into())
 }
 
+/// Where an address bar entry goes: a web address as typed, or a web search
+/// for anything that does not look like one (spaces, or a single word).
+pub fn address_bar_target(input: &str) -> Result<String, &'static str> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("Enter an address or search");
+    }
+    let has_scheme = input.contains("://");
+    let looks_like_host = input.contains('.') || input.contains(':') || input == "localhost";
+    if has_scheme || (!input.contains(char::is_whitespace) && looks_like_host) {
+        if let Ok(url) = normalize_url(input) {
+            return Ok(url);
+        }
+        if has_scheme {
+            return normalize_url(input);
+        }
+    }
+    url::Url::parse_with_params(SEARCH_URL, [("q", input)])
+        .map(String::from)
+        .map_err(|_| "Enter an address or search")
+}
+
+/// Whether `url` is an address bar search rather than a typed address.
+pub fn is_search_url(url: &str) -> bool {
+    url.strip_prefix(SEARCH_URL)
+        .is_some_and(|rest| rest.starts_with('?'))
+}
+
+/// Scrub every tab for saving, dropping tabs without a web address (such as
+/// a page still on `about:blank`). Returns the tabs and the index of the
+/// active one among those kept.
+pub fn scrub_tabs_for_storage(tabs: &[BrowserTab], active: usize) -> (Vec<BrowserTab>, usize) {
+    let mut kept = Vec::with_capacity(tabs.len());
+    let mut kept_active = 0;
+    for (index, tab) in tabs.iter().enumerate() {
+        let Some(url) = scrub_url_for_storage(&tab.url) else {
+            continue;
+        };
+        if index <= active {
+            kept_active = kept.len();
+        }
+        kept.push(BrowserTab {
+            url,
+            title: tab.title.clone(),
+            ..BrowserTab::default()
+        });
+    }
+    (kept, kept_active)
+}
+
 fn is_sensitive_query_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     matches!(
@@ -410,8 +482,11 @@ impl HasWindowHandle for NativeWindow {
 struct SharedState {
     current_url: String,
     current_title: Option<String>,
-    /// A page requested a new window; we navigate the same tile instead.
+    /// A page requested a new window; the tile opens it as a tab, or in
+    /// place when it shows no tabs.
     pending_navigation: Option<String>,
+    /// The page is loading, between WebView2's start and finish events.
+    loading: bool,
     /// A download was refused since the last poll.
     download_blocked: bool,
     /// The page's renderer process exited or stopped responding.
@@ -420,7 +495,159 @@ struct SharedState {
     playing_audio: bool,
     /// A finished Fit to Video lookup (see [`FIND_VIDEO_SCRIPT`]).
     video_rect: Option<Option<(f32, f32, f32, f32)>>,
+    /// The page's icon changed: its address and PNG bytes (empty when the
+    /// page has none).
+    favicon: Option<(String, Vec<u8>)>,
+    /// Links chosen with "Open Link in New Tile".
+    new_tile_requests: Vec<String>,
     dirty: bool,
+}
+
+/// Report the page's icon whenever it changes. Needs WebView2 Runtime 108+;
+/// older runtimes keep the letter badges.
+fn register_favicon_handler(
+    webview: &WebView,
+    shared: Arc<Mutex<SharedState>>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let core15: ICoreWebView2_15 = core.cast().map_err(|e| e.to_string())?;
+    let handler = FaviconChangedEventHandler::create(Box::new(move |sender, _| {
+        let Some(sender) = sender else {
+            return Ok(());
+        };
+        let sender: ICoreWebView2_15 = sender.cast()?;
+        let mut uri = WebViewPWSTR::null();
+        unsafe { sender.FaviconUri(&mut uri)? };
+        let uri = take_pwstr(uri);
+        if uri.is_empty() {
+            let mut state = shared.lock();
+            state.favicon = Some((uri, Vec::new()));
+            state.dirty = true;
+            return Ok(());
+        }
+        let shared = shared.clone();
+        let completed = GetFaviconCompletedHandler::create(Box::new(move |result, stream| {
+            result?;
+            let png = stream.as_ref().map(read_stream).unwrap_or_default();
+            let mut state = shared.lock();
+            state.favicon = Some((uri, png));
+            state.dirty = true;
+            Ok(())
+        }));
+        unsafe { sender.GetFavicon(COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, &completed) }
+    }));
+    let mut token = 0i64;
+    unsafe { core15.add_FaviconChanged(&handler, &mut token) }.map_err(|e| e.to_string())
+}
+
+fn read_stream(stream: &webview2_windows::Win32::System::Com::IStream) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let mut read = 0u32;
+        let result = unsafe {
+            stream.Read(
+                chunk.as_mut_ptr().cast(),
+                chunk.len() as u32,
+                Some(&mut read),
+            )
+        };
+        if result.is_err() || read == 0 {
+            return bytes;
+        }
+        bytes.extend_from_slice(&chunk[..read as usize]);
+        if bytes.len() > MAX_FAVICON_BYTES {
+            return Vec::new();
+        }
+    }
+}
+
+/// Decode a site icon for drawing, scaled down to [`FAVICON_SIZE`].
+fn decode_favicon(uri: String, png: &[u8]) -> Option<Favicon> {
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+    let image = if image.width() > FAVICON_SIZE || image.height() > FAVICON_SIZE {
+        image.thumbnail(FAVICON_SIZE, FAVICON_SIZE)
+    } else {
+        image
+    };
+    let rgba = image.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(Favicon {
+        uri,
+        image: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+            size,
+            rgba.as_raw(),
+        )),
+    })
+}
+
+/// Add "Open Link in New Tile" to the page's right-click menu on links.
+/// Needs WebView2 Runtime 98+; older runtimes keep the standard menu.
+fn register_context_menu_handler(
+    webview: &WebView,
+    shared: Arc<Mutex<SharedState>>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let core11: ICoreWebView2_11 = core.cast().map_err(|e| e.to_string())?;
+    let environment: ICoreWebView2Environment9 =
+        webview.environment().cast().map_err(|e| e.to_string())?;
+    let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let target = unsafe { args.ContextMenuTarget()? };
+        let mut has_link = Default::default();
+        unsafe { target.HasLinkUri(&mut has_link)? };
+        if !has_link.as_bool() {
+            return Ok(());
+        }
+        let mut link = WebViewPWSTR::null();
+        unsafe { target.LinkUri(&mut link)? };
+        let link = take_pwstr(link);
+        if !is_web_url(&link) {
+            return Ok(());
+        }
+        let item = unsafe {
+            environment.CreateContextMenuItem(
+                &WebViewHString::from("Open Link in New Tile"),
+                None::<&webview2_windows::Win32::System::Com::IStream>,
+                COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
+            )?
+        };
+        let shared = shared.clone();
+        let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
+            let mut state = shared.lock();
+            state.new_tile_requests.push(link.clone());
+            state.dirty = true;
+            Ok(())
+        }));
+        let mut token = 0i64;
+        unsafe { item.add_CustomItemSelected(&selected, &mut token)? };
+        let items = unsafe { args.MenuItems()? };
+        let index = menu_index_after(&items, OPEN_LINK_IN_NEW_WINDOW_ITEM);
+        unsafe { items.InsertValueAtIndex(index, &item) }
+    }));
+    let mut token = 0i64;
+    unsafe { core11.add_ContextMenuRequested(&handler, &mut token) }.map_err(|e| e.to_string())
+}
+
+/// The position just after the menu item called `name`, or the top.
+fn menu_index_after(items: &ICoreWebView2ContextMenuItemCollection, name: &str) -> u32 {
+    let mut count = 0u32;
+    if unsafe { items.Count(&mut count) }.is_err() {
+        return 0;
+    }
+    (0..count)
+        .find(|&index| {
+            unsafe { items.GetValueAtIndex(index) }
+                .and_then(|item| {
+                    let mut item_name = WebViewPWSTR::null();
+                    unsafe { item.Name(&mut item_name)? };
+                    Ok(take_pwstr(item_name))
+                })
+                .is_ok_and(|item_name| item_name == name)
+        })
+        .map_or(0, |index| index + 1)
 }
 
 fn parse_video_rect(json: &str) -> Option<(f32, f32, f32, f32)> {
@@ -457,6 +684,21 @@ fn register_audio_handler(
     let mut token = 0i64;
     unsafe { core8.add_IsDocumentPlayingAudioChanged(&handler, &mut token) }
         .map_err(|e| e.to_string())
+}
+
+/// Back/forward availability changes without a document load when a
+/// single-page app pushes history, so listen for history changes directly.
+fn register_history_handler(
+    webview: &WebView,
+    shared: Arc<Mutex<SharedState>>,
+) -> Result<(), String> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+    let handler = HistoryChangedEventHandler::create(Box::new(move |_, _| {
+        shared.lock().dirty = true;
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe { core.add_HistoryChanged(&handler, &mut token) }.map_err(|e| e.to_string())
 }
 
 /// Engine-wide WebView2 events, shared by every host's handlers.
@@ -570,6 +812,8 @@ fn register_engine_update_handler(
 /// Title/URL changes since the last poll, for the app to mirror onto the tile.
 #[derive(Default)]
 pub struct BrowserUpdate {
+    /// Something below changed; the other fields describe the whole tile.
+    pub changed: bool,
     pub title: Option<String>,
     pub url: Option<String>,
     /// The page tried to download a file, which browser tiles do not allow.
@@ -579,6 +823,15 @@ pub struct BrowserUpdate {
     /// A Fit to Video request finished: the video's crop, or None if the
     /// page has no visible video.
     pub video_rect: Option<Option<(f32, f32, f32, f32)>>,
+    pub tabs: Vec<BrowserTab>,
+    pub active_tab: usize,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
+    pub loading: bool,
+    /// Pages asked to open these addresses in a new window.
+    pub new_window_requests: Vec<String>,
+    /// Links chosen with "Open Link in New Tile".
+    pub new_tile_requests: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -613,6 +866,53 @@ fn browser_geometry(
     }
 }
 
+/// Move and resize a page and set its zoom in one step. The page's CSS
+/// viewport is `size / zoom`, which every call keeps the same. wry's separate
+/// `set_bounds` and `zoom` let the page lay out once at the new size with the
+/// old zoom: half or twice as wide, which responsive sites like YouTube
+/// answer by switching layouts, visible as the page jumping in and out of
+/// interaction.
+fn set_page_geometry(webview: &WebView, position: (i32, i32), size: (i32, i32), zoom: f64) {
+    let controller = webview.controller();
+    unsafe {
+        // wry hosts each controller in its own child window; size it first so
+        // the new bounds are not clipped. It belongs to this thread, so the
+        // resize is synchronous, unlike wry's own `set_bounds`.
+        let mut container = webview2_windows::Win32::Foundation::HWND::default();
+        if controller.ParentWindow(&mut container).is_ok() {
+            let _ = SetWindowPos(
+                HWND(container.0),
+                None,
+                position.0,
+                position.1,
+                size.0,
+                size.1,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+        let bounds = webview2_windows::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: size.0,
+            bottom: size.1,
+        };
+        let _ = controller.SetBoundsAndZoomFactor(bounds, zoom);
+    }
+}
+
+/// Where the tab at `index` ends up after the tab at `from` moves to `to`.
+fn moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
 pub fn capture_size_for_tile(width: i32, height: i32) -> (i32, i32) {
     let width = width.max(1) as f64;
     let height = height.max(1) as f64;
@@ -628,291 +928,31 @@ pub fn capture_size_for_tile(width: i32, height: i32) -> (i32, i32) {
     )
 }
 
-pub struct BrowserHost {
-    webview: Option<WebView>,
-    window: NativeWindow,
-    active: bool,
-    /// Mirrors `active` for the WebView2 permission handler.
-    interactive: Arc<std::sync::atomic::AtomicBool>,
-    muted: bool,
-    /// Last host/page geometry applied while active (physical px), to skip
-    /// redundant positioning calls while glued to the tile.
-    last_geometry: Option<BrowserGeometry>,
-    /// While set, the host remains offscreen at its interactive size until
-    /// WebView2 has had time to render the resized/zoomed page.
-    reveal_at: Option<Instant>,
-    /// Backing resolution used while parked and captured. Kept in sync with
-    /// the tile's physical display size so preview and live modes are 1:1.
-    capture_size: (i32, i32),
-    /// When the live address was last read from WebView2 (see [`Self::poll`]).
-    last_url_check: Option<Instant>,
+/// One loaded page of a browser tile and the handlers reporting its state.
+struct TabView {
+    webview: WebView,
     shared: Arc<Mutex<SharedState>>,
-    /// Desired sleeping state. WebView2 suspension itself is best-effort, but
-    /// the controller remains hidden until the user explicitly resumes it.
-    suspended: bool,
+    /// Whether the tile showing this page is interactive, for its popup and
+    /// permission handlers. Per page, so a page can move to another tile.
+    interactive: Arc<std::sync::atomic::AtomicBool>,
+    /// When the live address was last read from WebView2 (see [`BrowserHost::poll`]).
+    last_url_check: Option<Instant>,
     /// Ad-block activation may request navigation while a tile sleeps. Keep
     /// it deferred because WebView2 navigation would otherwise auto-resume it.
     after_resume: Option<AfterResume>,
-    /// When this tile last reloaded itself after its page crashed.
+    /// When this page last reloaded itself after it crashed.
     last_crash_reload: Option<Instant>,
     /// A repeated crash was already reported for the current cooldown.
     crash_reported: bool,
-    /// The tile's own page zoom, multiplied into every zoom this host sets.
-    page_zoom: f64,
 }
 
-enum AfterResume {
-    Load(String),
-    Reload,
-}
-
-impl BrowserHost {
-    fn new(context: &mut WebContext, url: &str, signals: &EngineSignals) -> Result<Self, String> {
-        static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
-        REGISTERED.get_or_init(register_window_class).clone()?;
-
-        let hwnd = unsafe {
-            CreateWindowExW(
-                WS_EX_TOOLWINDOW,
-                w!("PluriviewBrowserHost"),
-                w!("Pluriview Browser"),
-                WS_POPUP | WS_CLIPCHILDREN,
-                PARK_X,
-                PARK_Y,
-                WIDTH,
-                HEIGHT,
-                None,
-                None,
-                None,
-                None,
-            )
-            .map_err(|error| error.to_string())?
-        };
-        let window = NativeWindow(hwnd);
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
-
-        let shared = Arc::new(Mutex::new(SharedState {
-            current_url: url.to_owned(),
-            ..Default::default()
-        }));
-
-        let nav_shared = shared.clone();
-        let title_shared = shared.clone();
-        let new_window_shared = shared.clone();
-        let download_shared = shared.clone();
-        let interactive = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let popup_interactive = interactive.clone();
-
-        let webview = WebViewBuilder::new_with_web_context(context)
-            // All tiles share one WebView2 environment/profile, so this must
-            // be identical on every builder. Runtime 120+ supports the flag;
-            // uBOL itself requires Chromium/WebView2 122+.
-            .with_browser_extensions_enabled(true)
-            .with_additional_browser_args(BROWSER_ARGUMENTS)
-            // Preserve transparent page backgrounds for overlay widgets.
-            .with_transparent(true)
-            // Captured hosts start parked; focus belongs to the canvas until
-            // the user explicitly enters browser interaction.
-            .with_focused(false)
-            // Wry enables autoplay by default, which passes WebView2 the
-            // `no-user-gesture-required` Chromium policy. Do not opt into
-            // that policy: restored media pages (notably YouTube watch URLs)
-            // should wait for the user to press Play after app startup.
-            .with_autoplay(false)
-            .with_initialization_script(MEDIA_AUTOPLAY_GUARD)
-            .with_url(url)
-            .with_bounds(parked_bounds())
-            .with_download_started_handler(move |_, _| {
-                let mut state = download_shared.lock();
-                state.download_blocked = true;
-                state.dirty = true;
-                false
-            })
-            .with_navigation_handler(move |url| {
-                if !is_allowed_navigation(&url) {
-                    return false;
-                }
-                if url.starts_with("http") {
-                    let mut state = nav_shared.lock();
-                    state.current_url = url;
-                    state.dirty = true;
-                }
-                true
-            })
-            .with_document_title_changed_handler(move |title| {
-                let mut state = title_shared.lock();
-                state.current_title = Some(title);
-                state.dirty = true;
-            })
-            .with_new_window_req_handler(move |url, features| {
-                let interactive = popup_interactive.load(std::sync::atomic::Ordering::Relaxed);
-                if opens_as_popup(interactive, features.size.is_some()) && is_web_url(&url) {
-                    // Sign-in flows ("Continue with Google/Discord") open a
-                    // sized popup and talk back to this page through
-                    // window.opener; replacing the tile's page breaks them.
-                    return NewWindowResponse::Allow;
-                }
-                if is_web_url(&url) {
-                    new_window_shared.lock().pending_navigation = Some(url);
-                }
-                NewWindowResponse::Deny
-            })
-            .build_as_child(&window)
-            .map_err(|error| error.to_string())?;
-        if let Err(error) = register_permission_policy(&webview, interactive.clone()) {
-            log::warn!("Browser permission requests use WebView2 defaults: {error}");
-        }
-        if let Err(error) =
-            register_process_failure_handler(&webview, shared.clone(), signals.lost.clone())
-        {
-            log::warn!("Browser tiles cannot detect crashed pages: {error}");
-        }
-        if let Err(error) = register_audio_handler(&webview, shared.clone()) {
-            log::warn!("Browser tiles cannot report playing audio: {error}");
-        }
-        if let Err(error) = register_engine_update_handler(&webview, signals.update_ready.clone()) {
-            log::warn!("Browser tiles cannot detect WebView2 updates: {error}");
-        }
-
-        Ok(Self {
-            webview: Some(webview),
-            window,
-            active: false,
-            interactive,
-            muted: false,
-            last_geometry: None,
-            reveal_at: None,
-            capture_size: (WIDTH, HEIGHT),
-            last_url_check: None,
-            shared,
-            suspended: false,
-            after_resume: None,
-            last_crash_reload: None,
-            crash_reported: false,
-            page_zoom: 1.0,
-        })
-    }
-
-    pub fn hwnd(&self) -> isize {
-        self.window.0 .0 as isize
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    pub fn is_preparing_interaction(&self) -> bool {
-        self.reveal_at.is_some()
-    }
-
-    pub fn is_muted(&self) -> bool {
-        self.muted
-    }
-
-    /// Match an inactive browser's capture backing to 2× its displayed
-    /// physical size. The zoom changes with the backing width, preserving the
-    /// same CSS viewport while keeping the canvas preview reasonably sharp.
-    pub fn sync_capture_size(&mut self, width: i32, height: i32) {
-        if self.active || self.suspended {
-            return;
-        }
-        let size = (width.max(1), height.max(1));
-        if self.capture_size == size {
-            return;
-        }
-        self.capture_size = size;
-        unsafe {
-            let _ = SetWindowPos(
-                self.window.0,
-                HWND_BOTTOM,
-                PARK_X,
-                PARK_Y,
-                size.0,
-                size.1,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-        }
-        if let Some(webview) = self.webview.as_ref() {
-            let _ = webview.set_bounds(Rect {
-                position: PhysicalPosition::new(0, 0).into(),
-                size: PhysicalSize::new(size.0, size.1).into(),
-            });
-            let _ = webview.zoom(self.zoom_for_width(size.0));
-        }
-    }
-
-    /// WebView2 zoom for a page `width` physical pixels wide: the tile-size
-    /// zoom that keeps the layout at WIDTH CSS pixels, times the tile's own
-    /// page zoom.
-    fn zoom_for_width(&self, width: i32) -> f64 {
-        (width as f64 / WIDTH as f64 * self.page_zoom).clamp(MIN_ZOOM, MAX_ZOOM)
-    }
-
-    /// Apply the tile's page zoom (1.0 = the page's normal size).
-    pub fn set_page_zoom(&mut self, zoom: f32) {
-        let zoom = f64::from(zoom.clamp(MIN_PAGE_ZOOM, MAX_PAGE_ZOOM));
-        if (self.page_zoom - zoom).abs() < 1e-4 || self.suspended {
-            return;
-        }
-        self.page_zoom = zoom;
-        let width = match (self.active, self.last_geometry) {
-            (true, Some(geometry)) => geometry.page_width,
-            _ => self.capture_size.0,
-        };
-        if let Some(webview) = self.webview.as_ref() {
-            let _ = webview.zoom(self.zoom_for_width(width));
-        }
-    }
-
-    /// Scroll the page under a normalized point by `delta` CSS pixels
-    /// (positive scrolls down), without entering interaction mode.
-    pub fn scroll_page(&self, u: f32, v: f32, delta: f32) {
-        if self.suspended || !u.is_finite() || !v.is_finite() || !delta.is_finite() {
-            return;
-        }
-        if let Some(webview) = self.webview.as_ref() {
-            let script = format!(
-                "{SCROLL_PAGE_SCRIPT}({}, {}, {});",
-                u.clamp(0.0, 1.0),
-                v.clamp(0.0, 1.0),
-                delta
-            );
-            let _ = webview.evaluate_script(&script);
-        }
-    }
-
-    /// Look for the page's main video. The answer arrives through
-    /// [`BrowserUpdate::video_rect`].
-    pub fn request_video_rect(&self) {
-        if self.suspended {
-            return;
-        }
-        let Some(webview) = self.webview.as_ref() else {
-            return;
-        };
-        let shared = self.shared.clone();
-        let requested = webview.evaluate_script_with_callback(FIND_VIDEO_SCRIPT, move |json| {
-            let mut state = shared.lock();
-            state.video_rect = Some(parse_video_rect(&json));
-            state.dirty = true;
-        });
-        if requested.is_err() {
-            let mut state = self.shared.lock();
-            state.video_rect = Some(None);
-            state.dirty = true;
-        }
-    }
-
-    pub fn current_url(&self) -> String {
+impl TabView {
+    fn current_url(&self) -> String {
         self.shared.lock().current_url.clone()
     }
 
-    /// The page's address read straight from WebView2, or None while the host
-    /// has no WebView or sits on a non-web page.
-    pub fn live_url(&self) -> Option<String> {
-        let url = self.webview.as_ref()?.url().ok()?;
+    fn live_url(&self) -> Option<String> {
+        let url = self.webview.url().ok()?;
         url.starts_with("http").then_some(url)
     }
 
@@ -938,40 +978,22 @@ impl BrowserHost {
         }
     }
 
-    /// Drain pending title/URL changes and apply queued same-tile navigation
-    /// from blocked new-window requests. Call once per frame.
-    pub fn poll(&mut self) -> BrowserUpdate {
-        if self.suspended {
-            return BrowserUpdate::default();
+    fn load(&self, url: &str) {
+        let _ = self.webview.load_url(url);
+        let mut state = self.shared.lock();
+        state.current_url = url.to_owned();
+        state.dirty = true;
+    }
+
+    fn reload(&self) {
+        let _ = self.webview.reload();
+    }
+
+    fn run(&self, action: AfterResume) {
+        match action {
+            AfterResume::Load(url) => self.load(&url),
+            AfterResume::Reload => self.reload(),
         }
-        self.refresh_live_url();
-        let (mut update, navigate, crashed) = {
-            let mut state = self.shared.lock();
-            let navigate = state.pending_navigation.take();
-            if !state.dirty && navigate.is_none() {
-                return BrowserUpdate::default();
-            }
-            state.dirty = false;
-            (
-                BrowserUpdate {
-                    title: state.current_title.clone(),
-                    url: Some(state.current_url.clone()),
-                    download_blocked: std::mem::take(&mut state.download_blocked),
-                    page_crash: None,
-                    playing_audio: state.playing_audio,
-                    video_rect: state.video_rect.take(),
-                },
-                navigate,
-                std::mem::take(&mut state.page_crashed),
-            )
-        };
-        if let Some(url) = navigate {
-            self.load(&url);
-        }
-        if crashed {
-            update.page_crash = self.recover_crashed_page();
-        }
-        update
     }
 
     /// Reload a crashed page, unless it already crashed shortly after the
@@ -991,6 +1013,823 @@ impl BrowserHost {
                 Some(PageCrash::Repeated)
             }
         }
+    }
+
+    fn with_core<T>(
+        &self,
+        f: impl FnOnce(
+            &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
+        ) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let core =
+            unsafe { self.webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
+        f(&core)
+    }
+
+    fn set_muted(&self, muted: bool) -> Result<(), String> {
+        self.with_core(|core| {
+            let core8: ICoreWebView2_8 = core.cast().map_err(|e| e.to_string())?;
+            unsafe { core8.SetIsMuted(muted) }.map_err(|e| e.to_string())
+        })
+    }
+
+    /// Whether the page can go back and forward in its history.
+    fn history_state(&self) -> (bool, bool) {
+        self.with_core(|core| {
+            let mut back = Default::default();
+            let mut forward = Default::default();
+            unsafe {
+                core.CanGoBack(&mut back).map_err(|e| e.to_string())?;
+                core.CanGoForward(&mut forward).map_err(|e| e.to_string())?;
+            }
+            Ok((back.as_bool(), forward.as_bool()))
+        })
+        .unwrap_or((false, false))
+    }
+
+    /// Hide the page and ask WebView2 to put it to sleep. The callback is
+    /// intentionally non-blocking because WebView2 dispatches it through the
+    /// UI thread's message pump.
+    fn suspend(&self) -> Result<(), String> {
+        let controller = self.webview.controller();
+        unsafe {
+            controller
+                .SetIsVisible(false)
+                .map_err(|error| error.to_string())?;
+        }
+        let core = unsafe { controller.CoreWebView2() }.map_err(|error| error.to_string())?;
+        let core3: ICoreWebView2_3 = core.cast().map_err(|error| error.to_string())?;
+        let callback = TrySuspendCompletedHandler::create(Box::new(|result, successful| {
+            if let Err(error) = result {
+                log::warn!("WebView2 tile suspension failed: {error}");
+            } else if !successful {
+                log::warn!("WebView2 declined to suspend a frozen tile");
+            }
+            Ok(())
+        }));
+        unsafe {
+            core3
+                .TrySuspend(&callback)
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn resume(&mut self, visible: bool) -> Result<(), String> {
+        let controller = self.webview.controller();
+        let resume_result = unsafe { controller.CoreWebView2() }
+            .map_err(|error| error.to_string())
+            .and_then(|core| {
+                let core3: ICoreWebView2_3 = core.cast().map_err(|error| error.to_string())?;
+                unsafe { core3.Resume().map_err(|error| error.to_string()) }
+            });
+        unsafe {
+            controller
+                .SetIsVisible(visible)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(action) = self.after_resume.take() {
+            self.run(action);
+        }
+        if let Err(error) = resume_result {
+            log::warn!("WebView2 resume API was unavailable; restored visibility instead: {error}");
+        }
+        Ok(())
+    }
+}
+
+/// A tab of a browser tile. Tabs restored from a layout keep only their
+/// address and title until they are first shown, so reopening a workspace
+/// starts one page per tile rather than every saved tab at once.
+struct HostTab {
+    view: Option<TabView>,
+    url: String,
+    title: String,
+    playing_audio: bool,
+    favicon: Option<Favicon>,
+    /// When this loaded tab was last hidden or heard; None while shown.
+    hidden_since: Option<Instant>,
+}
+
+impl HostTab {
+    fn loaded(view: TabView, url: &str, shown: bool) -> Self {
+        Self {
+            view: Some(view),
+            url: url.to_owned(),
+            title: String::new(),
+            playing_audio: false,
+            favicon: None,
+            hidden_since: (!shown).then(Instant::now),
+        }
+    }
+
+    fn unloaded(tab: &BrowserTab) -> Self {
+        Self {
+            view: None,
+            url: tab.url.clone(),
+            title: tab.title.clone(),
+            playing_audio: false,
+            favicon: tab.favicon.clone(),
+            hidden_since: None,
+        }
+    }
+
+    fn snapshot(&self) -> BrowserTab {
+        BrowserTab {
+            url: self.url.clone(),
+            title: self.title.clone(),
+            playing_audio: self.playing_audio,
+            favicon: self.favicon.clone(),
+            sleeping: self.view.is_none(),
+        }
+    }
+
+    /// Whether a background tab has been idle long enough to sleep.
+    fn ready_to_sleep(&mut self, now: Instant) -> bool {
+        if self.view.is_none() {
+            return false;
+        }
+        if self.playing_audio {
+            self.hidden_since = Some(now);
+            return false;
+        }
+        self.hidden_since
+            .is_some_and(|since| now.duration_since(since) >= TAB_SLEEP_AFTER)
+    }
+}
+
+pub struct BrowserHost {
+    /// Every page of the tile. Each loaded tab is its own WebView inside the
+    /// host window; only the active one is visible, so the tile's capture of
+    /// the host window always shows it. Never empty.
+    tabs: Vec<HostTab>,
+    active_tab: usize,
+    /// Tabs were opened, closed or switched since the last poll.
+    tabs_dirty: bool,
+    window: NativeWindow,
+    active: bool,
+    muted: bool,
+    /// Last host/page geometry applied while active (physical px), to skip
+    /// redundant positioning calls while glued to the tile.
+    last_geometry: Option<BrowserGeometry>,
+    /// While set, the host remains offscreen at its interactive size until
+    /// WebView2 has had time to render the resized/zoomed page.
+    reveal_at: Option<Instant>,
+    /// While set, the host was just parked and its capture should stay
+    /// paused until WebView2 has rendered the page at capture resolution.
+    capture_resume_at: Option<Instant>,
+    /// Backing resolution used while parked and captured. Kept in sync with
+    /// the tile's physical display size so preview and live modes are 1:1.
+    capture_size: (i32, i32),
+    /// Desired sleeping state. WebView2 suspension itself is best-effort, but
+    /// the controller remains hidden until the user explicitly resumes it.
+    suspended: bool,
+    /// The tile's own page zoom, multiplied into every zoom this host sets.
+    page_zoom: f64,
+}
+
+enum AfterResume {
+    Load(String),
+    Reload,
+}
+
+impl BrowserHost {
+    fn new(context: &mut WebContext, url: &str, signals: &EngineSignals) -> Result<Self, String> {
+        let mut host = Self::empty()?;
+        let view = host.build_view(context, url, signals, true)?;
+        host.tabs.push(HostTab::loaded(view, url, true));
+        Ok(host)
+    }
+
+    /// A parked host window without tabs yet. It must get one before it is
+    /// used: see [`Self::adopt_tab`].
+    fn empty() -> Result<Self, String> {
+        static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+        REGISTERED.get_or_init(register_window_class).clone()?;
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("PluriviewBrowserHost"),
+                w!("Pluriview Browser"),
+                WS_POPUP | WS_CLIPCHILDREN,
+                PARK_X,
+                PARK_Y,
+                WIDTH,
+                HEIGHT,
+                None,
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?
+        };
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+
+        Ok(Self {
+            tabs: Vec::new(),
+            active_tab: 0,
+            tabs_dirty: true,
+            window: NativeWindow(hwnd),
+            active: false,
+            muted: false,
+            last_geometry: None,
+            reveal_at: None,
+            capture_resume_at: None,
+            capture_size: (WIDTH, HEIGHT),
+            suspended: false,
+            page_zoom: 1.0,
+        })
+    }
+
+    /// Create a WebView for one tab inside this host's window.
+    fn build_view(
+        &self,
+        context: &mut WebContext,
+        url: &str,
+        signals: &EngineSignals,
+        visible: bool,
+    ) -> Result<TabView, String> {
+        let shared = Arc::new(Mutex::new(SharedState {
+            current_url: url.to_owned(),
+            ..Default::default()
+        }));
+
+        let nav_shared = shared.clone();
+        let title_shared = shared.clone();
+        let new_window_shared = shared.clone();
+        let download_shared = shared.clone();
+        let load_shared = shared.clone();
+        let interactive = Arc::new(std::sync::atomic::AtomicBool::new(self.active));
+        let popup_interactive = interactive.clone();
+
+        let webview = WebViewBuilder::new_with_web_context(context)
+            // All tiles share one WebView2 environment/profile, so this must
+            // be identical on every builder. Runtime 120+ supports the flag;
+            // uBOL itself requires Chromium/WebView2 122+.
+            .with_browser_extensions_enabled(true)
+            .with_additional_browser_args(BROWSER_ARGUMENTS)
+            // Preserve transparent page backgrounds for overlay widgets.
+            .with_transparent(true)
+            // Captured hosts start parked; focus belongs to the canvas until
+            // the user explicitly enters browser interaction.
+            .with_focused(false)
+            // Background tabs start hidden so they never cover the tab the
+            // tile is showing.
+            .with_visible(visible)
+            // Wry enables autoplay by default, which passes WebView2 the
+            // `no-user-gesture-required` Chromium policy. Do not opt into
+            // that policy: restored media pages (notably YouTube watch URLs)
+            // should wait for the user to press Play after app startup.
+            .with_autoplay(false)
+            .with_initialization_script(MEDIA_AUTOPLAY_GUARD)
+            .with_url(url)
+            .with_bounds(parked_bounds())
+            .with_download_started_handler(move |_, _| {
+                let mut state = download_shared.lock();
+                state.download_blocked = true;
+                state.dirty = true;
+                false
+            })
+            .with_navigation_handler(move |url| {
+                if !is_allowed_navigation(&url) {
+                    return false;
+                }
+                if url.starts_with("http") {
+                    let mut state = nav_shared.lock();
+                    state.current_url = url;
+                    state.dirty = true;
+                }
+                true
+            })
+            .with_on_page_load_handler(move |event, _| {
+                let mut state = load_shared.lock();
+                state.loading = matches!(event, PageLoadEvent::Started);
+                state.dirty = true;
+            })
+            .with_document_title_changed_handler(move |title| {
+                let mut state = title_shared.lock();
+                state.current_title = Some(title);
+                state.dirty = true;
+            })
+            .with_new_window_req_handler(move |url, features| {
+                let interactive = popup_interactive.load(std::sync::atomic::Ordering::Relaxed);
+                if opens_as_popup(interactive, features.size.is_some()) && is_web_url(&url) {
+                    // Sign-in flows ("Continue with Google/Discord") open a
+                    // sized popup and talk back to this page through
+                    // window.opener; replacing the tile's page breaks them.
+                    return NewWindowResponse::Allow;
+                }
+                if is_web_url(&url) {
+                    let mut state = new_window_shared.lock();
+                    state.pending_navigation = Some(url);
+                    state.dirty = true;
+                }
+                NewWindowResponse::Deny
+            })
+            .build_as_child(&self.window)
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = register_permission_policy(&webview, interactive.clone()) {
+            log::warn!("Browser permission requests use WebView2 defaults: {error}");
+        }
+        if let Err(error) =
+            register_process_failure_handler(&webview, shared.clone(), signals.lost.clone())
+        {
+            log::warn!("Browser tiles cannot detect crashed pages: {error}");
+        }
+        if let Err(error) = register_audio_handler(&webview, shared.clone()) {
+            log::warn!("Browser tiles cannot report playing audio: {error}");
+        }
+        if let Err(error) = register_history_handler(&webview, shared.clone()) {
+            log::warn!("Browser tiles cannot follow page history: {error}");
+        }
+        if let Err(error) = register_favicon_handler(&webview, shared.clone()) {
+            log::warn!("Browser tabs cannot show site icons: {error}");
+        }
+        if let Err(error) = register_context_menu_handler(&webview, shared.clone()) {
+            log::warn!("Browser pages cannot offer Open Link in New Tile: {error}");
+        }
+        if let Err(error) = register_engine_update_handler(&webview, signals.update_ready.clone()) {
+            log::warn!("Browser tiles cannot detect WebView2 updates: {error}");
+        }
+
+        let view = TabView {
+            webview,
+            shared,
+            interactive,
+            last_url_check: None,
+            after_resume: None,
+            last_crash_reload: None,
+            crash_reported: false,
+        };
+        if self.muted {
+            if let Err(error) = view.set_muted(true) {
+                log::warn!("A new browser tab could not be muted: {error}");
+            }
+        }
+        Ok(view)
+    }
+
+    /// Replace the single tab a new host opened with `tabs`, keeping the
+    /// loaded page as the active one. The others load when first shown.
+    fn restore_tabs(&mut self, tabs: &[BrowserTab], active: usize) {
+        if tabs.len() < 2 || active >= tabs.len() || self.tabs.len() != 1 {
+            return;
+        }
+        let mut loaded = self.tabs.pop().expect("a new host has one tab");
+        loaded.title.clone_from(&tabs[active].title);
+        self.tabs = tabs.iter().map(HostTab::unloaded).collect();
+        self.tabs[active] = loaded;
+        self.active_tab = active;
+        self.tabs_dirty = true;
+    }
+
+    fn view(&self) -> Option<&TabView> {
+        self.tabs.get(self.active_tab)?.view.as_ref()
+    }
+
+    fn webview(&self) -> Option<&WebView> {
+        self.view().map(|view| &view.webview)
+    }
+
+    fn loaded_views(&self) -> impl Iterator<Item = &TabView> {
+        self.tabs.iter().filter_map(|tab| tab.view.as_ref())
+    }
+
+    pub fn hwnd(&self) -> isize {
+        self.window.0 .0 as isize
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn is_preparing_interaction(&self) -> bool {
+        self.reveal_at.is_some()
+    }
+
+    /// True once, when a host that was just parked has settled at capture
+    /// resolution and its capture can resume.
+    pub fn take_settled_capture(&mut self) -> bool {
+        if self
+            .capture_resume_at
+            .is_some_and(|resume_at| Instant::now() >= resume_at)
+        {
+            self.capture_resume_at = None;
+            return true;
+        }
+        false
+    }
+
+    pub fn is_settling_capture(&self) -> bool {
+        self.capture_resume_at.is_some()
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Open `url` in a new tab after the active one, showing it if `activate`.
+    fn open_tab(
+        &mut self,
+        context: &mut WebContext,
+        url: &str,
+        signals: &EngineSignals,
+        activate: bool,
+    ) -> Result<(), String> {
+        if self.suspended {
+            return Err("Unfreeze this browser tile to open a tab".to_owned());
+        }
+        if !is_web_url(url) {
+            return Err("Only web addresses can open in a browser tile".to_owned());
+        }
+        let view = self.build_view(context, url, signals, false)?;
+        let index = (self.active_tab + 1).min(self.tabs.len());
+        self.tabs.insert(index, HostTab::loaded(view, url, false));
+        self.tabs_dirty = true;
+        if activate {
+            self.select_tab(context, signals, index)?;
+        }
+        Ok(())
+    }
+
+    /// Show tab `index`, loading it first if it was restored unloaded.
+    fn select_tab(
+        &mut self,
+        context: &mut WebContext,
+        signals: &EngineSignals,
+        index: usize,
+    ) -> Result<(), String> {
+        if index >= self.tabs.len() || self.suspended {
+            return Ok(());
+        }
+        if self.tabs[index].view.is_none() {
+            let url = self.tabs[index].url.clone();
+            let view = self.build_view(context, &url, signals, false)?;
+            self.tabs[index].view = Some(view);
+        }
+        if index != self.active_tab {
+            if let Some(previous) = self.webview() {
+                let _ = previous.set_visible(false);
+            }
+            self.tabs[self.active_tab].hidden_since = Some(Instant::now());
+            self.active_tab = index;
+            self.tabs_dirty = true;
+        }
+        self.tabs[index].hidden_since = None;
+        self.show_active_view();
+        Ok(())
+    }
+
+    /// Move tab `from` to position `to`, keeping the same tab shown.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = moved_index(self.active_tab, from, to);
+        self.tabs_dirty = true;
+    }
+
+    /// Unload background tabs that have been idle for [`TAB_SLEEP_AFTER`].
+    fn sleep_idle_tabs(&mut self, now: Instant) {
+        if self.suspended {
+            return;
+        }
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if index == self.active_tab || !tab.ready_to_sleep(now) {
+                continue;
+            }
+            if let Some(url) = tab.view.as_ref().and_then(TabView::live_url) {
+                tab.url = url;
+            }
+            tab.view = None;
+            tab.hidden_since = None;
+            tab.playing_audio = false;
+            self.tabs_dirty = true;
+        }
+    }
+
+    /// Close tab `index`. The last tab stays: closing it would leave the tile
+    /// without a page.
+    fn close_tab(
+        &mut self,
+        context: &mut WebContext,
+        signals: &EngineSignals,
+        index: usize,
+    ) -> Result<(), String> {
+        if self.tabs.len() < 2 || index >= self.tabs.len() {
+            return Ok(());
+        }
+        self.take_tab(context, signals, index).map(drop)
+    }
+
+    /// Remove tab `index` with its page still loaded, for another host to
+    /// adopt. If it was shown, the tab that takes its place is shown. Taking
+    /// the last tab leaves the host empty, and the caller then drops it.
+    fn take_tab(
+        &mut self,
+        context: &mut WebContext,
+        signals: &EngineSignals,
+        index: usize,
+    ) -> Result<HostTab, String> {
+        if index >= self.tabs.len() {
+            return Err("That tab is no longer open".to_owned());
+        }
+        let taking_active = index == self.active_tab;
+        let tab = self.tabs.remove(index);
+        self.tabs_dirty = true;
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+        } else if index < self.active_tab {
+            self.active_tab -= 1;
+        } else if taking_active {
+            // Like a browser, move to the tab that took this one's place.
+            let next = index.min(self.tabs.len() - 1);
+            self.active_tab = next;
+            self.tabs[next].hidden_since = None;
+            if self.tabs[next].view.is_none() {
+                let url = self.tabs[next].url.clone();
+                match self.build_view(context, &url, signals, false) {
+                    Ok(view) => self.tabs[next].view = Some(view),
+                    Err(error) => log::warn!("Could not load the next browser tab: {error}"),
+                }
+            }
+            self.show_active_view();
+        }
+        Ok(tab)
+    }
+
+    /// Add `tab`, taken from another host with its page loaded, at `slot` and
+    /// show it. On failure the tab is handed back with the reason.
+    fn adopt_tab(
+        &mut self,
+        context: &mut WebContext,
+        signals: &EngineSignals,
+        mut tab: HostTab,
+        slot: usize,
+    ) -> Result<(), Box<(HostTab, String)>> {
+        if self.suspended {
+            return Err(Box::new((
+                tab,
+                "Unfreeze this browser tile to add tabs".to_owned(),
+            )));
+        }
+        if let Some(view) = tab.view.as_ref() {
+            // Hidden until shown at this host's size, so it never flashes at
+            // the old one.
+            let _ = view.webview.set_visible(false);
+            if let Err(error) = view.webview.reparent(self.hwnd()) {
+                return Err(Box::new((tab, error.to_string())));
+            }
+            // Its pop-ups and input follow the new window from here on.
+            unsafe {
+                let _ = view
+                    .webview
+                    .controller()
+                    .NotifyParentWindowPositionChanged();
+            }
+            view.interactive
+                .store(self.active, std::sync::atomic::Ordering::Relaxed);
+            if let Err(error) = view.set_muted(self.muted) {
+                log::warn!("A moved browser tab kept its old mute state: {error}");
+            }
+        }
+        tab.hidden_since = None;
+        let index = slot.min(self.tabs.len());
+        if !self.tabs.is_empty() && index <= self.active_tab {
+            self.active_tab += 1;
+        }
+        self.tabs.insert(index, tab);
+        self.tabs_dirty = true;
+        if let Err(error) = self.select_tab(context, signals, index) {
+            log::warn!("Could not show a moved browser tab: {error}");
+        }
+        Ok(())
+    }
+
+    /// Size, zoom and reveal the active tab's WebView for the host's mode.
+    fn show_active_view(&self) {
+        let Some(webview) = self.webview() else {
+            return;
+        };
+        let (x, y, width, height) = match (self.active, self.last_geometry) {
+            (true, Some(geometry)) => (
+                geometry.page_x,
+                geometry.page_y,
+                geometry.page_width,
+                geometry.page_height,
+            ),
+            _ => (0, 0, self.capture_size.0, self.capture_size.1),
+        };
+        set_page_geometry(webview, (x, y), (width, height), self.zoom_for_width(width));
+        let _ = webview.set_visible(true);
+        if self.active && self.reveal_at.is_none() {
+            let _ = webview.focus();
+        }
+    }
+
+    /// Match an inactive browser's capture backing to 2× its displayed
+    /// physical size. The zoom changes with the backing width, preserving the
+    /// same CSS viewport while keeping the canvas preview reasonably sharp.
+    pub fn sync_capture_size(&mut self, width: i32, height: i32) {
+        if self.active || self.suspended {
+            return;
+        }
+        let size = (width.max(1), height.max(1));
+        if self.capture_size == size {
+            return;
+        }
+        self.capture_size = size;
+        unsafe {
+            let _ = SetWindowPos(
+                self.window.0,
+                HWND_BOTTOM,
+                PARK_X,
+                PARK_Y,
+                size.0,
+                size.1,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        if let Some(webview) = self.webview() {
+            set_page_geometry(webview, (0, 0), size, self.zoom_for_width(size.0));
+        }
+        // A tile that just parked can settle at a new capture size, for
+        // example after its tab strip collapsed while it was interactive.
+        if self.capture_resume_at.is_some() {
+            self.capture_resume_at = Some(Instant::now() + PARK_SETTLE_DELAY);
+        }
+    }
+
+    /// WebView2 zoom for a page `width` physical pixels wide: the tile-size
+    /// zoom that keeps the layout at WIDTH CSS pixels, times the tile's own
+    /// page zoom.
+    fn zoom_for_width(&self, width: i32) -> f64 {
+        (width as f64 / WIDTH as f64 * self.page_zoom).clamp(MIN_ZOOM, MAX_ZOOM)
+    }
+
+    /// Apply the tile's page zoom (1.0 = the page's normal size).
+    pub fn set_page_zoom(&mut self, zoom: f32) {
+        let zoom = f64::from(zoom.clamp(MIN_PAGE_ZOOM, MAX_PAGE_ZOOM));
+        if (self.page_zoom - zoom).abs() < 1e-4 || self.suspended {
+            return;
+        }
+        self.page_zoom = zoom;
+        let width = match (self.active, self.last_geometry) {
+            (true, Some(geometry)) => geometry.page_width,
+            _ => self.capture_size.0,
+        };
+        if let Some(webview) = self.webview() {
+            let _ = webview.zoom(self.zoom_for_width(width));
+        }
+    }
+
+    /// Scroll the page under a normalized point by `delta` CSS pixels
+    /// (positive scrolls down), without entering interaction mode.
+    pub fn scroll_page(&self, u: f32, v: f32, delta: f32) {
+        if self.suspended || !u.is_finite() || !v.is_finite() || !delta.is_finite() {
+            return;
+        }
+        if let Some(webview) = self.webview() {
+            let script = format!(
+                "{SCROLL_PAGE_SCRIPT}({}, {}, {});",
+                u.clamp(0.0, 1.0),
+                v.clamp(0.0, 1.0),
+                delta
+            );
+            let _ = webview.evaluate_script(&script);
+        }
+    }
+
+    /// Look for the page's main video. The answer arrives through
+    /// [`BrowserUpdate::video_rect`].
+    pub fn request_video_rect(&self) {
+        if self.suspended {
+            return;
+        }
+        let Some(view) = self.view() else {
+            return;
+        };
+        let shared = view.shared.clone();
+        let requested =
+            view.webview
+                .evaluate_script_with_callback(FIND_VIDEO_SCRIPT, move |json| {
+                    let mut state = shared.lock();
+                    state.video_rect = Some(parse_video_rect(&json));
+                    state.dirty = true;
+                });
+        if requested.is_err() {
+            let mut state = view.shared.lock();
+            state.video_rect = Some(None);
+            state.dirty = true;
+        }
+    }
+
+    /// The active tab's address.
+    pub fn current_url(&self) -> String {
+        match self.view() {
+            Some(view) => view.current_url(),
+            None => self.tabs[self.active_tab].url.clone(),
+        }
+    }
+
+    /// The active page's address read straight from WebView2, or None while
+    /// the tab has no WebView or sits on a non-web page.
+    pub fn live_url(&self) -> Option<String> {
+        self.view()?.live_url()
+    }
+
+    /// Every tab's address for saving, read live where the page is loaded.
+    pub fn tab_urls(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .map(|tab| {
+                tab.view
+                    .as_ref()
+                    .and_then(TabView::live_url)
+                    .unwrap_or_else(|| tab.url.clone())
+            })
+            .collect()
+    }
+
+    /// Drain pending title/URL changes from every tab. Pages that asked for
+    /// a new window are reported in [`BrowserUpdate::new_window_requests`].
+    /// Call once per frame.
+    pub fn poll(&mut self) -> BrowserUpdate {
+        if self.suspended {
+            return BrowserUpdate::default();
+        }
+        let mut update = BrowserUpdate::default();
+        let mut changed = std::mem::take(&mut self.tabs_dirty);
+        let active_tab = self.active_tab;
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            let HostTab {
+                view,
+                url,
+                title,
+                playing_audio,
+                favicon,
+                ..
+            } = tab;
+            let Some(view) = view.as_mut() else {
+                continue;
+            };
+            view.refresh_live_url();
+            let (navigate, crashed, video_rect, icon) = {
+                let mut state = view.shared.lock();
+                if !state.dirty {
+                    continue;
+                }
+                state.dirty = false;
+                url.clone_from(&state.current_url);
+                if let Some(page_title) = &state.current_title {
+                    title.clone_from(page_title);
+                }
+                *playing_audio = state.playing_audio;
+                update.download_blocked |= std::mem::take(&mut state.download_blocked);
+                update
+                    .new_tile_requests
+                    .append(&mut state.new_tile_requests);
+                (
+                    state.pending_navigation.take(),
+                    std::mem::take(&mut state.page_crashed),
+                    state.video_rect.take(),
+                    state.favicon.take(),
+                )
+            };
+            changed = true;
+            if let Some((uri, png)) = icon {
+                *favicon = decode_favicon(uri, &png);
+            }
+            if let Some(url) = navigate {
+                update.new_window_requests.push(url);
+            }
+            if crashed {
+                update.page_crash = view.recover_crashed_page().or(update.page_crash);
+            }
+            if index == active_tab {
+                update.video_rect = video_rect;
+            }
+        }
+        if !changed {
+            return update;
+        }
+
+        let active = &self.tabs[self.active_tab];
+        update.changed = true;
+        update.title = Some(active.title.clone()).filter(|title| !title.is_empty());
+        update.url = Some(active.url.clone());
+        update.playing_audio = self.tabs.iter().any(|tab| tab.playing_audio);
+        if let Some(view) = active.view.as_ref() {
+            update.loading = view.shared.lock().loading;
+            (update.can_go_back, update.can_go_forward) = view.history_state();
+        }
+        update.tabs = self.tabs.iter().map(HostTab::snapshot).collect();
+        update.active_tab = self.active_tab;
+        update
     }
 
     /// Position the host over the visible part of `page_rect` inside
@@ -1043,15 +1882,16 @@ impl BrowserHost {
             return;
         }
 
+        // Keep the page's apparent scale identical to the captured texture:
+        // layout width stays WIDTH/dpi CSS px in both modes.
         let zoom = self.zoom_for_width(geometry.page_width);
         let resize_webview = |webview: &WebView| {
-            let _ = webview.set_bounds(Rect {
-                position: PhysicalPosition::new(geometry.page_x, geometry.page_y).into(),
-                size: PhysicalSize::new(geometry.page_width, geometry.page_height).into(),
-            });
-            // Keep the page's apparent scale identical to the captured
-            // texture: layout width stays WIDTH/dpi CSS px in both modes.
-            let _ = webview.zoom(zoom);
+            set_page_geometry(
+                webview,
+                (geometry.page_x, geometry.page_y),
+                (geometry.page_width, geometry.page_height),
+                zoom,
+            );
         };
 
         if take_focus {
@@ -1069,12 +1909,15 @@ impl BrowserHost {
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
             }
-            if let Some(webview) = self.webview.as_ref() {
+            if let Some(webview) = self.webview() {
                 resize_webview(webview);
             }
             self.set_active(true);
             self.last_geometry = Some(geometry);
             self.reveal_at = Some(Instant::now() + INTERACTION_PREP_DELAY);
+            // Re-entered before a previous park settled: the app resumes the
+            // capture after the reveal instead.
+            self.capture_resume_at = None;
             return;
         }
 
@@ -1093,7 +1936,7 @@ impl BrowserHost {
                         SWP_NOACTIVATE | SWP_SHOWWINDOW,
                     );
                 }
-                if let Some(webview) = self.webview.as_ref() {
+                if let Some(webview) = self.webview() {
                     resize_webview(webview);
                 }
                 self.last_geometry = Some(geometry);
@@ -1116,7 +1959,7 @@ impl BrowserHost {
                 );
                 let _ = SetForegroundWindow(self.window.0);
             }
-            if let Some(webview) = self.webview.as_ref() {
+            if let Some(webview) = self.webview() {
                 let _ = webview.focus();
             }
             self.reveal_at = None;
@@ -1137,7 +1980,7 @@ impl BrowserHost {
         }
         // While already active, resize after moving so a panning or zooming
         // tile stays glued to its new position.
-        if let Some(webview) = self.webview.as_ref() {
+        if let Some(webview) = self.webview() {
             resize_webview(webview);
         }
         self.set_active(true);
@@ -1146,14 +1989,31 @@ impl BrowserHost {
 
     fn set_active(&mut self, active: bool) {
         self.active = active;
-        self.interactive
-            .store(active, std::sync::atomic::Ordering::Relaxed);
+        for view in self.loaded_views() {
+            view.interactive
+                .store(active, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Give keyboard focus back to an interactive page after the user
+    /// clicked the tile's toolbar or tabs, which briefly focused the canvas.
+    pub fn refocus(&self) {
+        if !self.active || self.reveal_at.is_some() {
+            return;
+        }
+        unsafe {
+            let _ = SetForegroundWindow(self.window.0);
+        }
+        if let Some(webview) = self.webview() {
+            let _ = webview.focus();
+        }
     }
 
     /// Move the host back offscreen at capture resolution. Audio keeps
     /// playing and Windows Graphics Capture keeps rendering it.
     pub fn park(&mut self) {
-        let (width, height) = self.capture_size;
+        let size = self.capture_size;
+        let (width, height) = size;
         unsafe {
             let _ = SetWindowPos(
                 self.window.0,
@@ -1165,82 +2025,56 @@ impl BrowserHost {
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
         }
-        if let Some(webview) = self.webview.as_ref() {
-            let _ = webview.set_bounds(Rect {
-                position: PhysicalPosition::new(0, 0).into(),
-                size: PhysicalSize::new(width, height).into(),
-            });
-            let _ = webview.zoom((width as f64 / WIDTH as f64).clamp(MIN_ZOOM, MAX_ZOOM));
+        if let Some(webview) = self.webview() {
+            set_page_geometry(webview, (0, 0), size, self.zoom_for_width(width));
+        }
+        if self.active {
+            self.capture_resume_at = Some(Instant::now() + PARK_SETTLE_DELAY);
         }
         self.set_active(false);
         self.last_geometry = None;
         self.reveal_at = None;
     }
 
-    /// Hide the controller and ask WebView2 to put this page to sleep. The
-    /// callback is intentionally non-blocking because WebView2 dispatches it
-    /// through the UI thread's message pump.
+    /// Hide every tab and ask WebView2 to put their pages to sleep.
     pub fn suspend(&mut self) -> Result<(), String> {
         if self.suspended {
             return Ok(());
         }
         self.park();
-        let webview = self.webview.as_ref().ok_or("browser is closed")?;
-        let controller = webview.controller();
-        unsafe {
-            controller
-                .SetIsVisible(false)
-                .map_err(|error| error.to_string())?;
+        if self.view().is_none() {
+            return Err("browser is closed".to_owned());
         }
         self.suspended = true;
-        let core = unsafe { controller.CoreWebView2() }.map_err(|error| error.to_string())?;
-        let core3: ICoreWebView2_3 = core.cast().map_err(|error| error.to_string())?;
-        let callback = TrySuspendCompletedHandler::create(Box::new(|result, successful| {
-            if let Err(error) = result {
-                log::warn!("WebView2 tile suspension failed: {error}");
-            } else if !successful {
-                log::warn!("WebView2 declined to suspend a frozen tile");
+        let mut result = Ok(());
+        for view in self.loaded_views() {
+            if let Err(error) = view.suspend() {
+                result = Err(error);
             }
-            Ok(())
-        }));
-        unsafe {
-            core3
-                .TrySuspend(&callback)
-                .map_err(|error| error.to_string())?;
         }
-        Ok(())
+        result
     }
 
-    /// Wake a manually frozen page before its capture session is restarted.
+    /// Wake a manually frozen tile before its capture session is restarted.
     pub fn resume(&mut self) -> Result<(), String> {
         if !self.suspended {
             return Ok(());
         }
-        let webview = self.webview.as_ref().ok_or("browser is closed")?;
-        let controller = webview.controller();
-        let resume_result = unsafe { controller.CoreWebView2() }
-            .map_err(|error| error.to_string())
-            .and_then(|core| {
-                let core3: ICoreWebView2_3 = core.cast().map_err(|error| error.to_string())?;
-                unsafe { core3.Resume().map_err(|error| error.to_string()) }
-            });
-        unsafe {
-            controller
-                .SetIsVisible(true)
-                .map_err(|error| error.to_string())?;
+        if self.view().is_none() {
+            return Err("browser is closed".to_owned());
         }
-        self.suspended = false;
-        if let Some(action) = self.after_resume.take() {
-            match action {
-                AfterResume::Load(url) => self.load(&url),
-                AfterResume::Reload => self.reload(),
+        let active_tab = self.active_tab;
+        let mut result = Ok(());
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            if let Some(view) = tab.view.as_mut() {
+                if let Err(error) = view.resume(index == active_tab) {
+                    result = Err(error);
+                }
             }
         }
+        self.suspended = false;
         self.park();
-        if let Err(error) = resume_result {
-            log::warn!("WebView2 resume API was unavailable; restored visibility instead: {error}");
-        }
-        Ok(())
+        result
     }
 
     /// True when keyboard focus belongs to this host (or one of the WebView's
@@ -1255,20 +2089,42 @@ impl BrowserHost {
             log::warn!("Blocked non-web browser navigation");
             return;
         }
-        if let Some(webview) = self.webview.as_ref() {
-            let _ = webview.load_url(url);
+        if let Some(view) = self.view() {
+            view.load(url);
         }
-        let mut state = self.shared.lock();
-        state.current_url = url.to_owned();
-        state.dirty = true;
     }
 
     /// Record the address a tile held on `about:blank` will navigate to once
     /// filtering is live, so its label and saved layout show the real target.
     fn set_deferred_url(&self, url: &str) {
-        let mut state = self.shared.lock();
-        state.current_url = url.to_owned();
-        state.dirty = true;
+        if let Some(view) = self.view() {
+            let mut state = view.shared.lock();
+            state.current_url = url.to_owned();
+            state.dirty = true;
+        }
+    }
+
+    /// Run `action` on the active tab and reload the other loaded tabs, now
+    /// or when the tile wakes up.
+    fn reload_all(&mut self, active_action: Option<AfterResume>) {
+        let active_tab = self.active_tab;
+        let suspended = self.suspended;
+        let mut active_action = active_action;
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            let Some(view) = tab.view.as_mut() else {
+                continue;
+            };
+            let action = if index == active_tab {
+                active_action.take().unwrap_or(AfterResume::Reload)
+            } else {
+                AfterResume::Reload
+            };
+            if suspended {
+                view.after_resume.get_or_insert(action);
+            } else {
+                view.run(action);
+            }
+        }
     }
 
     pub fn go_back(&self) {
@@ -1282,8 +2138,8 @@ impl BrowserHost {
     }
 
     pub fn reload(&self) {
-        if let Some(webview) = self.webview.as_ref() {
-            let _ = webview.reload();
+        if let Some(view) = self.view() {
+            view.reload();
         }
     }
 
@@ -1299,11 +2155,12 @@ impl BrowserHost {
         .filter(|pid| *pid != 0)
     }
 
+    /// Mute or unmute every tab of the tile.
     pub fn set_muted(&mut self, muted: bool) -> Result<(), String> {
-        self.with_core(|core| {
-            let core8: ICoreWebView2_8 = core.cast().map_err(|e| e.to_string())?;
-            unsafe { core8.SetIsMuted(muted) }.map_err(|e| e.to_string())
-        })?;
+        self.view().ok_or("browser is closed")?.set_muted(muted)?;
+        for view in self.loaded_views() {
+            let _ = view.set_muted(muted);
+        }
         self.muted = muted;
         Ok(())
     }
@@ -1388,15 +2245,13 @@ impl BrowserHost {
             &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
         ) -> Result<T, String>,
     ) -> Result<T, String> {
-        let webview = self.webview.as_ref().ok_or("browser is closed")?;
-        let core = unsafe { webview.controller().CoreWebView2() }.map_err(|e| e.to_string())?;
-        f(&core)
+        self.view().ok_or("browser is closed")?.with_core(f)
     }
 }
 
 impl Drop for BrowserHost {
     fn drop(&mut self) {
-        self.webview.take();
+        self.tabs.clear();
         unsafe {
             let _ = DestroyWindow(self.window.0);
         }
@@ -1487,9 +2342,15 @@ impl BrowserManager {
         }
     }
 
-    /// Create a host + WebView for `url` and register it under `id`.
-    /// Returns the host HWND for capture.
-    pub fn create(&mut self, id: PreviewId, url: &str) -> Result<isize, String> {
+    /// Create a host for `tabs`, loading the `active` one, and register it
+    /// under `id`. Returns the host HWND for capture.
+    pub fn create(
+        &mut self,
+        id: PreviewId,
+        tabs: &[BrowserTab],
+        active: usize,
+    ) -> Result<isize, String> {
+        let url = tabs.get(active).map(|tab| tab.url.as_str()).unwrap_or("");
         // Hold the first real navigation on about:blank until uBOL has been
         // installed and enabled, avoiding an initial burst of unfiltered
         // requests. Extension failure is non-fatal: browser tiles still work.
@@ -1505,7 +2366,8 @@ impl BrowserManager {
         }
         let hold_navigation = initialize_extension || self.adblock_settling();
         let initial_url = if hold_navigation { "about:blank" } else { url };
-        let host = BrowserHost::new(&mut self.context, initial_url, &self.signals)?;
+        let mut host = BrowserHost::new(&mut self.context, initial_url, &self.signals)?;
+        host.restore_tabs(tabs, active);
 
         if initialize_extension {
             self.extension_initialized = true;
@@ -1667,19 +2529,7 @@ impl BrowserManager {
         self.adblock_settle_until = None;
         let deferred = std::mem::take(&mut self.deferred_loads);
         for (id, host) in &mut self.hosts {
-            let action = deferred
-                .get(id)
-                .cloned()
-                .map(AfterResume::Load)
-                .unwrap_or(AfterResume::Reload);
-            if host.suspended {
-                host.after_resume = Some(action);
-            } else {
-                match action {
-                    AfterResume::Load(url) => host.load(&url),
-                    AfterResume::Reload => host.reload(),
-                }
-            }
+            host.reload_all(deferred.get(id).cloned().map(AfterResume::Load));
         }
     }
 
@@ -1759,6 +2609,152 @@ impl BrowserManager {
         self.hosts.get_mut(&id)
     }
 
+    /// Open `url` in a new tab of tile `id`, showing it if `activate`.
+    pub fn open_tab(&mut self, id: PreviewId, url: &str, activate: bool) -> Result<(), String> {
+        let host = self
+            .hosts
+            .get_mut(&id)
+            .ok_or("This browser tile is still starting")?;
+        host.open_tab(&mut self.context, url, &self.signals, activate)
+    }
+
+    pub fn select_tab(&mut self, id: PreviewId, index: usize) -> Result<(), String> {
+        match self.hosts.get_mut(&id) {
+            Some(host) => host.select_tab(&mut self.context, &self.signals, index),
+            None => Ok(()),
+        }
+    }
+
+    pub fn close_tab(&mut self, id: PreviewId, index: usize) -> Result<(), String> {
+        match self.hosts.get_mut(&id) {
+            Some(host) => host.close_tab(&mut self.context, &self.signals, index),
+            None => Ok(()),
+        }
+    }
+
+    pub fn move_tab(&mut self, id: PreviewId, from: usize, to: usize) {
+        if let Some(host) = self.hosts.get_mut(&id) {
+            host.move_tab(from, to);
+        }
+    }
+
+    /// Move tab `index` of tile `from` to position `slot` of tile `to` with
+    /// its page still loaded, and show it there. Returns true when it was
+    /// `from`'s only tab: that host is then gone, and the caller removes the
+    /// tile.
+    pub fn transfer_tab(
+        &mut self,
+        from: PreviewId,
+        index: usize,
+        to: PreviewId,
+        slot: usize,
+    ) -> Result<bool, String> {
+        if from == to {
+            return Err("The tab is already in this tile".to_owned());
+        }
+        let Self {
+            hosts,
+            context,
+            signals,
+            ..
+        } = self;
+        let target = hosts
+            .get(&to)
+            .ok_or("That browser tile is still starting")?;
+        if target.suspended {
+            return Err("Unfreeze that browser tile to add tabs to it".to_owned());
+        }
+        let source = hosts
+            .get_mut(&from)
+            .ok_or("This browser tile is still starting")?;
+        if source.suspended {
+            return Err("Unfreeze this browser tile to move its tabs".to_owned());
+        }
+        let tab = source.take_tab(context, signals, index)?;
+        let target = hosts.get_mut(&to).expect("checked above");
+        if let Err(rejected) = target.adopt_tab(context, signals, tab, slot) {
+            let (tab, error) = *rejected;
+            Self::give_back(hosts, context, signals, from, tab, index);
+            return Err(error);
+        }
+        Ok(self.drop_if_empty(from))
+    }
+
+    /// Open tab `index` of tile `from` as the only tab of a new tile `id`,
+    /// with its page still loaded. Returns the new host's HWND for capture.
+    /// `from` never loses its last tab this way.
+    pub fn create_from_tab(
+        &mut self,
+        id: PreviewId,
+        from: PreviewId,
+        index: usize,
+    ) -> Result<isize, String> {
+        let Self {
+            hosts,
+            context,
+            signals,
+            ..
+        } = self;
+        let source = hosts
+            .get(&from)
+            .ok_or("This browser tile is still starting")?;
+        if source.tabs.len() < 2 {
+            return Err("A tile keeps its last tab".to_owned());
+        }
+        if source.suspended {
+            return Err("Unfreeze this browser tile to move its tabs".to_owned());
+        }
+        let (muted, page_zoom) = (source.muted, source.page_zoom);
+        let mut host = BrowserHost::empty()?;
+        host.muted = muted;
+        host.page_zoom = page_zoom;
+        let source = hosts.get_mut(&from).expect("checked above");
+        let tab = source.take_tab(context, signals, index)?;
+        if let Err(rejected) = host.adopt_tab(context, signals, tab, 0) {
+            let (tab, error) = *rejected;
+            Self::give_back(hosts, context, signals, from, tab, index);
+            return Err(error);
+        }
+        let hwnd = host.hwnd();
+        hosts.insert(id, host);
+        Ok(hwnd)
+    }
+
+    /// Return a tab that could not move to the tile it came from.
+    fn give_back(
+        hosts: &mut HashMap<PreviewId, BrowserHost>,
+        context: &mut WebContext,
+        signals: &EngineSignals,
+        from: PreviewId,
+        tab: HostTab,
+        index: usize,
+    ) {
+        if let Some(source) = hosts.get_mut(&from) {
+            if let Err(rejected) = source.adopt_tab(context, signals, tab, index) {
+                let error = &rejected.1;
+                log::warn!("A browser tab could not return to its tile: {error}");
+            }
+        }
+    }
+
+    /// Drop `id`'s host if it has no tabs left. Returns whether it did.
+    fn drop_if_empty(&mut self, id: PreviewId) -> bool {
+        if self.hosts.get(&id).is_some_and(|host| host.tabs.is_empty()) {
+            self.hosts.remove(&id);
+            self.deferred_loads.remove(&id);
+            return true;
+        }
+        false
+    }
+
+    /// Put idle background tabs of every tile to sleep.
+    pub fn sleep_idle_tabs(&mut self) {
+        let now = Instant::now();
+        for host in self.hosts.values_mut() {
+            host.sleep_idle_tabs(now);
+        }
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = PreviewId> + '_ {
         self.hosts.keys().copied()
     }
@@ -1781,6 +2777,19 @@ impl BrowserManager {
                 host.park();
             }
         }
+    }
+
+    /// Tiles whose hosts finished settling after parking, so their capture
+    /// can resume.
+    pub fn take_settled_captures(&mut self) -> Vec<PreviewId> {
+        self.hosts
+            .iter_mut()
+            .filter_map(|(id, host)| host.take_settled_capture().then_some(*id))
+            .collect()
+    }
+
+    pub fn any_settling_capture(&self) -> bool {
+        self.hosts.values().any(BrowserHost::is_settling_capture)
     }
 
     /// Drop hosts whose previews no longer exist.
@@ -1890,11 +2899,7 @@ impl BrowserManager {
         self.clearing_data = None;
         if result.is_ok() {
             for host in self.hosts.values_mut() {
-                if host.suspended {
-                    host.after_resume.get_or_insert(AfterResume::Reload);
-                } else {
-                    host.reload();
-                }
+                host.reload_all(None);
             }
         }
         Some(result)
@@ -2373,13 +3378,114 @@ unsafe extern "system" fn browser_window_proc(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_geometry, capture_size_for_tile, extract_ubol_archive_with_progress,
-        installed_ubol_has_current_marker, installed_ubol_matches_package, is_allowed_navigation,
-        normalize_url, parked_bounds, profile_install_marker_path, read_profile_install_marker,
+        browser_geometry, capture_size_for_tile, decode_favicon,
+        extract_ubol_archive_with_progress, installed_ubol_has_current_marker,
+        installed_ubol_matches_package, is_allowed_navigation, moved_index, normalize_url,
+        parked_bounds, profile_install_marker_path, read_profile_install_marker,
         scrub_url_for_storage, ubol_archive_candidates, ubol_verification_marker_path,
         verify_ubol_archive, write_profile_install_marker, write_ubol_verification_marker,
-        NativeWindow, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE_NAME, UBOL_VERSION,
+        NativeWindow, FAVICON_SIZE, PREPARATION_PROGRESS_SCALE, UBOL_ARCHIVE_NAME, UBOL_VERSION,
     };
+
+    /// Run this thread's WebView2 callbacks until `done`.
+    fn pump_until(mut done: impl FnMut() -> bool) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "WebView2 did not answer in time"
+            );
+            unsafe {
+                let mut message = MSG::default();
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// `script`'s result as JSON.
+    fn evaluate(webview: &wry::WebView, script: &str) -> String {
+        let result = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let slot = result.clone();
+        webview
+            .evaluate_script_with_callback(script, move |value| *slot.lock() = Some(value))
+            .unwrap();
+        pump_until(|| result.lock().is_some());
+        let value = result.lock().take();
+        value.unwrap()
+    }
+
+    #[test]
+    #[ignore = "starts WebView2 offscreen with a throwaway profile"]
+    fn a_tab_moved_to_another_tile_keeps_its_live_page() {
+        use wry::WebViewExtWindows;
+        let profile =
+            std::env::temp_dir().join(format!("pluriview-tab-move-test-{}", std::process::id()));
+        let signals = super::EngineSignals::default();
+        {
+            let mut context = wry::WebContext::new(Some(profile.clone()));
+            let mut source =
+                super::BrowserHost::new(&mut context, "about:blank", &signals).unwrap();
+            let second = source
+                .build_view(&mut context, "about:blank", &signals, false)
+                .unwrap();
+            source
+                .tabs
+                .push(super::HostTab::loaded(second, "about:blank", false));
+            let page = &source.tabs[0].view.as_ref().unwrap().webview;
+            pump_until(|| evaluate(page, "document.readyState") == "\"complete\"");
+            assert_eq!(evaluate(page, "window.pluriviewMarker = 42"), "42");
+
+            let tab = source.take_tab(&mut context, &signals, 0).unwrap();
+            assert_eq!(source.tabs.len(), 1);
+            assert_eq!(source.active_tab, 0);
+            let mut target = super::BrowserHost::empty().unwrap();
+            assert!(target.adopt_tab(&mut context, &signals, tab, 0).is_ok());
+
+            // The same document, not a reload: the marker is still there.
+            let moved = &target.tabs[0].view.as_ref().unwrap().webview;
+            assert_eq!(evaluate(moved, "String(window.pluriviewMarker)"), "\"42\"");
+            // And it now lives in the other tile's window.
+            let mut container = webview2_windows::Win32::Foundation::HWND::default();
+            unsafe { moved.controller().ParentWindow(&mut container).unwrap() };
+            let parent = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetParent(super::HWND(container.0))
+            }
+            .unwrap();
+            assert_eq!(parent, target.window.0);
+        }
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn moving_a_tab_keeps_track_of_every_other_tab() {
+        // Tabs a b c d; move b (1) to the end (3): a c d b.
+        assert_eq!(moved_index(1, 1, 3), 3);
+        assert_eq!(moved_index(2, 1, 3), 1);
+        assert_eq!(moved_index(3, 1, 3), 2);
+        assert_eq!(moved_index(0, 1, 3), 0);
+        // Move d (3) to the front (0): d a b c.
+        assert_eq!(moved_index(3, 3, 0), 0);
+        assert_eq!(moved_index(0, 3, 0), 1);
+        assert_eq!(moved_index(2, 3, 0), 3);
+    }
+
+    #[test]
+    fn site_icons_decode_and_shrink_to_badge_size() {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(128, 128, image::Rgba([200, 40, 40, 255]))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let favicon = decode_favicon("https://example.com/favicon.ico".to_owned(), &png).unwrap();
+        assert_eq!(favicon.image.size, [FAVICON_SIZE as usize; 2]);
+        assert!(decode_favicon(String::new(), b"not a png").is_none());
+    }
     use eframe::egui;
     use std::io::{Cursor, Read};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2429,6 +3535,46 @@ mod tests {
     #[test]
     fn tiny_browser_tiles_keep_the_css_viewport_zoom_floor() {
         assert_eq!(capture_size_for_tile(100, 56), (320, 179));
+    }
+
+    #[test]
+    fn address_bar_opens_addresses_and_searches_everything_else() {
+        use super::address_bar_target;
+        assert_eq!(
+            address_bar_target("twitch.tv/example").unwrap(),
+            "https://twitch.tv/example"
+        );
+        assert_eq!(
+            address_bar_target("http://localhost:8080").unwrap(),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            address_bar_target("lofi radio").unwrap(),
+            "https://www.google.com/search?q=lofi+radio"
+        );
+        assert_eq!(
+            address_bar_target("weather").unwrap(),
+            "https://www.google.com/search?q=weather"
+        );
+        assert!(address_bar_target("file:///C:/secret.txt").is_err());
+        assert!(address_bar_target("  ").is_err());
+    }
+
+    #[test]
+    fn saved_tabs_are_scrubbed_and_keep_their_active_tab() {
+        use super::scrub_tabs_for_storage;
+        use crate::preview::BrowserTab;
+        let tabs = [
+            BrowserTab::new("about:blank"),
+            BrowserTab::new("https://example.com/?token=abc#top"),
+            BrowserTab::new("https://youtube.com/watch?v=1"),
+        ];
+        let (kept, active) = scrub_tabs_for_storage(&tabs, 2);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].url, "https://example.com/");
+        assert_eq!(active, 1);
+        let (_, active) = scrub_tabs_for_storage(&tabs, 0);
+        assert_eq!(active, 0);
     }
 
     #[test]

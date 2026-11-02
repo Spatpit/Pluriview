@@ -9,9 +9,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows_capture::capture::GraphicsCaptureApiError;
 use windows_capture::graphics_capture_api::GraphicsCaptureApi;
-use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
+use windows_capture::settings::{
+    CursorCaptureSettings, DrawBorderSettings, SecondaryWindowSettings,
+};
 
-use super::downsample::{fitted_capture_size, RgbaDownsampler};
+use super::downsample::{exact_capture_size, fitted_capture_size, RgbaDownsampler};
 
 /// Frame data sent from capture threads
 pub(crate) struct CapturedFrame {
@@ -126,6 +128,17 @@ struct CaptureSession {
     /// repaint request because they are polled continuously.
     window_hwnd: Option<isize>,
 
+    /// Window title, kept so the session can be restarted with other settings.
+    window_title: String,
+
+    /// The tile's app is in use from the tile: frames include the mouse
+    /// pointer and, where Windows can, the app's menus and dialogs.
+    in_use: bool,
+
+    /// Browser sessions keep their newest frame on the GPU and resize that
+    /// copy when the target changes, instead of asking the source to repaint.
+    retains_source: bool,
+
     /// Is capture active?
     active: Arc<AtomicBool>,
 
@@ -185,6 +198,31 @@ impl CaptureCoordinator {
         window_title: String,
         target_fps: u32,
     ) {
+        self.start_window_capture(preview_id, hwnd, window_title, target_fps, false, false);
+    }
+
+    /// Capture a parked browser tile. Its output follows the size the page is
+    /// shown at (see [`Self::set_target_size`]), even while a static page
+    /// sends no new frames.
+    pub fn start_browser_capture(
+        &mut self,
+        preview_id: PreviewId,
+        hwnd: isize,
+        url: String,
+        target_fps: u32,
+    ) {
+        self.start_window_capture(preview_id, hwnd, url, target_fps, true, false);
+    }
+
+    fn start_window_capture(
+        &mut self,
+        preview_id: PreviewId,
+        hwnd: isize,
+        window_title: String,
+        target_fps: u32,
+        retain_source: bool,
+        in_use: bool,
+    ) {
         // Windows Graphics Capture rejects a second session on the same HWND
         // while the previous one is still shutting down. Replacing a live
         // tile must wait for that release, or the new session fails and the
@@ -217,14 +255,17 @@ impl CaptureCoordinator {
         // Start capture in a new thread
         let closed = Arc::new(AtomicBool::new(false));
         let worker_closed = closed.clone();
+        let title = window_title.clone();
         let worker = std::thread::spawn(move || {
             capture_window_loop(
                 preview_id,
                 hwnd,
-                window_title,
+                title,
                 worker_state,
                 stop_receiver,
                 worker_closed,
+                retain_source,
+                in_use,
             );
         });
 
@@ -234,6 +275,9 @@ impl CaptureCoordinator {
             target_height,
             target_generation,
             window_hwnd: Some(hwnd),
+            window_title,
+            in_use,
+            retains_source: retain_source,
             active,
             paused,
             has_produced_frame,
@@ -291,6 +335,9 @@ impl CaptureCoordinator {
                 target_height,
                 target_generation,
                 window_hwnd: None,
+                window_title: String::new(),
+                in_use: false,
+                retains_source: false,
                 active,
                 paused,
                 has_produced_frame,
@@ -334,6 +381,40 @@ impl CaptureCoordinator {
         self.reap_finished_workers();
     }
 
+    /// Capture a window tile for using its app from the tile: the mouse
+    /// pointer and the app's menus and dialogs show on the canvas wherever
+    /// the tile is. Windows only applies these when a session starts, so a
+    /// change restarts the capture; the tile keeps its last frame meanwhile,
+    /// and its frame rate, size and pause carry over.
+    pub fn set_in_use(&mut self, preview_id: PreviewId, in_use: bool) {
+        let Some(session) = self.sessions.get(&preview_id).filter(|session| {
+            session.in_use != in_use && !session.retains_source && session.is_live()
+        }) else {
+            return;
+        };
+        let Some(hwnd) = session.window_hwnd else {
+            return;
+        };
+        let title = session.window_title.clone();
+        let fps = session.target_fps.load(Ordering::Relaxed);
+        let width = session.target_width.load(Ordering::Relaxed);
+        let height = session.target_height.load(Ordering::Relaxed);
+        let paused = session.paused.load(Ordering::Relaxed);
+        self.start_window_capture(preview_id, hwnd, title, fps, false, in_use);
+        if let Some(session) = self.sessions.get(&preview_id) {
+            session.target_width.store(width, Ordering::Relaxed);
+            session.target_height.store(height, Ordering::Relaxed);
+            session.paused.store(paused, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_in_use(&self, preview_id: PreviewId) -> bool {
+        self.sessions
+            .get(&preview_id)
+            .is_some_and(|session| session.in_use)
+    }
+
     /// Update target FPS for a capture session; applies live on the
     /// capture thread's next frame, no restart needed.
     pub fn set_target_fps(&mut self, preview_id: PreviewId, fps: u32) {
@@ -359,7 +440,9 @@ impl CaptureCoordinator {
             // Windows Graphics Capture may not emit another callback for a
             // static source. Invalidating it is asynchronous and coalesced by
             // Windows, but prompts traditional windows to paint a fresh frame.
-            if (width > old_width || height > old_height)
+            // A browser session resizes its retained frame instead.
+            if !session.retains_source
+                && (width > old_width || height > old_height)
                 && session.window_hwnd.is_some_and(request_capture_repaint)
             {
                 log::trace!("Requested a source repaint for capture resolution upgrade");
@@ -518,6 +601,7 @@ fn capture_frame_due(
 }
 
 /// Capture loop running in a separate thread
+#[allow(clippy::too_many_arguments)]
 fn capture_window_loop(
     preview_id: PreviewId,
     hwnd: isize,
@@ -525,6 +609,8 @@ fn capture_window_loop(
     worker_state: CaptureWorkerState,
     stop_receiver: Receiver<()>,
     closed: Arc<AtomicBool>,
+    retain_source: bool,
+    in_use: bool,
 ) {
     use windows_capture::{
         capture::{Context, GraphicsCaptureApiHandler},
@@ -563,6 +649,7 @@ fn capture_window_loop(
         target_height: Arc<AtomicU32>,
         target_generation: Arc<AtomicU32>,
         frame_wake: Arc<FrameWake>,
+        retain_source: bool,
     }
 
     struct Capture {
@@ -584,6 +671,53 @@ fn capture_window_loop(
         readback_scratch: Vec<u8>,
         downsampler: RgbaDownsampler,
         gpu_downsampler: super::gpu_downsample::GpuDownsampler,
+        retain_source: bool,
+    }
+
+    impl Capture {
+        /// The size a `width` x `height` source frame is delivered at. A
+        /// browser's page is shown at exactly its requested size.
+        fn output_size(&self, width: u32, height: u32) -> (u32, u32) {
+            let target_width = self.target_width.load(Ordering::Relaxed);
+            let target_height = self.target_height.load(Ordering::Relaxed);
+            if self.retain_source {
+                exact_capture_size(width, height, target_width, target_height)
+            } else {
+                fitted_capture_size(width, height, target_width, target_height)
+            }
+        }
+
+        /// Publish the retained frame at a newly requested size. A static page
+        /// sends no new frame after a zoom, so without this it would keep
+        /// showing a frame sized for the old zoom.
+        fn refresh_from_retained(&mut self) {
+            if !self.retain_source
+                || !self.active.load(Ordering::Relaxed)
+                || self.paused.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            let requested_generation = self.target_generation.load(Ordering::Acquire);
+            if requested_generation == self.handled_target_generation {
+                return;
+            }
+            let Some((width, height)) = self.gpu_downsampler.retained_size() else {
+                return;
+            };
+            let (out_width, out_height) = self.output_size(width, height);
+            let Some(data) = self
+                .gpu_downsampler
+                .resample_retained(out_width, out_height)
+            else {
+                return;
+            };
+            *self.latest_frame.lock() = Some(CapturedFrame::from_rgba(
+                out_width, out_height, width, height, &data,
+            ));
+            self.handled_target_generation = requested_generation;
+            self.last_frame = std::time::Instant::now();
+            self.frame_wake.notify();
+        }
     }
 
     impl GraphicsCaptureApiHandler for Capture {
@@ -613,6 +747,7 @@ fn capture_window_loop(
                     ctx.device,
                     ctx.device_context,
                 ),
+                retain_source: ctx.flags.retain_source,
             })
         }
 
@@ -655,17 +790,26 @@ fn capture_window_loop(
             // Decide output geometry while the source is still GPU-only.
             let width = frame.width();
             let height = frame.height();
-            let (out_width, out_height) = fitted_capture_size(
-                width,
-                height,
-                self.target_width.load(Ordering::Relaxed),
-                self.target_height.load(Ordering::Relaxed),
-            );
+            let (out_width, out_height) = self.output_size(width, height);
 
-            let gpu_pixels = self.gpu_downsampler.downsample(
-                frame.as_raw_texture(),
-                [width, height, out_width, out_height],
-            );
+            // A browser keeps its newest frame on the GPU and resizes from that
+            // copy, so `refresh_from_retained` can resize it again later.
+            let retained = self.retain_source
+                && self
+                    .gpu_downsampler
+                    .retain(frame.as_raw_texture(), width, height);
+            let gpu_pixels = retained
+                .then(|| {
+                    self.gpu_downsampler
+                        .resample_retained(out_width, out_height)
+                })
+                .flatten()
+                .or_else(|| {
+                    self.gpu_downsampler.downsample(
+                        frame.as_raw_texture(),
+                        [width, height, out_width, out_height],
+                    )
+                });
             let captured_frame = if let Some(data) = gpu_pixels {
                 #[cfg(pluriview_performance)]
                 crate::app::performance::counters::record(
@@ -745,20 +889,23 @@ fn capture_window_loop(
         target_height,
         target_generation,
         frame_wake: frame_wake.clone(),
+        retain_source,
     };
 
     // Request WithoutCursor / WithoutBorder only when those Graphics Capture
     // properties exist. Windows 10 1903 has capture but not IsBorderRequired
     // (Win11) or, on 1903, IsCursorCaptureEnabled (2004+). The crate refuses to
-    // start if those settings are not Default and the API is missing.
-    let cursor = probed_cursor_capture_setting();
+    // start if those settings are not Default and the API is missing. The same
+    // goes for an app's menus and dialogs, which Windows 11 24H2 added.
+    let cursor = probed_cursor_capture_setting(in_use);
     let border = probed_draw_border_setting();
-    let try_start = |cursor, border, min_interval, flags| {
+    let popups = probed_secondary_window_setting(in_use);
+    let try_start = |cursor, border, popups, min_interval, flags| {
         let settings = Settings::new(
             capture_target_from_hwnd(hwnd),
             cursor,
             border,
-            SecondaryWindowSettings::Default,
+            popups,
             min_interval,
             DirtyRegionSettings::Default,
             ColorFormat::Rgba8,
@@ -767,17 +914,19 @@ fn capture_window_loop(
         Capture::start_free_threaded(settings)
     };
 
-    let start_result = match try_start(cursor, border, min_interval, flags.clone()) {
+    let start_result = match try_start(cursor, border, popups, min_interval, flags.clone()) {
         Err(error)
             if capture_settings_unsupported(&error)
                 && (cursor != CursorCaptureSettings::Default
                     || border != DrawBorderSettings::Default
+                    || popups != SecondaryWindowSettings::Default
                     || min_interval != MinimumUpdateIntervalSettings::Default) =>
         {
             log::warn!("Retrying capture with default capture settings: {error}");
             try_start(
                 CursorCaptureSettings::Default,
                 DrawBorderSettings::Default,
+                SecondaryWindowSettings::Default,
                 MinimumUpdateIntervalSettings::Default,
                 flags,
             )
@@ -789,10 +938,17 @@ fn capture_window_loop(
     // without waiting for another frame callback to arrive.
     match start_result {
         Ok(control) => {
+            // A browser session also wakes often enough to follow a zoom on a
+            // page that sends no new frames.
+            let handler = control.callback();
+            let wake = std::time::Duration::from_millis(if retain_source { 20 } else { 100 });
             while active.load(Ordering::Relaxed) {
-                match stop_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                match stop_receiver.recv_timeout(wake) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {}
+                }
+                if retain_source {
+                    handler.lock().refresh_from_retained();
                 }
             }
             if let Err(error) = control.stop() {
@@ -808,11 +964,11 @@ fn capture_window_loop(
     completion_active.store(false, Ordering::Relaxed);
 }
 
-fn cursor_capture_setting(supported: bool) -> CursorCaptureSettings {
-    if supported {
-        CursorCaptureSettings::WithoutCursor
-    } else {
-        CursorCaptureSettings::Default
+fn cursor_capture_setting(supported: bool, with_cursor: bool) -> CursorCaptureSettings {
+    match (supported, with_cursor) {
+        (false, _) => CursorCaptureSettings::Default,
+        (true, true) => CursorCaptureSettings::WithCursor,
+        (true, false) => CursorCaptureSettings::WithoutCursor,
     }
 }
 
@@ -824,12 +980,14 @@ fn draw_border_setting(supported: bool) -> DrawBorderSettings {
     }
 }
 
-fn probed_cursor_capture_setting() -> CursorCaptureSettings {
+fn probed_cursor_capture_setting(with_cursor: bool) -> CursorCaptureSettings {
     match GraphicsCaptureApi::is_cursor_settings_supported() {
-        Ok(supported) => cursor_capture_setting(supported),
+        Ok(supported) => cursor_capture_setting(supported, with_cursor),
         Err(error) => {
             log::debug!("Could not probe cursor capture support: {error}");
-            CursorCaptureSettings::WithoutCursor
+            // windows-capture repeats this probe before starting, and a
+            // failure there is not retried; only Default can start.
+            cursor_capture_setting(false, with_cursor)
         }
     }
 }
@@ -839,7 +997,31 @@ fn probed_draw_border_setting() -> DrawBorderSettings {
         Ok(supported) => draw_border_setting(supported),
         Err(error) => {
             log::debug!("Could not probe border capture support: {error}");
-            DrawBorderSettings::WithoutBorder
+            // As for the cursor: only Default can start.
+            draw_border_setting(false)
+        }
+    }
+}
+
+/// An app's menus and dialogs are separate windows; include them only while
+/// the app is used from its tile, so its pop-ups otherwise stay its own.
+fn secondary_window_setting(supported: bool, in_use: bool) -> SecondaryWindowSettings {
+    if supported && in_use {
+        SecondaryWindowSettings::Include
+    } else {
+        SecondaryWindowSettings::Default
+    }
+}
+
+fn probed_secondary_window_setting(in_use: bool) -> SecondaryWindowSettings {
+    if !in_use {
+        return SecondaryWindowSettings::Default;
+    }
+    match GraphicsCaptureApi::is_secondary_windows_supported() {
+        Ok(supported) => secondary_window_setting(supported, in_use),
+        Err(error) => {
+            log::debug!("Could not probe secondary window capture support: {error}");
+            SecondaryWindowSettings::Default
         }
     }
 }
@@ -850,6 +1032,7 @@ fn capture_settings_unsupported<E>(error: &GraphicsCaptureApiError<E>) -> bool {
         GraphicsCaptureApiError::GraphicsCaptureApiError(
             windows_capture::graphics_capture_api::Error::BorderConfigUnsupported
                 | windows_capture::graphics_capture_api::Error::CursorConfigUnsupported
+                | windows_capture::graphics_capture_api::Error::SecondaryWindowsUnsupported
                 | windows_capture::graphics_capture_api::Error::MinimumUpdateIntervalUnsupported
         )
     )
@@ -901,6 +1084,9 @@ mod tests {
             target_height: Arc::new(AtomicU32::new(0)),
             target_generation: Arc::new(AtomicU32::new(0)),
             window_hwnd: None,
+            window_title: String::new(),
+            in_use: false,
+            retains_source: false,
             active: Arc::new(AtomicBool::new(active)),
             paused: Arc::new(AtomicBool::new(paused)),
             has_produced_frame: Arc::new(AtomicBool::new(true)),
@@ -1190,6 +1376,9 @@ mod tests {
                 target_height: Arc::new(AtomicU32::new(0)),
                 target_generation: Arc::new(AtomicU32::new(0)),
                 window_hwnd: None,
+                window_title: String::new(),
+                in_use: false,
+                retains_source: false,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 has_produced_frame: Arc::new(AtomicBool::new(false)),
@@ -1221,6 +1410,9 @@ mod tests {
                 target_height: Arc::new(AtomicU32::new(0)),
                 target_generation: Arc::new(AtomicU32::new(0)),
                 window_hwnd: None,
+                window_title: String::new(),
+                in_use: false,
+                retains_source: false,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 has_produced_frame: Arc::new(AtomicBool::new(false)),
@@ -1240,19 +1432,43 @@ mod tests {
 
     #[test]
     fn capture_settings_use_defaults_when_unsupported() {
-        use super::{cursor_capture_setting, draw_border_setting};
-        use windows_capture::settings::{CursorCaptureSettings, DrawBorderSettings};
+        use super::{cursor_capture_setting, draw_border_setting, secondary_window_setting};
+        use windows_capture::settings::{
+            CursorCaptureSettings, DrawBorderSettings, SecondaryWindowSettings,
+        };
 
         assert_eq!(
-            cursor_capture_setting(true),
+            cursor_capture_setting(true, false),
             CursorCaptureSettings::WithoutCursor
         );
         assert_eq!(
-            cursor_capture_setting(false),
+            cursor_capture_setting(true, true),
+            CursorCaptureSettings::WithCursor
+        );
+        // Windows 10 1903 always draws the pointer and cannot change that.
+        assert_eq!(
+            cursor_capture_setting(false, false),
+            CursorCaptureSettings::Default
+        );
+        assert_eq!(
+            cursor_capture_setting(false, true),
             CursorCaptureSettings::Default
         );
         assert_eq!(draw_border_setting(true), DrawBorderSettings::WithoutBorder);
         assert_eq!(draw_border_setting(false), DrawBorderSettings::Default);
+        // Menus and dialogs only while in use, and only on Windows 11 24H2+.
+        assert_eq!(
+            secondary_window_setting(true, true),
+            SecondaryWindowSettings::Include
+        );
+        assert_eq!(
+            secondary_window_setting(true, false),
+            SecondaryWindowSettings::Default
+        );
+        assert_eq!(
+            secondary_window_setting(false, true),
+            SecondaryWindowSettings::Default
+        );
         use windows_capture::settings::MinimumUpdateIntervalSettings;
         assert_eq!(
             super::minimum_update_interval(false),
@@ -1307,6 +1523,9 @@ mod tests {
                 target_height: Arc::new(AtomicU32::new(0)),
                 target_generation: Arc::new(AtomicU32::new(0)),
                 window_hwnd: None,
+                window_title: String::new(),
+                in_use: false,
+                retains_source: false,
                 active: Arc::new(AtomicBool::new(true)),
                 paused: Arc::new(AtomicBool::new(false)),
                 has_produced_frame: Arc::new(AtomicBool::new(false)),

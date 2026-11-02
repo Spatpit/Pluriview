@@ -433,9 +433,10 @@ impl PluriviewApp {
         let mut layout = SavedLayout::new();
 
         // Save canvas state
+        let (pan, zoom) = self.canvas.layout_camera();
         layout.canvas = CanvasLayout {
-            pan: (self.canvas.pan.x, self.canvas.pan.y),
-            zoom: self.canvas.zoom,
+            pan: (pan.x, pan.y),
+            zoom,
             show_grid: self.canvas.show_grid,
             wallpaper: self
                 .canvas
@@ -458,13 +459,22 @@ impl PluriviewApp {
                     // reopens on the last page browsed rather than the one it
                     // was created with. Falls back to the mirrored URL for
                     // tiles whose host is gone.
-                    saved.browser_url = self
-                        .browser
-                        .get(p.id)
+                    let host = self.browser.get(p.id);
+                    saved.browser_url = host
                         .and_then(|host| host.live_url())
                         .or(saved.browser_url)
                         .as_deref()
                         .and_then(scrub_url_for_storage);
+                    if let Some(host) = host {
+                        let urls = host.tab_urls();
+                        if urls.len() == saved.browser_tabs.len() {
+                            for (tab, url) in saved.browser_tabs.iter_mut().zip(urls) {
+                                tab.url = url;
+                            }
+                        }
+                    }
+                    (saved.browser_tabs, saved.browser_active_tab) =
+                        scrub_tabs_for_storage(&saved.browser_tabs, saved.browser_active_tab);
                 }
                 saved
             })
@@ -484,6 +494,8 @@ impl PluriviewApp {
 
     /// Apply a SavedLayout to restore state
     pub(super) fn apply_layout(&mut self, layout: &SavedLayout) {
+        #[cfg(windows)]
+        self.drop_live_window();
         self.close_picture_in_picture();
         self.source_loads.clear();
         self.canvas_view_dialog = None;

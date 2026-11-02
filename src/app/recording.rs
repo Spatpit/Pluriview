@@ -1,10 +1,9 @@
 use super::*;
-use crate::recording::{Clock, Frame, Layer, Recorder, MAX_COMBINED_SIZE, MAX_FPS};
+use crate::recording::{Clock, Format, Frame, Layer, Recorder};
 use crate::screenshot::{self, CapturedPixels, CombinedPart, LocalTimestamp, ScreenshotImage};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / MAX_FPS as u64);
 /// How often the flight thumbnail follows the recorded picture.
 const THUMBNAIL_REFRESH: Duration = Duration::from_secs(1);
 const RECORD_RED: egui::Color32 = egui::Color32::from_rgb(232, 72, 72);
@@ -22,6 +21,7 @@ struct FinishingRecording {
     /// The flight thumbnail, reused by the Screenshots panel.
     thumbnail: Option<egui::TextureHandle>,
     length: Duration,
+    format: Format,
 }
 
 struct RecordedTile {
@@ -45,13 +45,19 @@ struct ActiveRecording {
     /// starts; `None` records a single tile filling the video.
     area: Option<egui::Rect>,
     recorder: Recorder,
+    format: Format,
     clock: Clock,
     last_sent: Option<Instant>,
     /// Where each tile sat in the last frame sent, to notice moves.
     last_places: Vec<Option<egui::Rect>>,
     /// Small copy of a recent frame that flies into the panel on stop.
     thumbnail: Option<(egui::ColorImage, Instant)>,
+    started: Instant,
 }
+
+/// How long a browser tile recorded alone waits for its first full-size
+/// frame (see `feed_recording`).
+const FULL_FRAME_WAIT: Duration = Duration::from_millis(500);
 
 /// Elapsed recording time as `m:ss`, or `h:mm:ss` past an hour.
 fn format_elapsed(elapsed: Duration) -> String {
@@ -61,6 +67,14 @@ fn format_elapsed(elapsed: Duration) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// What a finished recording is called in notices.
+fn recording_noun(format: Format) -> &'static str {
+    match format {
+        Format::Mp4 => "recording",
+        Format::Gif => "GIF",
     }
 }
 
@@ -96,7 +110,7 @@ impl PluriviewApp {
 
     /// Start recording the focused or selected tiles, or stop recording.
     /// Several selected tiles record into one video laid out like the canvas.
-    pub(super) fn toggle_recording(&mut self, ctx: &egui::Context) {
+    pub(super) fn toggle_recording(&mut self, ctx: &egui::Context, format: Format) {
         if self.recording.active.is_some() {
             self.stop_recording(ctx);
             return;
@@ -131,7 +145,8 @@ impl PluriviewApp {
         let ids: Vec<PreviewId> = order.into_iter().map(|(_, _, id)| id).collect();
 
         // Several tiles: the video shows the area around them, fitted
-        // inside 1080p at no more than twice their on-screen pixels.
+        // inside 1080p (or the GIF size) at no more than twice their
+        // on-screen pixels.
         let (area, size) = if ids.len() > 1 {
             let rects: Vec<egui::Rect> = ids
                 .iter()
@@ -146,7 +161,7 @@ impl PluriviewApp {
                 return notice(self, "The selected tiles aren't on the canvas yet.");
             };
             let pixels = screen.size() * ctx.pixels_per_point() * 2.0;
-            let size = crate::recording::fitted_size(pixels.x, pixels.y, MAX_COMBINED_SIZE);
+            let size = crate::recording::fitted_size(pixels.x, pixels.y, format.max_size(true));
             (Some(area), Some(size))
         } else {
             (None, None)
@@ -186,6 +201,8 @@ impl PluriviewApp {
             } else {
                 None
             };
+            // GIFs are silent.
+            let pid = pid.filter(|_| format == Format::Mp4);
             if let Some(pid) = pid.filter(|pid| *pid != 0 && !audio_pids.contains(pid)) {
                 audio_pids.push(pid);
             }
@@ -214,16 +231,19 @@ impl PluriviewApp {
         let path = unique_path(
             &directory,
             &screenshot::file_stem(&title, LocalTimestamp::now()),
+            format.extension(),
         );
         let started = Instant::now();
         self.recording.active = Some(ActiveRecording {
             last_places: vec![None; tiles.len()],
             tiles,
             area,
-            recorder: Recorder::start(path, audio_pids, size, started),
+            recorder: Recorder::start(path, format, audio_pids, size, started),
+            format,
             clock: Clock::new(started),
             last_sent: None,
             thumbnail: None,
+            started,
         });
         ctx.request_repaint();
     }
@@ -276,9 +296,14 @@ impl PluriviewApp {
             receiver: active.recorder.stop(),
             thumbnail,
             length,
+            format: active.format,
         });
         self.canvas_notice = Some((
-            format!("Saving the {} recording…", format_elapsed(length)),
+            format!(
+                "Saving the {} {}…",
+                format_elapsed(length),
+                recording_noun(active.format)
+            ),
             Instant::now(),
         ));
     }
@@ -297,8 +322,9 @@ impl PluriviewApp {
                         panel.add_saved_shot(path, finishing.thumbnail.clone());
                     }
                     notice = Some(format!(
-                        "Saved the {} recording with your screenshots.",
-                        format_elapsed(finishing.length)
+                        "Saved the {} {} with your screenshots.",
+                        format_elapsed(finishing.length),
+                        recording_noun(finishing.format)
                     ));
                     false
                 }
@@ -331,7 +357,12 @@ impl PluriviewApp {
         active
             .tiles
             .retain(|tile| self.preview_manager.get(tile.id).is_some());
-        if active.tiles.is_empty() {
+        // GIFs end on their own once they are full.
+        let full = active
+            .format
+            .max_length()
+            .is_some_and(|max| active.clock.media_time(Instant::now()) >= max);
+        if active.tiles.is_empty() || full {
             return self.stop_recording(ctx);
         }
         // Taken out while frames are gathered, which reads the canvas.
@@ -345,16 +376,17 @@ impl PluriviewApp {
     fn feed_recording(&mut self, active: &mut ActiveRecording, ctx: &egui::Context) {
         // Keep the timer and the REC badge moving even while nothing else
         // repaints.
+        let interval = Duration::from_millis(1000 / u64::from(active.format.max_fps()));
         ctx.request_repaint_after(if active.clock.paused() {
             Duration::from_millis(250)
         } else {
-            FRAME_INTERVAL
+            interval
         });
         let now = Instant::now();
         if active.clock.paused()
             || active
                 .last_sent
-                .is_some_and(|sent| now.duration_since(sent) < FRAME_INTERVAL)
+                .is_some_and(|sent| now.duration_since(sent) < interval)
         {
             return;
         }
@@ -410,7 +442,20 @@ impl PluriviewApp {
                 }
             } else if let Some(frame) = preview.latest_capture_frame() {
                 let source = Arc::as_ptr(&frame) as usize;
-                if source != tile.last_source {
+                // A tile recorded alone sets the video's size with its first
+                // frame. A browser's frames are only as big as the page on
+                // screen until the recording's full-size ones arrive, a frame
+                // or two later, so wait for those.
+                let full_size = preview.source_frame_size.is_some_and(|(width, height)| {
+                    (frame.size[0] as u32, frame.size[1] as u32)
+                        == crate::capture::screenshot_capture_size(width, height)
+                });
+                let waiting = preview.is_browser()
+                    && preview.recording_full_size
+                    && tile.latest.is_none()
+                    && !full_size
+                    && now.duration_since(active.started) < FULL_FRAME_WAIT;
+                if source != tile.last_source && !waiting {
                     tile.last_source = source;
                     pixels = Some(CapturedPixels::Premultiplied(frame));
                 }
@@ -520,11 +565,18 @@ impl PluriviewApp {
         }
         let shown = visible.into_iter().reduce(|a, b| a.union(b));
 
-        let elapsed = format_elapsed(active.clock.media_time(Instant::now()));
+        let mut elapsed = format_elapsed(active.clock.media_time(Instant::now()));
+        if let Some(max) = active.format.max_length() {
+            elapsed.push_str(&format!(" / {}", format_elapsed(max)));
+        }
+        let kind = match active.format {
+            Format::Mp4 => "REC",
+            Format::Gif => "GIF",
+        };
         let mut label = if paused {
             format!("PAUSED  {elapsed}")
         } else {
-            format!("REC  {elapsed}")
+            format!("{kind}  {elapsed}")
         };
         if active.tiles.len() > 1 {
             label.push_str(&format!("  ·  {} tiles", active.tiles.len()));
@@ -643,7 +695,7 @@ impl PluriviewApp {
             }
         };
         if button.clicked() {
-            self.toggle_recording(ui.ctx());
+            self.toggle_recording(ui.ctx(), Format::Mp4);
         }
     }
 
@@ -651,8 +703,9 @@ impl PluriviewApp {
     pub(super) fn recording_menu_ui(&mut self, ui: &mut egui::Ui) {
         crate::ui_theme::section(ui, "RECORDING");
         let shortcuts = &self.app_config.keyboard_shortcuts;
-        let (record, pause) = (
+        let (record, record_gif, pause) = (
             shortcuts.get(HotkeySlot::RecordTile),
+            shortcuts.get(HotkeySlot::RecordGif),
             shortcuts.get(HotkeySlot::PauseRecording),
         );
         let recording = self
@@ -669,7 +722,24 @@ impl PluriviewApp {
             .add(crate::ui_theme::shortcut_button(title, record))
             .clicked()
         {
-            self.toggle_recording(ui.ctx());
+            self.toggle_recording(ui.ctx(), Format::Mp4);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                recording.is_none(),
+                crate::ui_theme::shortcut_button(
+                    format!(
+                        "{}   Record a GIF (up to {} s)",
+                        egui_phosphor::regular::GIF,
+                        crate::recording::GIF_MAX_LENGTH.as_secs()
+                    ),
+                    record_gif,
+                ),
+            )
+            .clicked()
+        {
+            self.toggle_recording(ui.ctx(), Format::Gif);
             ui.close_menu();
         }
         let (icon, title) = if recording == Some(true) {
@@ -730,11 +800,11 @@ fn short_title(title: &str) -> String {
 
 /// `stem.mp4`, or `stem (2).mp4` and so on when a recording of that name
 /// already exists from the same second.
-fn unique_path(directory: &std::path::Path, stem: &str) -> PathBuf {
-    let mut path = directory.join(format!("{stem}.mp4"));
+fn unique_path(directory: &std::path::Path, stem: &str, extension: &str) -> PathBuf {
+    let mut path = directory.join(format!("{stem}.{extension}"));
     let mut number = 2;
     while path.exists() {
-        path = directory.join(format!("{stem} ({number}).mp4"));
+        path = directory.join(format!("{stem} ({number}).{extension}"));
         number += 1;
     }
     path

@@ -1,6 +1,6 @@
 [package]
 name = "pluriview"
-version = "0.7.2"
+version = "0.7.5"
 edition = "2021"
 description = "Live window preview application with infinite canvas"
 authors = ["Spatpit"]
@@ -34,6 +34,9 @@ env_logger = { version = "0.11", default-features = false }
 url = "2.5"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# GIF recordings; both already come with image's GIF support.
+gif = { version = "0.14", default-features = false, features = ["std"] }
+color_quant = "1.1"
 libloading = "0.8"
 sha2 = "0.10"
 
@@ -46,6 +49,8 @@ webview2-com = "0.38"
 # monitor's #[implement] macro resolves against the right version;
 # webview2-com interfaces need the 0.61 Interface trait for casts.
 webview2-core = { package = "windows-core", version = "0.61" }
+# The windows version webview2-com takes RECT, HWND and IStream from.
+webview2-windows = { package = "windows", version = "0.61", features = ["Win32_Foundation", "Win32_System_Com"] }
 # Reuse windows-capture's existing bindings without casting COM wrappers
 # between its windows version and the rest of the application's 0.58 bindings.
 capture-windows = { package = "windows", version = "0.62", features = [
@@ -58,6 +63,7 @@ windows = { version = "0.58", features = [
     "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Controls_Dialogs",
@@ -66,6 +72,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_OpenGL",
     "Win32_Media_Audio",

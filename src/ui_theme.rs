@@ -109,6 +109,20 @@ pub fn shortcut_toggle(
         f32::INFINITY,
         egui::TextStyle::Button,
     );
+    toggle_row(ui, value, title, Some(hint))
+}
+
+/// A check box menu row, like [`shortcut_toggle`] without a shortcut.
+pub fn toggle(ui: &mut egui::Ui, value: &mut bool, title: &str) -> egui::Response {
+    toggle_row(ui, value, title, None)
+}
+
+fn toggle_row(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    title: &str,
+    hint: Option<std::sync::Arc<egui::Galley>>,
+) -> egui::Response {
     let title_width = ui.fonts(|fonts| {
         fonts
             .layout_no_wrap(title.to_owned(), FontId::proportional(14.0), TEXT)
@@ -118,7 +132,8 @@ pub fn shortcut_toggle(
     let padding = ui.spacing().button_padding.x;
     let icon_width = ui.spacing().icon_width;
     let gap = ui.spacing().icon_spacing;
-    let desired_width = title_width + hint.size().x + icon_width + gap + 2.0 * padding + 20.0;
+    let hint_width = hint.as_ref().map_or(0.0, |hint| hint.size().x);
+    let desired_width = title_width + hint_width + icon_width + gap + 2.0 * padding + 20.0;
     let (rect, mut response) =
         ui.allocate_at_least(egui::vec2(desired_width, 28.0), egui::Sense::click());
     if response.clicked() {
@@ -154,16 +169,22 @@ pub fn shortcut_toggle(
                 Stroke::new(1.5, GOLD),
             ));
         }
-        let hint_pos = egui::pos2(
-            rect.right() - padding - hint.size().x,
-            rect.center().y - hint.size().y * 0.5,
-        );
+        let title_right = match hint {
+            Some(hint) => {
+                let hint_pos = egui::pos2(
+                    rect.right() - padding - hint.size().x,
+                    rect.center().y - hint.size().y * 0.5,
+                );
+                ui.painter().galley(hint_pos, hint, SECONDARY);
+                hint_pos.x - 20.0
+            }
+            None => rect.right() - padding,
+        };
         let title_rect = egui::Rect::from_min_max(
             egui::pos2(icon.right() + gap, rect.center().y - 9.0),
-            egui::pos2(hint_pos.x - 20.0, rect.center().y + 9.0),
+            egui::pos2(title_right, rect.center().y + 9.0),
         );
         clipped_text(ui, title_rect, title, 14.0, visuals.text_color());
-        ui.painter().galley(hint_pos, hint, SECONDARY);
     }
     response
 }

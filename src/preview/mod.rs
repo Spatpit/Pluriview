@@ -1,9 +1,11 @@
+pub mod browser_chrome;
 mod manager;
 // `preview::preview` holds the `Preview` tile model itself.
 #[allow(clippy::module_inception)]
 mod preview;
 mod video_preferences;
 
+pub use browser_chrome::{BrowserTab, Favicon};
 pub use video_preferences::{VideoPlaybackPreferences, VideoTrackPreference};
 
 pub use manager::{PreviewManager, RemovedPreviewInfo};

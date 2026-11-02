@@ -421,7 +421,9 @@ impl PluriviewApp {
         let _ = ctx;
 
         let latest = preview.latest_capture_frame();
-        let live = preview.is_live_capture() && !preview.manually_frozen;
+        // Browser frames are shrunk to the page's on-screen size like window
+        // frames, so a screenshot asks both for a full-size frame.
+        let live = (preview.is_live_capture() || preview.is_browser()) && !preview.manually_frozen;
         if live {
             let already_native = latest.as_ref().is_some_and(|frame| {
                 let size = (frame.size[0] as u32, frame.size[1] as u32);
@@ -440,11 +442,6 @@ impl PluriviewApp {
                 ShotStart::Unavailable("Resume this tile, then take the screenshot again.")
             }
             None if preview.is_video() => ShotStart::Unavailable("This video is still starting."),
-            None if preview.is_browser() => {
-                // No frame since the tile was selected: take the next one.
-                preview.screenshot_wants_native_frame = true;
-                ShotStart::Pending(PendingSource::NativeFrame { fallback: None })
-            }
             None => ShotStart::Unavailable("This tile has nothing to capture yet."),
         }
     }

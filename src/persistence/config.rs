@@ -25,6 +25,12 @@ pub struct AppConfig {
     pub screenshot_folder: Option<String>,
     /// Show a speaker badge on browser tiles that are playing sound.
     pub show_sound_badges: bool,
+    /// Where the Control Tile Center window was left, as its outer position
+    /// and inner size in points: `[x, y, width, height]`.
+    pub control_tile_center_rect: Option<[f32; 4]>,
+    /// The Control Tile Center lists tiles by name instead of in the user's
+    /// own order.
+    pub control_tile_center_sort_by_name: bool,
 }
 
 impl Default for AppConfig {
@@ -38,6 +44,8 @@ impl Default for AppConfig {
             screenshots_panel_open: false,
             screenshot_folder: None,
             show_sound_badges: false,
+            control_tile_center_rect: None,
+            control_tile_center_sort_by_name: false,
         }
     }
 }
@@ -66,6 +74,8 @@ mod tests {
         assert!(!config.screenshots_panel_open);
         assert!(config.screenshot_folder.is_none());
         assert!(!config.show_sound_badges);
+        assert!(config.control_tile_center_rect.is_none());
+        assert!(!config.control_tile_center_sort_by_name);
     }
 
     #[test]

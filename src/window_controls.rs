@@ -12,6 +12,9 @@ pub(crate) enum WindowAction {
 pub(crate) struct WindowControls {
     pub always_on_top: bool,
     pub click_through: bool,
+    /// Always on top is set aside while another app's window is used over a
+    /// tile, which must be able to come in front of Pluriview. Not saved.
+    pub topmost_suspended: bool,
     applied: Option<(bool, bool)>,
 }
 
@@ -20,8 +23,13 @@ impl WindowControls {
         Self {
             always_on_top,
             click_through: false,
+            topmost_suspended: false,
             applied: None,
         }
+    }
+
+    fn effective_topmost(&self) -> bool {
+        self.always_on_top && !self.topmost_suspended
     }
 
     pub fn handle(&mut self, action: WindowAction) {
@@ -45,12 +53,13 @@ impl WindowControls {
 
     /// Only issue native window commands when a setting changes.
     pub fn apply(&mut self, ctx: &Context) -> bool {
-        let state = (self.always_on_top, self.click_through);
+        let topmost = self.effective_topmost();
+        let state = (topmost, self.click_through);
         if self.applied == Some(state) {
             return false;
         }
-        if self.applied.map(|state| state.0) != Some(self.always_on_top) {
-            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if self.always_on_top {
+        if self.applied.map(|state| state.0) != Some(topmost) {
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if topmost {
                 WindowLevel::AlwaysOnTop
             } else {
                 WindowLevel::Normal
@@ -116,6 +125,30 @@ mod tests {
         state.handle(WindowAction::ToggleClickThrough);
         state.handle(WindowAction::ToggleClickThrough);
         assert!(commands(&mut state, &ctx).is_empty());
+    }
+
+    #[test]
+    fn suspending_topmost_for_a_window_in_use_keeps_the_saved_preference() {
+        let mut state = WindowControls::new(true);
+        let ctx = Context::default();
+        commands(&mut state, &ctx);
+        state.topmost_suspended = true;
+        assert_eq!(
+            commands(&mut state, &ctx),
+            vec![ViewportCommand::WindowLevel(WindowLevel::Normal)]
+        );
+        assert!(state.always_on_top);
+        state.topmost_suspended = false;
+        assert_eq!(
+            commands(&mut state, &ctx),
+            vec![ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop)]
+        );
+
+        // Without Always on Top there is nothing to set aside.
+        let mut normal = WindowControls::new(false);
+        commands(&mut normal, &ctx);
+        normal.topmost_suspended = true;
+        assert!(commands(&mut normal, &ctx).is_empty());
     }
 
     #[test]

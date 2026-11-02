@@ -1,6 +1,6 @@
 //! The screenshots folder as a small library: one level of named folders
 //! inside Pluriview's `screenshots` data folder, each holding PNG
-//! screenshots and MP4 tile recordings.
+//! screenshots, MP4 tile recordings and GIFs.
 //! Every path that reaches the file system is checked to stay inside it.
 
 use std::cmp::Ordering;
@@ -14,7 +14,7 @@ const MAX_FOLDER_CHARS: usize = 60;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenshotEntry {
     pub path: PathBuf,
-    /// File name without the `.png` / `.mp4` extension.
+    /// File name without the `.png` / `.mp4` / `.gif` extension.
     pub name: String,
     pub modified: SystemTime,
     /// Length of a recording; `None` for screenshots.
@@ -22,19 +22,25 @@ pub struct ScreenshotEntry {
     pub is_video: bool,
 }
 
-/// PNG screenshots and MP4 recordings both belong to the library.
-pub fn is_library_file(path: &Path) -> bool {
+fn has_extension(path: &Path, wanted: &str) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("png") || extension.eq_ignore_ascii_case("mp4")
-        })
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(wanted))
+}
+
+/// PNG screenshots, MP4 recordings and GIFs all belong to the library.
+pub fn is_library_file(path: &Path) -> bool {
+    ["png", "mp4", "gif"]
+        .into_iter()
+        .any(|extension| has_extension(path, extension))
 }
 
 pub fn is_video(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
+    has_extension(path, "mp4")
+}
+
+pub fn is_gif(path: &Path) -> bool {
+    has_extension(path, "gif")
 }
 
 /// One section of the panel. `name` is `None` for screenshots saved
@@ -233,7 +239,13 @@ pub fn move_shot(root: &Path, shot: &Path, folder: Option<&str>) -> Result<PathB
         .file_stem()
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| "That screenshot has an unreadable name.".to_owned())?;
-    let extension = if is_video(shot) { "mp4" } else { "png" };
+    let extension = if is_video(shot) {
+        "mp4"
+    } else if is_gif(shot) {
+        "gif"
+    } else {
+        "png"
+    };
     for attempt in 1..=999 {
         let target = if attempt == 1 {
             directory.join(format!("{stem}.{extension}"))
