@@ -610,7 +610,8 @@ fn draw_spout_sender_row(
 
 /// Create a preview for `window` at `position`/`size` and start capturing it.
 /// Shared by the sidebar picker's "+" button and the canvas right-click
-/// quick-add popup so both add windows the same way.
+/// quick-add popup so both add windows the same way. The first frame reshapes
+/// the tile to the window's proportions, keeping its area.
 pub fn spawn_preview(
     window: &WindowInfo,
     preview_manager: &mut PreviewManager,
@@ -627,6 +628,7 @@ pub fn spawn_preview(
     );
     if let Some(preview) = preview_manager.get_mut(id) {
         preview.window_exe = Some(window.exe_name.clone());
+        preview.shape_from_first_frame = Some(size);
     }
 
     capture_coordinator.start_capture(id, window.hwnd, window.title.clone(), 30);
