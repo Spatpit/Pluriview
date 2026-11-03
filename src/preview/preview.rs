@@ -332,6 +332,11 @@ pub struct Preview {
     /// Source aspect ratio from the captured window (width/height)
     pub source_aspect_ratio: f32,
 
+    /// Size a newly added window tile was given before its source was seen.
+    /// The first captured frame reshapes the tile to the source's proportions
+    /// (same area and top-left) unless the user has changed it by then.
+    pub shape_from_first_frame: Option<Vec2>,
+
     /// Z-order (higher = on top)
     pub z_order: u32,
 
@@ -508,6 +513,7 @@ impl Preview {
             list_order: 0,
             lock_aspect_ratio: true,
             source_aspect_ratio: aspect_ratio,
+            shape_from_first_frame: None,
             z_order: 0,
             target_fps: FpsPreset::default().as_u32(),
             fps_preset: FpsPreset::default(),
@@ -788,6 +794,16 @@ impl Preview {
             // Only update aspect ratio if we don't have a crop region
             if self.crop_uv.is_none() {
                 self.source_aspect_ratio = source_width as f32 / source_height as f32;
+            }
+            // Geometry edited before the source appeared belongs to the user.
+            if let Some(added_size) = self.shape_from_first_frame.take() {
+                if self.size == added_size
+                    && self.viewport_pin.is_none()
+                    && self.crop_uv.is_none()
+                    && self.tile_group.is_none()
+                {
+                    self.size = size_with_aspect(added_size, self.source_aspect_ratio);
+                }
             }
         }
         if width > 0 && height > 0 {
@@ -1294,6 +1310,12 @@ fn twitch_label(parsed: &url::Url) -> Option<String> {
     }
 }
 
+/// `size` reshaped to `aspect` (width / height), keeping its area.
+fn size_with_aspect(size: Vec2, aspect: f32) -> Vec2 {
+    let area = size.x * size.y;
+    Vec2::new((area * aspect).sqrt(), (area / aspect).sqrt()).round()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1304,6 +1326,64 @@ mod tests {
     use eframe::egui::{Context, Pos2, Rect, Vec2};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn added_window_tile() -> Preview {
+        let mut preview = Preview::for_window(
+            PreviewId(1),
+            1,
+            42,
+            "game".to_owned(),
+            Pos2::new(10.0, 20.0),
+            Vec2::new(320.0, 240.0),
+        );
+        preview.shape_from_first_frame = Some(preview.size);
+        preview
+    }
+
+    fn frame(preview: &mut Preview, width: u32, height: u32) {
+        let image = eframe::egui::ColorImage::new([16, 16], eframe::egui::Color32::WHITE);
+        preview.update_capture_frame(width, height, image);
+    }
+
+    #[test]
+    fn a_new_window_tile_takes_the_shape_of_its_first_frame() {
+        let mut preview = added_window_tile();
+        frame(&mut preview, 1920, 1080);
+        let size = preview.size;
+        assert!((size.x / size.y - 16.0 / 9.0).abs() < 0.01, "{size:?}");
+        assert!(
+            (size.x * size.y / (320.0 * 240.0) - 1.0).abs() < 0.01,
+            "{size:?}"
+        );
+        assert_eq!(preview.position, Pos2::new(10.0, 20.0));
+
+        // Later source changes leave the tile to the user.
+        frame(&mut preview, 1080, 1920);
+        assert_eq!(preview.size, size);
+
+        let mut portrait = added_window_tile();
+        frame(&mut portrait, 1080, 2340);
+        assert!((portrait.size.x / portrait.size.y - 1080.0 / 2340.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_window_tile_changed_before_its_first_frame_keeps_the_users_shape() {
+        let mut resized = added_window_tile();
+        resized.size = Vec2::new(500.0, 200.0);
+        frame(&mut resized, 1920, 1080);
+        assert_eq!(resized.size, Vec2::new(500.0, 200.0));
+
+        let mut grouped = added_window_tile();
+        grouped.tile_group = Some(super::TileGroup::new(1, "Group", 0));
+        frame(&mut grouped, 1920, 1080);
+        assert_eq!(grouped.size, Vec2::new(320.0, 240.0));
+
+        // Restored and duplicated tiles keep their saved shape.
+        let mut restored = added_window_tile();
+        restored.shape_from_first_frame = None;
+        frame(&mut restored, 1920, 1080);
+        assert_eq!(restored.size, Vec2::new(320.0, 240.0));
+    }
 
     #[test]
     fn video_preferences_round_trip_without_runtime_state() {
