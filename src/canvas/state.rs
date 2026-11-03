@@ -1586,18 +1586,12 @@ impl CanvasState {
             || !show_overlays
             || (!input.primary_down && !input.primary_released)
         {
-            self.groups.spotlight_drag = None;
+            self.groups.reorder = None;
         }
-        self.update_spotlight_drag_pointer(input.hover_pos, canvas_rect);
-        self.update_spotlight(canvas_rect, preview_manager);
-        if input.delete_pressed {
-            self.exit_spotlight_for_tile_action(preview_manager);
-        }
+        self.update_reorder_pointer(input.hover_pos, canvas_rect);
+        let layout_wake = self.update_group_layouts(canvas_rect, preview_manager, input.time);
         if input.escape_pressed && self.is_focusing_tile() {
             self.exit_focus();
-            input.escape_pressed = false;
-        } else if input.escape_pressed && self.is_spotlighting() {
-            self.exit_spotlight(preview_manager);
             input.escape_pressed = false;
         }
         if input.escape_pressed && self.crop_mode.is_some() {
@@ -1708,17 +1702,13 @@ impl CanvasState {
         // Draw previews and handle their interactions (AFTER bg allocation)
         self.draw_and_interact_previews(ui, frame_scope, preview_manager, ctx, capture_coordinator);
         if show_overlays {
-            self.draw_spotlight_drop_target(&painter, canvas_rect, preview_manager);
+            self.draw_reorder_drop_target(&painter, canvas_rect, preview_manager);
         }
 
         // Draw selection rectangles and interactive resize handles
         // Handles are allocated AFTER previews so they have higher interaction priority
         self.prune_preview_interactions(preview_manager);
-        if show_overlays
-            && self.marquee.is_none()
-            && !self.is_focusing_tile()
-            && !self.is_spotlighting()
-        {
+        if show_overlays && self.marquee.is_none() && !self.is_focusing_tile() {
             self.draw_and_interact_selection(ui, canvas_rect, preview_manager, &input);
             if self.crop_mode.is_some() {
                 let hint = Rect::from_center_size(
@@ -1749,7 +1739,7 @@ impl CanvasState {
         }
         if show_overlays {
             self.draw_and_interact_undo_toast(ui, canvas_rect);
-            self.spotlight_controls(ui, canvas_rect, preview_manager);
+            self.group_bar(ui, canvas_rect, preview_manager, keyboard_shortcuts);
         }
 
         // Handle canvas-level input using the pre-allocated bg_response
@@ -1762,7 +1752,7 @@ impl CanvasState {
             &mut canvas_views_menu,
         );
         if input.primary_released {
-            self.finish_spotlight_drag(
+            self.finish_reorder_drag(
                 input.interact_pos.or(input.hover_pos),
                 canvas_rect,
                 preview_manager,
@@ -1782,9 +1772,12 @@ impl CanvasState {
         // Request repaint if animations are active
         if self.animation.is_animating()
             || self.layout_is_animating()
-            || self.groups.spotlight_drag.is_some()
+            || self.groups.reorder.is_some()
         {
             ctx.request_repaint();
+        } else if let Some(at) = layout_wake {
+            // A source changed shape; its group re-flows once that holds.
+            ctx.request_repaint_after(Duration::from_secs_f64((at - input.time).max(0.0)));
         }
     }
 
@@ -2034,7 +2027,6 @@ impl CanvasState {
         // Left-dragging from empty canvas draws a marquee. Tile drags still
         // move tiles, while Alt+left and middle-button drags remain panning.
         if show_overlays
-            && !self.is_spotlighting()
             && self.groups.resize.is_none()
             && !input.pointer_blocked
             && input.primary_pressed
@@ -2272,10 +2264,6 @@ impl CanvasState {
             &background_context_response,
             background_context_menu_active,
             |ui| {
-                if self.is_spotlighting() {
-                    self.spotlight_menu(ui, canvas_rect, preview_manager);
-                    return;
-                }
                 crate::ui_theme::section(ui, "ADD TO CANVAS");
                 if crate::ui_theme::action(ui, egui_phosphor::regular::APP_WINDOW, "Add Window...")
                     .clicked()
@@ -2465,7 +2453,7 @@ impl CanvasState {
         preview_info.sort_by_key(|info| {
             (
                 self.groups
-                    .spotlight_drag
+                    .reorder
                     .as_ref()
                     .is_some_and(|d| d.id == info.id),
                 info.viewport_pin.is_some(),
@@ -3482,7 +3470,7 @@ impl CanvasState {
 
             // Handle click to select
             if show_overlays {
-                self.spotlight_drag_response(
+                self.reorder_drag_response(
                     id,
                     &preview_response,
                     canvas_rect,
@@ -3491,9 +3479,7 @@ impl CanvasState {
                 );
             }
             if preview_response.clicked() {
-                if self.is_spotlighting() {
-                    self.spotlight_tile(id, canvas_rect, preview_manager);
-                } else if input.ctrl {
+                if input.ctrl {
                     self.toggle_group_selection(id, preview_manager);
                 } else {
                     self.select_group_tile(id, preview_manager);
@@ -3520,7 +3506,6 @@ impl CanvasState {
             });
             if preview_response.double_clicked()
                 && on_page
-                && !self.is_spotlighting()
                 && !manually_frozen
                 && self.crop_mode != Some(id)
             {
@@ -3534,7 +3519,7 @@ impl CanvasState {
 
             // Handle drag start and remember screen-space origins for pinned tiles.
             if preview_response.drag_started()
-                && !self.is_spotlighting()
+                && self.groups.reorder.is_none()
                 && self.groups.resize.is_none()
                 && self.crop_mode != Some(id)
                 && !input.alt
@@ -3553,6 +3538,7 @@ impl CanvasState {
                 } else {
                     vec![id]
                 };
+                self.release_partial_groups(&dragged_ids, preview_manager);
 
                 for sel_id in dragged_ids {
                     if let Some(preview) = preview_manager.get(sel_id) {
@@ -3566,7 +3552,7 @@ impl CanvasState {
             // Handle drag to move (only when not panning with Alt or middle mouse)
             // Resize is handled separately in draw_and_interact_selection()
             if preview_response.dragged()
-                && !self.is_spotlighting()
+                && self.groups.reorder.is_none()
                 && self.groups.resize.is_none()
                 && self.crop_mode != Some(id)
                 && !input.alt
@@ -4410,6 +4396,7 @@ impl CanvasState {
                             start_crop_uv: current_crop,
                         });
                     } else {
+                        self.release_partial_groups(&[id], preview_manager);
                         self.drag_state = Some(DragState::Resizing {
                             id,
                             handle: handle_type,

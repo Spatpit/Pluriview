@@ -127,14 +127,16 @@ Press `C` to open a separate window that lists every tile.
   around, or **Move tiles** to drag tiles to new places. Pinned tiles can also
   be moved and resized there.
 
-### Groups and Spotlight
+### Groups
 
 Select tiles (`Ctrl`+click or drag a box) and press `Ctrl+G` to group them, so
 they move and resize together. `Alt+1`–`Alt+4` arrange a group with one, two,
-or three large tiles, or all equal.
+or three large tiles, or all equal; the bar above a selected group does the
+same. An arranged group keeps its layout: tiles that join, leave or change
+shape fit back into the group's box, and dragging the box's edges re-flows it.
 
-`Shift+F` opens **Spotlight** for a group: drag a tile onto another to swap
-them, press `F` to fill the view with one, and `Esc` to leave.
+`Shift`+drag a tile onto another to swap them. `Shift+F` makes the selected
+tile the large one, and `Shift+←`/`Shift+→` step through the group.
 
 ### Tile tools
 
@@ -220,7 +222,7 @@ app for the full list.
 | Picture in Picture | `Shift+P` |
 | Group / ungroup | `Ctrl+G` / `Ctrl+U` |
 | Group layouts | `Alt+1`–`Alt+4` |
-| Spotlight | `Shift+F` |
+| Make main tile / next / previous | `Shift+F` / `Shift+→` / `Shift+←` |
 | Screenshot / Screenshots panel | `Shift+S` / `S` |
 | Record / pause | `Shift+R` / `P` |
 | Hide interface | `H` |

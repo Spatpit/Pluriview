@@ -1548,7 +1548,7 @@ fn tile_menu_puts_the_tiles_own_actions_first_and_remove_last() {
         // Group-only items stay out of a lone tile's menu, and settings stay
         // in their submenu until it opens.
         for hidden in [
-            "Spotlight This Tile",
+            "Make Main Tile",
             "Fit Group to View",
             "Edit Crop",
             "Lock Aspect Ratio",
@@ -2803,11 +2803,8 @@ fn hidden_tiles_leave_the_selection_and_a_grouped_tile_moves_its_group() {
     let second = previews.add("second".to_owned(), Pos2::new(60.0, 0.0), Vec2::splat(50.0));
     let loose = previews.add("loose".to_owned(), Pos2::new(200.0, 0.0), Vec2::splat(50.0));
     for (order, id) in [first, second].into_iter().enumerate() {
-        previews.get_mut(id).unwrap().tile_group = Some(crate::preview::TileGroup {
-            id: 7,
-            name: "Group".to_owned(),
-            order: order as u32,
-        });
+        previews.get_mut(id).unwrap().tile_group =
+            Some(crate::preview::TileGroup::new(7, "Group", order as u32));
     }
 
     canvas.move_tile_by(second, Vec2::new(10.0, 20.0), &mut previews);

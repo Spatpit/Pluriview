@@ -4210,7 +4210,6 @@ impl PluriviewApp {
                     );
                 });
                 if ui.button("Reset View").clicked() {
-                    self.canvas.exit_spotlight(&mut self.preview_manager);
                     self.canvas.reset();
                     ui.close_menu();
                 }
@@ -4391,7 +4390,6 @@ impl PluriviewApp {
     }
 
     fn jump_to_canvas_view(&mut self, index: usize, ctx: &egui::Context) {
-        self.canvas.exit_spotlight(&mut self.preview_manager);
         let Some(view) = self.canvas_views.get(index).cloned() else {
             return;
         };
@@ -5348,11 +5346,7 @@ mod tests {
         preview.stream_audio = true;
         preview.left_click_disabled = true;
         preview.playlist_group = Some(3);
-        preview.tile_group = Some(crate::preview::TileGroup {
-            id: 17,
-            name: "Streams".into(),
-            order: 1,
-        });
+        preview.tile_group = Some(crate::preview::TileGroup::new(17, "Streams", 1));
         preview.viewport_pin = Some(crate::preview::ViewportPin::from_rect(
             preview.rect(),
             Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0)),
@@ -5595,11 +5589,7 @@ mod tests {
         saved.crop_uv = Some((0.25, 0.0, 1.0, 1.0));
         saved.manually_frozen = true;
         saved.left_click_disabled = true;
-        saved.tile_group = Some(crate::preview::TileGroup {
-            id: 81,
-            name: "Sources".into(),
-            order: 2,
-        });
+        saved.tile_group = Some(crate::preview::TileGroup::new(81, "Sources", 2));
         saved.viewport_pin = Some(ViewportPin::from_rect(
             Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(240.0, 180.0)),
             Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)),
@@ -6157,8 +6147,7 @@ impl eframe::App for PluriviewApp {
         let keyboard_shortcuts = &self.app_config.keyboard_shortcuts;
         let show_canvas_overlays = !self.canvas_only;
         let mut viewer_blocked = self.viewer_is_blocked(ctx);
-        let viewer_navigation_blocked =
-            viewer_blocked || self.window_controls.click_through || self.canvas.is_spotlighting();
+        let viewer_navigation_blocked = viewer_blocked || self.window_controls.click_through;
         // A window in use sits at its tile's scale; phone zooming would end it.
         #[cfg(windows)]
         let viewer_navigation_blocked = viewer_navigation_blocked || self.live_window.is_some();
@@ -6775,15 +6764,15 @@ impl eframe::App for PluriviewApp {
                             for slot in [
                                 HotkeySlot::GroupTiles,
                                 HotkeySlot::UngroupTiles,
-                                HotkeySlot::LayoutGrid,
-                                HotkeySlot::LayoutRow,
-                                HotkeySlot::LayoutColumn,
-                                HotkeySlot::LayoutSideStack,
+                                HotkeySlot::LayoutOneLarge,
+                                HotkeySlot::LayoutTwoLarge,
+                                HotkeySlot::LayoutThreeLarge,
+                                HotkeySlot::LayoutEqual,
                                 HotkeySlot::SizeMedium,
                                 HotkeySlot::SizeLarge,
-                                HotkeySlot::ToggleSpotlight,
-                                HotkeySlot::PreviousSpotlight,
-                                HotkeySlot::NextSpotlight,
+                                HotkeySlot::MakeMainTile,
+                                HotkeySlot::PreviousMainTile,
+                                HotkeySlot::NextMainTile,
                             ] {
                                 ui.label(slot.label());
                                 ui.label(crate::ui_theme::shortcut_text(

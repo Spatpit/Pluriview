@@ -27,10 +27,6 @@ impl CanvasState {
         ui.set_max_width(280.0);
         tile_menu_header(ui, info, preview_manager, selected.len());
         ui.separator();
-        if self.is_spotlighting() {
-            self.spotlight_menu(ui, canvas_rect, preview_manager);
-            return;
-        }
 
         // A frozen tile's own controls are unavailable until it resumes.
         if info.manually_frozen {
@@ -53,7 +49,6 @@ impl CanvasState {
 
         self.arrange_menu(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
         self.group_menu(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
-        self.spotlight_item(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
         ui.separator();
 
         self.tile_settings_menu(ui, info, canvas_rect, preview_manager);
