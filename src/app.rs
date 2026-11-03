@@ -67,6 +67,7 @@ mod screenshots;
 mod settings;
 mod source_loading;
 mod tile_control;
+mod welcome_tour;
 mod workspaces;
 use source_loading::{PreparedSource, SourceLoads, SourceTarget};
 
@@ -1035,6 +1036,8 @@ pub struct PluriviewApp {
 
     /// Show Keyboard Shortcuts dialog
     show_shortcuts: bool,
+    /// Getting Started tour, open on the first launch and from Help.
+    welcome_tour: Option<welcome_tour::WelcomeTour>,
 
     /// Low-level keyboard tracker keeps Numpad keys distinct and continues to
     /// receive configured shortcuts while an interactive WebView has focus.
@@ -1130,6 +1133,7 @@ impl PluriviewApp {
             || self.show_settings
             || self.show_shortcuts
             || self.show_about
+            || self.welcome_tour.is_some()
             || self.workspace_dialog.is_some()
             || self.canvas_view_dialog.is_some()
             || self.confirm_workspace_delete
@@ -1173,6 +1177,7 @@ impl PluriviewApp {
                 Some("Settings storage is unavailable.".to_owned()),
             ),
         };
+        let welcome_tour = (!app_config.welcome_tour_seen).then(welcome_tour::WelcomeTour::default);
         let external_tools = ExternalTools::new(app_config.external_tools.streamlink_path.clone());
         let (workspaces, workspace_error, workspace_persistence_ready) = match &storage {
             Some(storage) => match storage.load_or_initialize_workspaces() {
@@ -1269,6 +1274,7 @@ impl PluriviewApp {
             hwnd_set: false,
             show_about: false,
             show_shortcuts: false,
+            welcome_tour,
             hotkey_tracker: HotkeyTracker::default(),
             hotkey_recording: None,
             hotkey_recording_first: None,
@@ -4286,6 +4292,16 @@ impl PluriviewApp {
 
             ui.menu_button("Help", |ui| {
                 crate::ui_theme::menu(ui);
+                if crate::ui_theme::action(
+                    ui,
+                    egui_phosphor::regular::ROCKET_LAUNCH,
+                    "Getting Started",
+                )
+                .clicked()
+                {
+                    self.open_welcome_tour();
+                    ui.close_menu();
+                }
                 if ui
                     .add(crate::ui_theme::shortcut_button(
                         format!("{}   Keyboard Shortcuts", egui_phosphor::regular::KEYBOARD),
@@ -5949,6 +5965,7 @@ impl eframe::App for PluriviewApp {
             && !self.show_settings
             && !self.show_shortcuts
             && !self.show_about
+            && self.welcome_tour.is_none()
             && self.canvas_view_dialog.is_none()
             && self.workspace_dialog.is_none()
             && !self.confirm_workspace_delete
@@ -6532,6 +6549,8 @@ impl eframe::App for PluriviewApp {
                     });
                 });
         }
+
+        self.welcome_tour_ui(ctx);
 
         // Keyboard Shortcuts dialog
         if self.show_shortcuts {

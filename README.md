@@ -47,7 +47,8 @@ folder, so keep it. See the [changelog](CHANGELOG.md) for what's new.
 - **Move around:** drag with the middle mouse button to pan, and scroll to zoom.
 
 Hover a tile for its controls, or right-click it for everything else. Press
-`F1` to see all shortcuts.
+`F1` to see all shortcuts. A short tour of the main features opens the first
+time you start Pluriview; reopen it from **Help → Getting Started**.
 
 ## What you can add
 
