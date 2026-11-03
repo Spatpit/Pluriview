@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The desktop icon (assets/icon.png) redrawn inside the adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFCFA139" android:pathData="M36.61,29.51 H48.76 A4,4 0 0 1 52.76,33.51 V74.8 A4,4 0 0 1 48.76,78.8 H36.61 A4,4 0 0 1 32.61,74.8 V33.51 A4,4 0 0 1 36.61,29.51 Z" />
+    <path android:fillColor="#FFE8CB7F" android:pathData="M57.04,29.51 H67.7 A8,8 0 0 1 75.7,37.51 V44.14 A1.8,1.8 0 0 1 73.9,45.94 H57.04 A1.8,1.8 0 0 1 55.24,44.14 V31.31 A1.8,1.8 0 0 1 57.04,29.51 Z" />
+    <path android:fillColor="#FF988D46" android:pathData="M57.04,48.42 H68.7 A7,7 0 0 1 75.7,55.42 V56.92 A7,7 0 0 1 68.7,63.92 H57.04 A1.8,1.8 0 0 1 55.24,62.12 V50.22 A1.8,1.8 0 0 1 57.04,48.42 Z" />
+</vector>

@@ -4,6 +4,7 @@ import android.content.Context;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import java.net.Inet4Address;
@@ -61,12 +62,21 @@ final class NearbyDiscovery implements AutoCloseable {
             public void onResolveFailed(NsdServiceInfo service, int error) { main.post(() -> { resolving = false; resolveNext(); }); }
             public void onServiceResolved(NsdServiceInfo service) { main.post(() -> {
                 resolving = false;
-                if (!closed && seen.contains(info.getServiceName()) && service.getHost() instanceof Inet4Address
-                        && ViewerActivity.privateIpv4(service.getHost().getHostAddress()) && service.getPort() > 0 && service.getPort() <= 65535)
-                    listener.found(info.getServiceName(), service.getHost().getHostAddress(), service.getPort());
+                String address = privateAddress(service);
+                if (!closed && seen.contains(info.getServiceName()) && address != null && service.getPort() > 0 && service.getPort() <= 65535)
+                    listener.found(info.getServiceName(), address, service.getPort());
                 resolveNext();
             }); }
         }); } catch (RuntimeException error) { resolving = false; resolveNext(); }
+    }
+    /** The first private IPv4 address; Android 14 can report several addresses per host. */
+    private static String privateAddress(NsdServiceInfo service) {
+        java.util.List<java.net.InetAddress> addresses = Build.VERSION.SDK_INT >= 34
+            ? service.getHostAddresses() : java.util.Collections.singletonList(service.getHost());
+        for (java.net.InetAddress address : addresses) {
+            if (address instanceof Inet4Address && ViewerActivity.privateIpv4(address.getHostAddress())) return address.getHostAddress();
+        }
+        return null;
     }
     @Override public void close() {
         closed = true; queue.clear(); seen.clear();

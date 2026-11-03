@@ -68,14 +68,12 @@ final class AudioStream implements AutoCloseable {
         if (error instanceof java.io.EOFException) return "PC ended audio";
         if (error instanceof java.net.SocketException) return "Connection interrupted";
         String detail = error.getMessage();
-        if ("Audio decoder startup timed out".equals(detail)) return "Decoder startup timed out";
-        if ("Audio decoder unavailable".equals(detail)) return "Decoder unavailable";
-        if ("Audio output unavailable".equals(detail)) return "Phone audio output unavailable";
-        if ("Audio backlog".equals(detail)) return "Audio queue full";
-        if ("Audio input queue stalled".equals(detail)) return "Decoder not accepting audio";
-        if ("Audio decoder stalled".equals(detail)) return "Decoder stalled";
-        if ("Audio output stalled".equals(detail)) return "Phone audio output stalled";
-        if ("Unsupported decoded audio".equals(detail) || "Unsupported audio format".equals(detail)) return "Unsupported audio format";
+        if (AudioStartup.TIMEOUT.equals(detail)) return "Decoder startup timed out";
+        if (AudioDecoder.DECODER_UNAVAILABLE.equals(detail)) return "Decoder unavailable";
+        if (AudioDecoder.OUTPUT_UNAVAILABLE.equals(detail)) return "Phone audio output unavailable";
+        if (AudioDecoder.DECODER_STALLED.equals(detail)) return "Decoder stalled";
+        if (AudioDecoder.OUTPUT_STALLED.equals(detail)) return "Phone audio output stalled";
+        if (AudioDecoder.UNSUPPORTED_OUTPUT.equals(detail) || AudioPacket.UNSUPPORTED.equals(detail)) return "Unsupported audio format";
         return "Audio playback interrupted";
     }
     @Override public void close() {

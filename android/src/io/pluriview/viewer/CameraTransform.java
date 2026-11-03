@@ -29,6 +29,8 @@ public final class CameraTransform {
         return result;
     }
 
+    public synchronized boolean pending() { return scale != 1 || x != 0 || y != 0; }
+
     public synchronized void clear() { scale = 1; x = 0; y = 0; anchorX = 0; anchorY = 0; }
 
     /** Translation that holds a pinch's old midpoint under its new midpoint. */

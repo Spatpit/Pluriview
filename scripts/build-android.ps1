@@ -27,14 +27,18 @@ $classes = Join-Path $build 'classes'
 $dex = Join-Path $build 'dex'
 $tests = Join-Path $build 'tests'
 $resources = Join-Path $build 'res'
-$drawable = Join-Path $resources 'drawable'
 $assets = Join-Path $build 'assets'
-New-Item -ItemType Directory -Force -Path $classes, $dex, $tests, $drawable, $assets | Out-Null
-Copy-Item -LiteralPath (Join-Path $workspace 'assets\icon.png') -Destination (Join-Path $drawable 'pluriview.png')
+$generated = Join-Path $build 'generated'
+New-Item -ItemType Directory -Force -Path $classes, $dex, $tests, $resources, $assets, $generated | Out-Null
+Copy-Item -Path (Join-Path $source 'res\*') -Destination $resources -Recurse
 Copy-Item -LiteralPath (Join-Path $workspace 'LICENSE') -Destination $assets
 $resourceZip = Join-Path $build 'resources.zip'
 Invoke-Checked "$tools\aapt2.exe" @('compile', '--dir', $resources, '-o', $resourceZip)
+# Link before compiling Java: linking generates the R class the sources use.
+$unsigned = Join-Path $build 'unsigned.apk'
+Invoke-Checked "$tools\aapt2.exe" @('link', '-I', $androidJar, '--manifest', "$source\AndroidManifest.xml", '-A', $assets, '--java', $generated, '-o', $unsigned, $resourceZip)
 $javaSources = @(Get-ChildItem -LiteralPath (Join-Path $source 'src\io\pluriview\viewer') -Filter '*.java' | ForEach-Object FullName)
+$javaSources += @(Get-ChildItem -LiteralPath $generated -Filter '*.java' -Recurse | ForEach-Object FullName)
 Invoke-Checked javac (@('-encoding', 'UTF-8', '--release', '8', '-classpath', $androidJar, '-d', $classes) + $javaSources)
 Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', $classes, '-d', $tests, "$source\tests\CameraTransformTest.java", "$source\tests\VideoPacketTest.java", "$source\tests\DisplayMappingTest.java", "$source\tests\DoubleTapTest.java", "$source\tests\StreamTimingTest.java", "$source\tests\DecoderLifecycleTest.java")
 Invoke-Checked javac @('-encoding', 'UTF-8', '--release', '8', '-classpath', "$classes;$tests", '-d', $tests, "$source\tests\VideoConnectionTest.java")
@@ -64,12 +68,12 @@ Invoke-Checked java @('-cp', "$classes;$tests", 'io.pluriview.viewer.DecoderLife
 $classJar = Join-Path $build 'classes.jar'
 Invoke-Checked jar @('cf', $classJar, '-C', $classes, '.')
 Invoke-Checked "$tools\d8.bat" @('--lib', $androidJar, '--min-api', '26', '--output', $dex, $classJar)
-$unsigned = Join-Path $build 'unsigned.apk'
-Invoke-Checked "$tools\aapt2.exe" @('link', '-I', $androidJar, '--manifest', "$source\AndroidManifest.xml", '-A', $assets, '-o', $unsigned, $resourceZip)
 Invoke-Checked jar @('uf', $unsigned, '-C', $dex, 'classes.dex')
 $aligned = Join-Path $build 'aligned.apk'
 Invoke-Checked "$tools\zipalign.exe" @('-f', '4', $unsigned, $aligned)
 # Local test signing only. Neither this key nor generated APKs enter Git.
+# Keep this file: updates must be signed with the installed app's key, so a new
+# key means uninstalling the viewer on every phone first.
 $key = Join-Path $output 'debug.keystore'
 if (-not (Test-Path -LiteralPath $key)) {
     Invoke-Checked keytool @('-genkeypair', '-keystore', $key, '-storepass', 'android', '-keypass', 'android', '-alias', 'androiddebugkey', '-keyalg', 'RSA', '-keysize', '2048', '-validity', '10000', '-dname', 'CN=Android Debug,O=Android,C=US')

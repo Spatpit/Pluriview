@@ -7,6 +7,7 @@ import java.util.concurrent.TimeUnit;
 
 /** Prepare the decoder before asking the PC to produce live audio. */
 final class AudioStartup {
+    static final String TIMEOUT = "Audio decoder startup timed out";
     private final CountDownLatch done = new CountDownLatch(1);
     private volatile IOException failure;
     synchronized void finish(IOException error) {
@@ -15,7 +16,7 @@ final class AudioStartup {
     }
     void await() throws IOException {
         try {
-            if (!done.await(3, TimeUnit.SECONDS)) throw new IOException("Audio decoder startup timed out");
+            if (!done.await(3, TimeUnit.SECONDS)) throw new IOException(TIMEOUT);
         } catch (InterruptedException stopped) {
             Thread.currentThread().interrupt();
             throw new InterruptedIOException("Audio stopped");
