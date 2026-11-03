@@ -23,11 +23,59 @@ fn ease_out_cubic(t: f32) -> f32 {
 pub struct PreviewId(pub u64);
 
 /// Workspace group identity travels with each member, including deletion undo.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Every member carries the same name, arrangement and gap.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TileGroup {
     pub id: u64,
     pub name: String,
     pub order: u32,
+    #[serde(default)]
+    pub arrangement: GroupArrangement,
+    #[serde(default)]
+    pub gap: GroupGap,
+    /// The group's box as `[x, y, width, height]` in units of this member's
+    /// own tile size, measured from its top-left corner. Moving, scaling or
+    /// pinning the whole group keeps it valid for every member, and any
+    /// remaining member still knows the box after another one leaves.
+    #[serde(default)]
+    pub frame: Option<[f32; 4]>,
+}
+
+impl TileGroup {
+    /// A freely arranged group.
+    pub fn new(id: u64, name: impl Into<String>, order: u32) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            order,
+            arrangement: GroupArrangement::Free,
+            gap: GroupGap::Small,
+            frame: None,
+        }
+    }
+}
+
+/// How a group lays out its members inside its box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupArrangement {
+    /// Members stay wherever they were put.
+    #[default]
+    Free,
+    /// One to three large tiles, with the others beside or below them.
+    Main(u8),
+    /// Every member gets the same visible area.
+    Equal,
+}
+
+/// Space between the tiles of an arranged group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupGap {
+    None,
+    #[default]
+    Small,
+    Large,
 }
 
 /// Browser-specific startup state shown inside a tile before capture begins.

@@ -356,7 +356,6 @@ impl PluriviewApp {
             || !usable
             || minimized
             || self.window_controls.click_through
-            || self.canvas.is_spotlighting()
             || self.canvas.is_editing_crop(id)
             || self.browser.active_id().is_some()
             || native::is_minimized(session.hwnd)

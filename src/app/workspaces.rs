@@ -452,7 +452,7 @@ impl PluriviewApp {
             .preview_manager
             .all()
             .map(|p| {
-                let mut saved = self.canvas.saved_tile_layout(p);
+                let mut saved = PreviewLayout::from(p);
                 #[cfg(windows)]
                 {
                     // Ask the live WebView where it actually is, so the tile

@@ -4,7 +4,7 @@ impl CanvasState {
     /// Cancel a gesture when the app switches to passing input through.
     pub fn cancel_pointer_interaction(&mut self) {
         self.groups.resize = None;
-        self.groups.spotlight_drag = None;
+        self.groups.reorder = None;
         self.finish_crop();
         self.drag_state = None;
         self.marquee = None;
@@ -69,7 +69,7 @@ impl CanvasState {
 
     /// Fit one tile in the current canvas without changing its saved geometry.
     pub fn focus_on_tile(&mut self, id: PreviewId, tile_rect: Rect, canvas_rect: Rect) {
-        self.groups.spotlight_drag = None;
+        self.groups.reorder = None;
         self.remember_current_tile(id);
         self.finish_crop();
         self.cancel_camera_transition();
@@ -112,9 +112,6 @@ impl CanvasState {
         hidden: bool,
         previews: &mut PreviewManager,
     ) {
-        if hidden && self.spotlight_includes(ids) {
-            self.exit_spotlight(previews);
-        }
         for id in ids {
             if let Some(preview) = previews.get_mut(*id) {
                 preview.hidden = hidden;
@@ -187,9 +184,6 @@ impl CanvasState {
             return;
         }
         let members = self.group_members(id, previews);
-        if self.spotlight_includes(&members) {
-            self.exit_spotlight(previews);
-        }
         let screen = self.last_screen_rect;
         let pinned: Vec<(PreviewId, ViewportPin)> = members
             .iter()
@@ -315,9 +309,6 @@ impl CanvasState {
             let members = self.group_members(id, previews);
             self.set_tiles_hidden(&members, false, previews);
         }
-        if self.is_spotlighting() && !self.spotlight_includes(&[id]) {
-            self.exit_spotlight(previews);
-        }
         match self.last_screen_rect {
             Some(viewport) if !pinned => self.focus_on_tile(id, rect, viewport),
             _ => {
@@ -330,9 +321,6 @@ impl CanvasState {
 
     /// Remote focus uses canvas hit testing, never tile clicks or source input.
     pub fn focus_viewer_at(&mut self, at: [f32; 2], previews: &PreviewManager) {
-        if self.is_spotlighting() {
-            return;
-        }
         let Some(rect) = self.last_screen_rect else {
             return;
         };
@@ -789,6 +777,7 @@ impl CanvasState {
         // Focus mode owns the canvas zoom, so restore the user's normal view
         // before calculating a persistent 1:1 tile size.
         self.exit_focus();
+        self.release_partial_groups(&[id], preview_manager);
 
         let Some((screen_rect, crop_uv, is_pinned)) = preview_manager.get(id).map(|preview| {
             (
@@ -841,9 +830,6 @@ impl CanvasState {
         preview_manager: &PreviewManager,
         alt: bool,
     ) -> Option<(PreviewId, ResizeHandle)> {
-        if self.is_spotlighting() {
-            return None;
-        }
         if self.has_selected_group(preview_manager) && !alt {
             return self.group_handle_at(screen_pos, canvas_rect, preview_manager);
         }
@@ -961,7 +947,7 @@ impl CanvasState {
             keyboard_shortcuts: _,
         } = frame;
         if input.pointer_blocked
-            || self.is_spotlighting()
+            || self.groups.reorder.is_some()
             || self.groups.resize.is_some()
             || self.crop_mode == Some(id)
             || preview_manager
@@ -1023,13 +1009,16 @@ impl CanvasState {
             return false;
         }
 
-        if input.ctrl {
+        // Ctrl toggles selection; Shift+drag swaps places in a group.
+        if input.ctrl || (input.shift && self.is_arranged(id, preview_manager)) {
             return false;
         }
         self.remember_current_tile(id);
         if !self.selection.contains(&id) {
             self.select_group_tile(id, preview_manager);
         }
+        let selection = self.selection.clone();
+        self.release_partial_groups(&selection, preview_manager);
         self.pinned_drag_origins = self
             .selection
             .iter()

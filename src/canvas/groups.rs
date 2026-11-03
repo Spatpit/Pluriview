@@ -1,29 +1,43 @@
+use std::collections::hash_map::Entry;
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use super::*;
 use crate::hotkeys::HotkeyPresses;
-use crate::preview::{PreviewLayout, TileGroup, ViewportAnchor};
+use crate::preview::{GroupArrangement, GroupGap, TileGroup, ViewportAnchor};
 
 #[derive(Clone, Default)]
 pub(super) struct GroupState {
-    spotlight: Option<Spotlight>,
     pub(super) resize: Option<GroupResize>,
     editing: Option<PreviewId>,
     active_tile: Option<PreviewId>,
-    pub(super) spotlight_drag: Option<SpotlightDrag>,
+    pub(super) reorder: Option<ReorderDrag>,
     motions: Vec<TileMotion>,
     animation_time: Option<f64>,
     error: Option<String>,
+    /// Source shapes the layouts use, once a change has held for a moment.
+    aspects: HashMap<PreviewId, SettledAspect>,
+    /// A hash of every arranged group's members as last laid out, so an
+    /// unchanged group costs one hash per member per frame.
+    signatures: HashMap<u64, u64>,
+    scratch: HashMap<u64, u64>,
+    changed: Vec<u64>,
+    /// Each arranged group's last box, which settles a tie between members
+    /// that disagree about it.
+    frames: HashMap<u64, (bool, Rect)>,
+    /// When a source shape that is still changing should be looked at again.
+    aspect_wake: Option<f64>,
+    /// A group name being edited in the group bar.
+    renaming: Option<(u64, String)>,
+}
+
+#[derive(Clone, Copy)]
+struct SettledAspect {
+    value: f32,
+    pending: Option<(f32, f64)>,
 }
 
 #[derive(Clone)]
-struct Spotlight {
-    originals: Vec<TileGeometry>,
-    active: usize,
-    selection: Vec<PreviewId>,
-    order: Vec<PreviewId>,
-}
-
-#[derive(Clone)]
-pub(super) struct SpotlightDrag {
+pub(super) struct ReorderDrag {
     pub(super) id: PreviewId,
     origin: Rect,
     start: Pos2,
@@ -53,82 +67,85 @@ impl TileMotion {
     }
 }
 
-const LAYOUTS: [(usize, HotkeySlot, &str); 4] = [
-    (1, HotkeySlot::LayoutGrid, "One large tile"),
-    (2, HotkeySlot::LayoutRow, "Two large tiles"),
-    (3, HotkeySlot::LayoutColumn, "Three large tiles"),
-    (usize::MAX, HotkeySlot::LayoutSideStack, "Equal tiles"),
+const PRESETS: [(GroupArrangement, HotkeySlot, &str); 4] = [
+    (
+        GroupArrangement::Main(1),
+        HotkeySlot::LayoutOneLarge,
+        "One Large Tile",
+    ),
+    (
+        GroupArrangement::Main(2),
+        HotkeySlot::LayoutTwoLarge,
+        "Two Large Tiles",
+    ),
+    (
+        GroupArrangement::Main(3),
+        HotkeySlot::LayoutThreeLarge,
+        "Three Large Tiles",
+    ),
+    (
+        GroupArrangement::Equal,
+        HotkeySlot::LayoutEqual,
+        "Equal Tiles",
+    ),
 ];
-
-#[derive(Clone, Copy)]
-struct TileGeometry {
-    id: PreviewId,
-    position: Pos2,
-    size: Vec2,
-    pin: Option<ViewportPin>,
-    z_order: u32,
-}
-
-impl TileGeometry {
-    fn capture(p: &Preview) -> Self {
-        Self {
-            id: p.id,
-            position: p.position,
-            size: p.size,
-            pin: p.viewport_pin,
-            z_order: p.z_order,
-        }
-    }
-
-    fn restore(self, p: &mut Preview) {
-        p.position = self.position;
-        p.size = self.size;
-        p.viewport_pin = self.pin;
-        p.z_order = self.z_order;
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct GroupResize {
-    bounds: Rect,
-    pointer: Pos2,
-    min_scale: f32,
-    members: Vec<(PreviewId, Rect)>,
-}
-
-#[derive(Clone, Copy)]
-enum Arrangement {
-    #[cfg(test)]
-    Grid,
-    #[cfg(test)]
-    Row,
-    #[cfg(test)]
-    Column,
-    SideStack,
-}
 
 const SIZES: [(f32, HotkeySlot, &str); 2] = [
     (960.0, HotkeySlot::SizeMedium, "Medium · 960 wide"),
     (1440.0, HotkeySlot::SizeLarge, "Large · 1440 wide"),
 ];
 
-#[cfg(test)]
-impl Arrangement {
-    const ALL: [(Self, HotkeySlot, &'static str); 4] = [
-        (Self::Grid, HotkeySlot::LayoutGrid, "Grid"),
-        (Self::Row, HotkeySlot::LayoutRow, "Row"),
-        (Self::Column, HotkeySlot::LayoutColumn, "Column"),
-        (
-            Self::SideStack,
-            HotkeySlot::LayoutSideStack,
-            "Main + Side Stack",
-        ),
-    ];
+/// A source has to keep a new shape this long before its group re-flows, so
+/// a window being dragged larger or briefly reporting odd sizes does not
+/// shuffle the group on every frame.
+const ASPECT_SETTLE: f64 = 0.6;
+/// Shape changes smaller than this fraction are ignored.
+const ASPECT_TOLERANCE: f32 = 0.005;
+/// The tiles beside or below the large ones never get more than this share of
+/// a large tile's area...
+const COMPANION_MAX_AREA: f32 = 0.1;
+/// ...and wrap into more columns or rows rather than shrink below this
+/// fraction of a large tile's size.
+const COMPANION_MIN_SCALE: f32 = 0.2;
+
+fn gap_fraction(gap: GroupGap) -> f32 {
+    match gap {
+        GroupGap::None => 0.0,
+        GroupGap::Small => 0.008,
+        GroupGap::Large => 0.022,
+    }
 }
 
-/// Pack visible edges rather than centering different aspect ratios in equal
-/// cells. Any unused space belongs outside the arrangement, not between tiles.
-fn arranged_rects(aspects: &[f32], bounds: Rect, layout: Arrangement, main: usize) -> Vec<Rect> {
+#[derive(Clone)]
+pub(super) struct GroupResize {
+    group: u64,
+    handle: ResizeHandle,
+    /// On screen at the start: the box of an arranged group, or the outline
+    /// of a free group's tiles.
+    bounds: Rect,
+    pointer: Pos2,
+    /// Free groups scale their tiles together...
+    members: Vec<(PreviewId, Rect)>,
+    min_scale: f32,
+    /// ...while arranged groups lay out again inside the dragged box, never
+    /// leaving a tile smaller than this (in tile units).
+    arranged: bool,
+    smallest: f32,
+}
+
+fn bounds_of(rects: impl Iterator<Item = Rect>) -> Option<Rect> {
+    rects.reduce(|a, b| a.union(b))
+}
+
+/// Lay tiles of the given shapes out inside `frame`, in member order. Tiles
+/// keep their shapes and only `gap` separates them; any room the shapes
+/// cannot use is shared evenly around the arrangement.
+fn layout_rects(
+    aspects: &[f32],
+    frame: Rect,
+    arrangement: GroupArrangement,
+    gap: GroupGap,
+) -> Vec<Rect> {
     let count = aspects.len();
     if count == 0 {
         return Vec::new();
@@ -143,186 +160,273 @@ fn arranged_rects(aspects: &[f32], bounds: Rect, layout: Arrangement, main: usiz
             }
         })
         .collect();
-    let gap = 8.0_f32
-        .min(bounds.width() / (count as f32 * 4.0))
-        .min(bounds.height() / (count as f32 * 4.0));
-    let mut rects = Vec::with_capacity(count);
-    match layout {
-        Arrangement::SideStack if count > 1 => {
-            let main = main.min(count - 1);
-            // Size companions against the group's height and the tallest
-            // possible stack, not the active tile's width. A portrait main
-            // then uses less horizontal space without miniaturizing its peers.
-            let inverse_sum: f32 = aspects.iter().map(|aspect| aspect.recip()).sum();
-            let shortest = aspects
-                .iter()
-                .map(|aspect| aspect.recip())
-                .fold(f32::INFINITY, f32::min);
-            let stack_inverse_sum = inverse_sum - shortest;
-            let companion_stack = |width: f32| {
-                let height = width / aspects[main];
-                let gap = gap.min(height / (count as f32 * 4.0));
-                let side_width = (height * (16.0 / 9.0) * (0.24 / 0.76))
-                    .min((height - gap * (count - 2) as f32) / stack_inverse_sum);
-                (gap, side_width)
-            };
-            // Fit the actual main + stack envelope. Reserving a fixed fraction
-            // for a narrow stack wastes room and shrinks repeated Spotlight entry.
-            let mut width = bounds.width().min(bounds.height() * aspects[main]);
-            let (initial_gap, initial_side) = companion_stack(width);
-            if width + initial_gap + initial_side > bounds.width() {
-                let mut low = 0.0;
-                let mut high = width;
-                for _ in 0..24 {
-                    let candidate = (low + high) * 0.5;
-                    let (gap, side) = companion_stack(candidate);
-                    if candidate + gap + side <= bounds.width() {
-                        low = candidate;
-                    } else {
-                        high = candidate;
-                    }
-                }
-                width = low;
-            }
-            let main_size = Vec2::new(width, width / aspects[main]);
-            let (gap, side_width) = companion_stack(width);
-            let mut y = 0.0;
-            for (index, aspect) in aspects.iter().enumerate() {
-                if index == main {
-                    rects.push(Rect::from_min_size(Pos2::ZERO, main_size));
-                } else {
-                    let size = Vec2::new(side_width, side_width / aspect);
-                    rects.push(Rect::from_min_size(Pos2::new(main_size.x + gap, y), size));
-                    y += size.y + gap;
-                }
-            }
+    let size = frame.size().max(Vec2::splat(1.0));
+    // Proportional to the box, so scaling a group scales its gaps, and a
+    // member joining or leaving does not change them.
+    let gap =
+        (gap_fraction(gap) * (size.x * size.y).sqrt()).min(size.min_elem() / (count as f32 * 4.0));
+    let rects = match arrangement {
+        GroupArrangement::Main(large) if (large.max(1) as usize) < count => {
+            main_rects(&aspects, size, large.max(1) as usize, gap)
         }
-        #[cfg(test)]
-        Arrangement::Column => {
-            let inverse_sum: f32 = aspects.iter().map(|a| a.recip()).sum();
-            let width = bounds
-                .width()
-                .min((bounds.height() - gap * (count - 1) as f32) / inverse_sum);
-            let mut y = 0.0;
-            for aspect in &aspects {
-                let size = Vec2::new(width, width / aspect);
-                rects.push(Rect::from_min_size(Pos2::new(0.0, y), size));
-                y += size.y + gap;
-            }
-        }
-        _ => {
-            #[cfg(not(test))]
-            let cols = count;
-            #[cfg(test)]
-            let cols = if matches!(layout, Arrangement::Grid) {
-                (count as f32).sqrt().ceil() as usize
-            } else {
-                count
-            };
-            let mut y = 0.0;
-            let mut previous_height = bounds.height();
-            for row in aspects.chunks(cols) {
-                let mut height =
-                    (bounds.width() - gap * (row.len() - 1) as f32) / row.iter().sum::<f32>();
-                // An incomplete last row should not balloon to fill the width.
-                if row.len() < cols {
-                    height = height.min(previous_height);
-                }
-                let mut x = 0.0;
-                for aspect in row {
-                    let size = Vec2::new(height * aspect, height);
-                    rects.push(Rect::from_min_size(Pos2::new(x, y), size));
-                    x += size.x + gap;
-                }
-                y += height + gap;
-                previous_height = height;
-            }
-        }
-    }
-    let packed = bounds_of(rects.iter().copied()).unwrap();
-    let scale = (bounds.width() / packed.width())
-        .min(bounds.height() / packed.height())
-        .min(1.0);
-    let origin = if matches!(layout, Arrangement::SideStack) {
-        bounds.min
-    } else {
-        bounds.center() - packed.size() * scale * 0.5
+        _ => equal_rects(&aspects, size, gap),
     };
+    let packed = bounds_of(rects.iter().copied()).unwrap_or(Rect::ZERO);
+    let offset = frame.center() - packed.center();
     rects
         .into_iter()
-        .map(|rect| {
-            Rect::from_min_size(
-                origin + (rect.min - packed.min) * scale,
-                rect.size() * scale,
-            )
-        })
+        .map(|rect| rect.translate(offset))
         .collect()
 }
 
-fn bounds_of(rects: impl Iterator<Item = Rect>) -> Option<Rect> {
-    rects.reduce(|a, b| a.union(b))
+/// Equal visible area gives portrait and landscape sources the same weight
+/// without stretching either. The column count that lets the tiles grow the
+/// most wins, so a wide box becomes one row instead of a square grid. Rows
+/// are centered, and tiles are centered within their row.
+fn equal_rects(aspects: &[f32], size: Vec2, gap: f32) -> Vec<Rect> {
+    let row_width = |row: &[f32], scale: f32| {
+        row.iter().map(|a| a.sqrt() * scale).sum::<f32>() + gap * (row.len() - 1) as f32
+    };
+    let row_height =
+        |row: &[f32], scale: f32| row.iter().map(|a| scale / a.sqrt()).fold(0.0_f32, f32::max);
+    let fit = |cols: usize| {
+        let mut scale = f32::INFINITY;
+        let mut height = 0.0;
+        let mut rows = 0;
+        for row in aspects.chunks(cols) {
+            let tiles = row.iter().map(|a| a.sqrt()).sum::<f32>();
+            scale = scale.min((size.x - gap * (row.len() - 1) as f32) / tiles);
+            height += row_height(row, 1.0);
+            rows += 1;
+        }
+        scale.min((size.y - gap * (rows - 1) as f32) / height)
+    };
+    let (cols, scale) = (1..=aspects.len())
+        .map(|cols| (cols, fit(cols)))
+        .reduce(|best, next| if next.1 > best.1 * 1.0001 { next } else { best })
+        .unwrap();
+    let scale = scale.max(0.0);
+    let width = aspects
+        .chunks(cols)
+        .map(|row| row_width(row, scale))
+        .fold(0.0_f32, f32::max);
+    let mut rects = Vec::with_capacity(aspects.len());
+    let mut y = 0.0;
+    for row in aspects.chunks(cols) {
+        let height = row_height(row, scale);
+        let mut x = (width - row_width(row, scale)) / 2.0;
+        for aspect in row {
+            let tile = Vec2::new(aspect.sqrt() * scale, scale / aspect.sqrt());
+            rects.push(Rect::from_min_size(
+                Pos2::new(x, y + (height - tile.y) / 2.0),
+                tile,
+            ));
+            x += tile.x + gap;
+        }
+        y += height + gap;
+    }
+    rects
 }
 
-/// The order is the slot assignment: large tiles first, then companions.
-fn spotlight_rects(aspects: &[f32], bounds: Rect, large_count: usize) -> Vec<Rect> {
-    let count = aspects.len();
-    if count == 0 {
-        return Vec::new();
-    }
-    let large_count = large_count.clamp(1, count);
-    if large_count == 1 && count > 1 {
-        return arranged_rects(aspects, bounds, Arrangement::SideStack, 0);
-    }
-    let gap = 8.0_f32.min(bounds.width().min(bounds.height()) / (count as f32 * 4.0));
-    if large_count == count {
-        // Equal visible area gives portrait and landscape sources equal weight
-        // without stretching either into a common rectangle.
-        // The column count follows the group's outline, so a wide group
-        // becomes one row instead of always forcing a square grid.
-        let grid = |cols: usize| {
-            let mut rects = Vec::with_capacity(count);
-            let mut y = 0.0;
-            for row in aspects.chunks(cols) {
-                let mut x = 0.0;
-                let mut height = 0.0_f32;
-                for aspect in row {
-                    let size = Vec2::new(aspect.sqrt() * 180.0, 180.0 / aspect.sqrt());
-                    rects.push(Rect::from_min_size(Pos2::new(x, y), size));
-                    x += size.x + gap;
-                    height = height.max(size.y);
+/// Where the tiles that are not large go.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Strip {
+    /// Up to this many columns beside the large tiles.
+    Side(usize),
+    /// Up to this many rows below them.
+    Below(usize),
+}
+
+/// The large tiles share one row. The others wrap into one to three columns
+/// beside it or rows below it, whichever leaves the large tiles biggest while
+/// keeping the others at least `COMPANION_MIN_SCALE` of their size.
+fn main_rects(aspects: &[f32], size: Vec2, large: usize, gap: f32) -> Vec<Rect> {
+    let companions = aspects.len() - large;
+    let mut best: Option<(Strip, f32, bool, f32)> = None;
+    for lines in 1..=companions.min(3) {
+        for strip in [Strip::Side(lines), Strip::Below(lines)] {
+            let height = main_fit_height(aspects, size, large, gap, strip);
+            let scale = companion_scale(aspects, large, gap, strip, height);
+            let readable = scale >= COMPANION_MIN_SCALE - 1e-4;
+            let better = best.is_none_or(|(_, best_height, best_readable, best_scale)| {
+                match (readable, best_readable) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    (true, true) => height > best_height * 1.0005,
+                    (false, false) => scale > best_scale * 1.0005,
                 }
-                y += height + gap;
+            });
+            if better {
+                best = Some((strip, height, readable, scale));
             }
-            let packed = bounds_of(rects.iter().copied()).unwrap();
-            let scale = (bounds.width() / packed.width()).min(bounds.height() / packed.height());
-            (rects, scale)
-        };
-        let (rects, scale) = (1..=count)
-            .map(grid)
-            .reduce(|best, next| if next.1 > best.1 * 1.0001 { next } else { best })
-            .unwrap();
-        return rects
-            .into_iter()
-            .map(|r| Rect::from_min_size(bounds.min + r.min.to_vec2() * scale, r.size() * scale))
-            .collect();
+        }
     }
-    let primary_aspect: f32 = aspects[..large_count].iter().sum();
-    let mut spans = Vec::with_capacity(count - large_count + 1);
-    spans.push(primary_aspect);
-    spans.extend_from_slice(&aspects[large_count..]);
-    let packed = arranged_rects(&spans, bounds, Arrangement::SideStack, 0);
-    let primary = packed[0];
-    let gap = gap.min(primary.width() / (large_count as f32 * 4.0));
-    let height = (primary.width() - gap * (large_count - 1) as f32) / primary_aspect;
-    let mut x = primary.left();
-    let mut rects = Vec::with_capacity(count);
-    for aspect in &aspects[..large_count] {
-        let size = Vec2::new(height * aspect, height);
-        rects.push(Rect::from_min_size(Pos2::new(x, primary.top()), size));
-        x += size.x + gap;
+    let (strip, height, _, _) = best.expect("a main layout has companions");
+    main_layout(aspects, large, gap, strip, height)
+}
+
+/// The width (beside) or height (below) every companion shares when the
+/// large tiles are `height` tall.
+fn companion_extent(aspects: &[f32], large: usize, gap: f32, strip: Strip, height: f32) -> f32 {
+    let (big, small) = aspects.split_at(large);
+    let big_width = height * big.iter().sum::<f32>() + gap * (large - 1) as f32;
+    let big_area = height * height * big.iter().copied().fold(f32::INFINITY, f32::min);
+    match strip {
+        Strip::Side(cols) => {
+            let per_column = small.len().div_ceil(cols);
+            let fit = small
+                .chunks(per_column)
+                .map(|column| {
+                    (height - gap * (column.len() - 1) as f32)
+                        / column.iter().map(|a| a.recip()).sum::<f32>()
+                })
+                .fold(f32::INFINITY, f32::min);
+            let narrowest = small.iter().copied().fold(f32::INFINITY, f32::min);
+            fit.min((COMPANION_MAX_AREA * big_area * narrowest).sqrt())
+                .max(0.0)
+        }
+        Strip::Below(rows) => {
+            let per_row = small.len().div_ceil(rows);
+            let fit = small
+                .chunks(per_row)
+                .map(|row| (big_width - gap * (row.len() - 1) as f32) / row.iter().sum::<f32>())
+                .fold(f32::INFINITY, f32::min);
+            let widest = small.iter().copied().fold(0.0_f32, f32::max);
+            fit.min((COMPANION_MAX_AREA * big_area / widest).sqrt())
+                .max(0.0)
+        }
     }
-    rects.extend_from_slice(&packed[1..]);
+}
+
+fn main_extent(aspects: &[f32], large: usize, gap: f32, strip: Strip, height: f32) -> Vec2 {
+    let small = aspects.len() - large;
+    let big_width = height * aspects[..large].iter().sum::<f32>() + gap * (large - 1) as f32;
+    let shared = companion_extent(aspects, large, gap, strip, height);
+    match strip {
+        Strip::Side(cols) => {
+            let used = small.div_ceil(small.div_ceil(cols));
+            Vec2::new(big_width + used as f32 * (shared + gap), height)
+        }
+        Strip::Below(rows) => {
+            let used = small.div_ceil(small.div_ceil(rows));
+            Vec2::new(big_width, height + used as f32 * (shared + gap))
+        }
+    }
+}
+
+/// The tallest large row whose whole arrangement fits `size`.
+fn main_fit_height(aspects: &[f32], size: Vec2, large: usize, gap: f32, strip: Strip) -> f32 {
+    let fits = |height: f32| {
+        let extent = main_extent(aspects, large, gap, strip, height);
+        extent.x <= size.x * 1.00001 && extent.y <= size.y * 1.00001
+    };
+    let mut high = size
+        .y
+        .min((size.x - gap * (large - 1) as f32) / aspects[..large].iter().sum::<f32>())
+        .max(0.0);
+    if fits(high) {
+        return high;
+    }
+    let mut low = 0.0;
+    for _ in 0..32 {
+        let middle = (low + high) * 0.5;
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+/// How big the smallest companion is next to the smallest large tile.
+fn companion_scale(aspects: &[f32], large: usize, gap: f32, strip: Strip, height: f32) -> f32 {
+    let (big, small) = aspects.split_at(large);
+    let shared = companion_extent(aspects, large, gap, strip, height);
+    let smallest = small
+        .iter()
+        .map(|a| match strip {
+            Strip::Side(_) => shared * shared / a,
+            Strip::Below(_) => shared * shared * a,
+        })
+        .fold(f32::INFINITY, f32::min);
+    let big_area = height * height * big.iter().copied().fold(f32::INFINITY, f32::min);
+    if big_area > 0.0 {
+        (smallest / big_area).sqrt()
+    } else {
+        0.0
+    }
+}
+
+fn main_layout(aspects: &[f32], large: usize, gap: f32, strip: Strip, height: f32) -> Vec<Rect> {
+    let (big, small) = aspects.split_at(large);
+    let big_width = height * big.iter().sum::<f32>() + gap * (large - 1) as f32;
+    let shared = companion_extent(aspects, large, gap, strip, height);
+    let mut rects = Vec::with_capacity(aspects.len());
+    let mut x = 0.0;
+    for aspect in big {
+        rects.push(Rect::from_min_size(
+            Pos2::new(x, 0.0),
+            Vec2::new(height * aspect, height),
+        ));
+        x += height * aspect + gap;
+    }
+    match strip {
+        Strip::Side(cols) => {
+            let left = big_width + gap;
+            for (index, column) in small.chunks(small.len().div_ceil(cols)).enumerate() {
+                let column_height = column.iter().map(|a| shared / a).sum::<f32>()
+                    + gap * (column.len() - 1) as f32;
+                let mut y = (height - column_height) / 2.0;
+                for aspect in column {
+                    rects.push(Rect::from_min_size(
+                        Pos2::new(left + index as f32 * (shared + gap), y),
+                        Vec2::new(shared, shared / aspect),
+                    ));
+                    y += shared / aspect + gap;
+                }
+            }
+        }
+        Strip::Below(rows) => {
+            let mut y = height + gap;
+            for row in small.chunks(small.len().div_ceil(rows)) {
+                let row_width =
+                    row.iter().map(|a| shared * a).sum::<f32>() + gap * (row.len() - 1) as f32;
+                let mut x = (big_width - row_width) / 2.0;
+                for aspect in row {
+                    rects.push(Rect::from_min_size(
+                        Pos2::new(x, y),
+                        Vec2::new(shared * aspect, shared),
+                    ));
+                    x += shared * aspect + gap;
+                }
+                y += shared + gap;
+            }
+        }
+    }
     rects
+}
+
+/// The box a group gets when it starts being arranged. The arrangement keeps
+/// the tiles' total visible area and the group's top-left corner; fitting it
+/// into the old outline instead would shrink tiles that were spread apart.
+fn initial_frame(
+    current: &[Rect],
+    aspects: &[f32],
+    arrangement: GroupArrangement,
+    gap: GroupGap,
+) -> Option<Rect> {
+    let outline = bounds_of(current.iter().copied())?;
+    let trial = layout_rects(aspects, outline, arrangement, gap);
+    let content = bounds_of(trial.iter().copied())?;
+    let area = current.iter().map(Rect::area).sum::<f32>();
+    let arranged = trial.iter().map(Rect::area).sum::<f32>();
+    let scale = if area > 0.0 && arranged > 0.0 {
+        (area / arranged).sqrt()
+    } else {
+        1.0
+    };
+    Some(Rect::from_min_size(outline.min, content.size() * scale))
 }
 
 /// Smallest side, in tile units, that dragging a group's resize handle can
@@ -341,6 +445,13 @@ fn group_resize_min_scale(members: &[(PreviewId, Rect)], screen_per_unit: f32) -
     } else {
         1.0
     }
+}
+
+fn smallest_side(rects: &[Rect]) -> f32 {
+    rects
+        .iter()
+        .map(|r| r.width().min(r.height()))
+        .fold(f32::INFINITY, f32::min)
 }
 
 /// Slide a rearranged group back toward the window when its new shape sticks
@@ -390,68 +501,98 @@ fn content_aspect(p: &Preview) -> Option<f32> {
     (aspect.is_finite() && aspect > 0.0).then_some(aspect)
 }
 
-/// The largest rect of `aspect` centered inside `slot`.
-fn fit_aspect(slot: Rect, aspect: f32) -> Rect {
-    let size = if slot.aspect_ratio() > aspect {
-        Vec2::new(slot.height() * aspect, slot.height())
-    } else {
-        Vec2::new(slot.width(), slot.width() / aspect)
+/// The shape a member is laid out at. A source shape counts once it has held
+/// for `ASPECT_SETTLE` seconds; `wake` collects when to look again.
+fn settled_aspect(
+    aspects: &mut HashMap<PreviewId, SettledAspect>,
+    p: &Preview,
+    rect: Rect,
+    now: f64,
+    wake: &mut Option<f64>,
+) -> f32 {
+    let Some(raw) = content_aspect(p) else {
+        aspects.remove(&p.id);
+        return rect.aspect_ratio();
     };
-    Rect::from_center_size(slot.center(), size)
-}
-
-/// Lay a group out from its current outline while keeping its visible area.
-/// Fitting each preset inside the previous preset's outline loses the space
-/// the new shape cannot use, so switching layouts would shrink the group.
-/// `aspects` are the shapes the tiles should take, which can differ from
-/// their current, stretched shapes.
-fn spotlight_group_rects(current: &[Rect], aspects: &[f32], large_count: usize) -> Vec<Rect> {
-    let Some(bounds) = bounds_of(current.iter().copied()) else {
-        return Vec::new();
-    };
-    let rects = spotlight_rects(aspects, bounds, large_count);
-    let area = current.iter().map(Rect::area).sum::<f32>();
-    let arranged = rects.iter().map(Rect::area).sum::<f32>();
-    if !(area > 0.0 && arranged > 0.0) {
-        return rects;
+    let near = |a: f32, b: f32| (a / b - 1.0).abs() <= ASPECT_TOLERANCE;
+    let mut later = |at: f64| *wake = Some(wake.map_or(at, |wake| wake.min(at)));
+    match aspects.entry(p.id) {
+        Entry::Vacant(entry) => {
+            entry.insert(SettledAspect {
+                value: raw,
+                pending: None,
+            });
+            raw
+        }
+        Entry::Occupied(mut entry) => {
+            let settled = entry.get_mut();
+            if near(raw, settled.value) {
+                settled.pending = None;
+            } else {
+                match settled.pending {
+                    Some((shape, since)) if near(shape, raw) => {
+                        if now - since >= ASPECT_SETTLE {
+                            settled.value = raw;
+                            settled.pending = None;
+                        } else {
+                            later(since + ASPECT_SETTLE);
+                        }
+                    }
+                    _ => {
+                        settled.pending = Some((raw, now));
+                        later(now + ASPECT_SETTLE);
+                    }
+                }
+            }
+            settled.value
+        }
     }
-    let scale = (area / arranged).sqrt();
-    rects
-        .into_iter()
-        .map(|r| Rect::from_min_size(bounds.min + (r.min - bounds.min) * scale, r.size() * scale))
-        .collect()
 }
 
-/// A layout change conserves visible content area. Fitting a column into the
-/// previous row's bounds (then vice versa) would otherwise collapse the group.
-#[cfg(test)]
-fn arranged_group_rects(current: &[Rect], layout: Arrangement, main: usize) -> Vec<Rect> {
-    let Some(bounds) = bounds_of(current.iter().copied()) else {
-        return Vec::new();
-    };
-    let count = current.len();
-    let cols = (count as f32).sqrt().ceil() as usize;
-    let size = match layout {
-        Arrangement::Grid => Vec2::new(cols as f32 * 320.0, count.div_ceil(cols) as f32 * 180.0),
-        Arrangement::Row => Vec2::new(count as f32 * 320.0, 180.0),
-        Arrangement::Column => Vec2::new(320.0, count as f32 * 180.0),
-        Arrangement::SideStack => Vec2::new(1280.0, 720.0),
-    };
-    let aspects: Vec<_> = current.iter().map(Rect::aspect_ratio).collect();
-    let slots = arranged_rects(
-        &aspects,
-        Rect::from_min_size(Pos2::ZERO, size),
-        layout,
-        main,
-    );
-    let origin = bounds_of(slots.iter().copied()).unwrap().min;
-    let area = current.iter().map(Rect::area).sum::<f32>();
-    let slot_area = slots.iter().map(Rect::area).sum::<f32>().max(0.001);
-    let scale = (area / slot_area).sqrt();
-    slots
-        .into_iter()
-        .map(|r| Rect::from_min_size(bounds.min + (r.min - origin) * scale, r.size() * scale))
-        .collect()
+/// A member's rect in its group's layout space: canvas units, or points from
+/// the viewport's top-left corner for a pinned group.
+fn layout_rect(p: &Preview, viewport: Rect) -> Rect {
+    match p.viewport_pin {
+        Some(pin) => pin.rect(viewport).translate(-viewport.min.to_vec2()),
+        None => p.rect(),
+    }
+}
+
+fn set_layout_rect(p: &mut Preview, rect: Rect, viewport: Rect) {
+    if p.viewport_pin.is_some() {
+        p.viewport_pin = Some(group_pin(rect.translate(viewport.min.to_vec2()), viewport));
+    } else {
+        p.position = rect.min;
+        p.size = rect.size();
+    }
+}
+
+fn frame_from(member: Rect, relative: [f32; 4]) -> Rect {
+    let size = member.size();
+    Rect::from_min_size(
+        member.min + Vec2::new(relative[0] * size.x, relative[1] * size.y),
+        Vec2::new(relative[2] * size.x, relative[3] * size.y),
+    )
+}
+
+fn relative_frame(frame: Rect, member: Rect) -> Option<[f32; 4]> {
+    let size = member.size();
+    (size.x > 0.0 && size.y > 0.0).then(|| {
+        [
+            (frame.min.x - member.min.x) / size.x,
+            (frame.min.y - member.min.y) / size.y,
+            frame.width() / size.x,
+            frame.height() / size.y,
+        ]
+    })
+}
+
+fn rects_close(a: Rect, b: Rect, tolerance: f32) -> bool {
+    (a.min - b.min).abs().max_elem() <= tolerance && (a.max - b.max).abs().max_elem() <= tolerance
+}
+
+fn frame_tolerance(frame: Rect) -> f32 {
+    frame.size().max_elem() * 1e-4 + 1e-3
 }
 
 /// Every group member uses the same corner, so viewport resizing cannot pull
@@ -472,6 +613,20 @@ pub(super) fn pin_for_tile(preview: &Preview, rect: Rect, viewport: Rect) -> Vie
     }
 }
 
+/// An arranged group's members as laid out now.
+struct Arranged {
+    settings: TileGroup,
+    pinned: bool,
+    members: Vec<(PreviewId, Rect, Option<[f32; 4]>)>,
+    aspects: Vec<f32>,
+}
+
+impl Arranged {
+    fn rects(&self) -> Vec<Rect> {
+        self.members.iter().map(|(_, rect, _)| *rect).collect()
+    }
+}
+
 impl CanvasState {
     pub(super) fn update_layout_animation(&mut self, now: f64) {
         self.groups.animation_time = Some(now);
@@ -483,7 +638,7 @@ impl CanvasState {
             || self.is_focusing_tile()
         {
             self.groups.motions.clear();
-            self.groups.spotlight_drag = None;
+            self.groups.reorder = None;
         }
     }
 
@@ -495,7 +650,7 @@ impl CanvasState {
         if self.is_focusing_tile() {
             return target;
         }
-        if let Some(drag) = &self.groups.spotlight_drag {
+        if let Some(drag) = &self.groups.reorder {
             if drag.id == id {
                 return drag.origin.translate(drag.pointer - drag.start);
             }
@@ -553,7 +708,20 @@ impl CanvasState {
         }
     }
 
-    pub(super) fn spotlight_drag_response(
+    fn group_settings(&self, id: PreviewId, previews: &PreviewManager) -> Option<TileGroup> {
+        let first = *self.group_members(id, previews).first()?;
+        previews.get(first)?.tile_group.clone()
+    }
+
+    pub(super) fn is_arranged(&self, id: PreviewId, previews: &PreviewManager) -> bool {
+        previews
+            .get(id)
+            .and_then(|p| p.tile_group.as_ref())
+            .is_some_and(|g| g.arrangement != GroupArrangement::Free)
+    }
+
+    /// Shift+drag inside an arranged group swaps two tiles' places.
+    pub(super) fn reorder_drag_response(
         &mut self,
         id: PreviewId,
         response: &egui::Response,
@@ -561,54 +729,43 @@ impl CanvasState {
         previews: &mut PreviewManager,
         input: &FrameInput,
     ) {
-        if !self.is_spotlighting() || self.is_focusing_tile() {
+        if self.is_focusing_tile() || self.crop_mode.is_some() {
             return;
         }
         if input.alt || input.middle_down || input.pointer_blocked {
-            self.groups.spotlight_drag = None;
+            self.groups.reorder = None;
             return;
         }
-        if response.drag_started() {
+        if response.drag_started()
+            && input.shift
+            && self.groups.resize.is_none()
+            && self.is_arranged(id, previews)
+            && self.group_members(id, previews).len() > 1
+        {
             if let (Some(pointer), Some(p)) = (response.interact_pointer_pos(), previews.get(id)) {
                 let origin = self.preview_screen_rect(p, viewport);
-                self.groups.spotlight_drag = Some(SpotlightDrag {
+                self.groups.reorder = Some(ReorderDrag {
                     id,
                     origin,
                     start: pointer - response.drag_delta(),
                     pointer,
                     target: None,
                 });
-                self.selection = vec![id];
-                self.remember_current_tile(id);
-                if let Some(s) = &mut self.groups.spotlight {
-                    if let Some(index) = s.originals.iter().position(|p| p.id == id) {
-                        s.active = index;
-                    }
+                if !self.selection.contains(&id) {
+                    self.select_group_tile(id, previews);
                 }
+                self.remember_current_tile(id);
             }
         }
-        if self
-            .groups
-            .spotlight_drag
-            .as_ref()
-            .is_some_and(|d| d.id == id)
-        {
+        if self.groups.reorder.as_ref().is_some_and(|d| d.id == id) {
             if let Some(pointer) = response.interact_pointer_pos().or(input.hover_pos) {
-                let target = self.groups.spotlight.as_ref().and_then(|s| {
-                    s.order.iter().copied().find(|other| {
-                        *other != id
-                            && previews.get(*other).is_some_and(|p| {
-                                !p.left_click_disabled
-                                    && self.preview_screen_rect(p, viewport).contains(pointer)
-                            })
-                    })
-                });
-                let drag = self.groups.spotlight_drag.as_mut().unwrap();
+                let target = self.reorder_target(id, pointer, viewport, previews);
+                let drag = self.groups.reorder.as_mut().unwrap();
                 drag.pointer = pointer;
                 drag.target = target;
             }
             if response.drag_stopped() {
-                self.finish_spotlight_drag(
+                self.finish_reorder_drag(
                     response.interact_pointer_pos().or(input.hover_pos),
                     viewport,
                     previews,
@@ -617,7 +774,28 @@ impl CanvasState {
         }
     }
 
-    pub(super) fn draw_spotlight_drop_target(
+    fn reorder_target(
+        &self,
+        source: PreviewId,
+        pointer: Pos2,
+        viewport: Rect,
+        previews: &PreviewManager,
+    ) -> Option<PreviewId> {
+        if !viewport.contains(pointer) {
+            return None;
+        }
+        self.group_members(source, previews)
+            .into_iter()
+            .find(|other| {
+                *other != source
+                    && previews.get(*other).is_some_and(|p| {
+                        !p.left_click_disabled
+                            && self.preview_screen_rect(p, viewport).contains(pointer)
+                    })
+            })
+    }
+
+    pub(super) fn draw_reorder_drop_target(
         &self,
         painter: &egui::Painter,
         viewport: Rect,
@@ -625,7 +803,7 @@ impl CanvasState {
     ) {
         if let Some(preview) = self
             .groups
-            .spotlight_drag
+            .reorder
             .as_ref()
             .and_then(|d| d.target)
             .and_then(|id| previews.get(id))
@@ -638,8 +816,8 @@ impl CanvasState {
         }
     }
 
-    pub(super) fn update_spotlight_drag_pointer(&mut self, pointer: Option<Pos2>, viewport: Rect) {
-        if let Some(drag) = &mut self.groups.spotlight_drag {
+    pub(super) fn update_reorder_pointer(&mut self, pointer: Option<Pos2>, viewport: Rect) {
+        if let Some(drag) = &mut self.groups.reorder {
             if let Some(pointer) = pointer {
                 drag.pointer = pointer;
                 if !viewport.contains(pointer) {
@@ -649,85 +827,56 @@ impl CanvasState {
         }
     }
 
-    pub(super) fn finish_spotlight_drag(
+    pub(super) fn finish_reorder_drag(
         &mut self,
         pointer: Option<Pos2>,
         viewport: Rect,
         previews: &mut PreviewManager,
     ) {
-        let Some(source) = self.groups.spotlight_drag.as_ref().map(|d| d.id) else {
+        let Some(source) = self.groups.reorder.as_ref().map(|d| d.id) else {
             return;
         };
-        let target = pointer
-            .filter(|p| viewport.contains(*p))
-            .and_then(|pointer| {
-                self.groups.spotlight.as_ref().and_then(|s| {
-                    s.order.iter().copied().find(|id| {
-                        *id != source
-                            && previews.get(*id).is_some_and(|p| {
-                                !p.left_click_disabled
-                                    && self.preview_screen_rect(p, viewport).contains(pointer)
-                            })
-                    })
-                })
-            });
+        let target =
+            pointer.and_then(|pointer| self.reorder_target(source, pointer, viewport, previews));
         if let Some(target) = target {
-            self.swap_spotlight_tiles(source, target, viewport, previews);
+            self.swap_member_order(source, target, viewport, previews);
         } else if let Some(p) = previews.get(source) {
             let start = self.preview_screen_rect(p, viewport);
+            self.groups.reorder = None;
             self.animate_layout_from(vec![(source, start)], viewport, previews);
         }
-        self.groups.spotlight_drag = None;
+        self.groups.reorder = None;
     }
 
-    fn swap_spotlight_tiles(
+    /// Trade two members' places in their group's order. Their tiles move
+    /// to each other's slots at their own shapes; nobody else's slot does
+    /// unless the shapes need it.
+    fn swap_member_order(
         &mut self,
         source: PreviewId,
         target: PreviewId,
         viewport: Rect,
         previews: &mut PreviewManager,
     ) {
-        let (Some(source_tile), Some(target_tile)) = (previews.get(source), previews.get(target))
-        else {
-            return;
-        };
-        let source_geometry = TileGeometry::capture(source_tile);
-        let target_geometry = TileGeometry::capture(target_tile);
-        let starts = vec![
-            (source, self.preview_screen_rect(source_tile, viewport)),
-            (target, self.preview_screen_rect(target_tile, viewport)),
-        ];
-        let Some(s) = &mut self.groups.spotlight else {
-            return;
-        };
+        let mut order = self.group_members(source, previews);
         let (Some(a), Some(b)) = (
-            s.order.iter().position(|id| *id == source),
-            s.order.iter().position(|id| *id == target),
+            order.iter().position(|id| *id == source),
+            order.iter().position(|id| *id == target),
         ) else {
             return;
         };
-        s.order.swap(a, b);
-        s.active = s.originals.iter().position(|p| p.id == source).unwrap();
-        // Exchange the actual destinations, independent of membership order or
-        // which preset originally produced them. Other tiles never reflow.
-        for (id, destination) in [(source, target_geometry), (target, source_geometry)] {
-            if let Some(p) = previews.get_mut(id) {
-                p.position = destination.position;
-                p.size = destination.size;
-                p.viewport_pin = destination.pin;
-            }
-            // A slot shaped for the other tile would stretch this one's
-            // picture, so show it at its own proportions inside the slot.
-            if let Some((aspect, slot)) = previews
-                .get(id)
-                .and_then(|p| Some((content_aspect(p)?, self.target_screen_rect(p, viewport))))
-            {
-                self.set_group_screen_rect(id, fit_aspect(slot, aspect), viewport, previews);
+        order.swap(a, b);
+        self.set_member_order(&order, previews);
+        self.arrange_group_of(source, viewport, previews);
+        self.remember_current_tile(source);
+    }
+
+    fn set_member_order(&self, order: &[PreviewId], previews: &mut PreviewManager) {
+        for (index, id) in order.iter().enumerate() {
+            if let Some(group) = previews.get_mut(*id).and_then(|p| p.tile_group.as_mut()) {
+                group.order = index as u32;
             }
         }
-        self.selection = vec![source];
-        self.remember_current_tile(source);
-        self.animate_layout_from(starts, viewport, previews);
     }
 
     pub(super) fn remember_current_tile(&mut self, id: PreviewId) {
@@ -793,89 +942,26 @@ impl CanvasState {
         }
     }
 
-    pub(super) fn spotlight_tile(
-        &mut self,
-        id: PreviewId,
-        _viewport: Rect,
-        _previews: &mut PreviewManager,
-    ) {
-        self.exit_focus();
-        let Some(spotlight) = &mut self.groups.spotlight else {
-            return;
-        };
-        if let Some(index) = spotlight.originals.iter().position(|p| p.id == id) {
-            spotlight.active = index;
-            self.selection = vec![id];
-            self.remember_current_tile(id);
-        }
-    }
-
-    pub(super) fn spotlight_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-        viewport: Rect,
-        previews: &mut PreviewManager,
-    ) {
-        if !self.is_spotlighting() || self.is_focusing_tile() {
-            return;
-        }
-        let Some(bounds) = self
-            .spotlight_screen_bounds(viewport)
-            .filter(|bounds| bounds.intersects(viewport))
-        else {
-            return;
-        };
-        egui::Area::new(ui.id().with("spotlight_controls"))
-            .fixed_pos(egui::pos2(
-                (bounds.center().x - 146.0).clamp(
-                    viewport.left(),
-                    (viewport.right() - 292.0).max(viewport.left()),
-                ),
-                (bounds.bottom() + 6.0).clamp(
-                    viewport.top(),
-                    (viewport.bottom() - 36.0).max(viewport.top()),
-                ),
-            ))
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::none()
-                    .fill(crate::ui_theme::PANEL)
-                    .rounding(6.0)
-                    .inner_margin(5.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Spotlight").on_hover_text("Drag a tile onto another to swap their places. Alt+1–4 changes the number of large tiles.");
-                            if ui.button("Previous").clicked() {
-                                self.cycle_spotlight(false, viewport, previews);
-                            }
-                            if ui.button("Next").clicked() {
-                                self.cycle_spotlight(true, viewport, previews);
-                            }
-                            if ui.button("Exit").clicked() {
-                                self.exit_spotlight(previews);
-                            }
-                        });
-                    });
-            });
-    }
-
-    pub fn group_members(&self, id: PreviewId, previews: &PreviewManager) -> Vec<PreviewId> {
-        let group = previews.get(id).and_then(|p| p.tile_group.as_ref());
-        let Some(group) = group else {
-            return vec![id];
-        };
+    fn members_of(group: u64, previews: &PreviewManager) -> Vec<PreviewId> {
         let mut members: Vec<_> = previews
             .all()
             .filter(|p| p.removing.is_none())
             .filter_map(|p| {
                 p.tile_group
                     .as_ref()
-                    .filter(|g| g.id == group.id)
+                    .filter(|g| g.id == group)
                     .map(|g| (g.order, p.id))
             })
             .collect();
         members.sort_by_key(|(order, id)| (*order, id.0));
         members.into_iter().map(|(_, id)| id).collect()
+    }
+
+    pub fn group_members(&self, id: PreviewId, previews: &PreviewManager) -> Vec<PreviewId> {
+        match previews.get(id).and_then(|p| p.tile_group.as_ref()) {
+            Some(group) => Self::members_of(group.id, previews),
+            None => vec![id],
+        }
     }
 
     pub(super) fn selection_for_tile(
@@ -940,11 +1026,481 @@ impl CanvasState {
             .unwrap_or_else(|| self.canvas_rect_to_screen(p.rect(), viewport))
     }
 
-    /// Scale the whole group, keeping its arrangement, to fill the window.
-    fn fit_group_to_view(&mut self, id: PreviewId, viewport: Rect, previews: &mut PreviewManager) {
-        self.exit_spotlight(previews);
+    fn to_layout_space(&self, screen: Rect, pinned: bool, viewport: Rect) -> Rect {
+        if pinned {
+            screen.translate(-viewport.min.to_vec2())
+        } else {
+            Rect::from_min_size(
+                self.screen_to_canvas(screen.min, viewport),
+                screen.size() / self.zoom,
+            )
+        }
+    }
+
+    fn to_screen_space(&self, rect: Rect, pinned: bool, viewport: Rect) -> Rect {
+        if pinned {
+            rect.translate(viewport.min.to_vec2())
+        } else {
+            self.canvas_rect_to_screen(rect, viewport)
+        }
+    }
+
+    /// An arranged group's members with the shapes they are laid out at.
+    /// `None` for a free group, or one whose members are not all pinned or
+    /// all unpinned.
+    fn arranged(
+        &mut self,
+        group: u64,
+        viewport: Rect,
+        previews: &PreviewManager,
+        now: f64,
+    ) -> Option<Arranged> {
+        let ids = Self::members_of(group, previews);
+        let first = previews.get(*ids.first()?)?;
+        let settings = first.tile_group.clone()?;
+        let pinned = first.viewport_pin.is_some();
+        if settings.arrangement == GroupArrangement::Free {
+            return None;
+        }
+        let mut wake = self.groups.aspect_wake;
+        let mut members = Vec::with_capacity(ids.len());
+        let mut aspects = Vec::with_capacity(ids.len());
+        for p in ids.iter().filter_map(|id| previews.get(*id)) {
+            if p.viewport_pin.is_some() != pinned {
+                return None;
+            }
+            let rect = layout_rect(p, viewport);
+            aspects.push(settled_aspect(
+                &mut self.groups.aspects,
+                p,
+                rect,
+                now,
+                &mut wake,
+            ));
+            members.push((p.id, rect, p.tile_group.as_ref().and_then(|g| g.frame)));
+        }
+        self.groups.aspect_wake = wake;
+        Some(Arranged {
+            settings,
+            pinned,
+            members,
+            aspects,
+        })
+    }
+
+    /// The box the most members agree on. A member resized on its own (a
+    /// crop, say) disagrees with the others, and a new member has no say.
+    /// A tie goes to the box the group had last, then to the earlier member.
+    fn resolve_frame(&self, arranged: &Arranged) -> Option<Rect> {
+        let mut votes: Vec<(Rect, usize)> = Vec::new();
+        for (_, rect, relative) in &arranged.members {
+            let Some(frame) = relative
+                .map(|relative| frame_from(*rect, relative))
+                .filter(|f| f.is_finite() && f.width() > 0.0 && f.height() > 0.0)
+            else {
+                continue;
+            };
+            match votes
+                .iter_mut()
+                .find(|(other, _)| rects_close(*other, frame, frame_tolerance(frame)))
+            {
+                Some((_, count)) => *count += 1,
+                None => votes.push((frame, 1)),
+            }
+        }
+        let last = self
+            .groups
+            .frames
+            .get(&arranged.settings.id)
+            .filter(|(pinned, _)| *pinned == arranged.pinned)
+            .map(|(_, frame)| *frame);
+        votes
+            .into_iter()
+            .enumerate()
+            .max_by(|(a_index, (a, a_votes)), (b_index, (b, b_votes))| {
+                let was = |frame: &Rect| {
+                    last.is_some_and(|last| rects_close(last, *frame, frame_tolerance(last)))
+                };
+                a_votes
+                    .cmp(b_votes)
+                    .then(was(a).cmp(&was(b)))
+                    .then(b_index.cmp(a_index))
+            })
+            .map(|(_, (frame, _))| frame)
+    }
+
+    /// Move an arranged group's members into `frame`, gliding there unless
+    /// `animate` is off (while a handle drags the box).
+    fn place_group(
+        &mut self,
+        arranged: &Arranged,
+        frame: Rect,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+        animate: bool,
+    ) {
+        let settings = &arranged.settings;
+        if !animate {
+            self.groups
+                .motions
+                .retain(|m| !arranged.members.iter().any(|(id, _, _)| *id == m.id));
+        }
+        let expected = layout_rects(&arranged.aspects, frame, settings.arrangement, settings.gap);
+        let tolerance = frame_tolerance(frame);
+        let mut starts = Vec::new();
+        for ((id, rect, _), slot) in arranged.members.iter().zip(&expected) {
+            let moved = !rects_close(*rect, *slot, tolerance);
+            if moved && animate {
+                if let Some(p) = previews.get(*id) {
+                    starts.push((*id, self.preview_screen_rect(p, viewport)));
+                }
+            }
+            let Some(p) = previews.get_mut(*id) else {
+                continue;
+            };
+            if moved {
+                set_layout_rect(p, *slot, viewport);
+            }
+            let fresh = relative_frame(frame, *slot);
+            let Some(group) = p.tile_group.as_mut() else {
+                continue;
+            };
+            let stale = match (group.frame, fresh) {
+                (Some(old), Some(new)) => old
+                    .iter()
+                    .zip(new)
+                    .any(|(old, new)| (old - new).abs() > 1e-4 * new.abs().max(1.0)),
+                (old, new) => old.is_some() != new.is_some(),
+            };
+            if moved || stale {
+                group.frame = fresh;
+            }
+            if group.arrangement != settings.arrangement || group.gap != settings.gap {
+                group.arrangement = settings.arrangement;
+                group.gap = settings.gap;
+            }
+            if group.name != settings.name {
+                group.name.clone_from(&settings.name);
+            }
+        }
+        self.groups
+            .frames
+            .insert(settings.id, (arranged.pinned, frame));
+        if !starts.is_empty() {
+            self.animate_layout_from(starts, viewport, previews);
+        }
+    }
+
+    /// Lay an arranged group out inside its box again. A group without a
+    /// box yet gets one that keeps its tiles' total area.
+    fn arrange_group(
+        &mut self,
+        group: u64,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+        now: f64,
+    ) {
+        let Some(arranged) = self.arranged(group, viewport, previews, now) else {
+            return;
+        };
+        let frame = self.resolve_frame(&arranged).or_else(|| {
+            let current = arranged.rects();
+            let outline = bounds_of(current.iter().copied())?;
+            let frame = initial_frame(
+                &current,
+                &arranged.aspects,
+                arranged.settings.arrangement,
+                arranged.settings.gap,
+            )?;
+            let window = self.to_layout_space(viewport, arranged.pinned, viewport);
+            keep_in_view(vec![frame], outline, window).pop()
+        });
+        if let Some(frame) = frame {
+            self.place_group(&arranged, frame, viewport, previews, true);
+        }
+    }
+
+    fn arrange_group_of(&mut self, id: PreviewId, viewport: Rect, previews: &mut PreviewManager) {
+        if let Some(group) = previews.get(id).and_then(|p| p.tile_group.as_ref()) {
+            let group = group.id;
+            let now = self.groups.animation_time.unwrap_or(0.0);
+            self.arrange_group(group, viewport, previews, now);
+        }
+    }
+
+    fn group_layouts_paused(&self) -> bool {
+        self.drag_state.is_some()
+            || self.preview_dragging
+            || self.groups.resize.is_some()
+            || self.groups.reorder.is_some()
+            || self.pinned_pointer_drag.is_some()
+            || self.crop_mode.is_some()
+            || self.is_focusing_tile()
+            || self.interactive_browser.is_some()
+            || self.live_window.id.is_some()
+    }
+
+    /// Keep arranged groups laid out as members join or leave, change order
+    /// or their sources change shape. Moving or scaling a whole group keeps
+    /// every member's view of the box, so it never triggers a re-flow.
+    /// Returns when a source shape that is still changing should be checked.
+    pub(super) fn update_group_layouts(
+        &mut self,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+        now: f64,
+    ) -> Option<f64> {
+        if self.group_layouts_paused() {
+            return None;
+        }
+        self.groups.aspect_wake = None;
+        let mut wake = None;
+        let mut scratch = std::mem::take(&mut self.groups.scratch);
+        scratch.clear();
+        for p in previews.all() {
+            let Some(group) = p
+                .tile_group
+                .as_ref()
+                .filter(|g| g.arrangement != GroupArrangement::Free && p.removing.is_none())
+            else {
+                continue;
+            };
+            let rect = layout_rect(p, viewport);
+            let aspect = settled_aspect(&mut self.groups.aspects, p, rect, now, &mut wake);
+            let mut hasher = DefaultHasher::new();
+            (
+                p.id.0,
+                group.order,
+                group.arrangement,
+                group.gap,
+                p.viewport_pin.is_some(),
+            )
+                .hash(&mut hasher);
+            for value in [rect.min.x, rect.min.y, rect.max.x, rect.max.y, aspect] {
+                value.to_bits().hash(&mut hasher);
+            }
+            group.frame.map(|f| f.map(f32::to_bits)).hash(&mut hasher);
+            let sum = scratch.entry(group.id).or_insert(0);
+            *sum = sum.wrapping_add(hasher.finish());
+        }
+        let mut changed = std::mem::take(&mut self.groups.changed);
+        changed.clear();
+        changed.extend(
+            scratch
+                .iter()
+                .filter(|(group, signature)| self.groups.signatures.get(group) != Some(signature))
+                .map(|(group, _)| *group),
+        );
+        std::mem::swap(&mut self.groups.signatures, &mut scratch);
+        self.groups.scratch = scratch;
+        for group in &changed {
+            self.arrange_group(*group, viewport, previews, now);
+        }
+        self.groups.changed = changed;
+        if self.groups.aspects.len() > self.groups.signatures.len() * 4 + 16 {
+            self.groups.aspects.retain(|id, _| {
+                previews.get(*id).is_some_and(|p| {
+                    p.tile_group
+                        .as_ref()
+                        .is_some_and(|g| g.arrangement != GroupArrangement::Free)
+                })
+            });
+        }
+        let signatures = &self.groups.signatures;
+        self.groups
+            .frames
+            .retain(|group, _| signatures.contains_key(group));
+        [wake, self.groups.aspect_wake]
+            .into_iter()
+            .flatten()
+            .reduce(f64::min)
+    }
+
+    /// Change how a group arranges its tiles. Going from free to arranged
+    /// gives the group a box that keeps its total visible area; switching
+    /// between arrangements keeps the box, so switching back restores the
+    /// previous layout exactly. With a large-tile arrangement, `target`
+    /// takes a large slot.
+    pub(super) fn set_group_arrangement(
+        &mut self,
+        id: PreviewId,
+        arrangement: GroupArrangement,
+        target: Option<PreviewId>,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+    ) {
+        let Some(settings) = self.group_settings(id, previews) else {
+            return;
+        };
+        let mut order = self.group_members(id, previews);
+        if order.len() < 2 {
+            return;
+        }
         self.exit_focus();
         self.finish_crop();
+        self.groups.reorder = None;
+        if let (GroupArrangement::Main(large), Some(slot)) = (
+            arrangement,
+            target.and_then(|target| order.iter().position(|member| *member == target)),
+        ) {
+            let large = (large.max(1) as usize).min(order.len());
+            if slot >= large || large == 1 {
+                order.swap(large - 1, slot);
+            }
+        }
+        let starting = settings.arrangement == GroupArrangement::Free;
+        for (index, member) in order.iter().enumerate() {
+            if let Some(group) = previews
+                .get_mut(*member)
+                .and_then(|p| p.tile_group.as_mut())
+            {
+                group.order = index as u32;
+                group.arrangement = arrangement;
+                if starting {
+                    group.frame = None;
+                }
+            }
+            // The user asked for a layout now; use the sources' shapes as
+            // they are rather than waiting for a change to settle.
+            self.groups.aspects.remove(member);
+        }
+        if arrangement != GroupArrangement::Free {
+            self.arrange_group(
+                settings.id,
+                viewport,
+                previews,
+                self.groups.animation_time.unwrap_or(0.0),
+            );
+        }
+        if let Some(target) = target.filter(|target| order.contains(target)) {
+            if !self.selection.contains(&target) {
+                self.select_group_tile(target, previews);
+            }
+            self.remember_current_tile(target);
+        }
+    }
+
+    fn set_group_gap(
+        &mut self,
+        id: PreviewId,
+        gap: GroupGap,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+    ) {
+        let members = self.group_members(id, previews);
+        for member in &members {
+            if let Some(group) = previews
+                .get_mut(*member)
+                .and_then(|p| p.tile_group.as_mut())
+            {
+                group.gap = gap;
+            }
+        }
+        self.arrange_group_of(id, viewport, previews);
+    }
+
+    /// Moving or resizing some members of an arranged group by hand takes
+    /// the group out of its arrangement, so the next layout pass keeps the
+    /// change instead of undoing it.
+    pub(super) fn release_partial_groups(
+        &mut self,
+        ids: &[PreviewId],
+        previews: &mut PreviewManager,
+    ) {
+        let mut groups: Vec<u64> = ids
+            .iter()
+            .filter_map(|id| previews.get(*id)?.tile_group.as_ref())
+            .filter(|g| g.arrangement != GroupArrangement::Free)
+            .map(|g| g.id)
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        for group in groups {
+            let members = Self::members_of(group, previews);
+            if members.iter().all(|member| ids.contains(member)) {
+                continue;
+            }
+            for member in members {
+                if let Some(group) = previews.get_mut(member).and_then(|p| p.tile_group.as_mut()) {
+                    group.arrangement = GroupArrangement::Free;
+                }
+            }
+        }
+    }
+
+    /// Put `id` in its group's large slot. A group without large tiles
+    /// switches to one large tile.
+    pub(super) fn make_main_tile(
+        &mut self,
+        id: PreviewId,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+    ) {
+        let arrangement = match self.group_settings(id, previews).map(|g| g.arrangement) {
+            Some(GroupArrangement::Main(large)) => GroupArrangement::Main(large),
+            Some(_) => GroupArrangement::Main(1),
+            None => return,
+        };
+        self.set_group_arrangement(id, arrangement, Some(id), viewport, previews);
+    }
+
+    /// With large tiles, the next or previous member becomes the large one.
+    /// Otherwise the current tile moves to the next or previous member.
+    fn cycle_main_tile(
+        &mut self,
+        next: bool,
+        target: Option<PreviewId>,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+    ) {
+        let Some(id) = target else {
+            return;
+        };
+        let mut order = self.group_members(id, previews);
+        if order.len() < 2 {
+            return;
+        }
+        self.exit_focus();
+        let arrangement = self.group_settings(id, previews).map(|g| g.arrangement);
+        let current = if let Some(GroupArrangement::Main(_)) = arrangement {
+            if next {
+                order.rotate_left(1);
+            } else {
+                order.rotate_right(1);
+            }
+            self.set_member_order(&order, previews);
+            self.arrange_group_of(id, viewport, previews);
+            order[0]
+        } else {
+            let index = order.iter().position(|member| *member == id).unwrap_or(0);
+            let step = if next { 1 } else { order.len() - 1 };
+            order[(index + step) % order.len()]
+        };
+        if !self.selection.contains(&current) {
+            self.select_group_tile(current, previews);
+        }
+        self.remember_current_tile(current);
+    }
+
+    /// Scale the whole group to fill the window. An arranged group lays out
+    /// again in the window's shape; a free one keeps its arrangement.
+    fn fit_group_to_view(&mut self, id: PreviewId, viewport: Rect, previews: &mut PreviewManager) {
+        self.exit_focus();
+        self.finish_crop();
+        let area = viewport.shrink(viewport.width().min(viewport.height()) * 0.04);
+        if let Some(group) = previews
+            .get(id)
+            .and_then(|p| p.tile_group.as_ref())
+            .filter(|g| g.arrangement != GroupArrangement::Free)
+            .map(|g| g.id)
+        {
+            let now = self.groups.animation_time.unwrap_or(0.0);
+            if let Some(arranged) = self.arranged(group, viewport, previews, now) {
+                let frame = self.to_layout_space(area, arranged.pinned, viewport);
+                self.place_group(&arranged, frame, viewport, previews, true);
+                return;
+            }
+        }
         let members: Vec<_> = self
             .group_members(id, previews)
             .into_iter()
@@ -960,7 +1516,6 @@ impl CanvasState {
         let Some(bounds) = bounds_of(members.iter().map(|(_, _, r)| *r)) else {
             return;
         };
-        let area = viewport.shrink(viewport.width().min(viewport.height()) * 0.04);
         let scale =
             (area.width() / bounds.width().max(1.0)).min(area.height() / bounds.height().max(1.0));
         if !(scale.is_finite() && scale > 0.0) {
@@ -992,7 +1547,6 @@ impl CanvasState {
         viewport: Rect,
         previews: &mut PreviewManager,
     ) {
-        self.exit_spotlight(previews);
         self.finish_crop();
         self.groups.editing = None;
         let pinned = ids
@@ -1006,9 +1560,17 @@ impl CanvasState {
                 continue;
             };
             let min = self.screen_to_canvas(rect.min, viewport);
+            self.groups.aspects.remove(id);
             if let Some(p) = previews.get_mut(*id) {
+                // A member keeps its view of the box; a new one has none.
+                let frame = p
+                    .tile_group
+                    .as_ref()
+                    .filter(|g| g.id == group.id)
+                    .and_then(|g| g.frame);
                 p.tile_group = Some(TileGroup {
                     order: order as u32,
+                    frame,
                     ..group.clone()
                 });
                 p.viewport_pin = pinned.then(|| group_pin(rect, viewport));
@@ -1021,8 +1583,19 @@ impl CanvasState {
         self.selection = ids.to_vec();
     }
 
+    /// "Group 1", "Group 2"... the first number no other group uses.
+    fn next_group_name(previews: &PreviewManager) -> String {
+        (1..)
+            .map(|n| format!("Group {n}"))
+            .find(|name| {
+                !previews
+                    .all()
+                    .any(|p| p.tile_group.as_ref().is_some_and(|g| &g.name == name))
+            })
+            .unwrap()
+    }
+
     fn create_group(&mut self, viewport: Rect, previews: &mut PreviewManager) {
-        self.exit_spotlight(previews);
         if self.selected_group(previews).is_some() {
             return;
         }
@@ -1054,21 +1627,12 @@ impl CanvasState {
         {
             return;
         }
-        self.assign_group(
-            &ids,
-            TileGroup {
-                id,
-                name: "Group".into(),
-                order: 0,
-            },
-            viewport,
-            previews,
-        );
+        let name = Self::next_group_name(previews);
+        self.assign_group(&ids, TileGroup::new(id, name, 0), viewport, previews);
         self.groups.error = None;
     }
 
     fn ungroup_selection(&mut self, previews: &mut PreviewManager) {
-        self.exit_spotlight(previews);
         self.finish_crop();
         self.groups.editing = None;
         self.expand_group_selection(previews);
@@ -1077,64 +1641,13 @@ impl CanvasState {
                 p.tile_group = None;
             }
         }
-        self.groups.editing = None;
-    }
-
-    #[cfg(test)]
-    fn arrange_selection(
-        &mut self,
-        layout: Arrangement,
-        main: Option<PreviewId>,
-        viewport: Rect,
-        previews: &mut PreviewManager,
-    ) {
-        self.exit_spotlight(previews);
-        self.exit_focus();
-        self.finish_crop();
-        let ids = self
-            .selected_group(previews)
-            .map(|id| self.group_members(id, previews))
-            .unwrap_or_else(|| self.selection.clone());
-        let members: Vec<_> = ids
-            .iter()
-            .filter_map(|id| {
-                previews
-                    .get(*id)
-                    .filter(|p| p.removing.is_none())
-                    .map(|p| (*id, self.preview_screen_rect(p, viewport)))
-            })
-            .collect();
-        if members.len() < 2 {
-            return;
-        }
-        let main = members
-            .iter()
-            .position(|(id, _)| Some(*id) == main)
-            .unwrap_or(0);
-        let current: Vec<_> = members.iter().map(|(_, rect)| *rect).collect();
-        for ((id, _), rect) in members
-            .iter()
-            .zip(arranged_group_rects(&current, layout, main))
-        {
-            self.set_group_screen_rect(*id, rect, viewport, previews);
-        }
-    }
-
-    pub fn is_spotlighting(&self) -> bool {
-        self.groups.spotlight.is_some()
-    }
-
-    pub(super) fn spotlight_includes(&self, ids: &[PreviewId]) -> bool {
-        self.groups
-            .spotlight
-            .as_ref()
-            .is_some_and(|spotlight| spotlight.order.iter().any(|id| ids.contains(id)))
     }
 
     fn resize_selection(&mut self, width: f32, viewport: Rect, previews: &mut PreviewManager) {
-        self.exit_spotlight(previews);
         self.exit_focus();
         self.finish_crop();
+        let selection = self.selection.clone();
+        self.release_partial_groups(&selection, previews);
         let members: Vec<_> = self
             .selection
             .iter()
@@ -1165,208 +1678,22 @@ impl CanvasState {
         }
     }
 
-    pub fn exit_spotlight(&mut self, previews: &mut PreviewManager) -> bool {
-        self.finish_spotlight(previews, false)
-    }
-
-    fn finish_spotlight(&mut self, previews: &mut PreviewManager, restore_geometry: bool) -> bool {
-        let Some(spotlight) = self.groups.spotlight.take() else {
-            return false;
-        };
-        let active = spotlight.originals[spotlight.active].id;
-        self.exit_focus();
-        self.groups.spotlight_drag = None;
-        if restore_geometry {
-            self.groups.motions.clear();
-        }
-        if !restore_geometry {
-            for (order, id) in spotlight.order.iter().enumerate() {
-                if let Some(group) = previews.get_mut(*id).and_then(|p| p.tile_group.as_mut()) {
-                    group.order = order as u32;
-                }
-            }
-        }
-        if restore_geometry {
-            for original in spotlight.originals {
-                if let Some(p) = previews.get_mut(original.id) {
-                    original.restore(p);
-                }
-            }
-        }
-        self.selection = spotlight
-            .selection
+    /// Bring a tile's whole group above (or below) everything else, keeping
+    /// the members' order among themselves.
+    fn restack_group(&mut self, id: PreviewId, front: bool, previews: &mut PreviewManager) {
+        let mut members: Vec<_> = self
+            .group_members(id, previews)
             .into_iter()
-            .filter(|id| previews.get(*id).is_some())
+            .filter_map(|id| previews.get(id).map(|p| (p.z_order, id)))
             .collect();
-        if previews.get(active).is_some_and(|p| p.removing.is_none()) {
-            // A member selected while Spotlight was open may not have belonged
-            // to the entry selection (for example, when editing one tile).
-            if !self.selection.contains(&active) {
-                self.select_group_tile(active, previews);
+        members.sort_by_key(|(z, _)| *z);
+        if front {
+            for (_, member) in members {
+                previews.bring_to_front(member);
             }
-            self.remember_current_tile(active);
-        }
-        true
-    }
-
-    pub(super) fn exit_spotlight_for_tile_action(&mut self, previews: &mut PreviewManager) {
-        if self.is_spotlighting() {
-            let selection = self.selection.clone();
-            // Deletion snapshots retain the arrangement from before Spotlight.
-            self.finish_spotlight(previews, true);
-            self.selection = selection;
-        }
-    }
-
-    pub fn saved_tile_layout(&self, preview: &Preview) -> PreviewLayout {
-        let mut saved = PreviewLayout::from(preview);
-        if let Some(original) = self
-            .groups
-            .spotlight
-            .as_ref()
-            .and_then(|s| s.originals.iter().find(|p| p.id == preview.id))
-        {
-            saved.position = (original.position.x, original.position.y);
-            saved.size = (original.size.x, original.size.y);
-            saved.viewport_pin = original.pin;
-            saved.z_order = original.z_order;
-        }
-        saved
-    }
-
-    fn toggle_spotlight(&mut self, id: PreviewId, _viewport: Rect, previews: &mut PreviewManager) {
-        if self.exit_spotlight(previews) {
-            return;
-        }
-        let members = self.group_members(id, previews);
-        if members.len() < 2 {
-            return;
-        }
-        self.exit_focus();
-        self.cancel_pointer_interaction();
-        self.cancel_camera_transition();
-        self.animation.momentum_active = false;
-        let originals = members
-            .iter()
-            .filter_map(|id| previews.get(*id).map(TileGeometry::capture))
-            .collect();
-        self.groups.spotlight = Some(Spotlight {
-            originals,
-            active: members.iter().position(|member| *member == id).unwrap_or(0),
-            selection: self.selection.clone(),
-            order: members,
-        });
-        self.selection = vec![id];
-        self.remember_current_tile(id);
-    }
-
-    fn spotlight_screen_bounds(&self, viewport: Rect) -> Option<Rect> {
-        bounds_of(self.groups.spotlight.as_ref()?.originals.iter().map(|p| {
-            p.pin.map(|pin| pin.rect(viewport)).unwrap_or_else(|| {
-                self.canvas_rect_to_screen(Rect::from_min_size(p.position, p.size), viewport)
-            })
-        }))
-    }
-
-    fn cycle_spotlight(&mut self, next: bool, _viewport: Rect, _previews: &mut PreviewManager) {
-        self.exit_focus();
-        let Some(spotlight) = &mut self.groups.spotlight else {
-            return;
-        };
-        let count = spotlight.originals.len();
-        spotlight.active = (spotlight.active + if next { 1 } else { count - 1 }) % count;
-        let id = spotlight.originals[spotlight.active].id;
-        self.selection = vec![id];
-        self.remember_current_tile(id);
-    }
-
-    fn apply_spotlight_layout(
-        &mut self,
-        large_count: usize,
-        target: Option<PreviewId>,
-        viewport: Rect,
-        previews: &mut PreviewManager,
-    ) {
-        self.exit_focus();
-        self.finish_crop();
-        self.groups.spotlight_drag = None;
-        let mut order = if let Some(s) = &self.groups.spotlight {
-            s.order.clone()
-        } else if let Some(id) = target.or_else(|| self.current_tile(previews)) {
-            self.group_members(id, previews)
         } else {
-            return;
-        };
-        if order.len() < 2 {
-            return;
-        }
-        let large_count = large_count.clamp(1, order.len());
-        if let Some(slot) = target.and_then(|id| order.iter().position(|member| *member == id)) {
-            if slot >= large_count || large_count == 1 {
-                order.swap(large_count - 1, slot);
-            }
-        }
-        let starts = order
-            .iter()
-            .filter_map(|id| {
-                previews
-                    .get(*id)
-                    .map(|p| (*id, self.preview_screen_rect(p, viewport)))
-            })
-            .collect();
-        let current: Vec<_> = order
-            .iter()
-            .filter_map(|id| previews.get(*id))
-            .map(|p| self.target_screen_rect(p, viewport))
-            .collect();
-        let Some(previous) = bounds_of(current.iter().copied()) else {
-            return;
-        };
-        let aspects: Vec<_> = order
-            .iter()
-            .filter_map(|id| previews.get(*id))
-            .zip(&current)
-            .map(|(p, rect)| content_aspect(p).unwrap_or(rect.aspect_ratio()))
-            .collect();
-        let rects = keep_in_view(
-            spotlight_group_rects(&current, &aspects, large_count),
-            previous,
-            viewport,
-        );
-        for (index, (id, rect)) in order.iter().zip(rects).enumerate() {
-            self.set_group_screen_rect(*id, rect, viewport, previews);
-            if let Some(p) = previews.get_mut(*id) {
-                if !self.is_spotlighting() {
-                    if let Some(group) = &mut p.tile_group {
-                        group.order = index as u32;
-                    }
-                }
-            }
-        }
-        if let Some(s) = &mut self.groups.spotlight {
-            s.order = order;
-            if let Some(index) = s.originals.iter().position(|p| Some(p.id) == target) {
-                s.active = index;
-                self.selection = vec![s.originals[index].id];
-            }
-        }
-        if let Some(id) = target {
-            if !self.is_spotlighting() && !self.selection.contains(&id) {
-                self.select_group_tile(id, previews);
-            }
-            self.remember_current_tile(id);
-        }
-        self.animate_layout_from(starts, viewport, previews);
-    }
-
-    pub(super) fn update_spotlight(&mut self, _viewport: Rect, previews: &mut PreviewManager) {
-        if let Some(spotlight) = &self.groups.spotlight {
-            if spotlight
-                .originals
-                .iter()
-                .any(|p| previews.get(p.id).is_none_or(|p| p.removing.is_some()))
-            {
-                self.finish_spotlight(previews, true);
+            for (_, member) in members.into_iter().rev() {
+                previews.send_to_back(member);
             }
         }
     }
@@ -1381,17 +1708,15 @@ impl CanvasState {
         if ![
             HotkeySlot::GroupTiles,
             HotkeySlot::UngroupTiles,
-            HotkeySlot::LayoutGrid,
-            HotkeySlot::LayoutRow,
-            HotkeySlot::LayoutColumn,
-            HotkeySlot::LayoutSideStack,
+            HotkeySlot::LayoutOneLarge,
+            HotkeySlot::LayoutTwoLarge,
+            HotkeySlot::LayoutThreeLarge,
+            HotkeySlot::LayoutEqual,
             HotkeySlot::SizeMedium,
             HotkeySlot::SizeLarge,
-            HotkeySlot::ToggleSpotlight,
-            HotkeySlot::PreviousSpotlight,
-            HotkeySlot::NextSpotlight,
-            HotkeySlot::FocusCurrentTile,
-            HotkeySlot::DeleteSelected,
+            HotkeySlot::MakeMainTile,
+            HotkeySlot::PreviousMainTile,
+            HotkeySlot::NextMainTile,
         ]
         .into_iter()
         .any(|slot| presses.pressed(slot))
@@ -1412,9 +1737,14 @@ impl CanvasState {
         if presses.pressed(HotkeySlot::UngroupTiles) {
             self.ungroup_selection(previews);
         }
-        for (large_count, slot, _) in LAYOUTS {
-            if presses.pressed(slot) {
-                self.apply_spotlight_layout(large_count, target, viewport, previews);
+        if let Some(id) = target {
+            for (arrangement, slot, _) in PRESETS {
+                if presses.pressed(slot) {
+                    self.set_group_arrangement(id, arrangement, Some(id), viewport, previews);
+                }
+            }
+            if presses.pressed(HotkeySlot::MakeMainTile) {
+                self.make_main_tile(id, viewport, previews);
             }
         }
         for (width, slot, _) in SIZES {
@@ -1422,21 +1752,19 @@ impl CanvasState {
                 self.resize_selection(width, viewport, previews);
             }
         }
-        if presses.pressed(HotkeySlot::ToggleSpotlight) {
-            if self.is_spotlighting() {
-                self.exit_spotlight(previews);
-            } else if let Some(id) = target {
-                self.toggle_spotlight(id, viewport, previews);
+        if presses.pressed(HotkeySlot::NextMainTile) {
+            self.cycle_main_tile(true, target, viewport, previews);
+        }
+        if presses.pressed(HotkeySlot::PreviousMainTile) {
+            self.cycle_main_tile(false, target, viewport, previews);
+        }
+    }
+
+    fn rename_group(&mut self, group: u64, name: &str, previews: &mut PreviewManager) {
+        for member in Self::members_of(group, previews) {
+            if let Some(g) = previews.get_mut(member).and_then(|p| p.tile_group.as_mut()) {
+                g.name = name.to_owned();
             }
-        }
-        if presses.pressed(HotkeySlot::NextSpotlight) {
-            self.cycle_spotlight(true, viewport, previews);
-        }
-        if presses.pressed(HotkeySlot::PreviousSpotlight) {
-            self.cycle_spotlight(false, viewport, previews);
-        }
-        if presses.pressed(HotkeySlot::DeleteSelected) {
-            self.exit_spotlight_for_tile_action(previews);
         }
     }
 
@@ -1475,13 +1803,7 @@ impl CanvasState {
                     )
                     .changed()
                 {
-                    for member in self.group_members(id, previews) {
-                        if let Some(g) =
-                            previews.get_mut(member).and_then(|p| p.tile_group.as_mut())
-                        {
-                            g.name = name.clone();
-                        }
-                    }
+                    self.rename_group(group.id, &name, previews);
                 }
                 if ui.button("Select This Tile Only").clicked() {
                     self.remember_current_tile(id);
@@ -1499,6 +1821,8 @@ impl CanvasState {
                     if let Some(p) = previews.get_mut(id) {
                         p.tile_group = None;
                     }
+                    // The others close the gap; keep the tile visibly on top.
+                    previews.bring_to_front(id);
                     self.groups.editing = None;
                     self.selection = vec![id];
                     ui.close_menu();
@@ -1520,19 +1844,19 @@ impl CanvasState {
                 crate::ui_theme::menu(ui);
                 let mut groups: Vec<_> = previews
                     .all()
+                    .filter(|p| p.removing.is_none())
                     .filter_map(|p| p.tile_group.clone().map(|g| (p.id, g)))
                     .collect();
                 groups.sort_by_key(|(_, g)| g.id);
                 groups.dedup_by_key(|(_, g)| g.id);
                 for (member, group) in groups {
-                    if ui
-                        .button(if group.name.trim().is_empty() {
-                            "Group"
-                        } else {
-                            &group.name
-                        })
-                        .clicked()
-                    {
+                    let count = Self::members_of(group.id, previews).len();
+                    let name = if group.name.trim().is_empty() {
+                        "Group"
+                    } else {
+                        &group.name
+                    };
+                    if ui.button(format!("{name} · {count} tiles")).clicked() {
                         let mut ids = self.group_members(member, previews);
                         for selected in &self.selection {
                             if !ids.contains(selected) {
@@ -1550,7 +1874,7 @@ impl CanvasState {
         });
     }
 
-    /// Group layouts (for a tile in a group), sizes and stacking order.
+    /// Group arrangements (for a tile in a group), sizes and stacking order.
     pub(super) fn arrange_menu(
         &mut self,
         ui: &mut egui::Ui,
@@ -1559,18 +1883,61 @@ impl CanvasState {
         previews: &mut PreviewManager,
         shortcuts: &HotkeyBindings,
     ) {
-        let grouped = self.group_members(id, previews).len() > 1;
+        let settings = self
+            .group_settings(id, previews)
+            .filter(|_| self.group_members(id, previews).len() > 1);
         ui.menu_button("Arrange", |ui| {
             crate::ui_theme::menu(ui);
-            if grouped {
-                for (large_count, slot, label) in LAYOUTS {
-                    if ui
-                        .add(crate::ui_theme::shortcut_button(label, shortcuts.get(slot)))
+            if let Some(settings) = &settings {
+                let mut free = settings.arrangement == GroupArrangement::Free;
+                if crate::ui_theme::toggle(ui, &mut free, "Free Arrangement")
+                    .on_hover_text("Tiles stay wherever you put them")
+                    .clicked()
+                {
+                    self.set_group_arrangement(
+                        id,
+                        GroupArrangement::Free,
+                        None,
+                        viewport,
+                        previews,
+                    );
+                    ui.close_menu();
+                }
+                for (arrangement, slot, label) in PRESETS {
+                    let mut chosen = settings.arrangement == arrangement;
+                    if crate::ui_theme::shortcut_toggle(ui, &mut chosen, label, shortcuts.get(slot))
                         .clicked()
                     {
-                        self.apply_spotlight_layout(large_count, Some(id), viewport, previews);
+                        self.set_group_arrangement(id, arrangement, Some(id), viewport, previews);
                         ui.close_menu();
                     }
+                }
+                if ui
+                    .add(crate::ui_theme::shortcut_button(
+                        "Make Main Tile",
+                        shortcuts.get(HotkeySlot::MakeMainTile),
+                    ))
+                    .on_hover_text("Show this tile in the group's large slot")
+                    .clicked()
+                {
+                    self.make_main_tile(id, viewport, previews);
+                    ui.close_menu();
+                }
+                if settings.arrangement != GroupArrangement::Free {
+                    ui.menu_button("Gap", |ui| {
+                        crate::ui_theme::menu(ui);
+                        for (gap, label) in [
+                            (GroupGap::None, "None"),
+                            (GroupGap::Small, "Small"),
+                            (GroupGap::Large, "Large"),
+                        ] {
+                            let mut chosen = settings.gap == gap;
+                            if crate::ui_theme::toggle(ui, &mut chosen, label).clicked() {
+                                self.set_group_gap(id, gap, viewport, previews);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                 }
                 if ui.button("Fit Group to View").clicked() {
                     self.fit_group_to_view(id, viewport, previews);
@@ -1592,63 +1959,14 @@ impl CanvasState {
             });
             ui.separator();
             if ui.button("Bring to Front").clicked() {
-                previews.bring_to_front(id);
+                self.restack_group(id, true, previews);
                 ui.close_menu();
             }
             if ui.button("Send to Back").clicked() {
-                previews.send_to_back(id);
+                self.restack_group(id, false, previews);
                 ui.close_menu();
             }
         });
-    }
-
-    /// Spotlight is only offered for a tile in a group.
-    pub(super) fn spotlight_item(
-        &mut self,
-        ui: &mut egui::Ui,
-        id: PreviewId,
-        viewport: Rect,
-        previews: &mut PreviewManager,
-        shortcuts: &HotkeyBindings,
-    ) {
-        if self.group_members(id, previews).len() > 1
-            && ui
-                .add(crate::ui_theme::shortcut_button(
-                    "Spotlight This Tile",
-                    shortcuts.get(HotkeySlot::ToggleSpotlight),
-                ))
-                .clicked()
-        {
-            self.toggle_spotlight(id, viewport, previews);
-            ui.close_menu();
-        }
-    }
-
-    pub(super) fn spotlight_menu(
-        &mut self,
-        ui: &mut egui::Ui,
-        viewport: Rect,
-        previews: &mut PreviewManager,
-    ) {
-        for (count, _, label) in LAYOUTS {
-            if ui.button(label).clicked() {
-                self.apply_spotlight_layout(count, self.current_tile(previews), viewport, previews);
-                ui.close_menu();
-            }
-        }
-        ui.separator();
-        if ui.button("Previous Spotlight Tile").clicked() {
-            self.cycle_spotlight(false, viewport, previews);
-            ui.close_menu();
-        }
-        if ui.button("Next Spotlight Tile").clicked() {
-            self.cycle_spotlight(true, viewport, previews);
-            ui.close_menu();
-        }
-        if ui.button("Exit Spotlight").clicked() {
-            self.exit_spotlight(previews);
-            ui.close_menu();
-        }
     }
 
     pub(super) fn toggle_viewport_pin(
@@ -1657,7 +1975,6 @@ impl CanvasState {
         viewport: Rect,
         previews: &mut PreviewManager,
     ) {
-        self.exit_spotlight(previews);
         self.exit_focus();
         let pinned = previews.get(id).is_some_and(|p| p.viewport_pin.is_some());
         let members = self.group_members(id, previews);
@@ -1698,25 +2015,160 @@ impl CanvasState {
         }
     }
 
+    /// The group's outline on screen: an arranged group's box, or the
+    /// outline of a free group's tiles.
+    fn group_outline(
+        &self,
+        id: PreviewId,
+        viewport: Rect,
+        previews: &PreviewManager,
+    ) -> Option<(Rect, bool)> {
+        let members = self.group_members(id, previews);
+        let arranged = self.is_arranged(id, previews);
+        if arranged {
+            let frame = members.iter().find_map(|member| {
+                let p = previews.get(*member)?;
+                let relative = p.tile_group.as_ref()?.frame?;
+                let pinned = p.viewport_pin.is_some();
+                let frame = frame_from(layout_rect(p, viewport), relative);
+                Some(self.to_screen_space(frame, pinned, viewport))
+            });
+            if let Some(frame) = frame.filter(|f| f.is_finite() && f.is_positive()) {
+                return Some((frame, true));
+            }
+        }
+        bounds_of(
+            members
+                .iter()
+                .filter_map(|member| previews.get(*member))
+                .map(|p| self.preview_screen_rect(p, viewport)),
+        )
+        .map(|bounds| (bounds, false))
+    }
+
+    /// Arranged groups resize their box from any edge or corner; free groups
+    /// scale from a corner.
+    fn group_handles(outline: Rect, arranged: bool) -> Vec<(Pos2, ResizeHandle)> {
+        let mut handles = vec![
+            (outline.left_top(), ResizeHandle::TopLeft),
+            (outline.right_top(), ResizeHandle::TopRight),
+            (outline.left_bottom(), ResizeHandle::BottomLeft),
+            (outline.right_bottom(), ResizeHandle::BottomRight),
+        ];
+        if arranged {
+            handles.extend([
+                (outline.center_top(), ResizeHandle::Top),
+                (outline.left_center(), ResizeHandle::Left),
+                (outline.right_center(), ResizeHandle::Right),
+                (outline.center_bottom(), ResizeHandle::Bottom),
+            ]);
+        }
+        handles
+    }
+
     pub(super) fn group_handle_at(
         &self,
         pointer: Pos2,
         viewport: Rect,
         previews: &PreviewManager,
     ) -> Option<(PreviewId, ResizeHandle)> {
-        if self.is_spotlighting() {
-            return None;
-        }
         let id = self.selected_group(previews)?;
-        let bounds = bounds_of(
-            self.selection
+        let (outline, arranged) = self.group_outline(id, viewport, previews)?;
+        Self::group_handles(outline.expand(3.0), arranged)
+            .into_iter()
+            .find(|(at, _)| {
+                Rect::from_center_size(*at, Vec2::splat(RESIZE_HANDLE_HIT_SIZE)).contains(pointer)
+            })
+            .map(|(_, handle)| (id, handle))
+    }
+
+    fn start_group_resize(
+        &mut self,
+        id: PreviewId,
+        handle: ResizeHandle,
+        (outline, arranged): (Rect, bool),
+        pointer: Pos2,
+        viewport: Rect,
+        previews: &PreviewManager,
+    ) {
+        let Some(group) = previews.get(id).and_then(|p| p.tile_group.as_ref()) else {
+            return;
+        };
+        let members: Vec<_> = self
+            .group_members(id, previews)
+            .into_iter()
+            .filter_map(|member| {
+                previews
+                    .get(member)
+                    .map(|p| (member, self.target_screen_rect(p, viewport)))
+            })
+            .collect();
+        let pinned = members
+            .iter()
+            .all(|(id, _)| previews.get(*id).is_some_and(|p| p.viewport_pin.is_some()));
+        let unit = if pinned { 1.0 } else { self.zoom };
+        self.groups.resize = Some(GroupResize {
+            group: group.id,
+            handle,
+            bounds: if arranged {
+                outline
+            } else {
+                bounds_of(members.iter().map(|(_, r)| *r)).unwrap_or(outline)
+            },
+            pointer,
+            min_scale: group_resize_min_scale(&members, unit),
+            smallest: members
                 .iter()
-                .filter_map(|id| previews.get(*id))
-                .map(|p| self.preview_screen_rect(p, viewport)),
-        )?;
-        Rect::from_center_size(bounds.right_bottom(), Vec2::splat(RESIZE_HANDLE_HIT_SIZE))
-            .contains(pointer)
-            .then_some((id, ResizeHandle::BottomRight))
+                .map(|(_, r)| r.width().min(r.height()) / unit)
+                .fold(f32::INFINITY, f32::min),
+            members,
+            arranged,
+        });
+    }
+
+    fn drag_group_resize(&mut self, pointer: Pos2, viewport: Rect, previews: &mut PreviewManager) {
+        let Some(resize) = self.groups.resize.clone() else {
+            return;
+        };
+        let delta = pointer - resize.pointer;
+        if resize.arranged {
+            let now = self.groups.animation_time.unwrap_or(0.0);
+            let Some(arranged) = self.arranged(resize.group, viewport, previews, now) else {
+                return;
+            };
+            let screen = apply_resize(resize.handle, resize.bounds, delta, None);
+            let frame = self.to_layout_space(screen, arranged.pinned, viewport);
+            let slots = layout_rects(
+                &arranged.aspects,
+                frame,
+                arranged.settings.arrangement,
+                arranged.settings.gap,
+            );
+            // Stop before any tile gets smaller than the single-tile limit,
+            // or smaller than it already was.
+            if smallest_side(&slots) + 0.01 >= MIN_TILE_SIDE.min(resize.smallest) {
+                self.place_group(&arranged, frame, viewport, previews, false);
+            }
+            return;
+        }
+        // The opposite corner stays put.
+        let (anchor, sign) = match resize.handle {
+            ResizeHandle::TopLeft => (resize.bounds.right_bottom(), Vec2::new(-1.0, -1.0)),
+            ResizeHandle::TopRight => (resize.bounds.left_bottom(), Vec2::new(1.0, -1.0)),
+            ResizeHandle::BottomLeft => (resize.bounds.right_top(), Vec2::new(-1.0, 1.0)),
+            _ => (resize.bounds.left_top(), Vec2::new(1.0, 1.0)),
+        };
+        let extent = resize.bounds.size() + delta * sign;
+        let scale = (extent.x / resize.bounds.width())
+            .max(extent.y / resize.bounds.height())
+            .clamp(resize.min_scale, 20.0);
+        for (id, rect) in &resize.members {
+            let resized = Rect::from_two_pos(
+                anchor + (rect.min - anchor) * scale,
+                anchor + (rect.max - anchor) * scale,
+            );
+            self.set_group_screen_rect(*id, resized, viewport, previews);
+        }
     }
 
     pub(super) fn draw_group_selection(
@@ -1727,28 +2179,20 @@ impl CanvasState {
         input: &FrameInput,
     ) -> bool {
         let Some(id) = self.selected_group(previews) else {
-            if !input.pointer_blocked && self.crop_mode.is_none() && !self.is_spotlighting() {
-                if let Some(id) = input.hover_pos.and_then(|pointer| {
-                    self.left_click_preview_at_screen(pointer, viewport, previews)
-                }) {
-                    if let Some(group) = previews.get(id).and_then(|p| p.tile_group.as_ref()) {
-                        let bounds = bounds_of(
-                            previews
-                                .all()
-                                .filter(|p| {
-                                    p.removing.is_none()
-                                        && p.tile_group.as_ref().is_some_and(|g| g.id == group.id)
-                                })
-                                .map(|p| self.preview_screen_rect(p, viewport)),
-                        );
-                        if let Some(bounds) = bounds {
-                            ui.painter().rect_stroke(
-                                bounds.expand(3.0),
-                                5.0,
-                                Stroke::new(1.0, crate::ui_theme::GOLD.gamma_multiply(0.5)),
-                            );
-                        }
-                    }
+            if !input.pointer_blocked && self.crop_mode.is_none() {
+                if let Some((outline, _)) = input
+                    .hover_pos
+                    .and_then(|pointer| {
+                        self.left_click_preview_at_screen(pointer, viewport, previews)
+                    })
+                    .filter(|id| previews.get(*id).is_some_and(|p| p.tile_group.is_some()))
+                    .and_then(|id| self.group_outline(id, viewport, previews))
+                {
+                    ui.painter().rect_stroke(
+                        outline.expand(3.0),
+                        5.0,
+                        Stroke::new(1.0, crate::ui_theme::GOLD.gamma_multiply(0.5)),
+                    );
                 }
             }
             return false;
@@ -1756,21 +2200,13 @@ impl CanvasState {
         if input.alt {
             return false;
         }
-        let members: Vec<_> = self
-            .selection
-            .iter()
-            .filter_map(|id| {
-                previews
-                    .get(*id)
-                    .map(|p| (*id, self.preview_screen_rect(p, viewport)))
-            })
-            .collect();
-        let Some(bounds) = bounds_of(members.iter().map(|(_, r)| *r)) else {
+        let Some((outline, arranged)) = self.group_outline(id, viewport, previews) else {
             return false;
         };
         let color = crate::ui_theme::GOLD;
+        let outline = outline.expand(3.0);
         ui.painter()
-            .rect_stroke(bounds.expand(3.0), 5.0, Stroke::new(1.5, color));
+            .rect_stroke(outline, 5.0, Stroke::new(1.5, color));
         if let Some(active) = self.current_tile(previews).and_then(|id| previews.get(id)) {
             ui.painter().rect_stroke(
                 self.preview_screen_rect(active, viewport),
@@ -1778,1498 +2214,197 @@ impl CanvasState {
                 Stroke::new(1.5, color),
             );
         }
-        let name = previews
-            .get(id)
-            .and_then(|p| p.tile_group.as_ref())
-            .map(|g| g.name.as_str())
-            .unwrap_or("Group");
-        ui.painter().text(
-            bounds.left_top() - Vec2::new(0.0, 5.0),
-            egui::Align2::LEFT_BOTTOM,
-            if name.trim().is_empty() {
-                "Group"
-            } else {
-                name
-            },
-            egui::FontId::proportional(12.0),
-            color,
-        );
-        let handle =
-            Rect::from_center_size(bounds.right_bottom(), Vec2::splat(RESIZE_HANDLE_HIT_SIZE));
-        ui.painter().rect_filled(handle.shrink(3.0), 2.0, color);
-        let response = ui.interact(handle, ui.id().with(("group_resize", id.0)), Sense::drag());
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe);
-        }
-        if response.drag_started() {
-            let pinned = members
-                .iter()
-                .all(|(id, _)| previews.get(*id).is_some_and(|p| p.viewport_pin.is_some()));
-            self.groups.resize = Some(GroupResize {
-                bounds,
-                pointer: input.interact_pos.unwrap_or(bounds.max) - response.drag_delta(),
-                min_scale: group_resize_min_scale(&members, if pinned { 1.0 } else { self.zoom }),
-                members,
-            });
-        }
-        if response.dragged() {
-            if let (Some(resize), Some(pointer)) = (&self.groups.resize, input.interact_pos) {
-                let extent = resize.bounds.size() + (pointer - resize.pointer);
-                let scale = (extent.x / resize.bounds.width())
-                    .max(extent.y / resize.bounds.height())
-                    .clamp(resize.min_scale, 20.0);
-                for (id, rect) in &resize.members {
-                    let resized = Rect::from_min_size(
-                        resize.bounds.min + (rect.min - resize.bounds.min) * scale,
-                        rect.size() * scale,
-                    );
-                    self.set_group_screen_rect(*id, resized, viewport, previews);
+        for (at, handle) in Self::group_handles(outline, arranged) {
+            let hit = Rect::from_center_size(at, Vec2::splat(RESIZE_HANDLE_HIT_SIZE));
+            ui.painter().rect_filled(hit.shrink(3.0), 2.0, color);
+            let response = ui.interact(
+                hit,
+                ui.id().with(("group_resize", id.0, handle as u8)),
+                Sense::drag(),
+            );
+            if response.hovered() || response.dragged() {
+                ui.ctx().set_cursor_icon(handle.cursor());
+            }
+            if response.drag_started() {
+                let pointer = input.interact_pos.unwrap_or(at) - response.drag_delta();
+                self.start_group_resize(
+                    id,
+                    handle,
+                    (outline.shrink(3.0), arranged),
+                    pointer,
+                    viewport,
+                    previews,
+                );
+            }
+            if response.dragged() {
+                if let Some(pointer) = input.interact_pos {
+                    self.drag_group_resize(pointer, viewport, previews);
                 }
             }
-        }
-        if response.drag_stopped() {
-            self.groups.resize = None;
+            if response.drag_stopped() {
+                self.groups.resize = None;
+            }
         }
         true
+    }
+
+    /// A small bar above a selected group: its name (double-click to
+    /// rename) and its arrangement.
+    pub(super) fn group_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+        shortcuts: &HotkeyBindings,
+    ) {
+        let selected = self
+            .selected_group(previews)
+            .filter(|_| !self.is_focusing_tile() && self.marquee.is_none());
+        let Some((id, settings, (outline, _))) = selected.and_then(|id| {
+            Some((
+                id,
+                self.group_settings(id, previews)?,
+                self.group_outline(id, viewport, previews)?,
+            ))
+        }) else {
+            self.groups.renaming = None;
+            return;
+        };
+        if !outline.intersects(viewport) {
+            return;
+        }
+        if self
+            .groups
+            .renaming
+            .as_ref()
+            .is_some_and(|(group, _)| *group != settings.id)
+        {
+            self.groups.renaming = None;
+        }
+        // Above the group, or below it when the group reaches the window's
+        // top, so the bar never covers the group's own handles.
+        const BAR_HEIGHT: f32 = 32.0;
+        let above = outline.top() - BAR_HEIGHT - 12.0;
+        let below = outline.bottom() + 12.0;
+        let top = if above >= viewport.top() || below + BAR_HEIGHT > viewport.bottom() {
+            above
+        } else {
+            below
+        };
+        let position = egui::pos2(
+            (outline.left() - 3.0).clamp(
+                viewport.left(),
+                (viewport.right() - 300.0).max(viewport.left()),
+            ),
+            top.clamp(
+                viewport.top(),
+                (viewport.bottom() - BAR_HEIGHT).max(viewport.top()),
+            ),
+        );
+        egui::Area::new(ui.id().with("group_bar"))
+            .fixed_pos(position)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::none()
+                    .fill(crate::ui_theme::PANEL)
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let mut finished = None;
+                            if let Some((group, name)) = &mut self.groups.renaming {
+                                let edit = ui.add(
+                                    egui::TextEdit::singleline(name)
+                                        .char_limit(60)
+                                        .desired_width(120.0),
+                                );
+                                if !edit.has_focus() && !edit.lost_focus() {
+                                    edit.request_focus();
+                                }
+                                if edit.lost_focus() {
+                                    let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    let name = name.trim().to_owned();
+                                    finished = Some((
+                                        *group,
+                                        (!cancel && !name.is_empty()).then_some(name),
+                                    ));
+                                }
+                            } else {
+                                let name = if settings.name.trim().is_empty() {
+                                    "Group"
+                                } else {
+                                    settings.name.as_str()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(name)
+                                                .color(crate::ui_theme::GOLD)
+                                                .strong(),
+                                        )
+                                        .sense(Sense::click()),
+                                    )
+                                    .on_hover_text("Double-click to rename")
+                                    .double_clicked()
+                                {
+                                    self.groups.renaming =
+                                        Some((settings.id, settings.name.clone()));
+                                }
+                            }
+                            if let Some((group, name)) = finished {
+                                self.groups.renaming = None;
+                                if let Some(name) = name {
+                                    self.rename_group(group, &name, previews);
+                                }
+                            }
+                            ui.separator();
+                            if ui
+                                .selectable_label(
+                                    settings.arrangement == GroupArrangement::Free,
+                                    "Free",
+                                )
+                                .on_hover_text("Tiles stay wherever you put them")
+                                .clicked()
+                            {
+                                self.set_group_arrangement(
+                                    id,
+                                    GroupArrangement::Free,
+                                    None,
+                                    viewport,
+                                    previews,
+                                );
+                            }
+                            for (arrangement, slot, label) in PRESETS {
+                                let short = match arrangement {
+                                    GroupArrangement::Main(large) => large.to_string(),
+                                    _ => "Equal".to_owned(),
+                                };
+                                let hint = format!(
+                                    "{label} ({}). Shift+drag a tile onto another to swap them.",
+                                    shortcuts.get(slot).display()
+                                );
+                                if ui
+                                    .selectable_label(settings.arrangement == arrangement, short)
+                                    .on_hover_text(hint)
+                                    .clicked()
+                                {
+                                    let target = self.current_tile(previews);
+                                    self.set_group_arrangement(
+                                        id,
+                                        arrangement,
+                                        target,
+                                        viewport,
+                                        previews,
+                                    );
+                                }
+                            }
+                        });
+                    });
+            });
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fixture() -> (CanvasState, PreviewManager, Vec<PreviewId>, Rect) {
-        let mut canvas = CanvasState {
-            pan: Vec2::new(25.0, -10.0),
-            zoom: 0.8,
-            ..Default::default()
-        };
-        let viewport = Rect::from_min_size(Pos2::new(200.0, 40.0), Vec2::new(1200.0, 800.0));
-        canvas.last_screen_rect = Some(viewport);
-        let mut previews = PreviewManager::new();
-        let ids: Vec<_> = (0..4)
-            .map(|i| {
-                previews.add(
-                    format!("Tile {i}"),
-                    Pos2::new((i % 2) as f32 * 320.0, (i / 2) as f32 * 200.0),
-                    Vec2::new(300.0, 180.0),
-                )
-            })
-            .collect();
-        canvas.selection = ids.clone();
-        canvas.create_group(viewport, &mut previews);
-        (canvas, previews, ids, viewport)
-    }
-
-    #[test]
-    fn spotlight_presets_have_the_requested_large_count_and_equal_area() {
-        let bounds = Rect::from_min_size(Pos2::new(30.0, 50.0), Vec2::new(1400.0, 800.0));
-        for count in [1, 2, 3, 6] {
-            let rects = spotlight_rects(&[1.5; 6], bounds, count);
-            for (index, rect) in rects.iter().enumerate() {
-                assert!(bounds.expand(0.001).contains_rect(*rect));
-                assert!((rect.aspect_ratio() - 1.5).abs() < 0.001);
-                for other in &rects[..index] {
-                    assert!(!rect.intersects(*other));
-                }
-                if index < count {
-                    assert!((rect.area() / rects[0].area() - 1.0).abs() < 0.001);
-                } else {
-                    assert!(rect.area() < rects[0].area() * 0.5);
-                }
-            }
-        }
-        let aspects = [0.5, 1.0, 2.5, 16.0 / 9.0];
-        let rects = spotlight_rects(&aspects, bounds, usize::MAX);
-        for (index, rect) in rects.iter().enumerate() {
-            assert!((rect.area() / rects[0].area() - 1.0).abs() < 0.001);
-            assert!((rect.aspect_ratio() - aspects[index]).abs() < 0.001);
-        }
-    }
-
-    #[test]
-    fn selected_member_enters_a_large_slot_when_applying_a_preset() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        canvas.apply_spotlight_layout(2, Some(ids[0]), viewport, &mut previews);
-        canvas.apply_spotlight_layout(2, Some(ids[3]), viewport, &mut previews);
-        assert_eq!(
-            &canvas.group_members(ids[0], &previews)[..2],
-            &[ids[0], ids[3]]
-        );
-        canvas.apply_spotlight_layout(1, Some(ids[3]), viewport, &mut previews);
-        assert!(!canvas.is_spotlighting());
-        assert_eq!(canvas.group_members(ids[0], &previews)[0], ids[3]);
-        assert_eq!(canvas.current_tile(&previews), Some(ids[3]));
-    }
-
-    #[test]
-    fn spotlight_entry_preserves_manual_geometry_and_swaps_only_actual_slots() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, viewport) = fixture();
-            // Deliberately unrelated to member order, including a portrait and
-            // a large tile that is neither the first nor the selected member.
-            for (i, (position, size)) in [
-                (Pos2::new(830.0, 50.0), Vec2::new(90.0, 200.0)),
-                (Pos2::new(95.0, 480.0), Vec2::new(190.0, 110.0)),
-                (Pos2::new(70.0, 35.0), Vec2::new(700.0, 390.0)),
-                (Pos2::new(350.0, 470.0), Vec2::new(230.0, 130.0)),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let p = previews.get_mut(ids[i]).unwrap();
-                p.position = position;
-                p.size = size;
-                p.tile_group.as_mut().unwrap().order = (3 - i) as u32;
-            }
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            let before: Vec<_> = ids
-                .iter()
-                .map(|id| TileGeometry::capture(previews.get(*id).unwrap()))
-                .collect();
-            let order = canvas.group_members(ids[0], &previews);
-            canvas.toggle_spotlight(ids[1], viewport, &mut previews);
-            canvas.spotlight_tile(ids[0], viewport, &mut previews);
-            canvas.cycle_spotlight(true, viewport, &mut previews);
-            canvas.update_spotlight(
-                Rect::from_min_size(viewport.min, Vec2::new(900.0, 600.0)),
-                &mut previews,
-            );
-            assert_eq!(canvas.groups.spotlight.as_ref().unwrap().order, order);
-            for (id, original) in ids.iter().zip(&before) {
-                let p = previews.get(*id).unwrap();
-                assert_eq!(
-                    (p.position, p.size, p.viewport_pin, p.z_order),
-                    (
-                        original.position,
-                        original.size,
-                        original.pin,
-                        original.z_order
-                    )
-                );
-            }
-            canvas.swap_spotlight_tiles(ids[2], ids[0], viewport, &mut previews);
-            for (i, id) in ids.iter().enumerate() {
-                let original = &before[match i {
-                    0 => 2,
-                    2 => 0,
-                    _ => i,
-                }];
-                let p = previews.get(*id).unwrap();
-                assert_eq!(
-                    (p.position, p.size, p.viewport_pin),
-                    (original.position, original.size, original.pin)
-                );
-            }
-            assert_eq!(canvas.current_tile(&previews), Some(ids[2]));
-        }
-    }
-
-    #[test]
-    fn spotlight_swaps_large_small_and_peer_slots_and_saves_order() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, viewport) = fixture();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            canvas.apply_spotlight_layout(2, Some(ids[0]), viewport, &mut previews);
-            canvas.toggle_spotlight(ids[2], viewport, &mut previews);
-            let mut order = ids.clone();
-            for (a, b) in [(0, 3), (0, 1), (2, 3)] {
-                let before: Vec<_> = order
-                    .iter()
-                    .map(|id| {
-                        let p = previews.get(*id).unwrap();
-                        (p.position, p.size, p.viewport_pin, p.crop_uv, p.z_order)
-                    })
-                    .collect();
-                canvas.swap_spotlight_tiles(order[a], order[b], viewport, &mut previews);
-                for (index, id) in order.iter().enumerate() {
-                    let p = previews.get(*id).unwrap();
-                    let dest = if index == a {
-                        b
-                    } else if index == b {
-                        a
-                    } else {
-                        index
-                    };
-                    assert_eq!(
-                        (p.position, p.size, p.viewport_pin),
-                        (before[dest].0, before[dest].1, before[dest].2)
-                    );
-                    assert_eq!((p.crop_uv, p.z_order), (before[index].3, before[index].4));
-                }
-                order.swap(a, b);
-                assert_eq!(canvas.groups.spotlight.as_ref().unwrap().order, order);
-                assert_eq!(canvas.current_tile(&previews), Some(order[b]));
-            }
-            canvas.apply_spotlight_layout(3, None, viewport, &mut previews);
-            assert_eq!(canvas.groups.spotlight.as_ref().unwrap().order, order);
-            canvas.exit_spotlight(&mut previews);
-            assert_eq!(canvas.group_members(ids[0], &previews), order);
-            for (index, id) in order.iter().enumerate() {
-                assert_eq!(
-                    canvas
-                        .saved_tile_layout(previews.get(*id).unwrap())
-                        .tile_group
-                        .unwrap()
-                        .order,
-                    index as u32
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn layout_animation_retargets_without_jumping_or_saving_intermediate_geometry() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, viewport) = fixture();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            let before = canvas.preview_screen_rect(previews.get(ids[0]).unwrap(), viewport);
-            canvas.update_layout_animation(1.0);
-            canvas.apply_spotlight_layout(2, Some(ids[0]), viewport, &mut previews);
-            assert!(canvas.layout_is_animating());
-            assert!(
-                canvas
-                    .preview_screen_rect(previews.get(ids[0]).unwrap(), viewport)
-                    .min
-                    .distance(before.min)
-                    < 0.001
-            );
-            canvas.update_layout_animation(1.09);
-            let midpoint = canvas.preview_screen_rect(previews.get(ids[0]).unwrap(), viewport);
-            canvas.apply_spotlight_layout(3, None, viewport, &mut previews);
-            let retarget = canvas.preview_screen_rect(previews.get(ids[0]).unwrap(), viewport);
-            assert!(retarget.min.distance(midpoint.min) < 0.001);
-            assert!((retarget.size() - midpoint.size()).length() < 0.001);
-            canvas.exit_spotlight(&mut previews);
-            let saved = canvas.saved_tile_layout(previews.get(ids[0]).unwrap());
-            assert_eq!(
-                saved.size,
-                (
-                    previews.get(ids[0]).unwrap().size.x,
-                    previews.get(ids[0]).unwrap().size.y
-                )
-            );
-            canvas.update_layout_animation(1.5);
-            assert!(!canvas.layout_is_animating());
-            let after = canvas.preview_screen_rect(previews.get(ids[0]).unwrap(), viewport);
-            let target = previews
-                .get(ids[0])
-                .unwrap()
-                .viewport_pin
-                .map(|pin| pin.rect(viewport))
-                .unwrap_or_else(|| {
-                    canvas.canvas_rect_to_screen(previews.get(ids[0]).unwrap().rect(), viewport)
-                });
-            assert_eq!(after, target);
-        }
-    }
-
-    #[test]
-    fn pointer_drop_swaps_spotlight_slots_and_outside_drop_cancels() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, _) = fixture();
-            let ctx = egui::Context::default();
-            let mut captures = CaptureCoordinator::new();
-            for id in &ids {
-                previews.get_mut(*id).unwrap().created_at = Instant::now() - Duration::from_secs(1);
-            }
-            frame(&ctx, &mut canvas, &mut previews, &mut captures, vec![]);
-            let viewport = canvas.last_screen_rect.unwrap();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            canvas.apply_spotlight_layout(2, Some(ids[0]), viewport, &mut previews);
-            canvas.toggle_spotlight(ids[0], viewport, &mut previews);
-            canvas.update_layout_animation(10.0);
-            for outside in [false, true] {
-                let start = canvas
-                    .preview_screen_rect(previews.get(ids[0]).unwrap(), viewport)
-                    .center();
-                let end = if outside {
-                    Pos2::new(-100.0, -100.0)
-                } else {
-                    canvas
-                        .preview_screen_rect(previews.get(ids[3]).unwrap(), viewport)
-                        .center()
-                };
-                let before = canvas.groups.spotlight.as_ref().unwrap().order.clone();
-                frame(
-                    &ctx,
-                    &mut canvas,
-                    &mut previews,
-                    &mut captures,
-                    vec![egui::Event::PointerMoved(start)],
-                );
-                frame(
-                    &ctx,
-                    &mut canvas,
-                    &mut previews,
-                    &mut captures,
-                    vec![button(start, true)],
-                );
-                frame(
-                    &ctx,
-                    &mut canvas,
-                    &mut previews,
-                    &mut captures,
-                    vec![egui::Event::PointerMoved(start + Vec2::new(20.0, 15.0))],
-                );
-                frame(
-                    &ctx,
-                    &mut canvas,
-                    &mut previews,
-                    &mut captures,
-                    vec![egui::Event::PointerMoved(end)],
-                );
-                frame(
-                    &ctx,
-                    &mut canvas,
-                    &mut previews,
-                    &mut captures,
-                    vec![button(end, false)],
-                );
-                assert!(canvas.groups.spotlight_drag.is_none());
-                let mut expected = before;
-                if !outside {
-                    expected.swap(0, 3);
-                }
-                assert_eq!(canvas.groups.spotlight.as_ref().unwrap().order, expected);
-                canvas.update_layout_animation(10.0);
-            }
-        }
-    }
-
-    #[test]
-    fn layouts_fit_mixed_aspects_without_overlap_or_stretch() {
-        let bounds = Rect::from_min_size(Pos2::new(30.0, -15.0), Vec2::new(1200.0, 700.0));
-        let aspects = [16.0 / 9.0, 0.5, 1.0, 2.4, 4.0 / 3.0];
-        for (layout, _, _) in Arrangement::ALL {
-            let rects = arranged_rects(&aspects, bounds, layout, 2);
-            for (i, rect) in rects.iter().enumerate() {
-                assert!(bounds.expand(0.001).contains_rect(*rect));
-                assert!((rect.aspect_ratio() - aspects[i]).abs() < 0.001);
-                assert!(rect.is_positive());
-                for other in &rects[..i] {
-                    assert!(!rect.intersects(*other));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn mixed_aspect_layouts_pack_visible_edges_with_small_gaps() {
-        let aspects = [0.25, 4.0, 1.0, 0.5, 2.4, 1.5, 0.75];
-        for size in [Vec2::new(1200.0, 700.0), Vec2::new(350.0, 900.0)] {
-            let bounds = Rect::from_min_size(Pos2::new(30.0, 50.0), size);
-            for (layout, _, _) in Arrangement::ALL {
-                for main in 0..aspects.len() {
-                    let rects = arranged_rects(&aspects, bounds, layout, main);
-                    for (index, rect) in rects.iter().enumerate() {
-                        assert!(bounds.expand(0.001).contains_rect(*rect));
-                        assert!((rect.aspect_ratio() - aspects[index]).abs() < 0.001);
-                        for other in &rects[..index] {
-                            assert!(!rect.intersects(*other));
-                        }
-                    }
-                    let close = |gap: f32| assert!(gap > 0.0 && gap <= 8.001, "gap: {gap}");
-                    match layout {
-                        Arrangement::Row | Arrangement::Grid => {
-                            let cols = if matches!(layout, Arrangement::Row) {
-                                aspects.len()
-                            } else {
-                                3
-                            };
-                            for row in rects.chunks(cols) {
-                                for pair in row.windows(2) {
-                                    close(pair[1].left() - pair[0].right());
-                                    assert!((pair[0].top() - pair[1].top()).abs() < 0.001);
-                                    assert!((pair[0].height() - pair[1].height()).abs() < 0.001);
-                                }
-                            }
-                            for index in (cols..rects.len()).step_by(cols) {
-                                close(rects[index].top() - rects[index - cols].bottom());
-                            }
-                        }
-                        Arrangement::Column => {
-                            for pair in rects.windows(2) {
-                                close(pair[1].top() - pair[0].bottom());
-                                assert!((pair[0].left() - pair[1].left()).abs() < 0.001);
-                                assert!((pair[0].width() - pair[1].width()).abs() < 0.001);
-                            }
-                        }
-                        Arrangement::SideStack => {
-                            let companions: Vec<_> = rects
-                                .iter()
-                                .enumerate()
-                                .filter(|(index, _)| *index != main)
-                                .map(|(_, rect)| rect)
-                                .collect();
-                            for rect in &companions {
-                                close(rect.left() - rects[main].right());
-                                assert!(rect.width() < rects[main].width() / 2.0);
-                            }
-                            for pair in companions.windows(2) {
-                                close(pair[1].top() - pair[0].bottom());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn portrait_spotlight_keeps_companion_scale_and_group_anchor() {
-        // One portrait source and three landscape sources, matching the case
-        // where selecting the portrait used to shrink and recenter everything.
-        for portrait in [0.5, 0.92, 1.0] {
-            let aspects = [portrait, 16.0 / 9.0, 16.0 / 9.0, 16.0 / 9.0];
-            let bounds = Rect::from_min_size(Pos2::new(24.0, 127.0), Vec2::new(1900.0, 820.0));
-            let landscape = arranged_rects(&aspects, bounds, Arrangement::SideStack, 1);
-            let vertical = arranged_rects(&aspects, bounds, Arrangement::SideStack, 0);
-            assert!(landscape[1].min.distance(bounds.min) < 0.001);
-            assert!(vertical[0].min.distance(bounds.min) < 0.001);
-            assert!((vertical[0].height() - bounds.height()).abs() < 0.001);
-            assert!((vertical[0].width() - bounds.height() * portrait).abs() < 0.001);
-            for index in [2, 3] {
-                assert!((landscape[index].size() - vertical[index].size()).length() < 0.001);
-            }
-            assert!((vertical[1].width() - landscape[0].width()).abs() < 0.001);
-            assert!((vertical[1].left() - vertical[0].right() - 8.0).abs() < 0.001);
-            assert!((vertical[1].top() - bounds.top()).abs() < 0.001);
-            assert!(vertical[1].width() > 250.0);
-        }
-    }
-
-    #[test]
-    fn compact_spotlight_does_not_shrink_when_reopened() {
-        let aspects = [0.5, 16.0 / 9.0, 1.0, 2.4, 0.75];
-        for main in 0..aspects.len() {
-            let bounds = Rect::from_min_size(Pos2::new(30.0, 50.0), Vec2::new(1200.0, 700.0));
-            let original = arranged_rects(&aspects, bounds, Arrangement::SideStack, main);
-            let mut rects = original.clone();
-            for _ in 0..20 {
-                let bounds = bounds_of(rects.iter().copied()).unwrap();
-                rects = arranged_rects(&aspects, bounds, Arrangement::SideStack, main);
-            }
-            for (before, after) in original.iter().zip(rects) {
-                assert!(before.min.distance(after.min) < 0.01);
-                assert!((before.size() - after.size()).length() < 0.01);
-            }
-        }
-    }
-
-    #[test]
-    fn layouts_handle_empty_single_and_tiny_viewports() {
-        assert!(arranged_rects(&[], Rect::EVERYTHING, Arrangement::Grid, 0).is_empty());
-        let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.0));
-        for count in [1, 2, 30] {
-            for (layout, _, _) in Arrangement::ALL {
-                for rect in arranged_rects(&vec![1.5; count], bounds, layout, 0) {
-                    assert!(rect.is_positive());
-                    assert!(bounds.expand(0.001).contains_rect(rect));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn cycling_layouts_preserves_content_area_and_reapplying_is_stable() {
-        let mut rects = vec![
-            Rect::from_min_size(Pos2::new(30.0, 50.0), Vec2::new(320.0, 180.0)),
-            Rect::from_min_size(Pos2::new(390.0, 50.0), Vec2::new(100.0, 200.0)),
-            Rect::from_min_size(Pos2::new(30.0, 290.0), Vec2::splat(180.0)),
-        ];
-        let area = rects.iter().map(Rect::area).sum::<f32>();
-        let origin = bounds_of(rects.iter().copied()).unwrap().min;
-        for _ in 0..20 {
-            for (layout, _, _) in Arrangement::ALL {
-                rects = arranged_group_rects(&rects, layout, 1);
-                assert!((rects.iter().map(Rect::area).sum::<f32>() / area - 1.0).abs() < 0.001);
-                assert!(
-                    bounds_of(rects.iter().copied())
-                        .unwrap()
-                        .min
-                        .distance(origin)
-                        < 0.01
-                );
-                for (before, after) in rects.iter().zip(arranged_group_rects(&rects, layout, 1)) {
-                    assert!(before.min.distance(after.min) < 0.02);
-                    assert!((before.size() - after.size()).length() < 0.02);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn switching_group_layouts_does_not_shrink_the_group() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, viewport) = fixture();
-            for (id, size) in ids.iter().zip([
-                Vec2::new(320.0, 180.0),
-                Vec2::new(120.0, 210.0),
-                Vec2::new(320.0, 180.0),
-                Vec2::splat(160.0),
-            ]) {
-                previews.get_mut(*id).unwrap().size = size;
-            }
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            let area = |canvas: &CanvasState, previews: &PreviewManager| {
-                ids.iter()
-                    .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport))
-                    .map(|r| r.area())
-                    .sum::<f32>()
-            };
-            let original = area(&canvas, &previews);
-            for _ in 0..10 {
-                for (count, _, _) in LAYOUTS {
-                    canvas.apply_spotlight_layout(count, Some(ids[1]), viewport, &mut previews);
-                    assert!((area(&canvas, &previews) / original - 1.0).abs() < 0.01);
-                }
-            }
-        }
-    }
-
-    /// Tiles squashed into the same 300×180 shape, showing sources of very
-    /// different shapes: a phone-shaped window, a wide window, a square crop
-    /// of a 4:3 capture and a landscape image.
-    fn stretched_fixture() -> (CanvasState, PreviewManager, Vec<PreviewId>, Rect, [f32; 4]) {
-        let (canvas, mut previews, ids, viewport) = fixture();
-        let sources = [
-            (Some((540, 1170)), None, None),
-            (Some((2560, 1080)), None, None),
-            (Some((1600, 1200)), None, Some((0.125, 0.0, 0.875, 1.0))),
-            (None, Some((1200, 800)), None),
-        ];
-        for (id, (source, frame, crop)) in ids.iter().zip(sources) {
-            let p = previews.get_mut(*id).unwrap();
-            p.source_frame_size = source;
-            p.frame_size = frame;
-            p.crop_uv = crop;
-        }
-        let aspects = [540.0 / 1170.0, 2560.0 / 1080.0, 1.0, 1.5];
-        (canvas, previews, ids, viewport, aspects)
-    }
-
-    #[test]
-    fn content_aspect_follows_the_source_frame_and_crop() {
-        let (_, mut previews, ids, _, aspects) = stretched_fixture();
-        for (id, aspect) in ids.iter().zip(aspects) {
-            let found = content_aspect(previews.get(*id).unwrap()).unwrap();
-            assert!((found - aspect).abs() < 0.001, "{found} vs {aspect}");
-        }
-        let p = previews.get_mut(ids[0]).unwrap();
-        p.browser_url = Some("https://example.com".into());
-        assert_eq!(content_aspect(p), None);
-        let p = previews.get_mut(ids[1]).unwrap();
-        p.source_frame_size = None;
-        assert_eq!(content_aspect(p), None);
-    }
-
-    #[test]
-    fn group_layouts_undo_stretched_tiles_without_overlap_or_shrinking() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, viewport, aspects) = stretched_fixture();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            let rects = |canvas: &CanvasState, previews: &PreviewManager| -> Vec<Rect> {
-                ids.iter()
-                    .map(|id| canvas.target_screen_rect(previews.get(*id).unwrap(), viewport))
-                    .collect()
-            };
-            let original: f32 = rects(&canvas, &previews).iter().map(Rect::area).sum();
-            for _ in 0..3 {
-                for (count, _, _) in LAYOUTS {
-                    for selected in [ids[0], ids[1]] {
-                        canvas.apply_spotlight_layout(
-                            count,
-                            Some(selected),
-                            viewport,
-                            &mut previews,
-                        );
-                        let rects = rects(&canvas, &previews);
-                        for (index, (rect, aspect)) in rects.iter().zip(aspects).enumerate() {
-                            assert!(
-                                (rect.aspect_ratio() / aspect - 1.0).abs() < 0.001,
-                                "tile {index}: {} vs {aspect}",
-                                rect.aspect_ratio()
-                            );
-                            for other in &rects[..index] {
-                                assert!(!rect.shrink(0.01).intersects(*other));
-                            }
-                        }
-                        let area: f32 = rects.iter().map(Rect::area).sum();
-                        assert!((area / original - 1.0).abs() < 0.01);
-                        // The selected tile is the main tile, at its own shape.
-                        // (Two or three large tiles share a height instead.)
-                        if count == 1 || count == usize::MAX {
-                            let largest = rects.iter().map(Rect::area).fold(0.0, f32::max);
-                            let index = ids.iter().position(|id| *id == selected).unwrap();
-                            assert!((rects[index].area() / largest - 1.0).abs() < 0.001);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn spotlight_swaps_fit_each_picture_inside_its_new_slot() {
-        let (mut canvas, mut previews, ids, viewport, aspects) = stretched_fixture();
-        canvas.toggle_spotlight(ids[0], viewport, &mut previews);
-        let slots: Vec<_> = ids
-            .iter()
-            .map(|id| canvas.target_screen_rect(previews.get(*id).unwrap(), viewport))
-            .collect();
-        canvas.swap_spotlight_tiles(ids[0], ids[1], viewport, &mut previews);
-        for (id, slot, aspect) in [
-            (ids[0], slots[1], aspects[0]),
-            (ids[1], slots[0], aspects[1]),
-        ] {
-            let rect = canvas.target_screen_rect(previews.get(id).unwrap(), viewport);
-            assert!((rect.aspect_ratio() / aspect - 1.0).abs() < 0.001);
-            assert!(slot.expand(0.01).contains_rect(rect));
-            assert!((rect.center() - slot.center()).length() < 0.01);
-            assert!(
-                (rect.width() - slot.width()).abs() < 0.01
-                    || (rect.height() - slot.height()).abs() < 0.01
-            );
-        }
-        for index in [2, 3] {
-            let rect = canvas.target_screen_rect(previews.get(ids[index]).unwrap(), viewport);
-            assert_eq!(rect, slots[index]);
-        }
-    }
-
-    #[test]
-    fn group_selection_member_edit_and_ungroup_preserve_geometry() {
-        let (mut canvas, mut previews, ids, _) = fixture();
-        let before: Vec<_> = ids
-            .iter()
-            .map(|id| previews.get(*id).unwrap().rect())
-            .collect();
-        canvas.select_group_tile(ids[1], &previews);
-        assert_eq!(canvas.selection, ids);
-        canvas.toggle_group_selection(ids[2], &previews);
-        assert!(canvas.selection.is_empty());
-        canvas.toggle_group_selection(ids[2], &previews);
-        assert_eq!(canvas.selection, ids);
-        canvas.groups.editing = Some(ids[1]);
-        canvas.select_group_tile(ids[1], &previews);
-        assert_eq!(canvas.selection, vec![ids[1]]);
-        canvas.select_group_tile(ids[0], &previews);
-        assert_eq!(canvas.selection, ids);
-        canvas.ungroup_selection(&mut previews);
-        for (id, before) in ids.iter().zip(before) {
-            let p = previews.get(*id).unwrap();
-            assert_eq!(p.rect(), before);
-            assert!(p.tile_group.is_none());
-        }
-    }
-
-    #[test]
-    fn group_pin_survives_pan_zoom_and_viewport_resize_as_one_unit() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        let before: Vec<_> = ids
-            .iter()
-            .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport))
-            .collect();
-        canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-        canvas.pan = Vec2::new(-900.0, 400.0);
-        canvas.zoom = 3.0;
-        let resized = Rect::from_min_size(viewport.min, Vec2::new(600.0, 420.0));
-        for (id, before) in ids.iter().zip(&before) {
-            assert_eq!(
-                canvas.preview_screen_rect(previews.get(*id).unwrap(), resized),
-                *before
-            );
-        }
-        canvas.toggle_viewport_pin(ids[3], resized, &mut previews);
-        for (id, before) in ids.iter().zip(before) {
-            let p = previews.get(*id).unwrap();
-            assert!(p.viewport_pin.is_none());
-            let after = canvas.preview_screen_rect(p, resized);
-            assert!(after.min.distance(before.min) < 0.001);
-            assert!((after.size() - before.size()).length() < 0.001);
-        }
-    }
-
-    #[test]
-    fn grouping_mixed_pins_keeps_current_screen_positions() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        canvas.ungroup_selection(&mut previews);
-        canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-        let before: Vec<_> = ids
-            .iter()
-            .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport))
-            .collect();
-        canvas.create_group(viewport, &mut previews);
-        for (id, before) in ids.iter().zip(before) {
-            let p = previews.get(*id).unwrap();
-            assert!(p.viewport_pin.is_none());
-            let after = canvas.preview_screen_rect(p, viewport);
-            assert!(after.min.distance(before.min) < 0.001);
-            assert!((after.size() - before.size()).length() < 0.001);
-        }
-    }
-
-    #[test]
-    fn spotlight_cycles_resizes_and_saves_then_can_restore_exact_originals() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-        previews.get_mut(ids[1]).unwrap().crop_uv = Some((0.1, 0.2, 0.9, 0.8));
-        let before: Vec<_> = ids
-            .iter()
-            .map(|id| {
-                serde_json::to_value(PreviewLayout::from(previews.get(*id).unwrap())).unwrap()
-            })
-            .collect();
-        let camera = (canvas.pan, canvas.zoom);
-        canvas.toggle_spotlight(ids[2], viewport, &mut previews);
-        assert_eq!(canvas.selection, vec![ids[2]]);
-        canvas.cycle_spotlight(true, viewport, &mut previews);
-        assert_eq!(canvas.selection, vec![ids[3]]);
-        canvas.cycle_spotlight(true, viewport, &mut previews);
-        assert_eq!(canvas.selection, vec![ids[0]]);
-        canvas.cycle_spotlight(false, viewport, &mut previews);
-        assert_eq!(canvas.selection, vec![ids[3]]);
-        let resized = Rect::from_min_size(viewport.min, Vec2::new(700.0, 420.0));
-        canvas.update_spotlight(resized, &mut previews);
-        // Pinning can place the original group partly outside the viewport;
-        // Spotlight must honor that placement rather than recentering it.
-        let group_bounds = canvas.spotlight_screen_bounds(resized).unwrap();
-        for (id, original) in ids.iter().zip(&before) {
-            let p = previews.get(*id).unwrap();
-            assert_eq!(
-                &serde_json::to_value(PreviewLayout::from(p)).unwrap(),
-                original
-            );
-            assert!(group_bounds
-                .expand(0.001)
-                .contains_rect(canvas.preview_screen_rect(p, resized)));
-            assert_eq!(
-                &serde_json::to_value(canvas.saved_tile_layout(p)).unwrap(),
-                original
-            );
-        }
-        assert!(canvas.finish_spotlight(&mut previews, true));
-        assert_eq!((canvas.pan, canvas.zoom), camera);
-        assert_eq!(canvas.selection, ids);
-        for (id, original) in ids.iter().zip(before) {
-            assert_eq!(
-                serde_json::to_value(PreviewLayout::from(previews.get(*id).unwrap())).unwrap(),
-                original
-            );
-        }
-    }
-
-    #[test]
-    fn leaving_spotlight_keeps_and_saves_the_last_main_tile() {
-        for pinned in [false, true] {
-            for member_only in [false, true] {
-                let (mut canvas, mut previews, ids, viewport) = fixture();
-                if pinned {
-                    canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-                }
-                if member_only {
-                    canvas.groups.editing = Some(ids[0]);
-                    canvas.selection = vec![ids[0]];
-                }
-                previews.get_mut(ids[2]).unwrap().crop_uv = Some((0.1, 0.2, 0.9, 0.8));
-                canvas.apply_spotlight_layout(1, Some(ids[0]), viewport, &mut previews);
-                canvas.toggle_spotlight(ids[0], viewport, &mut previews);
-                canvas.swap_spotlight_tiles(ids[2], ids[0], viewport, &mut previews);
-                let saved_order = canvas.groups.spotlight.as_ref().unwrap().order.clone();
-                let expected: Vec<_> = ids
-                    .iter()
-                    .map(|id| {
-                        serde_json::to_value(PreviewLayout::from(previews.get(*id).unwrap()))
-                            .unwrap()
-                    })
-                    .collect();
-                let camera = (canvas.pan, canvas.zoom);
-                if !pinned {
-                    canvas.toggle_current_tile_focus(&previews);
-                }
-                // The same toggle used to enter Spotlight must keep its final arrangement.
-                canvas.toggle_spotlight(ids[2], viewport, &mut previews);
-                assert!(!canvas.is_spotlighting());
-                assert!(!canvas.is_focusing_tile());
-                assert_eq!((canvas.pan, canvas.zoom), camera);
-                assert_eq!(canvas.current_tile(&previews), Some(ids[2]));
-                assert!(canvas.has_selected_group(&previews));
-                for (id, mut expected) in ids.iter().zip(expected) {
-                    expected["tile_group"]["order"] = serde_json::json!(saved_order
-                        .iter()
-                        .position(|member| member == id)
-                        .unwrap());
-                    let p = previews.get(*id).unwrap();
-                    assert_eq!(
-                        serde_json::to_value(PreviewLayout::from(p)).unwrap(),
-                        expected
-                    );
-                    let saved = canvas.saved_tile_layout(p);
-                    assert_eq!(serde_json::to_value(&saved).unwrap(), expected);
-                    let restored: PreviewLayout = serde_json::from_value(expected).unwrap();
-                    assert_eq!(restored.position, saved.position);
-                    assert_eq!(restored.size, saved.size);
-                    assert_eq!(restored.viewport_pin, saved.viewport_pin);
-                }
-                let main = canvas.preview_screen_rect(previews.get(ids[2]).unwrap(), viewport);
-                let companion = canvas.preview_screen_rect(previews.get(ids[0]).unwrap(), viewport);
-                assert!(main.width() > companion.width() * 2.0);
-                canvas.toggle_spotlight(
-                    canvas.current_tile(&previews).unwrap(),
-                    viewport,
-                    &mut previews,
-                );
-                assert_eq!(canvas.selection, vec![ids[2]]);
-            }
-        }
-    }
-
-    #[test]
-    fn removing_spotlight_member_restores_geometry_before_undo_snapshot() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        let original = previews.get(ids[0]).unwrap().rect();
-        canvas.toggle_spotlight(ids[0], viewport, &mut previews);
-        previews.start_removal(ids[0]);
-        canvas.update_spotlight(viewport, &mut previews);
-        assert!(!canvas.is_spotlighting());
-        assert_eq!(previews.get(ids[0]).unwrap().rect(), original);
-        assert!(previews.get(ids[0]).unwrap().viewport_pin.is_none());
-    }
-
-    #[test]
-    fn spotlight_stays_inside_group_bounds_in_canvas_and_pinned_space() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, viewport) = fixture();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            let bounds = bounds_of(
-                ids.iter()
-                    .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport)),
-            )
-            .unwrap();
-            let camera = (canvas.pan, canvas.zoom);
-            let outsider =
-                previews.add("Outside".into(), Pos2::new(900.0, 10.0), Vec2::splat(100.0));
-            let outside_before = previews.get(outsider).unwrap().rect();
-            canvas.toggle_spotlight(ids[2], viewport, &mut previews);
-            for id in &ids {
-                let p = previews.get(*id).unwrap();
-                assert_eq!(p.viewport_pin.is_some(), pinned);
-                assert!(bounds
-                    .expand(0.001)
-                    .contains_rect(canvas.preview_screen_rect(p, viewport)));
-            }
-            assert_eq!((canvas.pan, canvas.zoom), camera);
-            assert_eq!(previews.get(outsider).unwrap().rect(), outside_before);
-            assert_eq!(canvas.current_tile(&previews), Some(ids[2]));
-        }
-    }
-
-    #[test]
-    fn zoom_and_pan_preserve_spotlight_member_geometry_and_active_tile() {
-        let (mut canvas, mut previews, ids, _) = fixture();
-        let ctx = egui::Context::default();
-        let mut captures = CaptureCoordinator::new();
-        frame(&ctx, &mut canvas, &mut previews, &mut captures, vec![]);
-        let viewport = canvas.last_screen_rect.unwrap();
-        canvas.select_group_tile(ids[2], &previews);
-        canvas.toggle_spotlight(ids[2], viewport, &mut previews);
-        let before: Vec<_> = ids
-            .iter()
-            .map(|id| previews.get(*id).unwrap().rect())
-            .collect();
-        let original_zoom = canvas.zoom;
-        frame(
-            &ctx,
-            &mut canvas,
-            &mut previews,
-            &mut captures,
-            vec![
-                egui::Event::PointerMoved(Pos2::new(1100.0, 700.0)),
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: Vec2::new(0.0, 50.0),
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert!(canvas.zoom > original_zoom);
-        assert!(canvas.is_spotlighting());
-        assert_eq!(canvas.current_tile(&previews), Some(ids[2]));
-        let start = Pos2::new(1100.0, 700.0);
-        frame(
-            &ctx,
-            &mut canvas,
-            &mut previews,
-            &mut captures,
-            vec![egui::Event::PointerButton {
-                pos: start,
-                button: egui::PointerButton::Middle,
-                pressed: true,
-                modifiers: egui::Modifiers::NONE,
-            }],
-        );
-        frame(
-            &ctx,
-            &mut canvas,
-            &mut previews,
-            &mut captures,
-            vec![egui::Event::PointerMoved(start + Vec2::new(40.0, 30.0))],
-        );
-        frame(
-            &ctx,
-            &mut canvas,
-            &mut previews,
-            &mut captures,
-            vec![egui::Event::PointerButton {
-                pos: start + Vec2::new(40.0, 30.0),
-                button: egui::PointerButton::Middle,
-                pressed: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-        );
-        assert!(canvas.is_spotlighting());
-        for (id, before) in ids.iter().zip(before) {
-            assert_eq!(previews.get(*id).unwrap().rect(), before);
-        }
-        let navigated = (canvas.pan, canvas.zoom);
-        canvas.exit_spotlight(&mut previews);
-        assert_eq!((canvas.pan, canvas.zoom), navigated);
-        assert_eq!(canvas.current_tile(&previews), Some(ids[2]));
-    }
-
-    #[test]
-    fn focus_uses_clicked_group_member_and_returns_to_spotlight_before_exiting_it() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        canvas.select_group_tile(ids[2], &previews);
-        assert_eq!(canvas.selection, ids);
-        assert_eq!(canvas.current_tile(&previews), Some(ids[2]));
-        canvas.toggle_current_tile_focus(&previews);
-        assert_eq!(canvas.focus.as_ref().unwrap().id, ids[2]);
-        canvas.toggle_current_tile_focus(&previews);
-        assert_eq!(canvas.current_tile(&previews), Some(ids[2]));
-        canvas.toggle_spotlight(ids[2], viewport, &mut previews);
-        let before: Vec<_> = ids
-            .iter()
-            .map(|id| previews.get(*id).unwrap().rect())
-            .collect();
-        let camera = (canvas.pan, canvas.zoom);
-        canvas.toggle_current_tile_focus(&previews);
-        let focused = canvas.preview_screen_rect(previews.get(ids[2]).unwrap(), viewport);
-        assert!(focused.center().distance(viewport.center()) < 0.001);
-        assert!(
-            (focused.width() - viewport.width()).abs() < 0.001
-                || (focused.height() - viewport.height()).abs() < 0.001
-        );
-        assert!(canvas.is_spotlighting());
-        canvas.set_keyboard_input(CanvasKeyboardInput {
-            exit_tile_focus: true,
-            ..Default::default()
-        });
-        frame(
-            &egui::Context::default(),
-            &mut canvas,
-            &mut previews,
-            &mut CaptureCoordinator::new(),
-            vec![],
-        );
-        assert!(!canvas.is_focusing_tile());
-        assert!(canvas.is_spotlighting());
-        assert_eq!((canvas.pan, canvas.zoom), camera);
-        assert_eq!(canvas.current_tile(&previews), Some(ids[2]));
-        for (id, before) in ids.iter().zip(before) {
-            assert_eq!(previews.get(*id).unwrap().rect(), before);
-        }
-        canvas.set_keyboard_input(CanvasKeyboardInput {
-            exit_tile_focus: true,
-            ..Default::default()
-        });
-        frame(
-            &egui::Context::default(),
-            &mut canvas,
-            &mut previews,
-            &mut CaptureCoordinator::new(),
-            vec![],
-        );
-        assert!(!canvas.is_spotlighting());
-    }
-
-    #[test]
-    fn small_group_member_focus_fills_view_beyond_navigation_zoom_limit() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        previews.get_mut(ids[3]).unwrap().size = Vec2::new(40.0, 25.0);
-        canvas.select_group_tile(ids[3], &previews);
-        let camera = (canvas.pan, canvas.zoom);
-        canvas.toggle_current_tile_focus(&previews);
-        assert!(canvas.zoom > canvas.zoom_max);
-        let focused = canvas.preview_screen_rect(previews.get(ids[3]).unwrap(), viewport);
-        assert!((focused.width() - viewport.width()).abs() < 0.001);
-        canvas.toggle_current_tile_focus(&previews);
-        assert_eq!((canvas.pan, canvas.zoom), camera);
-    }
-
-    #[test]
-    fn spotlight_delete_keeps_the_current_target_instead_of_deleting_the_group() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        let original = previews.get(ids[2]).unwrap().rect();
-        canvas.toggle_spotlight(ids[2], viewport, &mut previews);
-        canvas.set_keyboard_input(CanvasKeyboardInput {
-            delete_selected: true,
-            ..Default::default()
-        });
-        frame(
-            &egui::Context::default(),
-            &mut canvas,
-            &mut previews,
-            &mut CaptureCoordinator::new(),
-            vec![],
-        );
-        assert!(!canvas.is_spotlighting());
-        assert_eq!(previews.get(ids[2]).unwrap().rect(), original);
-        for (index, id) in ids.iter().enumerate() {
-            assert_eq!(previews.get(*id).unwrap().removing.is_some(), index == 2);
-        }
-    }
-
-    #[test]
-    fn regrouping_preserves_name_and_adding_members_preserves_one_identity() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        let mut group = previews.get(ids[0]).unwrap().tile_group.clone().unwrap();
-        group.name = "Streams".into();
-        canvas.assign_group(&ids, group.clone(), viewport, &mut previews);
-        canvas.create_group(viewport, &mut previews);
-        assert_eq!(
-            previews
-                .get(ids[0])
-                .unwrap()
-                .tile_group
-                .as_ref()
-                .unwrap()
-                .name,
-            "Streams"
-        );
-        let added = previews.add("Extra".into(), Pos2::new(20.0, 500.0), Vec2::splat(100.0));
-        let mut members = ids.clone();
-        members.push(added);
-        canvas.assign_group(&members, group.clone(), viewport, &mut previews);
-        assert_eq!(canvas.group_members(added, &previews), members);
-        assert_eq!(
-            previews.get(added).unwrap().tile_group.as_ref().unwrap().id,
-            group.id
-        );
-        canvas.groups.editing = Some(added);
-        canvas.selection = vec![added];
-        canvas.ungroup_selection(&mut previews);
-        assert!(members
-            .iter()
-            .all(|id| previews.get(*id).unwrap().tile_group.is_none()));
-    }
-
-    #[test]
-    fn arrangements_leave_crop_and_unselected_tiles_unchanged() {
-        let (mut canvas, mut previews, ids, viewport) = fixture();
-        previews.get_mut(ids[0]).unwrap().crop_uv = Some((0.25, 0.0, 0.75, 1.0));
-        let outsider = previews.add("Outside".into(), Pos2::new(-100.0, 20.0), Vec2::splat(30.0));
-        let before = previews.get(outsider).unwrap().rect();
-        for (layout, _, _) in Arrangement::ALL {
-            canvas.arrange_selection(layout, Some(ids[0]), viewport, &mut previews);
-            assert_eq!(
-                previews.get(ids[0]).unwrap().crop_uv,
-                Some((0.25, 0.0, 0.75, 1.0))
-            );
-            assert_eq!(previews.get(outsider).unwrap().rect(), before);
-        }
-    }
-
-    #[test]
-    fn legacy_tiles_default_to_ungrouped_and_membership_round_trips() {
-        let (_, previews, ids, _) = fixture();
-        let saved = PreviewLayout::from(previews.get(ids[0]).unwrap());
-        let mut value = serde_json::to_value(&saved).unwrap();
-        assert_eq!(
-            serde_json::from_value::<PreviewLayout>(value.clone())
-                .unwrap()
-                .tile_group,
-            saved.tile_group
-        );
-        value.as_object_mut().unwrap().remove("tile_group");
-        assert!(serde_json::from_value::<PreviewLayout>(value)
-            .unwrap()
-            .tile_group
-            .is_none());
-    }
-
-    fn frame(
-        context: &egui::Context,
-        canvas: &mut CanvasState,
-        previews: &mut PreviewManager,
-        captures: &mut CaptureCoordinator,
-        events: Vec<egui::Event>,
-    ) {
-        let _ = context.run(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
-                events,
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(ctx, |ui| {
-                        canvas.ui(ui, previews, captures, ctx, true);
-                    });
-            },
-        );
-    }
-
-    fn button(pos: Pos2, pressed: bool) -> egui::Event {
-        egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::NONE,
-        }
-    }
-
-    #[test]
-    fn pointer_drag_moves_all_group_members_with_and_without_pins() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, _) = fixture();
-            let context = egui::Context::default();
-            let mut captures = CaptureCoordinator::new();
-            for id in &ids {
-                previews.get_mut(*id).unwrap().created_at = Instant::now() - Duration::from_secs(1);
-            }
-            frame(&context, &mut canvas, &mut previews, &mut captures, vec![]);
-            let viewport = canvas.last_screen_rect.unwrap();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            canvas.selection.clear();
-            canvas.apply_spotlight_layout(1, Some(ids[0]), viewport, &mut previews);
-            canvas.update_layout_animation(10.0);
-            assert!(!canvas.is_spotlighting());
-            let before: Vec<_> = ids
-                .iter()
-                .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport))
-                .collect();
-            let start = before[0].center();
-            frame(
-                &context,
-                &mut canvas,
-                &mut previews,
-                &mut captures,
-                vec![egui::Event::PointerMoved(start)],
-            );
-            frame(
-                &context,
-                &mut canvas,
-                &mut previews,
-                &mut captures,
-                vec![button(start, true)],
-            );
-            for delta in [Vec2::new(30.0, 20.0), Vec2::new(60.0, 40.0)] {
-                frame(
-                    &context,
-                    &mut canvas,
-                    &mut previews,
-                    &mut captures,
-                    vec![egui::Event::PointerMoved(start + delta)],
-                );
-            }
-            frame(
-                &context,
-                &mut canvas,
-                &mut previews,
-                &mut captures,
-                vec![button(start + Vec2::new(60.0, 40.0), false)],
-            );
-            for (id, before) in ids.iter().zip(before) {
-                let after = canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport);
-                assert!(
-                    ((after.min - before.min) - Vec2::new(60.0, 40.0)).length() < 0.01,
-                    "pinned={pinned}: before={before:?} after={after:?}"
-                );
-            }
-            assert!(!canvas.is_spotlighting());
-        }
-    }
-
-    #[test]
-    fn pointer_group_resize_preserves_relative_geometry() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, _) = fixture();
-            let context = egui::Context::default();
-            let mut captures = CaptureCoordinator::new();
-            frame(&context, &mut canvas, &mut previews, &mut captures, vec![]);
-            let viewport = canvas.last_screen_rect.unwrap();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            let before: Vec<_> = ids
-                .iter()
-                .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport))
-                .collect();
-            let bounds = bounds_of(before.iter().copied()).unwrap();
-            frame(
-                &context,
-                &mut canvas,
-                &mut previews,
-                &mut captures,
-                vec![egui::Event::PointerMoved(bounds.max)],
-            );
-            frame(
-                &context,
-                &mut canvas,
-                &mut previews,
-                &mut captures,
-                vec![button(bounds.max, true)],
-            );
-            let end = bounds.max + bounds.size() * 0.3;
-            frame(
-                &context,
-                &mut canvas,
-                &mut previews,
-                &mut captures,
-                vec![egui::Event::PointerMoved(end)],
-            );
-            frame(
-                &context,
-                &mut canvas,
-                &mut previews,
-                &mut captures,
-                vec![button(end, false)],
-            );
-            for (id, before) in ids.iter().zip(before) {
-                let after = canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport);
-                assert!(
-                    (after.size() - before.size() * 1.3).length() < 0.01,
-                    "pinned={pinned}: {before:?} -> {after:?}"
-                );
-                assert!(
-                    ((after.min - bounds.min) - (before.min - bounds.min) * 1.3).length() < 0.01
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn pointer_group_resize_stops_at_the_minimum_tile_size() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, _) = fixture();
-            let context = egui::Context::default();
-            let mut captures = CaptureCoordinator::new();
-            frame(&context, &mut canvas, &mut previews, &mut captures, vec![]);
-            let viewport = canvas.last_screen_rect.unwrap();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            let bounds = bounds_of(
-                ids.iter()
-                    .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport)),
-            )
-            .unwrap();
-            let end = bounds.min + bounds.size() * 0.05;
-            for events in [
-                vec![egui::Event::PointerMoved(bounds.max)],
-                vec![button(bounds.max, true)],
-                vec![egui::Event::PointerMoved(end)],
-                vec![button(end, false)],
-            ] {
-                frame(&context, &mut canvas, &mut previews, &mut captures, events);
-            }
-            let unit = if pinned { 1.0 } else { canvas.zoom };
-            let smallest = ids
-                .iter()
-                .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport))
-                .map(|r| r.width().min(r.height()) / unit)
-                .fold(f32::INFINITY, f32::min);
-            assert!(
-                (smallest - MIN_TILE_SIDE).abs() < 0.5,
-                "pinned={pinned}: {smallest}"
-            );
-        }
-    }
-
-    #[test]
-    fn group_resize_floor_lets_an_already_small_group_grow() {
-        let tiny = [(
-            PreviewId(1),
-            Rect::from_min_size(Pos2::ZERO, Vec2::splat(40.0)),
-        )];
-        assert_eq!(group_resize_min_scale(&tiny, 1.0), 1.0);
-        let large = [(
-            PreviewId(1),
-            Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0)),
-        )];
-        assert!((group_resize_min_scale(&large, 1.0) - 0.25).abs() < 0.001);
-        assert!((group_resize_min_scale(&large, 2.0) - 0.5).abs() < 0.001);
-    }
-
-    #[test]
-    fn fit_group_to_view_recovers_a_tiny_group_without_rearranging_it() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, viewport) = fixture();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            let screen = |canvas: &CanvasState, previews: &PreviewManager| -> Vec<Rect> {
-                ids.iter()
-                    .map(|id| canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport))
-                    .collect()
-            };
-            let before = screen(&canvas, &previews);
-            let old = bounds_of(before.iter().copied()).unwrap();
-            // Shrink the group to a few pixels, like the old layout bug did.
-            for (id, rect) in ids.iter().zip(&before) {
-                canvas.set_group_screen_rect(
-                    *id,
-                    Rect::from_min_size(old.min + (rect.min - old.min) * 0.02, rect.size() * 0.02),
-                    viewport,
-                    &mut previews,
-                );
-            }
-            canvas.fit_group_to_view(ids[0], viewport, &mut previews);
-            let after = screen(&canvas, &previews);
-            let fitted = bounds_of(after.iter().copied()).unwrap();
-            assert!(viewport.contains_rect(fitted));
-            assert!(
-                fitted.width() > viewport.width() * 0.9
-                    || fitted.height() > viewport.height() * 0.9
-            );
-            assert!((fitted.center() - viewport.center()).length() < 0.5);
-            let scale = fitted.width() / old.width();
-            for (before, after) in before.iter().zip(&after) {
-                assert!((after.size() - before.size() * scale).length() < 0.5);
-                assert!(((after.min - fitted.min) - (before.min - old.min) * scale).length() < 0.5);
-            }
-            for id in &ids {
-                assert_eq!(previews.get(*id).unwrap().viewport_pin.is_some(), pinned);
-            }
-        }
-    }
-
-    #[test]
-    fn keep_in_view_slides_back_only_as_far_as_the_window_or_old_outline() {
-        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 600.0));
-        let previous = Rect::from_min_size(Pos2::new(700.0, 100.0), Vec2::new(200.0, 400.0));
-        let moved = keep_in_view(
-            vec![Rect::from_min_size(previous.min, Vec2::new(500.0, 300.0))],
-            previous,
-            viewport,
-        );
-        assert_eq!(moved[0].min, Pos2::new(500.0, 100.0));
-        // A group already parked past the edge is not pulled into the window.
-        let parked = Rect::from_min_size(Pos2::new(900.0, 100.0), Vec2::new(400.0, 200.0));
-        let moved = keep_in_view(
-            vec![Rect::from_min_size(parked.min, Vec2::new(300.0, 300.0))],
-            parked,
-            viewport,
-        );
-        assert_eq!(moved[0].min, parked.min);
-        // Wider than the window: keep the left edge inside it.
-        let moved = keep_in_view(
-            vec![Rect::from_min_size(previous.min, Vec2::new(1500.0, 100.0))],
-            previous,
-            viewport,
-        );
-        assert_eq!(moved[0].min, Pos2::new(0.0, 100.0));
-    }
-
-    #[test]
-    fn layout_switch_keeps_a_visible_group_inside_the_window() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, viewport) = fixture();
-            // A tall column against the window's right edge.
-            for (i, id) in ids.iter().enumerate() {
-                canvas.set_group_screen_rect(
-                    *id,
-                    Rect::from_min_size(
-                        Pos2::new(
-                            viewport.right() - 170.0,
-                            viewport.top() + 10.0 + i as f32 * 95.0,
-                        ),
-                        Vec2::new(160.0, 90.0),
-                    ),
-                    viewport,
-                    &mut previews,
-                );
-            }
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            for (count, _, _) in LAYOUTS {
-                canvas.apply_spotlight_layout(count, Some(ids[0]), viewport, &mut previews);
-                for id in &ids {
-                    let p = previews.get(*id).unwrap();
-                    let rect = canvas.target_screen_rect(p, viewport);
-                    assert!(
-                        viewport.expand(0.5).contains_rect(rect),
-                        "{count}: {rect:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn equal_tiles_follow_the_group_outline() {
-        let rows = |rects: &[Rect]| {
-            let mut tops: Vec<f32> = rects.iter().map(|r| r.top()).collect();
-            tops.sort_by(f32::total_cmp);
-            tops.dedup_by(|a, b| (*a - *b).abs() < 0.5);
-            tops.len()
-        };
-        let aspects = [16.0 / 9.0; 4];
-        let wide = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 230.0));
-        assert_eq!(rows(&spotlight_rects(&aspects, wide, usize::MAX)), 1);
-        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 1000.0));
-        assert_eq!(rows(&spotlight_rects(&aspects, tall, usize::MAX)), 4);
-        let even = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
-        assert_eq!(rows(&spotlight_rects(&aspects, even, usize::MAX)), 2);
-        // Reapplying to its own outline keeps the same arrangement.
-        for bounds in [wide, tall, even] {
-            let first = spotlight_rects(&aspects, bounds, usize::MAX);
-            let outline = bounds_of(first.iter().copied()).unwrap();
-            let again = spotlight_rects(&aspects, outline, usize::MAX);
-            for (a, b) in first.iter().zip(&again) {
-                assert!(a.min.distance(b.min) < 0.01 && (a.size() - b.size()).length() < 0.01);
-            }
-        }
-    }
-
-    #[test]
-    fn size_presets_use_canvas_units_or_pinned_screen_units() {
-        for pinned in [false, true] {
-            let (mut canvas, mut previews, ids, viewport) = fixture();
-            if pinned {
-                canvas.toggle_viewport_pin(ids[0], viewport, &mut previews);
-            }
-            for (width, _, _) in SIZES {
-                canvas.resize_selection(width, viewport, &mut previews);
-                let bounds =
-                    bounds_of(ids.iter().map(|id| {
-                        canvas.preview_screen_rect(previews.get(*id).unwrap(), viewport)
-                    }))
-                    .unwrap();
-                assert!(
-                    (bounds.width() - width * if pinned { 1.0 } else { canvas.zoom }).abs() < 0.01
-                );
-            }
-        }
-    }
-}
+#[path = "groups_tests.rs"]
+mod tests;
