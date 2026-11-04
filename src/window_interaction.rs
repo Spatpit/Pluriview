@@ -243,10 +243,10 @@ mod native {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect,
         GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-        SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-        GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, HWND_NOTOPMOST, HWND_TOP, SWP_ASYNCWINDOWPOS,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWMINNOACTIVE,
-        SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WS_EX_TOPMOST,
+        SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindow, ShowWindowAsync,
+        GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, HWND_NOTOPMOST, HWND_TOP,
+        SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WS_EX_TOPMOST,
     };
 
     fn hwnd(handle: isize) -> HWND {
@@ -564,6 +564,15 @@ mod native {
         placement.showCmd = SW_SHOWMINNOACTIVE.0 as u32;
         unsafe {
             let _ = SetWindowPlacement(hwnd(handle), &placement);
+        }
+    }
+
+    /// Ask the window to minimize without activating anything. Like
+    /// `move_window`, the request is posted, so a frozen app cannot block us;
+    /// it minimizes once it responds again.
+    pub fn minimize_without_waiting(handle: isize) {
+        unsafe {
+            let _ = ShowWindowAsync(hwnd(handle), SW_SHOWMINNOACTIVE);
         }
     }
 

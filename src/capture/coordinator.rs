@@ -107,7 +107,29 @@ pub struct CaptureCoordinator {
     retired_workers: Vec<JoinHandle<()>>,
 
     frame_wake: Arc<FrameWake>,
+
+    /// Window captures that stopped on their own and are being restarted.
+    recoveries: HashMap<PreviewId, Recovery>,
 }
+
+/// Restarting a tile's lost window capture. The first try waits a second,
+/// for a GPU reset to finish; each later one waits twice as long, so a
+/// source that keeps failing is retried calmly and then left alone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Recovery {
+    /// Restarts tried so far.
+    attempts: u8,
+    /// When the next restart is due; None once it has begun.
+    due: Option<Instant>,
+    /// When the latest restart began.
+    restarted: Option<Instant>,
+}
+
+const RECOVERY_ATTEMPTS: u8 = 5;
+const RECOVERY_FIRST_DELAY: Duration = Duration::from_secs(1);
+/// A restarted capture that runs this long counts as recovered, and the
+/// next loss starts over from the first, short pause.
+const RECOVERY_SETTLED: Duration = Duration::from_secs(30);
 
 /// A single capture session
 struct CaptureSession {
@@ -159,6 +181,11 @@ struct CaptureSession {
     /// Source closure is distinct from a requested stop or a capture failure.
     closed: Arc<AtomicBool>,
 
+    /// Windows Graphics Capture stopped on its own while the window was
+    /// still open, as when a GPU reset or driver update fails a frame. The
+    /// coordinator restarts such a session (see `recover_lost_captures`).
+    lost: Arc<AtomicBool>,
+
     /// Stops Windows Graphics Capture directly, even when a static window is
     /// no longer producing frame callbacks.
     stop_sender: Sender<()>,
@@ -182,6 +209,7 @@ impl CaptureCoordinator {
             sessions: HashMap::new(),
             retired_workers: Vec::new(),
             frame_wake: Arc::default(),
+            recoveries: HashMap::new(),
         }
     }
 
@@ -198,6 +226,7 @@ impl CaptureCoordinator {
         window_title: String,
         target_fps: u32,
     ) {
+        self.recoveries.remove(&preview_id);
         self.start_window_capture(preview_id, hwnd, window_title, target_fps, false, false);
     }
 
@@ -211,6 +240,7 @@ impl CaptureCoordinator {
         url: String,
         target_fps: u32,
     ) {
+        self.recoveries.remove(&preview_id);
         self.start_window_capture(preview_id, hwnd, url, target_fps, true, false);
     }
 
@@ -255,6 +285,8 @@ impl CaptureCoordinator {
         // Start capture in a new thread
         let closed = Arc::new(AtomicBool::new(false));
         let worker_closed = closed.clone();
+        let lost = Arc::new(AtomicBool::new(false));
+        let worker_lost = lost.clone();
         let title = window_title.clone();
         let worker = std::thread::spawn(move || {
             capture_window_loop(
@@ -263,7 +295,10 @@ impl CaptureCoordinator {
                 title,
                 worker_state,
                 stop_receiver,
-                worker_closed,
+                CaptureEnd {
+                    closed: worker_closed,
+                    lost: worker_lost,
+                },
                 retain_source,
                 in_use,
             );
@@ -284,6 +319,7 @@ impl CaptureCoordinator {
             latest_frame,
             failure,
             closed,
+            lost,
             stop_sender,
             worker: Some(worker),
         };
@@ -344,6 +380,7 @@ impl CaptureCoordinator {
                 latest_frame,
                 failure,
                 closed: Arc::new(AtomicBool::new(false)),
+                lost: Arc::new(AtomicBool::new(false)),
                 stop_sender,
                 worker: Some(worker),
             },
@@ -352,6 +389,7 @@ impl CaptureCoordinator {
 
     /// Stop capturing for a preview
     pub fn stop_capture(&mut self, preview_id: PreviewId) {
+        self.recoveries.remove(&preview_id);
         self.retire_session(preview_id, false);
     }
 
@@ -387,9 +425,17 @@ impl CaptureCoordinator {
     /// change restarts the capture; the tile keeps its last frame meanwhile,
     /// and its frame rate, size and pause carry over.
     pub fn set_in_use(&mut self, preview_id: PreviewId, in_use: bool) {
-        let Some(session) = self.sessions.get(&preview_id).filter(|session| {
+        if self.sessions.get(&preview_id).is_some_and(|session| {
             session.in_use != in_use && !session.retains_source && session.is_live()
-        }) else {
+        }) {
+            self.restart_window_capture(preview_id, in_use);
+        }
+    }
+
+    /// Start a window session again, keeping its frame rate, output size,
+    /// pause and browser mode.
+    fn restart_window_capture(&mut self, preview_id: PreviewId, in_use: bool) {
+        let Some(session) = self.sessions.get(&preview_id) else {
             return;
         };
         let Some(hwnd) = session.window_hwnd else {
@@ -400,11 +446,82 @@ impl CaptureCoordinator {
         let width = session.target_width.load(Ordering::Relaxed);
         let height = session.target_height.load(Ordering::Relaxed);
         let paused = session.paused.load(Ordering::Relaxed);
-        self.start_window_capture(preview_id, hwnd, title, fps, false, in_use);
+        let retains_source = session.retains_source;
+        self.start_window_capture(preview_id, hwnd, title, fps, retains_source, in_use);
         if let Some(session) = self.sessions.get(&preview_id) {
             session.target_width.store(width, Ordering::Relaxed);
             session.target_height.store(height, Ordering::Relaxed);
             session.paused.store(paused, Ordering::Relaxed);
+        }
+    }
+
+    /// Restart window captures that stopped on their own, after a pause that
+    /// doubles with each try. `failed` lists tiles whose session reported a
+    /// failure this frame: a restart that could not start is tried again.
+    fn recover_lost_captures(
+        &mut self,
+        failed: &[PreviewId],
+        now: Instant,
+        preview_manager: &mut PreviewManager,
+    ) {
+        for (id, session) in &self.sessions {
+            let lost = session.lost.swap(false, Ordering::AcqRel);
+            let restarting = self.recoveries.get(id).copied().filter(|r| r.due.is_none());
+            if lost || (restarting.is_some() && failed.contains(id)) {
+                let attempts = restarting.map_or(0, |r| r.attempts);
+                if attempts >= RECOVERY_ATTEMPTS {
+                    self.recoveries.remove(id);
+                    if let Some(preview) = preview_manager.get_mut(*id) {
+                        preview.set_capture_error(
+                            "Capture stopped. Reopening the app reconnects it.".to_owned(),
+                        );
+                    }
+                    continue;
+                }
+                let delay = RECOVERY_FIRST_DELAY * (1u32 << attempts);
+                self.recoveries.insert(
+                    *id,
+                    Recovery {
+                        attempts,
+                        due: Some(now + delay),
+                        restarted: restarting.and_then(|r| r.restarted),
+                    },
+                );
+            } else if restarting.is_some_and(|r| {
+                session.has_produced_frame.load(Ordering::Relaxed)
+                    && r.restarted
+                        .is_some_and(|at| now.saturating_duration_since(at) >= RECOVERY_SETTLED)
+            }) {
+                self.recoveries.remove(id);
+            }
+        }
+        // A stopped or removed tile no longer waits. (Starting a tile's
+        // capture afresh also cancels its recovery; see `start_capture`.)
+        let sessions = &self.sessions;
+        self.recoveries.retain(|id, _| {
+            sessions
+                .get(id)
+                .is_some_and(|session| session.window_hwnd.is_some())
+        });
+        let ready: Vec<PreviewId> = self
+            .recoveries
+            .iter()
+            .filter(|(_, recovery)| recovery.due.is_some_and(|due| due <= now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ready {
+            if let Some(recovery) = self.recoveries.get_mut(&id) {
+                recovery.attempts += 1;
+                recovery.due = None;
+                recovery.restarted = Some(now);
+            }
+            let in_use = self.sessions.get(&id).is_some_and(|session| session.in_use);
+            log::info!("Restarting the stopped capture for preview {id:?}");
+            self.restart_window_capture(id, in_use);
+        }
+        let next = self.recoveries.values().filter_map(|r| r.due).min();
+        if let (Some(next), Some(context)) = (next, self.frame_wake.context.get()) {
+            context.request_repaint_after(next.saturating_duration_since(now));
         }
     }
 
@@ -456,9 +573,13 @@ impl CaptureCoordinator {
             .max_live_fps()
             .map_or(Duration::ZERO, |fps| Duration::from_secs(1) / fps);
         self.frame_wake.frames_consumed(min_interval);
+        let mut failed = Vec::new();
         for (preview_id, session) in &self.sessions {
             let frame = session.latest_frame.lock().take();
             let failure = session.failure.lock().take();
+            if failure.is_some() {
+                failed.push(*preview_id);
+            }
             if let Some(preview) = preview_manager.get_mut(*preview_id) {
                 if session.closed.swap(false, Ordering::AcqRel) {
                     // The slot belongs to this session, so a retired worker
@@ -485,11 +606,13 @@ impl CaptureCoordinator {
                 }
             }
         }
+        self.recover_lost_captures(&failed, Instant::now(), preview_manager);
         self.reap_finished_workers();
     }
 
     /// Stop all captures
     pub fn stop_all(&mut self) {
+        self.recoveries.clear();
         for (_, mut session) in self.sessions.drain() {
             session.active.store(false, Ordering::Relaxed);
             let _ = session.stop_sender.send(());
@@ -600,6 +723,14 @@ fn capture_frame_due(
     requested_generation != handled_generation || elapsed >= frame_interval
 }
 
+/// How a window capture ended without being asked to stop.
+struct CaptureEnd {
+    /// The window closed.
+    closed: Arc<AtomicBool>,
+    /// Windows' capture thread stopped while the window stayed open.
+    lost: Arc<AtomicBool>,
+}
+
 /// Capture loop running in a separate thread
 #[allow(clippy::too_many_arguments)]
 fn capture_window_loop(
@@ -608,10 +739,11 @@ fn capture_window_loop(
     window_title: String,
     worker_state: CaptureWorkerState,
     stop_receiver: Receiver<()>,
-    closed: Arc<AtomicBool>,
+    end: CaptureEnd,
     retain_source: bool,
     in_use: bool,
 ) {
+    let CaptureEnd { closed, lost } = end;
     use windows_capture::{
         capture::{Context, GraphicsCaptureApiHandler},
         frame::Frame,
@@ -942,7 +1074,7 @@ fn capture_window_loop(
             // page that sends no new frames.
             let handler = control.callback();
             let wake = std::time::Duration::from_millis(if retain_source { 20 } else { 100 });
-            while active.load(Ordering::Relaxed) {
+            while active.load(Ordering::Relaxed) && !control.is_finished() {
                 match stop_receiver.recv_timeout(wake) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {}
@@ -951,7 +1083,24 @@ fn capture_window_loop(
                     handler.lock().refresh_from_retained();
                 }
             }
-            if let Err(error) = control.stop() {
+            // Windows' capture thread ends by itself when a frame fails, such
+            // as after a GPU reset or driver update, with no close event.
+            // Still active means nobody asked it to stop and the window did
+            // not close.
+            let ended_alone = control.is_finished() && active.load(Ordering::Relaxed);
+            let result = control.stop();
+            if ended_alone {
+                match &result {
+                    Err(error) => log::warn!("Capture stopped on its own: {error}"),
+                    Ok(()) => log::warn!("Capture stopped on its own"),
+                }
+                // Inactive first: the coordinator only restarts a session
+                // that is no longer live.
+                active.store(false, Ordering::Relaxed);
+                *failure.lock() = Some("Capture stopped. Reconnecting…".to_owned());
+                lost.store(true, Ordering::Release);
+                frame_wake.notify();
+            } else if let Err(error) = result {
                 log::error!("Failed to stop capture: {error}");
             }
         }
@@ -1067,14 +1216,15 @@ fn probed_minimum_update_interval() -> windows_capture::settings::MinimumUpdateI
 mod tests {
     use super::{
         capture_frame_due, capture_target_from_hwnd, CaptureCoordinator, CaptureSession,
-        CapturedFrame,
+        CapturedFrame, Recovery, RECOVERY_ATTEMPTS, RECOVERY_FIRST_DELAY, RECOVERY_SETTLED,
     };
     use crate::preview::{PreviewId, PreviewManager};
     use eframe::egui::{Pos2, Vec2};
     use parking_lot::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn session(fps: u32, active: bool, paused: bool) -> CaptureSession {
         let (stop_sender, _stop_receiver) = mpsc::channel();
@@ -1093,6 +1243,7 @@ mod tests {
             latest_frame: Arc::new(Mutex::new(None)),
             failure: Arc::new(Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
+            lost: Arc::new(AtomicBool::new(false)),
             stop_sender,
             worker: None,
         }
@@ -1385,6 +1536,7 @@ mod tests {
                 latest_frame: Arc::new(Mutex::new(None)),
                 failure: Arc::new(Mutex::new(None)),
                 closed: Arc::new(AtomicBool::new(false)),
+                lost: Arc::new(AtomicBool::new(false)),
                 stop_sender,
                 worker: Some(worker),
             },
@@ -1419,6 +1571,7 @@ mod tests {
                 latest_frame: Arc::new(Mutex::new(None)),
                 failure: Arc::new(Mutex::new(None)),
                 closed: Arc::new(AtomicBool::new(false)),
+                lost: Arc::new(AtomicBool::new(false)),
                 stop_sender,
                 worker: None,
             },
@@ -1501,6 +1654,111 @@ mod tests {
     }
 
     #[test]
+    fn a_capture_that_stops_on_its_own_restarts_with_growing_pauses() {
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_window(1, 42, "game".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
+        let mut lost = session(30, false, false);
+        // No such window: every restart fails to start, like a GPU that
+        // has not come back yet.
+        lost.window_hwnd = Some(0x1234);
+        lost.lost.store(true, Ordering::Release);
+        lost.paused.store(true, Ordering::Relaxed);
+        let mut coordinator = CaptureCoordinator::new();
+        coordinator.sessions.insert(id, lost);
+
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let wait_for_failure = |coordinator: &CaptureCoordinator| {
+            for _ in 0..500 {
+                if coordinator.sessions[&id].failure.lock().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the restarted capture should report its start failure");
+        };
+
+        coordinator.recover_lost_captures(&[id], at(0), &mut previews);
+        assert_eq!(
+            coordinator.recoveries[&id],
+            Recovery {
+                attempts: 0,
+                due: Some(at(1)),
+                restarted: None
+            }
+        );
+        // Not before it is due.
+        coordinator.recover_lost_captures(&[], at(0), &mut previews);
+        assert!(!coordinator.sessions[&id].is_live());
+        assert_eq!(coordinator.recoveries[&id].due, Some(at(1)));
+
+        let mut now = at(1);
+        for attempt in 1..=RECOVERY_ATTEMPTS {
+            coordinator.recover_lost_captures(&[], now, &mut previews);
+            assert_eq!(
+                coordinator.recoveries[&id],
+                Recovery {
+                    attempts: attempt,
+                    due: None,
+                    restarted: Some(now)
+                }
+            );
+            // A restart keeps the tile's pause.
+            assert!(coordinator.sessions[&id].paused.load(Ordering::Relaxed));
+            // The restart fails to start, as `process_frames` would see it.
+            wait_for_failure(&coordinator);
+            coordinator.sessions[&id].failure.lock().take();
+            coordinator.recover_lost_captures(&[id], now, &mut previews);
+            if attempt < RECOVERY_ATTEMPTS {
+                // Each pause is twice the last: 2, 4, 8 and 16 seconds.
+                let due = now + RECOVERY_FIRST_DELAY * (1 << attempt);
+                assert_eq!(coordinator.recoveries[&id].due, Some(due));
+                coordinator.recover_lost_captures(
+                    &[],
+                    due - Duration::from_millis(1),
+                    &mut previews,
+                );
+                assert_eq!(coordinator.recoveries[&id].attempts, attempt);
+                now = due;
+            }
+        }
+        // Out of tries: left alone, with an error saying how to reconnect.
+        assert!(!coordinator.recoveries.contains_key(&id));
+        assert_eq!(
+            previews.get(id).unwrap().capture_error.as_deref(),
+            Some("Capture stopped. Reopening the app reconnects it.")
+        );
+        coordinator.stop_all();
+    }
+
+    #[test]
+    fn a_restarted_capture_that_keeps_running_counts_as_recovered() {
+        let mut previews = PreviewManager::new();
+        let id = previews.add_for_window(1, 42, "game".to_owned(), Pos2::ZERO, Vec2::splat(10.0));
+        let mut coordinator = CaptureCoordinator::new();
+        let mut running = session(30, true, false);
+        running.window_hwnd = Some(0x1234);
+        coordinator.sessions.insert(id, running);
+        let start = Instant::now();
+        coordinator.recoveries.insert(
+            id,
+            Recovery {
+                attempts: 3,
+                due: None,
+                restarted: Some(start),
+            },
+        );
+
+        // Producing frames, but not for long yet: a quick loss would keep
+        // the longer pause.
+        coordinator.recover_lost_captures(&[], start + Duration::from_secs(5), &mut previews);
+        assert_eq!(coordinator.recoveries[&id].attempts, 3);
+
+        coordinator.recover_lost_captures(&[], start + RECOVERY_SETTLED, &mut previews);
+        assert!(!coordinator.recoveries.contains_key(&id));
+    }
+
+    #[test]
     fn live_session_clears_a_stale_capture_error() {
         let mut previews = PreviewManager::new();
         let preview_id =
@@ -1532,6 +1790,7 @@ mod tests {
                 latest_frame: Arc::new(Mutex::new(None)),
                 failure: Arc::new(Mutex::new(None)),
                 closed: Arc::new(AtomicBool::new(false)),
+                lost: Arc::new(AtomicBool::new(false)),
                 stop_sender,
                 worker: Some(worker),
             },

@@ -1303,8 +1303,13 @@ pub struct CanvasState {
     preview_dragging: bool,
 
     /// Original viewport placements for pinned tiles in the active
-    /// drag, paired with their IDs so egui's cumulative drag delta is stable.
+    /// drag, paired with their IDs. Pinned tiles are placed from these plus
+    /// `pinned_drag_offset`, so clamping never accumulates.
     pinned_drag_origins: Vec<(PreviewId, ViewportPin)>,
+
+    /// Screen distance the current tile drag has moved so far. egui's
+    /// `drag_delta` is per frame, so this sums it for pinned tiles.
+    pinned_drag_offset: Vec2,
 
     /// Direct left-button capture for repositioning one pinned tile.
     /// This does not depend on egui's general tile-drag ownership.
@@ -1457,6 +1462,7 @@ impl Default for CanvasState {
             tile_scratch: Vec::new(),
             preview_dragging: false,
             pinned_drag_origins: Vec::new(),
+            pinned_drag_offset: Vec2::ZERO,
             pinned_pointer_drag: None,
             canvas_panning: false,
             pan_drag_tracker: DragTracker::new(),
@@ -1587,6 +1593,10 @@ impl CanvasState {
         });
 
         self.prune_preview_interactions(preview_manager);
+        let pointer_held = ui
+            .ctx()
+            .input(|i| i.pointer.any_down() || i.pointer.any_released());
+        self.end_orphaned_handle_drag(pointer_held, preview_manager);
         self.update_layout_animation(input.time);
         if input.alt
             || input.middle_down
@@ -3553,6 +3563,7 @@ impl CanvasState {
                 self.preview_dragging = true;
                 self.remember_current_tile(id);
                 self.pinned_drag_origins.clear();
+                self.pinned_drag_offset = Vec2::ZERO;
                 if !self.selection.contains(&id) {
                     self.select_group_tile(id, preview_manager);
                 }
@@ -3593,9 +3604,11 @@ impl CanvasState {
                     } else {
                         vec![id]
                     };
-                    // Pinned tiles derive every frame from their original pin
-                    // because egui reports a cumulative drag delta. Ordinary
-                    // canvas tiles retain their existing movement behavior.
+                    // egui's drag delta is per frame. Canvas tiles add it each
+                    // frame; pinned tiles are placed from their original pin
+                    // plus the running total, so edge clamping can't drift.
+                    self.pinned_drag_offset += screen_delta;
+                    let pinned_offset = self.pinned_drag_offset;
                     for sel_id in dragged_ids {
                         let pinned_origin = self
                             .pinned_drag_origins
@@ -3605,7 +3618,7 @@ impl CanvasState {
                         if let Some(pin) = pinned_origin {
                             let moved_pin = self.moved_pin(
                                 sel_id,
-                                pin.rect(canvas_rect).translate(screen_delta),
+                                pin.rect(canvas_rect).translate(pinned_offset),
                                 canvas_rect,
                                 preview_manager,
                             );
@@ -3623,6 +3636,7 @@ impl CanvasState {
             if preview_response.drag_stopped() && self.preview_dragging {
                 self.preview_dragging = false;
                 self.pinned_drag_origins.clear();
+                self.pinned_drag_offset = Vec2::ZERO;
             }
 
             // Context menu for preview. The toolbar and tabs have their own

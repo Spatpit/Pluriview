@@ -887,6 +887,103 @@ fn left_drag_repositions_a_pinned_tile() {
 }
 
 #[test]
+fn pinned_tiles_follow_a_drag_started_on_an_unpinned_tile() {
+    let context = Context::default();
+    let mut canvas = CanvasState::default();
+    let mut previews = PreviewManager::new();
+    let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0));
+    let pinned = previews.add_for_spout(
+        "pinned".to_owned(),
+        Pos2::new(60.0, 60.0),
+        Vec2::new(160.0, 120.0),
+        FpsPreset::Medium,
+    );
+    previews.get_mut(pinned).unwrap().viewport_pin = Some(crate::preview::ViewportPin::from_rect(
+        Rect::from_min_size(Pos2::new(60.0, 60.0), Vec2::new(160.0, 120.0)),
+        screen_rect,
+    ));
+    let free = previews.add_for_spout(
+        "free".to_owned(),
+        Pos2::new(500.0, 300.0),
+        Vec2::new(200.0, 150.0),
+        FpsPreset::Medium,
+    );
+    let mut captures = CaptureCoordinator::new();
+    let mut run_frame = |canvas: &mut CanvasState, previews: &mut PreviewManager, events| {
+        let _ = context.run(
+            RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(context, |ui| {
+                        canvas.ui(ui, previews, &mut captures, context, true);
+                    });
+            },
+        );
+    };
+    run_frame(&mut canvas, &mut previews, vec![]);
+    canvas.selection = vec![pinned, free];
+    let viewport = canvas.last_screen_rect.unwrap();
+    let screen_of = |canvas: &CanvasState, previews: &PreviewManager, id| {
+        canvas.preview_screen_rect(previews.get(id).unwrap(), viewport)
+    };
+    let pinned_before = screen_of(&canvas, &previews, pinned);
+    let free_before = screen_of(&canvas, &previews, free);
+    assert!(!free_before.intersects(pinned_before));
+
+    let mut pointer = free_before.center();
+    run_frame(
+        &mut canvas,
+        &mut previews,
+        vec![Event::PointerMoved(pointer)],
+    );
+    run_frame(
+        &mut canvas,
+        &mut previews,
+        vec![Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    for _ in 0..6 {
+        pointer += Vec2::new(15.0, 10.0);
+        run_frame(
+            &mut canvas,
+            &mut previews,
+            vec![Event::PointerMoved(pointer)],
+        );
+    }
+    run_frame(
+        &mut canvas,
+        &mut previews,
+        vec![Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+
+    let free_moved = screen_of(&canvas, &previews, free).min - free_before.min;
+    let pinned_moved = screen_of(&canvas, &previews, pinned).min - pinned_before.min;
+    assert!(
+        free_moved.x > 60.0 && free_moved.y > 40.0,
+        "the drag should move the free tile: {free_moved:?}"
+    );
+    assert!(
+        (pinned_moved - free_moved).length() < 0.5,
+        "pinned tile moved {pinned_moved:?}, free tile moved {free_moved:?}"
+    );
+    assert!(previews.get(pinned).unwrap().viewport_pin.is_some());
+}
+
+#[test]
 fn unpinning_preserves_the_current_screen_rect() {
     let mut canvas = CanvasState {
         pan: Vec2::new(-60.0, 25.0),

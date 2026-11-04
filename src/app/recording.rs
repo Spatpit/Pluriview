@@ -16,6 +16,18 @@ pub(super) struct RecordingState {
     finishing: Vec<FinishingRecording>,
 }
 
+impl RecordingState {
+    /// On exit: give recordings still being finished until `deadline` to
+    /// complete their files, which are unplayable if cut off.
+    pub(super) fn wait_for_files(&mut self, deadline: Instant) {
+        for finishing in self.finishing.drain(..) {
+            let _ = finishing
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+}
+
 struct FinishingRecording {
     receiver: mpsc::Receiver<Result<PathBuf, String>>,
     /// The flight thumbnail, reused by the Screenshots panel.
@@ -825,9 +837,57 @@ fn unique_path(directory: &std::path::Path, stem: &str, extension: &str) -> Path
 
 #[cfg(test)]
 mod tests {
-    use super::{format_elapsed, place_in};
+    use super::{format_elapsed, place_in, FinishingRecording, RecordingState};
+    use crate::recording::Format;
     use eframe::egui;
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn finishing(
+        receiver: mpsc::Receiver<Result<std::path::PathBuf, String>>,
+    ) -> FinishingRecording {
+        FinishingRecording {
+            receiver,
+            thumbnail: None,
+            length: Duration::from_secs(3),
+            format: Format::Mp4,
+        }
+    }
+
+    #[test]
+    fn exit_waits_for_a_recording_still_being_finished() {
+        let (done, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            let _ = done.send(Ok("clip.mp4".into()));
+        });
+        let mut state = RecordingState::default();
+        state.finishing.push(finishing(receiver));
+
+        let started = Instant::now();
+        state.wait_for_files(started + Duration::from_secs(10));
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(state.finishing.is_empty());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn exit_stops_waiting_at_the_deadline() {
+        // Never answers: a stuck disk must not keep Pluriview open.
+        let (_done, stuck) = mpsc::channel();
+        let (_done2, stuck2) = mpsc::channel();
+        let mut state = RecordingState::default();
+        state.finishing.push(finishing(stuck));
+        state.finishing.push(finishing(stuck2));
+
+        let started = Instant::now();
+        state.wait_for_files(started + Duration::from_millis(100));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(100));
+        // One shared deadline, not one per file.
+        assert!(waited < Duration::from_millis(1_000), "waited {waited:?}");
+    }
 
     #[test]
     fn elapsed_time_reads_like_a_clock() {

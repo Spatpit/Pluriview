@@ -41,6 +41,16 @@ impl ScreenshotState {
         self.pending_combined.clear();
         self.landings.clear();
     }
+
+    /// On exit: give screenshots still being written until `deadline` to
+    /// finish, so none is left as a cut-off file.
+    pub(super) fn wait_for_saves(&mut self, deadline: Instant) {
+        for shot in self.saving.drain(..) {
+            let _ = shot
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
 }
 
 struct SavingShot {

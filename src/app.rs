@@ -101,6 +101,9 @@ const WALLPAPER_HIBERNATE_AFTER: Duration = Duration::from_secs(10);
 const MAX_RECENT_URLS: usize = 8;
 /// Persist a changed workspace at most this long after the previous check.
 const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
+/// On exit, the longest wait for recordings and screenshots still being
+/// written to finish.
+const EXIT_SAVE_WAIT: Duration = Duration::from_secs(15);
 /// Recoverable deletion window for a named canvas view.
 const CANVAS_VIEW_UNDO_SECS: f32 = 4.0;
 const CANVAS_NOTICE_SECS: f32 = 4.0;
@@ -2485,26 +2488,35 @@ impl PluriviewApp {
             if !still_needed {
                 continue;
             }
-            let ToolStatus::Available { path: mpv_path, .. } =
-                self.external_tools.status(ToolKind::Mpv)
-            else {
-                if let Some(entry) = self
-                    .preview_manager
-                    .get_mut(playlist_id)
-                    .and_then(|preview| preview.folder_playlist.as_mut())
-                    .and_then(|playlist| {
-                        playlist.entries.iter_mut().find(|entry| entry.path == path)
-                    })
-                {
-                    entry.thumbnail_state = ThumbnailState::Failed;
-                }
-                continue;
-            };
+            let mpv_path =
+                match available_tool_path(self.external_tools.status(ToolKind::Mpv), "mpv") {
+                    Ok(Some(mpv_path)) => mpv_path,
+                    // Still looking for mpv, as right after launch: wait for it
+                    // rather than failing every thumbnail for the session.
+                    Ok(None) => {
+                        self.playlist_thumbnail_queue
+                            .push_front((playlist_id, path));
+                        break;
+                    }
+                    Err(_) => {
+                        if let Some(entry) = self
+                            .preview_manager
+                            .get_mut(playlist_id)
+                            .and_then(|preview| preview.folder_playlist.as_mut())
+                            .and_then(|playlist| {
+                                playlist.entries.iter_mut().find(|entry| entry.path == path)
+                            })
+                        {
+                            entry.thumbnail_state = ThumbnailState::Failed;
+                        }
+                        continue;
+                    }
+                };
             self.playlist_thumbnail_jobs.push(PlaylistThumbnailJob {
                 playlist_id,
                 path: path.clone(),
                 receiver: video::spawn_video_thumbnail(
-                    mpv_path.clone(),
+                    mpv_path,
                     video::VideoThumbnailSource::LocalFile(path),
                     1.0,
                 ),
@@ -5859,6 +5871,9 @@ impl eframe::App for PluriviewApp {
         if let Err(error) = self.save_active_workspace() {
             eprintln!("{error}");
         }
+        // A recording in progress is finished like any other stop, so it
+        // shares the wait below.
+        self.stop_recording_for_layout_change();
         #[cfg(windows)]
         self.drop_live_window();
         self.capture_coordinator.stop_all();
@@ -5870,6 +5885,11 @@ impl eframe::App for PluriviewApp {
         } else {
             self.video_manager.clear();
         }
+        // Their workers would be cut off when the process ends, leaving a
+        // broken file. Bounded, so a stuck disk cannot keep Pluriview open.
+        let deadline = Instant::now() + EXIT_SAVE_WAIT;
+        self.recording.wait_for_files(deadline);
+        self.screenshots.wait_for_saves(deadline);
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {

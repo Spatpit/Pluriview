@@ -80,6 +80,26 @@ impl CanvasState {
         }
     }
 
+    /// End a resize or crop handle drag whose handle stopped being drawn
+    /// before the button came up: letting go of Alt over a group swaps the
+    /// tile handles for the group outline, and a removed tile takes its
+    /// handles with it. Without this the stale drag blocks pan, zoom, inertia
+    /// and box selection. `pointer_held` is any button down or released this
+    /// frame; a live handle clears its own drag on the release frame.
+    pub(super) fn end_orphaned_handle_drag(
+        &mut self,
+        pointer_held: bool,
+        preview_manager: &PreviewManager,
+    ) {
+        let Some(DragState::Resizing { id, .. } | DragState::Cropping { id, .. }) = self.drag_state
+        else {
+            return;
+        };
+        if !pointer_held || preview_manager.get(id).is_none() {
+            self.drag_state = None;
+        }
+    }
+
     /// Fit one tile in the current canvas without changing its saved geometry.
     pub fn focus_on_tile(&mut self, id: PreviewId, tile_rect: Rect, canvas_rect: Rect) {
         self.groups.reorder = None;

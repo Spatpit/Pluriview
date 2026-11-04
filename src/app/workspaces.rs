@@ -113,6 +113,9 @@ impl PluriviewApp {
                 );
             }
             Err(error) => {
+                // Reload Workspace failed: the recovery screen takes over,
+                // and what was running must not carry on behind it.
+                self.close_running_workspace();
                 self.workspace_error = Some(error);
             }
         }
@@ -687,6 +690,27 @@ impl PluriviewApp {
 
     /// Apply a SavedLayout to restore state
     pub(super) fn apply_layout(&mut self, layout: &SavedLayout) {
+        self.close_running_workspace();
+        #[cfg(windows)]
+        {
+            self.next_playlist_group = layout
+                .previews
+                .iter()
+                .filter_map(|preview| preview.playlist_group)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+        }
+
+        // Restore canvas state
+        self.apply_layout_contents(layout);
+    }
+
+    /// Stop everything the current workspace runs: tiles and their
+    /// captures, videos, browsers, audio, recording, wallpaper, picture in
+    /// picture and the window in use. Before a layout replaces it, and when a
+    /// reload fails, so nothing keeps playing behind the recovery screen.
+    fn close_running_workspace(&mut self) {
         #[cfg(windows)]
         self.drop_live_window();
         self.close_picture_in_picture();
@@ -713,13 +737,6 @@ impl PluriviewApp {
             self.seek_preview_manager.clear();
             self.playlist_thumbnail_queue.clear();
             self.playlist_thumbnail_jobs.clear();
-            self.next_playlist_group = layout
-                .previews
-                .iter()
-                .filter_map(|preview| preview.playlist_group)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
         }
         self.preview_manager.clear();
         self.canvas.clear_preview_interactions();
@@ -733,8 +750,10 @@ impl PluriviewApp {
             self.window_audio_monitors.clear();
             self.last_inactive_window_scan = None;
         }
+    }
 
-        // Restore canvas state
+    /// Restore `layout` into the cleared app: canvas, wallpaper and tiles.
+    fn apply_layout_contents(&mut self, layout: &SavedLayout) {
         self.canvas.pan = Vec2::new(layout.canvas.pan.0, layout.canvas.pan.1);
         self.canvas.zoom = layout.canvas.zoom;
         self.canvas.show_grid = layout.canvas.show_grid;

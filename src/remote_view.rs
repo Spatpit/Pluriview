@@ -600,12 +600,23 @@ impl RemoteView {
 }
 
 impl Host {
-    /// Replace the QR/link secret. A phone still using the old link loses
-    /// access on its next request; approved nearby pairings are unaffected.
+    /// Replace the QR/link secret and disconnect the phone using the old
+    /// link, as the dialog promises. Its open video, control and audio streams
+    /// never re-authenticate, so its watch ends here; later requests signed
+    /// with the old link are refused. A phone approved through nearby pairing
+    /// may reconnect with that approval.
     fn refresh_invite(&mut self) -> io::Result<()> {
         let invite = Invite::new()?;
         let (link, qr) = invite_link(self.address, &invite.token)?;
-        *self.shared.invite.lock() = invite;
+        let previous = std::mem::replace(&mut *self.shared.invite.lock(), invite);
+        if let Some(client) = previous.client {
+            let mut peer = self.shared.peer.lock();
+            if peer.as_ref().is_some_and(|peer| peer.id == client) {
+                *peer = None;
+                drop(peer);
+                self.shared.invalidate();
+            }
+        }
         self.invite = link;
         self.qr = qr;
         Ok(())
@@ -824,7 +835,11 @@ impl Host {
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 std::thread::sleep(Duration::from_millis(10))
                             }
-                            Err(_) => break,
+                            // A phone that drops before its connection is
+                            // accepted, or a brief socket shortage, fails one
+                            // accept. Keep the worker; the pause stops a
+                            // lasting error from spinning.
+                            Err(_) => std::thread::sleep(Duration::from_millis(100)),
                         }
                     }
                 })?;
@@ -1441,6 +1456,37 @@ mod tests {
         canvas.apply_viewer_camera(command);
         assert_eq!(canvas.zoom, canvas.zoom_max);
         assert!(canvas.screen_to_canvas(anchor, rect).distance(before) < 0.001);
+    }
+
+    #[test]
+    fn a_new_pairing_link_disconnects_only_the_phone_using_the_old_one() {
+        let mut host = Host::start(Ipv4Addr::LOCALHOST, egui::Context::default()).unwrap();
+        let watch = |host: &Host, id: &str| {
+            *host.shared.peer.lock() = Some(Peer {
+                id: id.into(),
+                seen: Instant::now(),
+            });
+        };
+        // The link's phone is watching: a new link ends its watch.
+        host.shared.invite.lock().client = Some("link-phone".into());
+        watch(&host, "link-phone");
+        let epoch = host.shared.epoch.load(Ordering::Relaxed);
+        host.refresh_invite().unwrap();
+        assert!(host.shared.peer.lock().is_none());
+        assert!(!host.shared.watching());
+        assert!(host.shared.epoch.load(Ordering::Relaxed) > epoch);
+        assert!(host.shared.invite.lock().client.is_none());
+
+        // A nearby-paired phone watching while an unrelated link is replaced
+        // keeps watching.
+        host.shared.invite.lock().client = Some("link-phone".into());
+        watch(&host, "paired-phone");
+        host.refresh_invite().unwrap();
+        assert!(host.shared.watching());
+
+        // An unused link has no phone to disconnect.
+        host.refresh_invite().unwrap();
+        assert!(host.shared.watching());
     }
 
     #[test]
