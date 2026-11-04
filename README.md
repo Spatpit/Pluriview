@@ -207,8 +207,10 @@ connection isn't encrypted, so only use it on a network you trust.
 
 ## Shortcuts
 
-All keyboard shortcuts can be changed in **Tools → Settings**. Press `F1` in the
-app for the full list.
+All keyboard shortcuts can be changed in **Tools → Settings → Keyboard
+Shortcuts**, grouped by area with a search box. Click a key, press the new one,
+and use **Swap** if another action already has it. Press `F1` in the app for the
+full list, with a **Change Shortcuts...** button.
 
 | Action | Shortcut |
 |---|---|

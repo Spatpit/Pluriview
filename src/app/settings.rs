@@ -30,50 +30,13 @@ impl PluriviewApp {
                 self.assign_recorded_hotkey(slot, Hotkey::pair(first_key, second_key));
             } else if self.hotkey_tracker.is_down(first_key) {
                 self.hotkey_recording_first = Some(first_key);
-                self.hotkey_error = None;
+                self.hotkey_conflict = None;
             } else {
                 // A quick tap can begin and end between polls; Windows retains
                 // the pressed edge, so it is still a valid single-key binding.
                 self.assign_recorded_hotkey(slot, Hotkey::key(first_key));
             }
         }
-    }
-
-    pub(super) fn assign_recorded_hotkey(&mut self, slot: HotkeySlot, hotkey: Hotkey) {
-        if let Some(conflict) = self.app_config.keyboard_shortcuts.conflict(slot, hotkey) {
-            self.hotkey_error = Some(format!(
-                "{} is already assigned to {}.",
-                hotkey.display(),
-                conflict.label()
-            ));
-            self.hotkey_recording_first = None;
-        } else {
-            self.app_config.keyboard_shortcuts.set(slot, hotkey);
-            self.hotkey_recording = None;
-            self.hotkey_recording_first = None;
-            self.hotkey_error = None;
-            self.save_app_config();
-        }
-    }
-
-    pub(super) fn shortcut_settings_row(&mut self, ui: &mut egui::Ui, slot: HotkeySlot) {
-        ui.label(slot.label());
-        let recording = self.hotkey_recording == Some(slot);
-        let text = if recording {
-            self.hotkey_recording_first.map_or_else(
-                || "Press a key…".to_owned(),
-                |first| format!("{} + …", Hotkey::key(first).display()),
-            )
-        } else {
-            self.app_config.keyboard_shortcuts.get(slot).display()
-        };
-        let button = egui::Button::new(text).min_size(Vec2::new(180.0, 24.0));
-        if ui.add(button).clicked() {
-            self.hotkey_recording = Some(slot);
-            self.hotkey_recording_first = None;
-            self.hotkey_error = None;
-        }
-        ui.end_row();
     }
 
     pub(super) fn settings_ui(&mut self, ctx: &egui::Context) {
@@ -88,137 +51,94 @@ impl PluriviewApp {
         let mut open = self.show_settings;
         let mut close = false;
         let mut action = None;
-        let mut restore_hotkeys = false;
-        let is_viewpoint_shortcut = |slot: HotkeySlot| {
-            matches!(
-                slot,
-                HotkeySlot::PreviousCanvasView | HotkeySlot::NextCanvasView
-            ) || HotkeySlot::CANVAS_VIEWS.contains(&slot)
-        };
+        // Leave room for the tabs and the Close row on short screens.
+        let scroll_height = (ctx.screen_rect().height() - 260.0).clamp(220.0, 560.0);
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(600.0)
-            .default_height(680.0)
+            .default_width(620.0)
+            .min_width(520.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(
                 egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 28)),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(580.0)
-                    .show(ui, |ui| {
-                        ui.heading("External tools");
-                        ui.label(
-                            egui::RichText::new(
-                                "Video files play with bundled libmpv. Streamlink is only needed for live stream URLs.",
-                            )
-                            .weak(),
-                        );
-                        ui.add_space(8.0);
-                        for kind in ToolKind::SETTINGS {
-                            ui.group(|ui| {
-                                Self::external_tool_settings_row(
-                                    ui,
-                                    kind,
-                                    &self.external_tools,
-                                    &mut action,
-                                );
-                            });
-                            ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    for (tab, icon, label) in [
+                        (
+                            SettingsTab::Shortcuts,
+                            egui_phosphor::regular::KEYBOARD,
+                            "Keyboard Shortcuts",
+                        ),
+                        (
+                            SettingsTab::ExternalTools,
+                            egui_phosphor::regular::WRENCH,
+                            "External Tools",
+                        ),
+                    ] {
+                        let selected = self.settings_tab == tab;
+                        let text = egui::RichText::new(format!("{icon}  {label}")).size(14.5);
+                        let text = if selected {
+                            text.color(crate::ui_theme::GOLD)
+                        } else {
+                            text
+                        };
+                        if ui.selectable_label(selected, text).clicked() && !selected {
+                            self.settings_tab = tab;
+                            self.stop_hotkey_recording();
                         }
-                        ui.separator();
-                        ui.add_space(12.0);
-                        ui.heading("Keyboard shortcuts");
-                        ui.label(
-                            egui::RichText::new(
-                                "Click a shortcut, then tap one key, or hold one key and press a second. Mouse controls are not changed here.",
-                            )
-                            .weak(),
-                        );
-                        ui.add_space(8.0);
+                    }
+                });
+                ui.separator();
+                ui.add_space(4.0);
 
-                        egui::Grid::new("settings_hotkeys_grid")
-                            .num_columns(2)
-                            .spacing([24.0, 7.0])
+                match self.settings_tab {
+                    SettingsTab::Shortcuts => self.shortcuts_tab(ui, scroll_height),
+                    SettingsTab::ExternalTools => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("settings_external_tools_scroll")
+                            .max_height(scroll_height)
                             .show(ui, |ui| {
-                                for slot in HotkeySlot::ALL.into_iter().filter(|slot| !is_viewpoint_shortcut(*slot)) {
-                                    self.shortcut_settings_row(ui, slot);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Video files play with bundled libmpv. Streamlink is only needed for live stream URLs.",
+                                    )
+                                    .weak(),
+                                );
+                                ui.add_space(8.0);
+                                for kind in ToolKind::SETTINGS {
+                                    ui.group(|ui| {
+                                        Self::external_tool_settings_row(
+                                            ui,
+                                            kind,
+                                            &self.external_tools,
+                                            &mut action,
+                                        );
+                                    });
+                                    ui.add_space(8.0);
+                                }
+                                if ui.button("Re-scan All").clicked() {
+                                    self.external_tools.rescan_all();
                                 }
                             });
-
-                        ui.add_space(12.0);
-                        let viewpoints = egui::CollapsingHeader::new("Saved Viewpoints")
-                            .id_salt("settings_saved_viewpoint_shortcuts")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                egui::Grid::new("settings_viewpoint_hotkeys_grid")
-                                    .num_columns(2)
-                                    .spacing([24.0, 7.0])
-                                    .show(ui, |ui| {
-                                        for slot in HotkeySlot::ALL.into_iter().filter(|slot| is_viewpoint_shortcut(*slot)) {
-                                            self.shortcut_settings_row(ui, slot);
-                                        }
-                                    });
-                            });
-                        if viewpoints.body_response.is_none()
-                            && self.hotkey_recording.is_some_and(is_viewpoint_shortcut)
-                        {
-                            self.hotkey_recording = None;
-                            self.hotkey_recording_first = None;
-                            self.hotkey_error = None;
-                        }
-
-                        if let Some(error) = &self.hotkey_error {
-                            ui.add_space(6.0);
-                            ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
-                        } else if self.hotkey_recording.is_some() {
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Listening… release for one key, or hold it and press another for a two-key shortcut.",
-                                )
-                                .weak(),
-                            );
-                        }
-
-                        ui.add_space(8.0);
-                        if ui.button("Restore Default Keys").clicked() {
-                            restore_hotkeys = true;
-                        }
-
-                        if let Some(error) = &self.config_error {
-                            ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
-                            ui.add_space(6.0);
-                        }
-                    });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Re-scan All").clicked() {
-                        self.external_tools.rescan_all();
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Close").clicked() {
-                            close = true;
-                        }
-                    });
+                }
+
+                if let Some(error) = &self.config_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::from_rgb(235, 120, 120), error);
+                }
+                ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
                 });
             });
         self.show_settings = open && !close;
         if !self.show_settings {
-            self.hotkey_recording = None;
-            self.hotkey_recording_first = None;
-            self.hotkey_error = None;
-        }
-
-        if restore_hotkeys {
-            self.app_config.keyboard_shortcuts = HotkeyBindings::default();
-            self.hotkey_recording = None;
-            self.hotkey_recording_first = None;
-            self.hotkey_error = None;
-            self.save_app_config();
+            self.stop_hotkey_recording();
         }
 
         match action {
@@ -259,6 +179,7 @@ impl PluriviewApp {
             });
         if open_settings {
             self.external_tool_error = None;
+            self.settings_tab = SettingsTab::ExternalTools;
             self.show_settings = true;
         } else if close {
             self.external_tool_error = None;

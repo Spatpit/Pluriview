@@ -65,10 +65,12 @@ mod screenshot_drop;
 mod screenshot_panel;
 mod screenshots;
 mod settings;
+mod shortcut_editor;
 mod source_loading;
 mod tile_control;
 mod welcome_tour;
 mod workspaces;
+use shortcut_editor::{HotkeyConflict, SettingsTab};
 use source_loading::{PreparedSource, SourceLoads, SourceTarget};
 
 /// How long after activating a browser we skip the focus-loss check, so the
@@ -1063,8 +1065,14 @@ pub struct PluriviewApp {
     /// First key held while the recorder waits to see whether this is a pair.
     hotkey_recording_first: Option<u16>,
 
-    /// Validation feedback for the keyboard shortcut editor.
-    hotkey_error: Option<String>,
+    /// A key the shortcut editor found in use by another shortcut.
+    hotkey_conflict: Option<HotkeyConflict>,
+
+    /// Search text in the shortcut editor.
+    shortcut_search: String,
+
+    /// Page showing in the Settings window.
+    settings_tab: SettingsTab,
 
     /// Active canvas right-click "Add Window..." popup, if any.
     quick_add: Option<QuickAddPopup>,
@@ -1293,7 +1301,9 @@ impl PluriviewApp {
             hotkey_tracker: HotkeyTracker::default(),
             hotkey_recording: None,
             hotkey_recording_first: None,
-            hotkey_error: None,
+            hotkey_conflict: None,
+            shortcut_search: String::new(),
+            settings_tab: SettingsTab::default(),
             quick_add: None,
             media_error: None,
             canvas_notice: None,
@@ -2147,6 +2157,7 @@ impl PluriviewApp {
     #[cfg(windows)]
     fn handle_video_action(&mut self, ctx: &egui::Context, id: PreviewId, action: VideoAction) {
         if action == VideoAction::OpenSettings {
+            self.settings_tab = SettingsTab::ExternalTools;
             self.show_settings = true;
             ctx.request_repaint();
             return;
@@ -6829,7 +6840,19 @@ impl eframe::App for PluriviewApp {
                         });
 
                     ui.add_space(15.0);
-                    ui.vertical_centered(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(format!(
+                                "{}  Change Shortcuts...",
+                                egui_phosphor::regular::KEYBOARD
+                            ))
+                            .on_hover_text("Open Settings to change any of these keys")
+                            .clicked()
+                        {
+                            self.show_shortcuts = false;
+                            self.settings_tab = SettingsTab::Shortcuts;
+                            self.show_settings = true;
+                        }
                         if ui.button("Close").clicked() {
                             self.show_shortcuts = false;
                         }
