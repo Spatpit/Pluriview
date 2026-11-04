@@ -32,8 +32,8 @@ enum View {
 /// What dragging on the map does. A click on a tile focuses it either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum MapMode {
-    #[default]
     Camera,
+    #[default]
     Tiles,
 }
 
@@ -1543,16 +1543,16 @@ fn map(
     ui.horizontal(|ui| {
         for (mode, icon, label, hint) in [
             (
-                MapMode::Camera,
-                icons::HAND,
-                "Move camera",
-                "Drag to move the canvas view; click empty space to jump there",
-            ),
-            (
                 MapMode::Tiles,
                 icons::ARROWS_OUT_CARDINAL,
                 "Move tiles",
                 "Drag tiles to move them on the canvas; a group moves together",
+            ),
+            (
+                MapMode::Camera,
+                icons::HAND,
+                "Move camera",
+                "Drag to move the canvas view; click empty space to jump there",
             ),
         ] {
             if ui
@@ -2176,6 +2176,11 @@ mod tests {
         // Moving the camera leaves no grip to catch the pointer.
         let actions = run_map_with(pinned_over_another(), MapMode::Camera, click(grip));
         assert_eq!(actions, vec![Action::Focus(PreviewId(2))]);
+    }
+
+    #[test]
+    fn the_map_moves_tiles_by_default() {
+        assert_eq!(UiState::default().map_mode, MapMode::Tiles);
     }
 
     #[test]

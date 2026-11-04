@@ -864,6 +864,14 @@ fn capture_resolution_badge_rect(left_of: Rect) -> Rect {
     )
 }
 
+/// The hover FPS pill, left of the close button. Click it to change the rate.
+fn fps_badge_rect(screen_rect: Rect) -> Rect {
+    Rect::from_min_size(
+        screen_rect.right_top() + Vec2::new(-72.0, 10.0),
+        Vec2::new(36.0, 20.0),
+    )
+}
+
 /// Hover FPS pill sits at x=-72 with width 36; Stream Audio is 4px to its left.
 fn stream_audio_badge_rect(screen_rect: Rect, enabled: bool, beside_fps: bool) -> Rect {
     let width = if enabled { 104.0 } else { 82.0 };
@@ -2324,6 +2332,7 @@ impl CanvasState {
                     self.pending_tile_control = true;
                     ui.close_menu();
                 }
+                self.show_hidden_items(ui, preview_manager);
                 saved_viewpoints_submenu(ui, |ui| canvas_views_menu(ui));
                 if ui.button("Reset View").clicked() {
                     self.reset();
@@ -2336,10 +2345,7 @@ impl CanvasState {
                     "Show Grid",
                     keyboard_shortcuts.get(HotkeySlot::ToggleGrid),
                 );
-                if ui
-                    .checkbox(&mut self.always_on_top, "Always on Top")
-                    .changed()
-                {
+                if crate::ui_theme::toggle(ui, &mut self.always_on_top, "Always on Top").changed() {
                     self.pending_always_on_top = Some(self.always_on_top);
                     ui.close_menu();
                 }
@@ -2876,22 +2882,40 @@ impl CanvasState {
                 // Capture FPS does not apply to file-backed image tiles.
                 if !is_media && !is_playlist {
                     let fps_text = format!("{}", target_fps);
-                    let fps_rect = Rect::from_min_size(
-                        screen_rect.right_top() + Vec2::new(-72.0, 10.0),
-                        Vec2::new(36.0, 20.0),
-                    );
+                    let fps_rect = fps_badge_rect(screen_rect);
+                    // Clicking steps through 15 → 30 → 60 → 15 FPS.
+                    let fps_response = ui
+                        .interact(fps_rect, ui.id().with(("fps_badge", id.0)), Sense::click())
+                        .on_hover_text(format!(
+                            "{} — click for {}",
+                            info.fps_preset.label(),
+                            info.fps_preset.next().label()
+                        ));
+                    let fps_hovered = fps_response.hovered();
                     painter.rect_filled(
                         fps_rect,
                         10.0,
-                        Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                        Color32::from_rgba_unmultiplied(
+                            0,
+                            0,
+                            0,
+                            if fps_hovered { 220 } else { 180 },
+                        ),
                     );
                     painter.text(
                         fps_rect.center(),
                         egui::Align2::CENTER_CENTER,
                         &fps_text,
                         egui::FontId::proportional(10.0),
-                        Color32::from_rgb(150, 150, 150),
+                        if fps_hovered {
+                            crate::ui_theme::GOLD
+                        } else {
+                            Color32::from_rgb(150, 150, 150)
+                        },
                     );
+                    if fps_response.clicked() {
+                        self.set_tile_fps(id, info.fps_preset.next());
+                    }
                     if is_window_capture {
                         self.paint_stream_audio_badge(
                             ui,

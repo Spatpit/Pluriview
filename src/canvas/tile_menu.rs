@@ -1,6 +1,6 @@
 //! A tile's right-click menu. Every kind of tile lists the same sections in
-//! the same order: what its content does, how it is viewed, where it sits,
-//! its settings, then Remove.
+//! the same order: what its content does ending with Tile Settings, how it is
+//! viewed, its group, then Remove.
 use super::*;
 use crate::preview::VideoSource;
 use crate::ui_theme;
@@ -33,25 +33,23 @@ impl CanvasState {
             self.activity_items(ui, &selected, preview_manager);
             ui.separator();
         }
-        if self.content_items(
+        // Tile Settings closes the tile's own actions (after Native Size on
+        // window tiles).
+        self.content_items(
             ui,
             info,
             canvas_rect,
             pixels_per_point,
             preview_manager,
             keyboard_shortcuts,
-        ) {
-            ui.separator();
-        }
+        );
+        self.tile_settings_menu(ui, info, canvas_rect, preview_manager, keyboard_shortcuts);
+        ui.separator();
 
         self.view_items(ui, info, canvas_rect, preview_manager, keyboard_shortcuts);
         ui.separator();
 
-        self.arrange_menu(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
         self.group_menu(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
-        ui.separator();
-
-        self.tile_settings_menu(ui, info, canvas_rect, preview_manager);
         if !info.manually_frozen {
             self.activity_items(ui, &selected, preview_manager);
         }
@@ -108,7 +106,7 @@ impl CanvasState {
         }
     }
 
-    /// The actions of the tile's own content. Returns whether there are any.
+    /// The actions of the tile's own content, if it has any.
     fn content_items(
         &mut self,
         ui: &mut egui::Ui,
@@ -117,7 +115,7 @@ impl CanvasState {
         pixels_per_point: f32,
         preview_manager: &mut PreviewManager,
         keyboard_shortcuts: &HotkeyBindings,
-    ) -> bool {
+    ) {
         if info.is_playlist {
             self.playlist_items(ui, info.id, preview_manager);
         } else if info.is_media {
@@ -128,10 +126,7 @@ impl CanvasState {
             self.video_items(ui, info);
         } else if info.is_window_capture {
             self.window_items(ui, info, canvas_rect, pixels_per_point, preview_manager);
-        } else {
-            return false;
         }
-        true
     }
 
     fn browser_items(
@@ -519,7 +514,7 @@ impl CanvasState {
         if ui
             .button(label)
             .on_hover_text(
-                "Take it off the canvas while it keeps running. Show it again from the Control Tile Center",
+                "Take it off the canvas while it keeps running. Show it again by right-clicking empty canvas, or from the Control Tile Center",
             )
             .clicked()
         {
@@ -528,21 +523,19 @@ impl CanvasState {
         }
     }
 
-    /// Options set once and rarely changed.
+    /// Frame rate first, then arrangement and stacking, crop and options set
+    /// once and rarely changed, then size last.
     fn tile_settings_menu(
         &mut self,
         ui: &mut egui::Ui,
         info: &TileInfo,
         canvas_rect: Rect,
         preview_manager: &mut PreviewManager,
+        keyboard_shortcuts: &HotkeyBindings,
     ) {
         let id = info.id;
         ui.menu_button("Tile Settings", |ui| {
             ui_theme::menu(ui);
-            if !info.is_playlist {
-                self.crop_items(ui, id, canvas_rect, preview_manager);
-                ui.separator();
-            }
             if !info.is_media && !info.is_playlist {
                 ui.menu_button(format!("Frame Rate: {}", info.fps_preset.label()), |ui| {
                     ui_theme::menu(ui);
@@ -559,6 +552,13 @@ impl CanvasState {
                         }
                     }
                 });
+                ui.separator();
+            }
+            self.arrange_items(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
+            ui.separator();
+            if !info.is_playlist {
+                self.crop_items(ui, id, canvas_rect, preview_manager);
+                ui.separator();
             }
             if info.is_browser {
                 let mut locked = info.lock_aspect_ratio;
@@ -580,6 +580,8 @@ impl CanvasState {
                 self.toggle_left_click_disabled(id, preview_manager);
                 ui.close_menu();
             }
+            ui.separator();
+            self.size_menu(ui, canvas_rect, preview_manager, keyboard_shortcuts);
         });
     }
 }

@@ -942,7 +942,7 @@ impl CanvasState {
         }
     }
 
-    fn members_of(group: u64, previews: &PreviewManager) -> Vec<PreviewId> {
+    pub(super) fn members_of(group: u64, previews: &PreviewManager) -> Vec<PreviewId> {
         let mut members: Vec<_> = previews
             .all()
             .filter(|p| p.removing.is_none())
@@ -1874,8 +1874,9 @@ impl CanvasState {
         });
     }
 
-    /// Group arrangements (for a tile in a group), sizes and stacking order.
-    pub(super) fn arrange_menu(
+    /// Group arrangements (for a tile in a group) and stacking order, in the
+    /// Tile Settings submenu.
+    pub(super) fn arrange_items(
         &mut self,
         ui: &mut egui::Ui,
         id: PreviewId,
@@ -1886,85 +1887,85 @@ impl CanvasState {
         let settings = self
             .group_settings(id, previews)
             .filter(|_| self.group_members(id, previews).len() > 1);
-        ui.menu_button("Arrange", |ui| {
-            crate::ui_theme::menu(ui);
-            if let Some(settings) = &settings {
-                let mut free = settings.arrangement == GroupArrangement::Free;
-                if crate::ui_theme::toggle(ui, &mut free, "Free Arrangement")
-                    .on_hover_text("Tiles stay wherever you put them")
+        if let Some(settings) = &settings {
+            let mut free = settings.arrangement == GroupArrangement::Free;
+            if crate::ui_theme::toggle(ui, &mut free, "Free Arrangement")
+                .on_hover_text("Tiles stay wherever you put them")
+                .clicked()
+            {
+                self.set_group_arrangement(id, GroupArrangement::Free, None, viewport, previews);
+                ui.close_menu();
+            }
+            for (arrangement, slot, label) in PRESETS {
+                let mut chosen = settings.arrangement == arrangement;
+                if crate::ui_theme::shortcut_toggle(ui, &mut chosen, label, shortcuts.get(slot))
                     .clicked()
                 {
-                    self.set_group_arrangement(
-                        id,
-                        GroupArrangement::Free,
-                        None,
-                        viewport,
-                        previews,
-                    );
+                    self.set_group_arrangement(id, arrangement, Some(id), viewport, previews);
                     ui.close_menu();
                 }
-                for (arrangement, slot, label) in PRESETS {
-                    let mut chosen = settings.arrangement == arrangement;
-                    if crate::ui_theme::shortcut_toggle(ui, &mut chosen, label, shortcuts.get(slot))
-                        .clicked()
-                    {
-                        self.set_group_arrangement(id, arrangement, Some(id), viewport, previews);
-                        ui.close_menu();
-                    }
-                }
-                if ui
-                    .add(crate::ui_theme::shortcut_button(
-                        "Make Main Tile",
-                        shortcuts.get(HotkeySlot::MakeMainTile),
-                    ))
-                    .on_hover_text("Show this tile in the group's large slot")
-                    .clicked()
-                {
-                    self.make_main_tile(id, viewport, previews);
-                    ui.close_menu();
-                }
-                if settings.arrangement != GroupArrangement::Free {
-                    ui.menu_button("Gap", |ui| {
-                        crate::ui_theme::menu(ui);
-                        for (gap, label) in [
-                            (GroupGap::None, "None"),
-                            (GroupGap::Small, "Small"),
-                            (GroupGap::Large, "Large"),
-                        ] {
-                            let mut chosen = settings.gap == gap;
-                            if crate::ui_theme::toggle(ui, &mut chosen, label).clicked() {
-                                self.set_group_gap(id, gap, viewport, previews);
-                                ui.close_menu();
-                            }
+            }
+            if ui
+                .add(crate::ui_theme::shortcut_button(
+                    "Make Main Tile",
+                    shortcuts.get(HotkeySlot::MakeMainTile),
+                ))
+                .on_hover_text("Show this tile in the group's large slot")
+                .clicked()
+            {
+                self.make_main_tile(id, viewport, previews);
+                ui.close_menu();
+            }
+            if settings.arrangement != GroupArrangement::Free {
+                ui.menu_button("Gap", |ui| {
+                    crate::ui_theme::menu(ui);
+                    for (gap, label) in [
+                        (GroupGap::None, "None"),
+                        (GroupGap::Small, "Small"),
+                        (GroupGap::Large, "Large"),
+                    ] {
+                        let mut chosen = settings.gap == gap;
+                        if crate::ui_theme::toggle(ui, &mut chosen, label).clicked() {
+                            self.set_group_gap(id, gap, viewport, previews);
+                            ui.close_menu();
                         }
-                    });
-                }
-                if ui.button("Fit Group to View").clicked() {
-                    self.fit_group_to_view(id, viewport, previews);
+                    }
+                });
+            }
+            if ui.button("Fit Group to View").clicked() {
+                self.fit_group_to_view(id, viewport, previews);
+                ui.close_menu();
+            }
+            ui.separator();
+        }
+        if ui.button("Bring to Front").clicked() {
+            self.restack_group(id, true, previews);
+            ui.close_menu();
+        }
+        if ui.button("Send to Back").clicked() {
+            self.restack_group(id, false, previews);
+            ui.close_menu();
+        }
+    }
+
+    /// Size presets for the selection, last in the Tile Settings submenu.
+    pub(super) fn size_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        viewport: Rect,
+        previews: &mut PreviewManager,
+        shortcuts: &HotkeyBindings,
+    ) {
+        ui.menu_button("Size", |ui| {
+            crate::ui_theme::menu(ui);
+            for (width, slot, label) in SIZES {
+                if ui
+                    .add(crate::ui_theme::shortcut_button(label, shortcuts.get(slot)))
+                    .clicked()
+                {
+                    self.resize_selection(width, viewport, previews);
                     ui.close_menu();
                 }
-                ui.separator();
-            }
-            ui.menu_button("Size", |ui| {
-                crate::ui_theme::menu(ui);
-                for (width, slot, label) in SIZES {
-                    if ui
-                        .add(crate::ui_theme::shortcut_button(label, shortcuts.get(slot)))
-                        .clicked()
-                    {
-                        self.resize_selection(width, viewport, previews);
-                        ui.close_menu();
-                    }
-                }
-            });
-            ui.separator();
-            if ui.button("Bring to Front").clicked() {
-                self.restack_group(id, true, previews);
-                ui.close_menu();
-            }
-            if ui.button("Send to Back").clicked() {
-                self.restack_group(id, false, previews);
-                ui.close_menu();
             }
         });
     }

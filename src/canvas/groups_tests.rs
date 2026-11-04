@@ -1353,3 +1353,31 @@ fn pointer_group_resize_stops_at_the_minimum_tile_size() {
         );
     }
 }
+
+#[test]
+fn a_hidden_group_is_one_entry_in_the_hidden_list() {
+    let mut canvas = CanvasState::default();
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+    canvas.last_screen_rect = Some(viewport);
+    let mut previews = PreviewManager::new();
+    let ids: Vec<_> = (0..3)
+        .map(|i| {
+            previews.add(
+                format!("Tile {i}"),
+                Pos2::new(i as f32 * 220.0, 0.0),
+                Vec2::new(200.0, 120.0),
+            )
+        })
+        .collect();
+    canvas.selection = ids[..2].to_vec();
+    canvas.create_group(viewport, &mut previews);
+    canvas.set_tiles_hidden(&ids, true, &mut previews);
+    let entries = CanvasState::hidden_entries(&previews);
+    assert_eq!(entries.len(), 2);
+    let group = entries
+        .iter()
+        .find(|entry| entry.members.len() == 2)
+        .expect("the group is one entry");
+    assert!(group.label.ends_with(" · 2 tiles"), "{}", group.label);
+    assert!(entries.iter().any(|entry| entry.label == "Tile 2"));
+}

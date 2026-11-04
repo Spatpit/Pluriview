@@ -590,24 +590,35 @@ struct AddStreamDialog {
     focused: bool,
 }
 
-#[derive(Clone, Copy)]
-enum WorkspaceDialogKind {
-    Create,
-    Duplicate,
-    Rename,
-}
-
+/// The New Workspace dialog.
 struct WorkspaceDialog {
-    kind: WorkspaceDialogKind,
     name: String,
     focused: bool,
 }
 
+/// A workspace being renamed in place in the Workspace menu.
+struct WorkspaceRename {
+    id: String,
+    name: String,
+    focused: bool,
+    /// Why the last name could not be saved.
+    error: Option<String>,
+}
+
+impl WorkspaceRename {
+    fn new(id: String, name: String) -> Self {
+        Self {
+            id,
+            name,
+            focused: false,
+            error: None,
+        }
+    }
+}
+
 enum WorkspaceMenuAction {
     Switch(String),
-    OpenDialog(WorkspaceDialogKind),
-    RestorePreviousSave,
-    ConfirmDelete,
+    New,
 }
 
 #[derive(Clone, Copy)]
@@ -994,8 +1005,11 @@ pub struct PluriviewApp {
     /// Named workspace catalog introduced in v0.5.
     workspaces: WorkspaceIndex,
 
-    /// Create, duplicate, or rename dialog.
+    /// New Workspace dialog.
     workspace_dialog: Option<WorkspaceDialog>,
+
+    /// Workspace whose name is being edited in the Workspace menu.
+    workspace_rename: Option<WorkspaceRename>,
 
     /// Named camera positions belonging to the active workspace.
     canvas_views: Vec<CanvasView>,
@@ -1010,8 +1024,8 @@ pub struct PluriviewApp {
     /// Most recently deleted view, retained briefly for a recoverable Undo.
     deleted_canvas_view: Option<DeletedCanvasView>,
 
-    /// Confirmation guard for deleting the active workspace.
-    confirm_workspace_delete: bool,
+    /// Workspace waiting for the user to confirm its deletion.
+    confirm_workspace_delete: Option<String>,
 
     /// Last workspace persistence error, shown as a dismissible dialog.
     workspace_error: Option<String>,
@@ -1136,7 +1150,7 @@ impl PluriviewApp {
             || self.welcome_tour.is_some()
             || self.workspace_dialog.is_some()
             || self.canvas_view_dialog.is_some()
-            || self.confirm_workspace_delete
+            || self.confirm_workspace_delete.is_some()
             || self.quick_add.is_some()
             || self.media_error.is_some()
             || self.external_tool_error.is_some()
@@ -1260,11 +1274,12 @@ impl PluriviewApp {
             config_error,
             workspaces,
             workspace_dialog: None,
+            workspace_rename: None,
             canvas_views: Vec::new(),
             active_canvas_view: None,
             canvas_view_dialog: None,
             deleted_canvas_view: None,
-            confirm_workspace_delete: false,
+            confirm_workspace_delete: None,
             workspace_error,
             workspace_persistence_ready,
             workspace_save: WorkspaceSaveState::default(),
@@ -4021,21 +4036,10 @@ impl PluriviewApp {
     /// to the app name (Minimal Void: one unified dark strip, no separate
     /// menu-bar row).
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let workspace_entries = self.workspaces.workspaces.clone();
         let canvas_views = self.canvas_views.clone();
         let active_canvas_view = self.active_canvas_view;
         let active_canvas_view_modified =
             active_canvas_view.is_some_and(|index| self.canvas_view_is_modified(index));
-        let active_workspace_id = self.workspaces.active_workspace_id.clone();
-        let active_workspace_name = self
-            .workspaces
-            .active()
-            .map(|workspace| workspace.name.clone())
-            .unwrap_or_else(|| "Default".to_owned());
-        let previous_save_available = self
-            .storage
-            .as_ref()
-            .is_some_and(|storage| storage.workspace_backup_exists(&active_workspace_id));
         let mut workspace_action = None;
         let mut canvas_view_action = None;
 
@@ -4121,59 +4125,13 @@ impl PluriviewApp {
                 }
             });
 
-            ui.menu_button("Workspace", |ui| {
-                crate::ui_theme::menu(ui);
-                crate::ui_theme::section(ui, "WORKSPACES");
-                ui.label(egui::RichText::new(format!("Current: {active_workspace_name}")).strong());
-                ui.separator();
-                for workspace in &workspace_entries {
-                    let selected = workspace.id == active_workspace_id;
-                    if ui.selectable_label(selected, &workspace.name).clicked() {
-                        workspace_action = Some(WorkspaceMenuAction::Switch(workspace.id.clone()));
-                        ui.close_menu();
-                    }
-                }
-                ui.separator();
-                if ui.button("New Workspace...").clicked() {
-                    workspace_action =
-                        Some(WorkspaceMenuAction::OpenDialog(WorkspaceDialogKind::Create));
-                    ui.close_menu();
-                }
-                if ui.button("Duplicate Workspace...").clicked() {
-                    workspace_action = Some(WorkspaceMenuAction::OpenDialog(
-                        WorkspaceDialogKind::Duplicate,
-                    ));
-                    ui.close_menu();
-                }
-                if ui.button("Rename Workspace...").clicked() {
-                    workspace_action =
-                        Some(WorkspaceMenuAction::OpenDialog(WorkspaceDialogKind::Rename));
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(
-                        previous_save_available,
-                        egui::Button::new("Restore Previous Save as New Workspace"),
-                    )
-                    .on_hover_text(
-                        "Opens the previous valid save as a separate workspace and preserves the current one.",
-                    )
-                    .clicked()
-                {
-                    workspace_action = Some(WorkspaceMenuAction::RestorePreviousSave);
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(
-                        workspace_entries.len() > 1,
-                        egui::Button::new(egui::RichText::new("Delete Workspace...").color(crate::ui_theme::DANGER)),
-                    )
-                    .clicked()
-                {
-                    workspace_action = Some(WorkspaceMenuAction::ConfirmDelete);
-                    ui.close_menu();
-                }
+            let workspace_menu = ui.menu_button("Workspace", |ui| {
+                workspace_action = self.workspace_menu_contents(ui);
             });
+            if workspace_menu.inner.is_none() && self.workspace_rename.is_some() {
+                let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+                self.workspace_menu_closed(escape);
+            }
 
             ui.menu_button("View", |ui| {
                 crate::ui_theme::menu(ui);
@@ -4190,11 +4148,11 @@ impl PluriviewApp {
                     self.set_screenshots_panel_open(screenshots_open);
                     ui.close_menu();
                 }
-                if ui
-                    .checkbox(
-                        &mut self.app_config.always_show_title_bar,
-                        "Always Show Top Bar",
-                    )
+                if crate::ui_theme::toggle(
+                    ui,
+                    &mut self.app_config.always_show_title_bar,
+                    "Always Show Top Bar",
+                )
                     .on_hover_text(
                         "When off, the top bar hides until you move the mouse to the top of the window.",
                     )
@@ -4205,6 +4163,21 @@ impl PluriviewApp {
                 }
                 ui.separator();
                 crate::ui_theme::section(ui, "CANVAS");
+                if crate::ui_theme::shortcut_toggle(ui, &mut self.canvas.show_grid, "Show Grid",
+                    self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleGrid)).clicked()
+                {
+                    ui.close_menu();
+                }
+                #[cfg(windows)]
+                if crate::ui_theme::toggle(ui, &mut self.app_config.show_sound_badges, "Show Sound Badges")
+                    .on_hover_text("Mark browser tiles that are playing sound with a speaker badge.")
+                    .clicked()
+                {
+                    self.canvas.show_sound_badges = self.app_config.show_sound_badges;
+                    self.save_app_config();
+                    ui.close_menu();
+                }
+                ui.separator();
                 ui.menu_button("Saved Viewpoints", |ui| {
                     crate::ui_theme::menu(ui);
                     canvas_view_action = canvas_views_menu_contents(
@@ -4217,21 +4190,6 @@ impl PluriviewApp {
                 });
                 if ui.button("Reset View").clicked() {
                     self.canvas.reset();
-                    ui.close_menu();
-                }
-                if crate::ui_theme::shortcut_toggle(ui, &mut self.canvas.show_grid, "Show Grid",
-                    self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleGrid)).clicked()
-                {
-                    ui.close_menu();
-                }
-                #[cfg(windows)]
-                if ui
-                    .checkbox(&mut self.app_config.show_sound_badges, "Show Sound Badges")
-                    .on_hover_text("Mark browser tiles that are playing sound with a speaker badge.")
-                    .clicked()
-                {
-                    self.canvas.show_sound_badges = self.app_config.show_sound_badges;
-                    self.save_app_config();
                     ui.close_menu();
                 }
                 if ui.button("Set Wallpaper...").clicked() {
@@ -4258,9 +4216,9 @@ impl PluriviewApp {
                     ui.separator();
                     crate::ui_theme::section(ui, "BROWSER TILES");
                     let mut enabled = self.browser.adblock_enabled();
-                    let response = ui
-                        .checkbox(&mut enabled, "Block Ads & Trackers (uBOL)")
-                        .on_hover_text(self.browser.adblock_status_text());
+                    let response =
+                        crate::ui_theme::toggle(ui, &mut enabled, "Block Ads & Trackers (uBOL)")
+                            .on_hover_text(self.browser.adblock_status_text());
                     if response.clicked() {
                         if let Err(error) = self.browser.set_adblock_enabled(enabled) {
                             log::error!("Could not change ad blocker state: {error}");
@@ -4333,24 +4291,12 @@ impl PluriviewApp {
                         self.workspace_error = Some(error);
                     }
                 }
-                WorkspaceMenuAction::OpenDialog(kind) => {
-                    let name = match kind {
-                        WorkspaceDialogKind::Create => "Untitled Workspace".to_owned(),
-                        WorkspaceDialogKind::Duplicate => format!("{active_workspace_name} Copy"),
-                        WorkspaceDialogKind::Rename => active_workspace_name,
-                    };
+                WorkspaceMenuAction::New => {
                     self.workspace_dialog = Some(WorkspaceDialog {
-                        kind,
-                        name,
+                        name: "Untitled Workspace".to_owned(),
                         focused: false,
                     });
                 }
-                WorkspaceMenuAction::RestorePreviousSave => {
-                    if let Err(error) = self.restore_previous_workspace_save() {
-                        self.workspace_error = Some(error);
-                    }
-                }
-                WorkspaceMenuAction::ConfirmDelete => self.confirm_workspace_delete = true,
             }
         }
     }
@@ -4696,14 +4642,9 @@ impl PluriviewApp {
         let Some(dialog) = &mut self.workspace_dialog else {
             return;
         };
-        let (title, submit_label) = match dialog.kind {
-            WorkspaceDialogKind::Create => ("New Workspace", "Create"),
-            WorkspaceDialogKind::Duplicate => ("Duplicate Workspace", "Duplicate"),
-            WorkspaceDialogKind::Rename => ("Rename Workspace", "Rename"),
-        };
         let mut submit = false;
         let mut cancel = false;
-        egui::Window::new(title)
+        egui::Window::new("New Workspace")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4719,7 +4660,7 @@ impl PluriviewApp {
                     response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(submit_label).clicked() || enter {
+                    if ui.button("Create").clicked() || enter {
                         submit = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -4735,26 +4676,26 @@ impl PluriviewApp {
                 .workspace_dialog
                 .take()
                 .expect("workspace dialog exists");
-            let result = match dialog.kind {
-                WorkspaceDialogKind::Create => self.create_workspace(&dialog.name, false),
-                WorkspaceDialogKind::Duplicate => self.create_workspace(&dialog.name, true),
-                WorkspaceDialogKind::Rename => self.rename_active_workspace(&dialog.name),
-            };
-            if let Err(error) = result {
+            if let Err(error) = self.create_workspace(&dialog.name) {
                 self.workspace_error = Some(error);
             }
         }
     }
 
     fn workspace_delete_confirmation_ui(&mut self, ctx: &egui::Context) {
-        if !self.confirm_workspace_delete {
+        let Some(id) = self.confirm_workspace_delete.clone() else {
             return;
-        }
-        let name = self
+        };
+        let Some(name) = self
             .workspaces
-            .active()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
             .map(|workspace| workspace.name.clone())
-            .unwrap_or_else(|| "this workspace".to_owned());
+        else {
+            self.confirm_workspace_delete = None;
+            return;
+        };
         let mut delete = false;
         let mut cancel = false;
         egui::Window::new("Delete Workspace")
@@ -4774,12 +4715,12 @@ impl PluriviewApp {
                 });
             });
         if delete {
-            self.confirm_workspace_delete = false;
-            if let Err(error) = self.delete_active_workspace() {
+            self.confirm_workspace_delete = None;
+            if let Err(error) = self.delete_workspace(&id) {
                 self.workspace_error = Some(error);
             }
         } else if cancel {
-            self.confirm_workspace_delete = false;
+            self.confirm_workspace_delete = None;
         }
     }
 
@@ -5968,7 +5909,7 @@ impl eframe::App for PluriviewApp {
             && self.welcome_tour.is_none()
             && self.canvas_view_dialog.is_none()
             && self.workspace_dialog.is_none()
-            && !self.confirm_workspace_delete
+            && self.confirm_workspace_delete.is_none()
             && self.hotkey_recording.is_none();
         // Dialog controls retain keyboard ownership even when the URL field
         // loses focus to a recent website or quality choice.

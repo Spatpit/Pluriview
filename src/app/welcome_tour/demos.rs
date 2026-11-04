@@ -1471,11 +1471,10 @@ fn tile_menu(s: &mut Stage, t: f32) {
     let at = pos2(150.0, 90.0);
     let items = [
         "Interact",
+        "Tile Settings",
         "Focus on This Tile",
         "Picture in Picture",
         "Pin to Viewport",
-        "Arrange",
-        "Tile Settings",
         "Freeze Tile",
         "Remove",
     ];

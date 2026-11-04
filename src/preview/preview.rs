@@ -180,6 +180,17 @@ impl FpsPreset {
             FpsPreset::High => "60 FPS (High)",
         }
     }
+
+    /// The next rate up, wrapping from 60 back to 15, as clicking a tile's
+    /// frame-rate badge steps through them. Starting anywhere, three steps
+    /// visit every rate once.
+    pub fn next(self) -> Self {
+        match self {
+            FpsPreset::Low => FpsPreset::Medium,
+            FpsPreset::Medium => FpsPreset::High,
+            FpsPreset::High => FpsPreset::Low,
+        }
+    }
 }
 
 /// Window handle information

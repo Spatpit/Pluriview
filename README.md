@@ -123,10 +123,11 @@ Press `C` to open a separate window that lists every tile.
   their group's name. Drag cards into your own order, or switch to **A–Z**.
 - **Click** a card to focus that tile on the canvas, the **eye** to hide or
   show it, and the **speaker** to mute it. Window tiles get a **Stream Audio**
-  button instead. Hidden tiles keep playing in the background.
-- **Map** shows the whole canvas in miniature. Use **Move camera** to look
-  around, or **Move tiles** to drag tiles to new places. Pinned tiles can also
-  be moved and resized there.
+  button instead. Hidden tiles keep playing in the background; right-click
+  empty canvas to show them again without opening this window.
+- **Map** shows the whole canvas in miniature. Drag tiles to new places
+  (**Move tiles**, the default), or switch to **Move camera** to look around.
+  Pinned tiles can also be moved and resized there.
 
 ### Groups
 
@@ -148,7 +149,7 @@ tile the large one, and `Shift+←`/`Shift+→` step through the group.
 | **Pin to Viewport** | Keeps a tile in place on screen while you pan and zoom. |
 | **Picture in Picture** | `Shift+P` pops tiles out into a small window that stays on top of other apps, including borderless or windowed games. |
 | **Freeze** | Holds a tile's current frame until you resume it. |
-| **Frame rate** | Right-click → **Tile Settings → Frame Rate** chooses 15, 30, or 60 FPS for a live tile. |
+| **Frame rate** | Click the FPS number on a live tile to step through 15, 30, and 60 FPS, or pick one under right-click → **Tile Settings → Frame Rate**. |
 
 ### Screenshots and recording
 
@@ -162,7 +163,8 @@ tile the large one, and `Shift+←`/`Shift+→` step through the group.
 ### Workspaces, viewpoints, and wallpapers
 
 - The **Workspace** menu creates and switches between separate canvases. They
-  save automatically.
+  save automatically. Hover a workspace to duplicate, rename, or delete it;
+  renaming happens right in the menu.
 - **View → Saved Viewpoints** bookmarks spots on the canvas; jump to them with
   `Ctrl+1`–`Ctrl+9`.
 - **View → Set Wallpaper...** puts an image, GIF, or looping video behind the

@@ -1,11 +1,12 @@
 use super::{
     apply_crop, apply_resize, browser_control_colors, capture_resolution_badge_rect, format_time,
-    live_capture_display_size, media_placeholder_content, native_capture_canvas_size,
-    pixel_aligned_rect, pixel_exact_image, playlist_first_row_center, rect_for_crop_change,
-    stream_audio_badge_rect, submenu_should_open_left, video_placeholder_content, video_time_style,
-    video_volume_popover_rect, video_volume_slider_rect, window_capture_placeholder_content,
-    window_capture_target, BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle,
-    TileActivityAction, VideoAction,
+    fps_badge_rect, live_capture_display_size, media_placeholder_content,
+    native_capture_canvas_size, pixel_aligned_rect, pixel_exact_image, playlist_first_row_center,
+    rect_for_crop_change, stream_audio_badge_rect, submenu_should_open_left,
+    video_placeholder_content, video_time_style, video_volume_popover_rect,
+    video_volume_slider_rect, window_capture_placeholder_content, window_capture_target,
+    BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle, TileActivityAction,
+    VideoAction,
 };
 use crate::capture::CaptureCoordinator;
 use crate::playlist::FolderPlaylist;
@@ -1515,12 +1516,11 @@ fn tile_menu_puts_the_tiles_own_actions_first_and_remove_last() {
             "Interact",
             "Reload",
             "Page",
+            "Tile Settings",
             "Focus on This Tile",
             "Picture in Picture",
             "Pin to Viewport",
-            "Arrange",
             "Group",
-            "Tile Settings",
             "Remove",
         ];
         if frozen {
@@ -1560,6 +1560,154 @@ fn tile_menu_puts_the_tiles_own_actions_first_and_remove_last() {
             );
         }
     }
+}
+
+#[test]
+fn tile_settings_starts_with_frame_rate_and_ends_with_size() {
+    let (mut test, id) = CropUiTest::new(1, false);
+    test.frame(vec![]);
+    let output = test.open_crop_menu(id);
+    let top = |label: &str| CropUiTest::label_pos(&output, label).y;
+    for pair in [
+        "Frame Rate: 30 FPS (Medium)",
+        "Bring to Front",
+        "Send to Back",
+        "Edit Crop",
+        "Disable Left Click",
+        "Size",
+    ]
+    .windows(2)
+    {
+        assert!(
+            top(pair[0]) < top(pair[1]),
+            "{} should come before {}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+fn hidden_fixture() -> (CropUiTest, PreviewId, PreviewId) {
+    let (mut test, first) = CropUiTest::new(0, false);
+    let second = test.previews.add_for_window(
+        2,
+        43,
+        "Chat".into(),
+        Pos2::new(100.0, 300.0),
+        Vec2::new(200.0, 100.0),
+    );
+    test.frame(vec![]);
+    (test, first, second)
+}
+
+#[test]
+fn window_tile_menu_puts_tile_settings_right_after_native_size() {
+    let (mut test, id) = CropUiTest::new(0, false);
+    test.frame(vec![]);
+    let rect = test
+        .canvas
+        .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+    test.click(rect.center(), PointerButton::Secondary);
+    test.frame(vec![]);
+    let output = test.frame(vec![]);
+    let top = |label: &str| CropUiTest::label_pos(&output, label).y;
+    assert!(top("Native Size (1:1)") < top("Tile Settings"));
+    assert!(top("Tile Settings") < top("Focus on This Tile"));
+}
+
+#[test]
+fn clicking_the_fps_badge_steps_through_the_rates() {
+    let (mut test, id) = CropUiTest::new(0, false);
+    test.frame(vec![]);
+    let rect = test
+        .canvas
+        .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+    let badge = fps_badge_rect(rect).center();
+    for expected in [
+        FpsPreset::High,
+        FpsPreset::Low,
+        FpsPreset::Medium,
+        FpsPreset::High,
+    ] {
+        test.click(badge, PointerButton::Primary);
+        let preview = test.previews.get(id).unwrap();
+        assert_eq!(preview.fps_preset, expected);
+        assert_eq!(preview.target_fps, expected.as_u32());
+    }
+}
+
+impl CropUiTest {
+    /// Rest the pointer on a menu label for a few frames, so its submenu
+    /// opens the way hovering opens it.
+    fn hover_label(&mut self, output: &egui::FullOutput, label: &str) -> egui::FullOutput {
+        let at = Self::label_pos(output, label);
+        for step in (0..4).rev() {
+            self.frame(vec![Event::PointerMoved(
+                at - Vec2::new(3.0 * step as f32, 0.0),
+            )]);
+        }
+        self.frame(vec![]);
+        self.frame(vec![])
+    }
+}
+
+#[test]
+fn empty_canvas_menu_shows_a_single_hidden_tile_back() {
+    let (mut test, first, second) = hidden_fixture();
+    let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+    assert!(
+        !output.shapes.iter().any(|shape| matches!(&shape.shape,
+            Shape::Text(text) if text.galley.text().starts_with("Show Hidden"))),
+        "nothing is hidden yet"
+    );
+    test.frame(vec![Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    }]);
+    test.canvas
+        .set_tiles_hidden(&[second], true, &mut test.previews);
+    let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+    let output = test.hover_label(&output, "Show Hidden Tiles");
+    assert!(
+        !output.shapes.iter().any(|shape| matches!(&shape.shape,
+            Shape::Text(text) if text.galley.text() == "Show All")),
+        "Show All is only for several hidden tiles"
+    );
+    test.click(
+        CropUiTest::label_pos(&output, "Chat"),
+        PointerButton::Primary,
+    );
+    assert!(!test.previews.get(second).unwrap().hidden);
+    assert!(!test.previews.get(first).unwrap().hidden);
+}
+
+#[test]
+fn empty_canvas_menu_lists_hidden_tiles_to_show_one_or_all() {
+    let (mut test, first, second) = hidden_fixture();
+    test.canvas
+        .set_tiles_hidden(&[first, second], true, &mut test.previews);
+    let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+    let output = test.hover_label(&output, "Show Hidden Tiles");
+    test.click(
+        CropUiTest::label_pos(&output, "Chat"),
+        PointerButton::Primary,
+    );
+    assert!(!test.previews.get(second).unwrap().hidden);
+    assert!(test.previews.get(first).unwrap().hidden);
+
+    test.canvas
+        .set_tiles_hidden(&[second], true, &mut test.previews);
+    let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+    let output = test.hover_label(&output, "Show Hidden Tiles");
+    test.click(
+        CropUiTest::label_pos(&output, "Show All"),
+        PointerButton::Primary,
+    );
+    assert!(!test.previews.get(first).unwrap().hidden);
+    assert!(!test.previews.get(second).unwrap().hidden);
 }
 
 #[test]

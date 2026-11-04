@@ -139,6 +139,78 @@ impl CanvasState {
         }
     }
 
+    /// Bring hidden tiles back from the empty-canvas menu without opening
+    /// the Control Tile Center. Hovering "Show Hidden Tiles" lists them by
+    /// name to the side, with Show All when there are several.
+    pub(super) fn show_hidden_items(&mut self, ui: &mut egui::Ui, previews: &mut PreviewManager) {
+        let entries = Self::hidden_entries(previews);
+        if entries.is_empty() {
+            return;
+        }
+        let mut show = None;
+        ui.menu_button("Show Hidden Tiles", |ui| {
+            crate::ui_theme::menu(ui);
+            for entry in &entries {
+                if ui.button(&entry.label).clicked() {
+                    show = Some(entry.members.clone());
+                }
+            }
+            if entries.len() > 1 {
+                ui.separator();
+                if ui.button("Show All").clicked() {
+                    show = Some(entries.iter().flat_map(|e| e.members.clone()).collect());
+                }
+            }
+        });
+        if let Some(ids) = show {
+            self.set_tiles_hidden(&ids, false, previews);
+            ui.close_menu();
+        }
+    }
+
+    /// Hidden tiles in the user's list order, for the empty-canvas menu. A
+    /// hidden group is one entry, as hiding one member hides them all.
+    pub(super) fn hidden_entries(previews: &PreviewManager) -> Vec<HiddenEntry> {
+        let mut hidden: Vec<_> = previews
+            .all()
+            .filter(|p| p.hidden && p.removing.is_none())
+            .collect();
+        hidden.sort_by_key(|p| (p.list_order, p.id.0));
+        let mut entries = Vec::new();
+        let mut groups_seen = Vec::new();
+        for preview in hidden {
+            let entry = match &preview.tile_group {
+                Some(group) => {
+                    if groups_seen.contains(&group.id) {
+                        continue;
+                    }
+                    groups_seen.push(group.id);
+                    let members: Vec<_> = Self::members_of(group.id, previews)
+                        .into_iter()
+                        .filter(|id| previews.get(*id).is_some_and(|p| p.hidden))
+                        .collect();
+                    let name = match group.name.trim() {
+                        "" => "Group",
+                        name => name,
+                    };
+                    HiddenEntry {
+                        label: format!("{} · {} tiles", compact_title(name, 30), members.len()),
+                        members,
+                    }
+                }
+                None => HiddenEntry {
+                    label: match preview.title.trim() {
+                        "" => "Untitled Tile".to_owned(),
+                        title => compact_title(title, 40),
+                    },
+                    members: vec![preview.id],
+                },
+            };
+            entries.push(entry);
+        }
+        entries
+    }
+
     /// Select `id` with its group, as a click on it would, showing it first
     /// when hidden.
     pub fn select_tile(&mut self, id: PreviewId, previews: &mut PreviewManager) {
@@ -1034,4 +1106,11 @@ impl CanvasState {
         });
         true
     }
+}
+
+/// One line of the empty-canvas menu's hidden-tile list.
+#[derive(Debug, PartialEq)]
+pub(super) struct HiddenEntry {
+    pub label: String,
+    pub members: Vec<PreviewId>,
 }
