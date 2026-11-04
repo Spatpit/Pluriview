@@ -50,5 +50,8 @@ design_mockups.html
 # Icon exploration / candidates (production SVG, PNG, and ICO remain tracked)
 assets/icon_options/
 
+# Image generation output (development only)
+/output/
+
 # Personal dev notes (not part of the project)
 Journal/
