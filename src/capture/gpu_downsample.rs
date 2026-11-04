@@ -94,6 +94,12 @@ impl GpuDownsampler {
         }
     }
 
+    /// Whether a failure moved this worker to the CPU resize.
+    #[cfg(test)]
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
     /// Size of the retained frame, if there is one.
     pub fn retained_size(&self) -> Option<(u32, u32)> {
         self.retained
@@ -217,7 +223,10 @@ impl GpuDownsampler {
         unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             source.GetDesc(&mut desc);
-            if desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM
+            // The shader reads channels by name, so a BGRA source (Spout)
+            // still produces RGBA.
+            if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM
+                && desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
                 || desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 == 0
                 || desc.SampleDesc.Count != 1
                 || desc.ArraySize != 1

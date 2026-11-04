@@ -3,6 +3,7 @@ use image::{AnimationDecoder, ImageDecoder, ImageError, ImageFormat, ImageReader
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Avoid allowing a pathological animation to consume unbounded memory.
@@ -57,8 +58,25 @@ pub fn is_supported_video_path(path: &Path) -> bool {
 pub struct MediaFrame {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    /// Premultiplied pixels, converted once while decoding. Each upload
+    /// shares them, so showing a GIF frame again converts and copies nothing.
+    pub image: Arc<eframe::egui::ColorImage>,
     pub duration: Duration,
+}
+
+impl MediaFrame {
+    /// A frame from straight-alpha RGBA bytes.
+    pub fn from_rgba(width: u32, height: u32, rgba: &[u8], duration: Duration) -> Self {
+        Self {
+            width,
+            height,
+            image: Arc::new(eframe::egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                rgba,
+            )),
+            duration,
+        }
+    }
 }
 
 pub struct MediaAsset {
@@ -69,32 +87,50 @@ pub struct MediaAsset {
 
 /// Decode a supported static image or all frames of an animated GIF.
 pub fn load(path: &Path) -> Result<MediaAsset, String> {
-    let reader = ImageReader::open(path)
-        .map_err(|error| format!("Could not open image: {error}"))?
-        .with_guessed_format()
-        .map_err(|error| format!("Could not identify image format: {error}"))?;
-
+    let reader = open_image(path)?;
     if reader.format() == Some(ImageFormat::Gif) {
         return load_gif(path);
     }
 
+    let image = decode_still(reader)?;
+    let (width, height) = image.dimensions();
+    Ok(MediaAsset {
+        frames: vec![MediaFrame::from_rgba(
+            width,
+            height,
+            image.as_raw(),
+            Duration::ZERO,
+        )],
+        width,
+        height,
+    })
+}
+
+/// A still image's exact straight-alpha pixels, scaled to fit a texture the
+/// way [`load`] does, or `None` for a GIF. Frames from [`load`] are stored
+/// premultiplied, which rounds semi-transparent pixels.
+pub fn load_still_rgba(path: &Path) -> Result<Option<RgbaImage>, String> {
+    let reader = open_image(path)?;
+    if reader.format() == Some(ImageFormat::Gif) {
+        return Ok(None);
+    }
+    decode_still(reader).map(Some)
+}
+
+fn open_image(path: &Path) -> Result<ImageReader<BufReader<File>>, String> {
+    ImageReader::open(path)
+        .map_err(|error| format!("Could not open image: {error}"))?
+        .with_guessed_format()
+        .map_err(|error| format!("Could not identify image format: {error}"))
+}
+
+fn decode_still(reader: ImageReader<BufReader<File>>) -> Result<RgbaImage, String> {
     let image = reader
         .decode()
         .map_err(|error| format!("Could not decode image: {error}"))?
         .into_rgba8();
     validate_frame_size(image.width(), image.height(), image.len())?;
-    let image = fit_to_texture_side(image, MAX_TEXTURE_SIDE);
-    let (width, height) = image.dimensions();
-    Ok(MediaAsset {
-        frames: vec![MediaFrame {
-            width,
-            height,
-            rgba: image.into_raw(),
-            duration: Duration::ZERO,
-        }],
-        width,
-        height,
-    })
+    Ok(fit_to_texture_side(image, MAX_TEXTURE_SIDE))
 }
 
 fn load_gif(path: &Path) -> Result<MediaAsset, String> {
@@ -135,12 +171,12 @@ fn decode_gif<R: BufRead + Seek>(reader: R) -> Result<MediaAsset, String> {
             .checked_add(buffer.len())
             .ok_or_else(|| "Animated image is too large".to_owned())?;
         validate_frame_size(width, height, decoded_bytes)?;
-        frames.push(MediaFrame {
+        frames.push(MediaFrame::from_rgba(
             width,
             height,
-            rgba: buffer.into_raw(),
-            duration: Duration::from_millis(delay_ms).max(MIN_FRAME_DELAY),
-        });
+            buffer.as_raw(),
+            Duration::from_millis(delay_ms).max(MIN_FRAME_DELAY),
+        ));
     }
 
     let first = frames
@@ -192,29 +228,29 @@ fn fitted_size(width: u32, height: u32, max_side: u32) -> Option<(u32, u32)> {
     Some((fit(width), fit(height)))
 }
 
-/// Build the upload image for a decoded frame. Frames already fit
-/// `MAX_TEXTURE_SIDE`; this also covers a GPU reporting a smaller limit,
-/// where egui would otherwise panic during upload.
-pub fn frame_color_image(frame: &MediaFrame, max_texture_side: usize) -> eframe::egui::ColorImage {
+/// The upload image for a decoded frame: the frame's own pixels, shared.
+/// Frames already fit `MAX_TEXTURE_SIDE`; a GPU reporting a smaller limit
+/// gets a scaled copy, where egui would otherwise panic during upload.
+pub fn frame_upload(frame: &MediaFrame, max_texture_side: usize) -> Arc<eframe::egui::ColorImage> {
     let max_side = u32::try_from(max_texture_side).unwrap_or(u32::MAX);
     if let Some((width, height)) = fitted_size(frame.width, frame.height, max_side) {
-        if let Some(image) = RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone()) {
+        // Premultiplied pixels resize without dark fringes at transparent edges.
+        if let Some(image) =
+            RgbaImage::from_raw(frame.width, frame.height, frame.image.as_raw().to_vec())
+        {
             let image = image::imageops::resize(
                 &image,
                 width,
                 height,
                 image::imageops::FilterType::Triangle,
             );
-            return eframe::egui::ColorImage::from_rgba_unmultiplied(
+            return Arc::new(eframe::egui::ColorImage::from_rgba_premultiplied(
                 [width as usize, height as usize],
                 image.as_raw(),
-            );
+            ));
         }
     }
-    eframe::egui::ColorImage::from_rgba_unmultiplied(
-        [frame.width as usize, frame.height as usize],
-        &frame.rgba,
-    )
+    Arc::clone(&frame.image)
 }
 
 fn validate_frame_size(width: u32, height: u32, decoded_bytes: usize) -> Result<(), String> {
@@ -452,6 +488,15 @@ mod tests {
         assert_eq!(asset.frames.len(), 2);
         assert_eq!(asset.frames[0].duration, Duration::from_millis(50));
         assert_eq!(asset.frames[1].duration, Duration::from_millis(120));
+        let first_pixel = |frame: &super::MediaFrame| frame.image.pixels[0];
+        assert_eq!(
+            first_pixel(&asset.frames[0]),
+            eframe::egui::Color32::from_rgb(255, 0, 0)
+        );
+        assert_eq!(
+            first_pixel(&asset.frames[1]),
+            eframe::egui::Color32::from_rgb(0, 255, 0)
+        );
 
         fs::remove_file(path).unwrap();
     }
@@ -486,8 +531,8 @@ mod tests {
         let asset = super::decode_gif(std::io::Cursor::new(gif_with_screen(20_000, 1))).unwrap();
         assert_eq!((asset.width, asset.height), (super::MAX_TEXTURE_SIDE, 1));
         assert_eq!(
-            asset.frames[0].rgba.len(),
-            super::MAX_TEXTURE_SIDE as usize * 4
+            asset.frames[0].image.size,
+            [super::MAX_TEXTURE_SIDE as usize, 1]
         );
     }
 
@@ -510,13 +555,13 @@ mod tests {
 
     #[test]
     fn uploads_fit_a_gpu_with_a_smaller_texture_limit() {
-        let frame = super::MediaFrame {
-            width: 40,
-            height: 10,
-            rgba: vec![255; 40 * 10 * 4],
-            duration: Duration::ZERO,
-        };
-        assert_eq!(super::frame_color_image(&frame, 16).size, [16, 4]);
-        assert_eq!(super::frame_color_image(&frame, 16_384).size, [40, 10]);
+        let frame = super::MediaFrame::from_rgba(40, 10, &[255; 40 * 10 * 4], Duration::ZERO);
+        assert_eq!(super::frame_upload(&frame, 16).size, [16, 4]);
+        let shared = super::frame_upload(&frame, 16_384);
+        assert_eq!(shared.size, [40, 10]);
+        assert!(
+            std::sync::Arc::ptr_eq(&shared, &frame.image),
+            "a frame that fits is uploaded without a copy"
+        );
     }
 }

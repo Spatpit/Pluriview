@@ -92,7 +92,7 @@ enum CombinedFrame {
 
 enum PendingSource {
     /// Rereading a still image whose decoded pixels were released.
-    ImageFile(mpsc::Receiver<Option<ScreenshotImage>>),
+    ImageFile(mpsc::Receiver<Option<CapturedPixels>>),
     /// Waiting for a live capture to deliver one frame at its full size.
     NativeFrame {
         fallback: Option<Arc<egui::ColorImage>>,
@@ -124,7 +124,7 @@ fn poll_source(
     match (source, preview) {
         (_, None) => Some(None),
         (PendingSource::ImageFile(receiver), Some(_)) => match receiver.try_recv() {
-            Ok(image) => Some(image.map(CapturedPixels::Straight)),
+            Ok(pixels) => Some(pixels),
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some(None),
         },
@@ -170,16 +170,27 @@ fn combined_title<'a>(titles: impl ExactSizeIterator<Item = &'a str>) -> String 
 }
 
 /// Decode a still image's file again on a worker thread.
-pub(super) fn reread_image(path: PathBuf) -> mpsc::Receiver<Option<ScreenshotImage>> {
+pub(super) fn reread_image(path: PathBuf) -> mpsc::Receiver<Option<CapturedPixels>> {
     let (sender, receiver) = mpsc::channel();
     let _ = std::thread::Builder::new()
         .name("pluriview-screenshot-reread".to_owned())
         .spawn(move || {
-            let image = crate::media::load(&path).ok().and_then(|asset| {
-                let frame = asset.frames.into_iter().next()?;
-                ScreenshotImage::from_straight_rgba(frame.width, frame.height, frame.rgba)
-            });
-            let _ = sender.send(image);
+            let pixels = match crate::media::load_still_rgba(&path) {
+                Ok(Some(image)) => ScreenshotImage::from_straight_rgba(
+                    image.width(),
+                    image.height(),
+                    image.into_raw(),
+                )
+                .map(CapturedPixels::Straight),
+                // A one-frame GIF: its transparency is all or nothing, so the
+                // premultiplied frame loses nothing.
+                Ok(None) => crate::media::load(&path)
+                    .ok()
+                    .and_then(|asset| asset.frames.into_iter().next())
+                    .map(|frame| CapturedPixels::Premultiplied(frame.image)),
+                Err(_) => None,
+            };
+            let _ = sender.send(pixels);
         });
     receiver
 }
@@ -417,10 +428,8 @@ impl PluriviewApp {
             return ShotStart::Unavailable("Playlist tiles can't be captured.");
         }
         if preview.is_media() {
-            if let Some(image) = preview.current_media_frame().and_then(|frame| {
-                ScreenshotImage::from_straight_rgba(frame.width, frame.height, frame.rgba.clone())
-            }) {
-                return ShotStart::Ready(CapturedPixels::Straight(image));
+            if let Some(frame) = preview.current_media_frame() {
+                return ShotStart::Ready(CapturedPixels::Premultiplied(Arc::clone(&frame.image)));
             }
             return match preview.media_path.clone() {
                 Some(path) if preview.media_pixels_released() => {

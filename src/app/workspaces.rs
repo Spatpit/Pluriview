@@ -643,10 +643,13 @@ impl PluriviewApp {
             active_view: self.active_canvas_view,
         };
 
-        // Save all previews
-        layout.previews = self
-            .preview_manager
-            .all()
+        // Save all previews in the order they were added, which is the saved
+        // order for a loaded workspace. Hash-map order would make the first
+        // autosave after every load rewrite a workspace that has not changed.
+        let mut previews: Vec<&Preview> = self.preview_manager.all().collect();
+        previews.sort_by_key(|preview| preview.id.0);
+        layout.previews = previews
+            .into_iter()
             .map(|p| {
                 let mut saved = PreviewLayout::from(p);
                 #[cfg(windows)]

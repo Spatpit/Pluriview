@@ -45,7 +45,7 @@ struct RecordedTile {
     /// again.
     last_source: usize,
     /// A still image whose decoded pixels were released, read again once.
-    reread: Option<mpsc::Receiver<Option<ScreenshotImage>>>,
+    reread: Option<mpsc::Receiver<Option<CapturedPixels>>>,
     #[cfg(windows)]
     video_readback: Option<mpsc::Receiver<Option<VideoSnapshot>>>,
 }
@@ -426,7 +426,7 @@ impl PluriviewApp {
                 match receiver.try_recv() {
                     Ok(image) => {
                         tile.reread = None;
-                        pixels = image.map(CapturedPixels::Straight);
+                        pixels = image;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => tile.reread = None,
                     Err(mpsc::TryRecvError::Empty) => {}
@@ -454,15 +454,10 @@ impl PluriviewApp {
             }
             if preview.is_media() {
                 if let Some(frame) = preview.current_media_frame() {
-                    let source = frame.rgba.as_ptr() as usize;
+                    let source = Arc::as_ptr(&frame.image) as usize;
                     if source != tile.last_source {
                         tile.last_source = source;
-                        pixels = ScreenshotImage::from_straight_rgba(
-                            frame.width,
-                            frame.height,
-                            frame.rgba.clone(),
-                        )
-                        .map(CapturedPixels::Straight);
+                        pixels = Some(CapturedPixels::Premultiplied(Arc::clone(&frame.image)));
                     }
                 }
             } else if let Some(frame) = preview.latest_capture_frame() {

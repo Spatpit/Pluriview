@@ -564,6 +564,21 @@ fn flip_rgba_rows(rgba: &mut [u8], width: usize, height: usize) {
     }
 }
 
+/// Options that stop mpv's built-in Lua scripts. `load-scripts=no` only skips
+/// script folders, so without these every player, including each timeline
+/// preview core, starts a Lua thread per script that Pluriview never uses.
+/// `load-osd-console` is the older name of `load-console`.
+const BUILT_IN_SCRIPTS: [&str; 8] = [
+    "load-stats-overlay",
+    "load-console",
+    "load-osd-console",
+    "load-select",
+    "load-positioning",
+    "load-commands",
+    "load-context-menu",
+    "load-auto-profiles",
+];
+
 struct MpvCore {
     api: Arc<MpvApi>,
     handle: *mut MpvHandle,
@@ -613,8 +628,9 @@ impl MpvCore {
             ("terminal", "no"),
             ("osc", "no"),
             ("input-default-bindings", "no"),
-            // Match the seek-preview core: no built-in or user scripts, and
-            // no yt-dlp lookup on PATH. Streams are resolved by Streamlink.
+            // Match the seek-preview core: no user scripts (built-in ones are
+            // turned off below), and no yt-dlp lookup on PATH. Streams are
+            // resolved by Streamlink.
             ("load-scripts", "no"),
             ("ytdl", "no"),
             ("keep-open", "yes"),
@@ -634,6 +650,10 @@ impl MpvCore {
                 core.destroy_without_render_context();
                 return Err(error);
             }
+        }
+        for name in BUILT_IN_SCRIPTS {
+            // Best-effort: another libmpv build may not know every name.
+            let _ = core.set_option(name, "no");
         }
         if wallpaper {
             // Background video should fill its rectangle, loop, and never
@@ -1917,6 +1937,9 @@ impl ThumbnailCore {
                 return Err(error);
             }
         }
+        for name in BUILT_IN_SCRIPTS {
+            let _ = core.set_option(name, "no");
+        }
         if network_source {
             for (name, value) in [
                 ("cache", "yes"),
@@ -2912,6 +2935,16 @@ mod tests {
         core.set_property("pause", "no").expect("resume");
         core.set_property("pause", "yes").expect("pause");
         core.set_property("volume", "37").expect("set volume");
+        core.destroy_without_render_context();
+    }
+
+    #[test]
+    fn bundled_runtime_starts_without_built_in_scripts() {
+        let api = MpvApi::load().expect("load bundled libmpv");
+        let mut core = MpvCore::new(api, true, false, false).expect("initialize libmpv");
+        for name in BUILT_IN_SCRIPTS {
+            assert_eq!(core.property(name).as_deref(), Some("no"), "{name}");
+        }
         core.destroy_without_render_context();
     }
 

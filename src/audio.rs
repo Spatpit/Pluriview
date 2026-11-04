@@ -63,10 +63,42 @@ use windows::{
 const PRIME_MS: u32 = 50;
 
 /// A render endpoint the user can pick as the monitor target.
+#[derive(Clone, Debug, PartialEq)]
 pub struct AudioDevice {
     pub id: String,
     pub name: String,
     pub is_default: bool,
+}
+
+/// How long a menu shows the same device list before listing devices again.
+const DEVICE_LIST_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The render devices for a menu that stays open over many UI frames.
+/// Listing them opens every device's property store, so it is repeated at
+/// most every [`DEVICE_LIST_REFRESH`] instead of on every frame.
+#[derive(Default)]
+pub struct RenderDeviceList {
+    listed: Option<(std::time::Instant, Vec<AudioDevice>)>,
+}
+
+impl RenderDeviceList {
+    pub fn get(&mut self, now: std::time::Instant) -> &[AudioDevice] {
+        self.get_with(now, render_devices)
+    }
+
+    fn get_with(
+        &mut self,
+        now: std::time::Instant,
+        list: impl FnOnce() -> Vec<AudioDevice>,
+    ) -> &[AudioDevice] {
+        let stale = self.listed.as_ref().is_none_or(|(listed_at, _)| {
+            now.saturating_duration_since(*listed_at) >= DEVICE_LIST_REFRESH
+        });
+        if stale {
+            self.listed = Some((now, list()));
+        }
+        &self.listed.as_ref().unwrap().1
+    }
 }
 
 /// Active render devices, default first. Safe to call from the UI thread.
@@ -714,8 +746,8 @@ impl Drop for Render {
 #[cfg(test)]
 mod tests {
     use super::{
-        fold_to_stereo, render_devices, AudioMonitor, AudioMonitorStatus, Capture, MixFormat,
-        TileAudioCapture,
+        fold_to_stereo, render_devices, AudioDevice, AudioMonitor, AudioMonitorStatus, Capture,
+        MixFormat, RenderDeviceList, TileAudioCapture, DEVICE_LIST_REFRESH,
     };
     use std::os::windows::process::CommandExt;
     use std::time::{Duration, Instant};
@@ -727,6 +759,40 @@ mod tests {
         },
         System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
     };
+
+    #[test]
+    fn an_open_menu_lists_devices_again_only_after_a_pause() {
+        let device = |name: &str| AudioDevice {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            is_default: false,
+        };
+        let mut list = RenderDeviceList::default();
+        let mut listings = 0;
+        let start = Instant::now();
+        let mut get = |list: &mut RenderDeviceList, at: Duration, name: &str| {
+            list.get_with(start + at, || {
+                listings += 1;
+                vec![device(name)]
+            })
+            .to_vec()
+        };
+        assert_eq!(
+            get(&mut list, Duration::ZERO, "Speakers"),
+            [device("Speakers")]
+        );
+        // Frames while the menu stays open reuse the list.
+        assert_eq!(
+            get(&mut list, DEVICE_LIST_REFRESH / 2, "Cable"),
+            [device("Speakers")]
+        );
+        // A device plugged in meanwhile shows up after the pause.
+        assert_eq!(
+            get(&mut list, DEVICE_LIST_REFRESH, "Cable"),
+            [device("Cable")]
+        );
+        assert_eq!(listings, 2);
+    }
 
     #[test]
     fn fold_passes_stereo_through() {

@@ -58,6 +58,9 @@ const WINDOW_CONNECTING_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 /// Browser overlays may stay transparent until their external data arrives.
 /// Their loading card needs motion, but not an uncapped canvas repaint loop.
 const TRANSPARENT_BROWSER_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+/// The video and browser loading cards pulse slowly; 30 frames a second keeps
+/// them smooth without redrawing every tile at the monitor's refresh rate.
+const LOADING_CARD_REPAINT_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Represents the current drag operation
 #[derive(Clone, Debug)]
@@ -2480,6 +2483,7 @@ impl CanvasState {
         let mut any_spawn_or_remove_animating = false;
         let mut window_capture_connecting = false;
         let mut transparent_browser_waiting = false;
+        let mut loading_card_animating = false;
         self.browser_chrome_holds_interaction = false;
 
         for info in &preview_info {
@@ -2740,10 +2744,10 @@ impl CanvasState {
                         browser_status,
                         input.time as f32,
                     );
-                    any_spawn_or_remove_animating |=
+                    loading_card_animating |=
                         !matches!(browser_status, BrowserTileStatus::Failed(_));
                 } else if is_video {
-                    any_spawn_or_remove_animating |= paint_video_placeholder(
+                    loading_card_animating |= paint_video_placeholder(
                         &painter,
                         anim_rect,
                         video_status,
@@ -3668,10 +3672,13 @@ impl CanvasState {
         self.follow_tab_drag(ctx, canvas_rect, preview_manager);
         self.tile_scratch = preview_info;
 
-        // Keep repainting while any preview is spawning in, fading out, or
-        // still waiting on its first frame so the animations stay smooth.
+        // Keep repainting while any preview is spawning in or fading out so
+        // the animations stay smooth.
         if any_spawn_or_remove_animating {
             ctx.request_repaint();
+        }
+        if loading_card_animating {
+            ctx.request_repaint_after(LOADING_CARD_REPAINT_INTERVAL);
         }
         if window_capture_connecting {
             ctx.request_repaint_after(WINDOW_CONNECTING_REPAINT_INTERVAL);
@@ -4289,8 +4296,14 @@ impl CanvasState {
             ui.ctx().request_repaint();
         }
 
-        // Keep repainting while the toast is visible so it can fade out.
-        ui.ctx().request_repaint();
+        // Repaint for the fades; hovering Undo repaints by itself.
+        ui.ctx()
+            .request_repaint_after(crate::ui_theme::toast_repaint_after(
+                age,
+                UNDO_TOAST_SECS,
+                0.15,
+                0.5,
+            ));
     }
 
     /// Draw selection indicators and interactive resize handles

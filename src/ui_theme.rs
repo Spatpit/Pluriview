@@ -205,9 +205,38 @@ pub fn clipped_text(ui: &egui::Ui, rect: egui::Rect, text: &str, size: f32, colo
         .galley(rect.min, galley, color);
 }
 
+/// How long a toast that fades in over its first `fade_in` seconds and out
+/// over its last `fade_out` can wait before its next frame. While it holds
+/// still, nothing needs drawing until the fade-out begins.
+pub fn toast_repaint_after(
+    age: f32,
+    lifetime: f32,
+    fade_in: f32,
+    fade_out: f32,
+) -> std::time::Duration {
+    let fade_out_starts = lifetime - fade_out;
+    if age < fade_in || age >= fade_out_starts {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_secs_f32(fade_out_starts - age)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_toast_redraws_only_while_it_fades() {
+        let after = |age| toast_repaint_after(age, 4.0, 0.15, 0.5);
+        assert_eq!(after(0.0), std::time::Duration::ZERO);
+        assert_eq!(after(0.1), std::time::Duration::ZERO);
+        // Holding still: the next frame is the start of the fade-out.
+        let held = after(1.5).as_secs_f32();
+        assert!((held - 2.0).abs() < 1e-4, "{held}");
+        assert_eq!(after(3.5), std::time::Duration::ZERO);
+        assert_eq!(after(3.9), std::time::Duration::ZERO);
+    }
 
     #[test]
     fn real_popup_with_shortcut_toggles_stays_compact_across_frames() {

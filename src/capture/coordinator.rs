@@ -43,6 +43,15 @@ impl CapturedFrame {
     }
 }
 
+/// A message to a capture worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerSignal {
+    Stop,
+    /// A browser tile wants another size: resize the frame it keeps, since a
+    /// static page sends no new frame.
+    Retarget,
+}
+
 /// Wakes the UI when a worker publishes a frame. A static source therefore
 /// costs no repaints, while busy sources still repaint at most once per UI
 /// frame and no faster than the fastest live capture FPS.
@@ -188,7 +197,7 @@ struct CaptureSession {
 
     /// Stops Windows Graphics Capture directly, even when a static window is
     /// no longer producing frame callbacks.
-    stop_sender: Sender<()>,
+    stop_sender: Sender<WorkerSignal>,
 
     worker: Option<JoinHandle<()>>,
 }
@@ -404,7 +413,7 @@ impl CaptureCoordinator {
     fn retire_session(&mut self, preview_id: PreviewId, join: bool) {
         if let Some(mut session) = self.sessions.remove(&preview_id) {
             session.active.store(false, Ordering::Relaxed);
-            let _ = session.stop_sender.send(());
+            let _ = session.stop_sender.send(WorkerSignal::Stop);
             session.latest_frame.lock().take();
             if let Some(worker) = session.worker.take() {
                 if join {
@@ -553,6 +562,9 @@ impl CaptureCoordinator {
             // Publish both dimensions before the generation change. The
             // capture callback acquires this generation before reading them.
             session.target_generation.fetch_add(1, Ordering::Release);
+            if session.retains_source {
+                let _ = session.stop_sender.send(WorkerSignal::Retarget);
+            }
 
             // Windows Graphics Capture may not emit another callback for a
             // static source. Invalidating it is asynchronous and coalesced by
@@ -615,7 +627,7 @@ impl CaptureCoordinator {
         self.recoveries.clear();
         for (_, mut session) in self.sessions.drain() {
             session.active.store(false, Ordering::Relaxed);
-            let _ = session.stop_sender.send(());
+            let _ = session.stop_sender.send(WorkerSignal::Stop);
             session.latest_frame.lock().take();
             if let Some(worker) = session.worker.take() {
                 self.retired_workers.push(worker);
@@ -634,7 +646,10 @@ impl CaptureCoordinator {
     /// Resume capturing for a preview
     pub fn resume_capture(&mut self, preview_id: PreviewId) {
         if let Some(session) = self.sessions.get(&preview_id) {
-            session.paused.store(false, Ordering::Relaxed);
+            // A browser tile resized while paused shows the new size at once.
+            if session.paused.swap(false, Ordering::Relaxed) && session.retains_source {
+                let _ = session.stop_sender.send(WorkerSignal::Retarget);
+            }
         }
     }
 
@@ -738,7 +753,7 @@ fn capture_window_loop(
     hwnd: isize,
     window_title: String,
     worker_state: CaptureWorkerState,
-    stop_receiver: Receiver<()>,
+    stop_receiver: Receiver<WorkerSignal>,
     end: CaptureEnd,
     retain_source: bool,
     in_use: bool,
@@ -798,9 +813,10 @@ fn capture_window_loop(
         frame_wake: Arc<FrameWake>,
         last_frame: std::time::Instant,
         handled_target_generation: u32,
-        // windows-capture 2 lets the caller retain row-unpacking storage.
-        // Keep it per worker so padded frames do not allocate fresh scratch.
+        // Row-unpacking storage, kept per worker so padded frames do not
+        // allocate fresh scratch.
         readback_scratch: Vec<u8>,
+        readback: super::readback::StagingReadback,
         downsampler: RgbaDownsampler,
         gpu_downsampler: super::gpu_downsample::GpuDownsampler,
         retain_source: bool,
@@ -874,6 +890,10 @@ fn capture_window_loop(
                 // sentinel so the first callback is never FPS-throttled.
                 handled_target_generation: u32::MAX,
                 readback_scratch: Vec::new(),
+                readback: super::readback::StagingReadback::new(
+                    ctx.device.clone(),
+                    ctx.device_context.clone(),
+                ),
                 downsampler: RgbaDownsampler::default(),
                 gpu_downsampler: super::gpu_downsample::GpuDownsampler::new(
                     ctx.device,
@@ -949,27 +969,31 @@ fn capture_window_loop(
                 );
                 CapturedFrame::from_rgba(out_width, out_height, width, height, &data)
             } else if out_width == width && out_height == height {
-                let buffer = frame.buffer()?;
-                // Convert straight from the reused readback scratch: no
+                // Convert straight from the mapped staging texture: no
                 // intermediate byte copy, and no per-pixel work on the UI thread.
-                CapturedFrame::from_rgba(
-                    width,
-                    height,
-                    width,
-                    height,
-                    buffer.as_nopadding_buffer(&mut self.readback_scratch),
-                )
+                let scratch = &mut self.readback_scratch;
+                self.readback
+                    .read(frame.as_raw_texture(), width, height, |rows, pitch| {
+                        CapturedFrame::from_rgba(
+                            width,
+                            height,
+                            width,
+                            height,
+                            super::readback::unpadded_rgba(rows, width, height, pitch, scratch),
+                        )
+                    })?
             } else {
-                let mut buffer = frame.buffer()?;
-                let stride = buffer.row_pitch();
                 #[cfg(pluriview_performance)]
                 crate::app::performance::counters::record(
                     crate::app::performance::counters::CAPTURE_CPU_RESIZED,
                 );
-                let raw = buffer.as_raw_buffer();
-                let Some(data) = self
-                    .downsampler
-                    .downsample(raw, width, height, stride, out_width, out_height)
+                let downsampler = &mut self.downsampler;
+                let Some(data) =
+                    self.readback
+                        .read(frame.as_raw_texture(), width, height, |rows, pitch| {
+                            downsampler
+                                .downsample(rows, width, height, pitch, out_width, out_height)
+                        })?
                 else {
                     return Err("Could not downscale the captured frame".into());
                 };
@@ -1070,14 +1094,14 @@ fn capture_window_loop(
     // without waiting for another frame callback to arrive.
     match start_result {
         Ok(control) => {
-            // A browser session also wakes often enough to follow a zoom on a
-            // page that sends no new frames.
+            // A browser session is told when its tile changes size, so it
+            // can resize the frame it keeps for a page that sends no new
+            // frames. The timeout notices a capture that ended by itself.
             let handler = control.callback();
-            let wake = std::time::Duration::from_millis(if retain_source { 20 } else { 100 });
             while active.load(Ordering::Relaxed) && !control.is_finished() {
-                match stop_receiver.recv_timeout(wake) {
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => {}
+                match stop_receiver.recv_timeout(Duration::from_millis(100)) {
+                    Ok(WorkerSignal::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+                    Ok(WorkerSignal::Retarget) | Err(RecvTimeoutError::Timeout) => {}
                 }
                 if retain_source {
                     handler.lock().refresh_from_retained();
@@ -1216,7 +1240,8 @@ fn probed_minimum_update_interval() -> windows_capture::settings::MinimumUpdateI
 mod tests {
     use super::{
         capture_frame_due, capture_target_from_hwnd, CaptureCoordinator, CaptureSession,
-        CapturedFrame, Recovery, RECOVERY_ATTEMPTS, RECOVERY_FIRST_DELAY, RECOVERY_SETTLED,
+        CapturedFrame, Recovery, WorkerSignal, RECOVERY_ATTEMPTS, RECOVERY_FIRST_DELAY,
+        RECOVERY_SETTLED,
     };
     use crate::preview::{PreviewId, PreviewManager};
     use eframe::egui::{Pos2, Vec2};
@@ -1250,61 +1275,51 @@ mod tests {
     }
 
     #[test]
+    fn a_browser_worker_is_woken_only_when_its_tile_changes_size() {
+        let mut coordinator = CaptureCoordinator::new();
+        let mut signals = Vec::new();
+        for (index, retains_source) in [true, false].into_iter().enumerate() {
+            let (stop_sender, receiver) = mpsc::channel();
+            let mut session = session(30, true, false);
+            session.retains_source = retains_source;
+            session.stop_sender = stop_sender;
+            coordinator
+                .sessions
+                .insert(PreviewId(index as u64 + 1), session);
+            signals.push(receiver);
+        }
+        let received =
+            |receiver: &mpsc::Receiver<WorkerSignal>| receiver.try_iter().collect::<Vec<_>>();
+
+        for id in [PreviewId(1), PreviewId(2)] {
+            coordinator.set_target_size(id, 640, 360);
+            // The same size again is not a change.
+            coordinator.set_target_size(id, 640, 360);
+        }
+        assert_eq!(received(&signals[0]), [WorkerSignal::Retarget]);
+        assert!(
+            received(&signals[1]).is_empty(),
+            "window tiles get new frames instead"
+        );
+
+        // Resuming shows a size chosen while paused; resuming again does not.
+        for id in [PreviewId(1), PreviewId(2)] {
+            coordinator.pause_capture(id);
+            coordinator.resume_capture(id);
+            coordinator.resume_capture(id);
+        }
+        assert_eq!(received(&signals[0]), [WorkerSignal::Retarget]);
+        assert!(received(&signals[1]).is_empty());
+
+        coordinator.stop_capture(PreviewId(1));
+        assert_eq!(received(&signals[0]), [WorkerSignal::Stop]);
+    }
+
+    #[test]
     fn capture_target_preserves_supplied_hwnd() {
         let hwnd = 0x1234isize;
         let target = capture_target_from_hwnd(hwnd);
         assert_eq!(target.as_raw_hwnd() as isize, hwnd);
-    }
-
-    #[test]
-    fn capture_readback_preserves_rgba_across_padded_frame_resizes() {
-        use windows_capture::{frame::FrameBuffer, settings::ColorFormat};
-
-        let mut scratch = Vec::new();
-        let mut largest_capacity = 0;
-        // Grow, shrink, then reuse the original size. Padding bytes must never
-        // become pixels, and shrinking must not append stale rows to the frame.
-        for (width, height, padding) in [(7, 5, 12), (3, 2, 4), (7, 5, 12), (4, 3, 0)] {
-            let stride = width * 4 + padding;
-            let mut raw = vec![0xee; (stride * height) as usize];
-            let mut expected = Vec::new();
-            for y in 0..height {
-                for x in 0..width {
-                    let pixel = [x as u8, y as u8, (x + y) as u8, (x * y) as u8];
-                    let start = (y * stride + x * 4) as usize;
-                    raw[start..start + 4].copy_from_slice(&pixel);
-                    expected.extend_from_slice(&pixel);
-                }
-            }
-            let buffer = FrameBuffer::new(
-                &mut raw,
-                width,
-                height,
-                stride,
-                stride * height,
-                ColorFormat::Rgba8,
-            );
-            assert_eq!(buffer.as_nopadding_buffer(&mut scratch), expected);
-            if largest_capacity == 0 {
-                largest_capacity = scratch.capacity();
-            } else {
-                assert_eq!(scratch.capacity(), largest_capacity);
-            }
-        }
-    }
-
-    #[test]
-    fn unpadded_capture_readback_does_not_allocate_scratch() {
-        use windows_capture::{frame::FrameBuffer, settings::ColorFormat};
-
-        let mut raw = vec![1, 2, 3, 0, 5, 6, 7, 255];
-        let source = raw.as_ptr();
-        let buffer = FrameBuffer::new(&mut raw, 2, 1, 8, 8, ColorFormat::Rgba8);
-        let mut scratch = Vec::new();
-        let pixels = buffer.as_nopadding_buffer(&mut scratch);
-        assert_eq!(pixels, [1, 2, 3, 0, 5, 6, 7, 255]);
-        assert_eq!(pixels.as_ptr(), source);
-        assert_eq!(scratch.capacity(), 0);
     }
 
     #[test]

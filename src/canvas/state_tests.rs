@@ -1432,11 +1432,13 @@ impl CropUiTest {
                 PathBuf::from("fixture.png"),
                 "image".into(),
                 (0..if kind == 3 { 2 } else { 1 })
-                    .map(|_| crate::media::MediaFrame {
-                        width: 200,
-                        height: 100,
-                        rgba: vec![0; 200 * 100 * 4],
-                        duration: Duration::from_millis(100),
+                    .map(|_| {
+                        crate::media::MediaFrame::from_rgba(
+                            200,
+                            100,
+                            &[0; 200 * 100 * 4],
+                            Duration::from_millis(100),
+                        )
                     })
                     .collect(),
                 position,
@@ -2102,12 +2104,12 @@ fn alt_crop_drag_crops_an_image_tile() {
     let id = previews.add_media(
         PathBuf::from("image.png"),
         "image".to_owned(),
-        vec![crate::media::MediaFrame {
-            width: 200,
-            height: 100,
-            rgba: vec![0; 200 * 100 * 4],
-            duration: Duration::from_millis(100),
-        }],
+        vec![crate::media::MediaFrame::from_rgba(
+            200,
+            100,
+            &[0; 200 * 100 * 4],
+            Duration::from_millis(100),
+        )],
         Pos2::new(100.0, 100.0),
         Vec2::new(200.0, 100.0),
     );

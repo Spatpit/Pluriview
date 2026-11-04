@@ -101,8 +101,9 @@ impl CanvasWallpaper {
                 }
             } else {
                 self.paint_video_status(painter, canvas_rect);
+                // The status is still text; check back for the player soon.
                 if !self.video_sleeping && self.error.is_none() {
-                    ctx.request_repaint();
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 }
             }
             return;
@@ -147,7 +148,7 @@ impl CanvasWallpaper {
             self.frame_dirty = false;
             if let Some(frame) = self.frames.get(self.frame_index) {
                 let max_side = ctx.input(|input| input.max_texture_side);
-                let image = crate::media::frame_color_image(frame, max_side);
+                let image = crate::media::frame_upload(frame, max_side);
                 if let Some(texture) = self.texture.as_mut() {
                     texture.set(image, egui::TextureOptions::LINEAR);
                 } else {

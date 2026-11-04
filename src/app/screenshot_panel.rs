@@ -1,7 +1,7 @@
 use super::*;
 use crate::screenshot_library::{self, ScreenshotFolder};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::SystemTime;
 
 /// Folder contents can change in Explorer; refresh while the panel is open.
@@ -25,7 +25,9 @@ pub(super) struct ShotDrag {
 
 #[derive(Default)]
 pub(super) struct PanelState {
-    folders: Vec<ScreenshotFolder>,
+    /// Shared so drawing the panel can hold the listing while it changes the
+    /// rest of the state, without copying every folder each frame.
+    folders: Arc<Vec<ScreenshotFolder>>,
     scan: Option<mpsc::Receiver<Vec<ScreenshotFolder>>>,
     scan_queued: bool,
     last_scan: Option<Instant>,
@@ -196,6 +198,19 @@ enum EditOutcome {
     Cancel,
 }
 
+/// Screenshots in panel order, skipping collapsed folders so a Shift range
+/// never selects hidden shots.
+fn shot_order<'a>(
+    folders: &'a [ScreenshotFolder],
+    collapsed: &HashSet<Option<String>>,
+) -> Vec<&'a Path> {
+    folders
+        .iter()
+        .filter(|folder| !collapsed.contains(&folder.name))
+        .flat_map(|folder| folder.shots.iter().map(|shot| shot.path.as_path()))
+        .collect()
+}
+
 fn folder_label(name: Option<&str>) -> &str {
     name.unwrap_or("Unsorted")
 }
@@ -232,22 +247,12 @@ impl PanelState {
         self.scan_queued = true;
     }
 
-    /// Screenshots in panel order, skipping collapsed folders so a Shift
-    /// range never selects hidden shots.
-    fn order(&self) -> Vec<&Path> {
-        self.folders
-            .iter()
-            .filter(|folder| !self.collapsed.contains(&folder.name))
-            .flat_map(|folder| folder.shots.iter().map(|shot| shot.path.as_path()))
-            .collect()
-    }
-
     fn upkeep(&mut self, root: &Path, ctx: &egui::Context) {
         self.frame += 1;
         if let Some(receiver) = &self.scan {
             match receiver.try_recv() {
                 Ok(folders) => {
-                    self.folders = folders;
+                    self.folders = Arc::new(folders);
                     self.scan = None;
                     let existing: HashSet<&Path> = self
                         .folders
@@ -594,7 +599,7 @@ impl PluriviewApp {
                         .selected_text(folder_label(save_folder.as_deref()))
                         .width(ui.available_width())
                         .show_ui(ui, |ui| {
-                            for folder in &state.folders {
+                            for folder in state.folders.iter() {
                                 let selected = folder.name == save_folder;
                                 if ui
                                     .selectable_label(
@@ -611,9 +616,8 @@ impl PluriviewApp {
                 });
                 ui.add_space(8.0);
 
-                let order: Vec<PathBuf> =
-                    state.order().into_iter().map(Path::to_path_buf).collect();
-                let order_refs: Vec<&Path> = order.iter().map(PathBuf::as_path).collect();
+                let folders = Arc::clone(&state.folders);
+                let order_refs = shot_order(&folders, &state.collapsed);
                 let selected = state.selection.ordered(&order_refs);
                 if !selected.is_empty() {
                     selection_bar(
@@ -629,7 +633,7 @@ impl PluriviewApp {
                 let dragging = egui::DragAndDrop::payload::<ShotDrag>(ui.ctx());
                 let released = ui.input(|input| input.pointer.any_released());
                 let mut landing = None;
-                let total = order.len();
+                let total = order_refs.len();
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -658,8 +662,7 @@ impl PluriviewApp {
                         if total == 0 && state.folders.len() <= 1 && state.edit.is_none() {
                             empty_state(ui, shot_shortcut);
                         }
-                        let folders = state.folders.clone();
-                        for folder in &folders {
+                        for folder in folders.iter() {
                             let section_top = ui.cursor().top();
                             let renaming = folder.name.is_some()
                                 && state
@@ -1532,7 +1535,7 @@ mod tests {
     #[test]
     fn hiding_the_panel_releases_its_caches_but_keeps_collapsed_folders() {
         let mut panel = PanelState::default();
-        panel.folders.push(ScreenshotFolder {
+        Arc::make_mut(&mut panel.folders).push(ScreenshotFolder {
             name: None,
             shots: Vec::new(),
         });

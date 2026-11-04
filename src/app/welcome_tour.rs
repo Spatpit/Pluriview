@@ -460,7 +460,11 @@ impl WelcomeTour {
             self.started = Some(now);
             elapsed = 0.0;
         }
-        ctx.request_repaint();
+        // The demos animate on every frame, but a minimized window shows
+        // nothing; restoring it repaints and the demos carry on.
+        if !ctx.input(|input| input.viewport().minimized.unwrap_or(false)) {
+            ctx.request_repaint();
+        }
 
         let screen = ctx.screen_rect();
         let width = WIDTH.min(screen.width() - 96.0).max(320.0);

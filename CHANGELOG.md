@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Window tiles shown at the window's own size reuse one GPU copy buffer instead of creating a new one, up to 33 MB, for every frame.
+- Spout tiles are now shrunk to the tile's size on the graphics card, as window tiles are, and only that smaller picture is read back. They used to read back every full frame and shrink it on the processor.
+- GIF frames are prepared for display once, when the GIF loads, instead of being converted again every time the animation moves on. A 1080p GIF wallpaper used to convert about 240 MB a second. Recording or screenshotting a GIF tile reuses the prepared frames too.
+- The Phone Viewer's network threads now sleep until a phone connects instead of checking about 1,200 times a second while sharing is on. Stopping sharing still closes it at once.
+- Browser tiles' capture threads now wait to be told the tile changed size instead of checking 50 times a second.
+- Video players start without mpv's built-in extra scripts (statistics, console, menus), which Pluriview never uses. Each player and timeline preview runs about half as many threads.
+- Less redrawing while nothing moves. The undo and notice messages redraw only while fading in or out, the loading animations on video and browser tiles and the browser loading bar redraw 30 times a second instead of at the monitor's refresh rate, the ad-blocker's 8-second wait and a starting video wallpaper no longer redraw constantly, and the Getting Started tour stops animating while Pluriview is minimized.
+- The **Stream Audio Monitor** menu lists output devices every 2 seconds while it is open instead of on every frame, and the Screenshots panel no longer copies its whole list on every frame.
+- Workspaces save their tiles in the order they were added instead of an order that could change from one save to the next, so an unchanged workspace is not rewritten just because its tiles were listed differently.
 - Reorganized the shortcut editor. **Settings** now has **Keyboard Shortcuts** and **External Tools** tabs, opening on shortcuts (a video tool error still opens External Tools). Shortcuts are grouped into Panels & View, Tiles, Browser Tiles, Groups & Layouts, Screenshots & Recording and a folded Saved Viewpoints section, with a search box that finds actions by name or key. Each key is a button lined up on the right: click it and press the new key, or **Cancel**. A changed key gets a reset button back to its default, and a key already in use shows the conflict on that row with **Swap** to trade keys. **Help → Keyboard Shortcuts** has a **Change Shortcuts...** button.
 - The Control Tile Center map now starts in **Move tiles**, listed first; **Move camera** is one click away.
 - Right-clicking empty canvas now offers hidden tiles back without opening the Control Tile Center: hover **Show Hidden Tiles** to list them by name to the side, a hidden group as a single line, with **Show All** when several are hidden. It only appears while something is hidden. The empty-canvas **Always on Top** check box now lines up with the others.

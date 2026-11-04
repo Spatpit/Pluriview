@@ -1145,6 +1145,9 @@ pub struct PluriviewApp {
     /// Per-window process loopbacks for tiles with SA enabled.
     #[cfg(windows)]
     window_audio_monitors: HashMap<u32, crate::audio::AudioMonitor>,
+    /// Output devices offered by the Stream Audio Monitor menu.
+    #[cfg(windows)]
+    render_devices: crate::audio::RenderDeviceList,
 
     /// Last scan for applications backing inactive saved window tiles.
     #[cfg(windows)]
@@ -1345,6 +1348,8 @@ impl PluriviewApp {
             audio_monitor_checked: None,
             #[cfg(windows)]
             window_audio_monitors: HashMap::new(),
+            #[cfg(windows)]
+            render_devices: Default::default(),
             #[cfg(windows)]
             last_inactive_window_scan: None,
             last_privacy_check: None,
@@ -2745,10 +2750,13 @@ impl PluriviewApp {
 
         self.browser.poll_adblock_settle();
 
-        if matches!(status, ExtensionPreparationStatus::Preparing(_))
-            || self.browser.adblock_settling()
-        {
-            ctx.request_repaint();
+        // Unpacking runs on a worker; check its progress a few times a second.
+        if matches!(status, ExtensionPreparationStatus::Preparing(_)) {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        // Nothing changes while the rules settle; wake when held tiles can go.
+        if let Some(remaining) = self.browser.adblock_settle_remaining() {
+            ctx.request_repaint_after(remaining);
         }
     }
 
@@ -4584,7 +4592,12 @@ impl PluriviewApp {
                     .inner_margin(egui::Margin::symmetric(12.0, 7.0))
                     .show(ui, |ui| ui.label(message.as_str()));
             });
-        ctx.request_repaint();
+        ctx.request_repaint_after(crate::ui_theme::toast_repaint_after(
+            age,
+            CANVAS_NOTICE_SECS,
+            0.15,
+            0.5,
+        ));
     }
 
     fn canvas_view_undo_toast_ui(&mut self, ctx: &egui::Context) {
@@ -4640,7 +4653,12 @@ impl PluriviewApp {
                         });
                     });
             });
-        ctx.request_repaint();
+        ctx.request_repaint_after(crate::ui_theme::toast_repaint_after(
+            age,
+            CANVAS_VIEW_UNDO_SECS,
+            0.15,
+            0.5,
+        ));
 
         if undo {
             let deleted = self
@@ -4789,7 +4807,7 @@ impl PluriviewApp {
                 self.monitor_device = None;
                 ui.close_menu();
             }
-            for device in crate::audio::render_devices() {
+            for device in self.render_devices.get(Instant::now()) {
                 if device.is_default {
                     // Monitoring to the device you're hearing = double audio.
                     continue;
@@ -4799,7 +4817,7 @@ impl PluriviewApp {
                     .as_ref()
                     .is_some_and(|(id, _)| *id == device.id);
                 if ui.radio(selected, &device.name).clicked() {
-                    self.monitor_device = Some((device.id, device.name));
+                    self.monitor_device = Some((device.id.clone(), device.name.clone()));
                     ui.close_menu();
                 }
             }
@@ -5033,12 +5051,12 @@ mod tests {
                     let id = test.previews.add_media(
                         PathBuf::from("fixture.png"),
                         "Fixture".into(),
-                        vec![crate::media::MediaFrame {
-                            width: 2,
-                            height: 2,
-                            rgba: vec![255; 16],
-                            duration: Duration::ZERO,
-                        }],
+                        vec![crate::media::MediaFrame::from_rgba(
+                            2,
+                            2,
+                            &[255; 16],
+                            Duration::ZERO,
+                        )],
                         Pos2::new(100.0, 100.0),
                         Vec2::new(200.0, 100.0),
                     );
