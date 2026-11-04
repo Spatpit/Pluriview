@@ -2853,6 +2853,14 @@ impl PluriviewApp {
             self.add_browser = None;
         } else if let Some((url, position, target)) = submit {
             let result = match target {
+                Some(id)
+                    if !self
+                        .preview_manager
+                        .get(id)
+                        .is_some_and(|preview| preview.is_browser()) =>
+                {
+                    Err("This browser tile no longer exists.".to_owned())
+                }
                 // Retarget an existing tile: navigate its WebView in place.
                 Some(id) => normalize_url(&url).map_err(str::to_owned).map(|url| {
                     if let Some(host) = self.browser.get(id) {

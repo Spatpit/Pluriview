@@ -281,6 +281,17 @@ impl PluriviewApp {
     /// Finish the file and fly the recording's picture into its folder in
     /// the Screenshots panel (or the Capture button), like a screenshot.
     pub(super) fn stop_recording(&mut self, ctx: &egui::Context) {
+        self.finish_recording(Some(ctx));
+    }
+
+    /// Finish the file before a workspace change discards its tiles. Tile ids
+    /// restart at 1 in the next workspace, so the recording would otherwise
+    /// carry on with whichever new tiles reuse them.
+    pub(super) fn stop_recording_for_layout_change(&mut self) {
+        self.finish_recording(None);
+    }
+
+    fn finish_recording(&mut self, ctx: Option<&egui::Context>) {
         let Some(active) = self.recording.active.take() else {
             return;
         };
@@ -288,8 +299,10 @@ impl PluriviewApp {
         let from = self.recorded_screen_rect(&ids);
         self.release_recorded_tiles(&ids);
         let length = active.clock.media_time(Instant::now());
-        let thumbnail = match (active.thumbnail, from) {
-            (Some((image, _)), Some(from)) => self.launch_capture_flight_from(from, image, ctx),
+        let thumbnail = match (active.thumbnail, from, ctx) {
+            (Some((image, _)), Some(from), Some(ctx)) => {
+                self.launch_capture_flight_from(from, image, ctx)
+            }
             _ => None,
         };
         self.recording.finishing.push(FinishingRecording {

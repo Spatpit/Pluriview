@@ -690,6 +690,10 @@ impl PluriviewApp {
         #[cfg(windows)]
         self.drop_live_window();
         self.close_picture_in_picture();
+        self.stop_recording_for_layout_change();
+        self.screenshots.forget_tile_requests();
+        // "Change URL..." targets a tile id that the next layout reuses.
+        self.add_browser = None;
         self.source_loads.clear();
         self.canvas_view_dialog = None;
         self.active_canvas_view = None;
@@ -753,18 +757,6 @@ impl PluriviewApp {
         // `pending_maximize` (read once, in `new`) in sync.
         self.window_layout = layout.window.unwrap_or(self.window_layout);
 
-        #[cfg(windows)]
-        {
-            self.recent_urls = layout
-                .recent_browser_urls
-                .iter()
-                .filter_map(|url| scrub_url_for_storage(url))
-                .collect();
-        }
-        #[cfg(not(windows))]
-        {
-            self.recent_urls = layout.recent_browser_urls.clone();
-        }
         #[cfg(windows)]
         {
             self.monitor_device = layout.monitor_device.clone();
@@ -950,6 +942,21 @@ impl PluriviewApp {
                     privacy::redact_title(&preview_layout.window_title)
                 );
             }
+        }
+
+        // Restored after the tiles: recreating each browser tile remembers
+        // its URL, which would otherwise push the saved recent sites out.
+        #[cfg(windows)]
+        {
+            self.recent_urls = layout
+                .recent_browser_urls
+                .iter()
+                .filter_map(|url| scrub_url_for_storage(url))
+                .collect();
+        }
+        #[cfg(not(windows))]
+        {
+            self.recent_urls = layout.recent_browser_urls.clone();
         }
 
         #[cfg(windows)]

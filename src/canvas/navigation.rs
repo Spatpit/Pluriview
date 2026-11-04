@@ -38,16 +38,29 @@ impl CanvasState {
         self.cancel_camera_transition();
     }
 
-    /// Drop transient tile interaction state from a previous layout.
+    /// Drop transient tile interaction state from a previous layout. Tile
+    /// ids restart at 1 in the next layout, so anything still holding an old
+    /// id (selection, focus, a gesture, a queued action) would otherwise act
+    /// on an unrelated tile there.
     pub fn clear_preview_interactions(&mut self) {
+        self.cancel_pointer_interaction();
         self.groups = GroupState::default();
-        self.finish_crop();
+        self.selection.clear();
+        self.focus = None;
+        self.browser_tab_scroll.clear();
         self.last_removed = None;
         self.removed_undo_requested = false;
         self.pending_removed_restore = None;
+        self.pending_stream_audio_toggles.clear();
+        self.pending_browser_actions.clear();
+        self.pending_browser_scrolls.clear();
+        self.pending_browser_navigations.clear();
+        self.pending_video_actions.clear();
+        self.pending_tile_activity_actions.clear();
+        self.pending_playlist_actions.clear();
         self.pending_media_actions.clear();
-        self.pinned_drag_origins.clear();
-        self.pinned_pointer_drag = None;
+        self.pending_show_window = None;
+        self.pending_picture_in_picture = None;
         self.video_volume_hover = None;
         self.live_window = LiveWindow::default();
     }

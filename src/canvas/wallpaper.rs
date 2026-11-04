@@ -146,10 +146,8 @@ impl CanvasWallpaper {
         if self.frame_dirty {
             self.frame_dirty = false;
             if let Some(frame) = self.frames.get(self.frame_index) {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                );
+                let max_side = ctx.input(|input| input.max_texture_side);
+                let image = crate::media::frame_color_image(frame, max_side);
                 if let Some(texture) = self.texture.as_mut() {
                     texture.set(image, egui::TextureOptions::LINEAR);
                 } else {

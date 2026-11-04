@@ -904,12 +904,11 @@ impl Preview {
         // image directly from that slice instead of cloning a second buffer.
         let media_image = if self.media_frame_dirty {
             self.media_frame_dirty = false;
-            let image = self.media_frames.get(self.media_frame_index).map(|frame| {
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                )
-            });
+            let max_side = ctx.input(|input| input.max_texture_side);
+            let image = self
+                .media_frames
+                .get(self.media_frame_index)
+                .map(|frame| crate::media::frame_color_image(frame, max_side));
             // A still image never uploads again, so its decoded copy would
             // only double its memory. GIF frames stay for animation.
             if image.is_some() && self.media_frames.len() == 1 {

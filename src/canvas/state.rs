@@ -4573,38 +4573,65 @@ fn apply_crop(
     let uv_delta_y = delta.y / start_rect.height().max(0.001) * v_span;
     let mut crop = start_crop;
 
+    let low_u = |value: f32| clamp_low_crop_edge(value, min_u, max_u);
+    let low_v = |value: f32| clamp_low_crop_edge(value, min_v, max_v);
+    let high_u = |value: f32| clamp_high_crop_edge(value, max_u, min_u);
+    let high_v = |value: f32| clamp_high_crop_edge(value, max_v, min_v);
+
     match handle {
         ResizeHandle::TopLeft => {
-            crop.0 = (min_u + uv_delta_x).clamp(0.0, max_u - 0.1);
-            crop.1 = (min_v + uv_delta_y).clamp(0.0, max_v - 0.1);
+            crop.0 = low_u(min_u + uv_delta_x);
+            crop.1 = low_v(min_v + uv_delta_y);
         }
         ResizeHandle::Top => {
-            crop.1 = (min_v + uv_delta_y).clamp(0.0, max_v - 0.1);
+            crop.1 = low_v(min_v + uv_delta_y);
         }
         ResizeHandle::TopRight => {
-            crop.2 = (max_u + uv_delta_x).clamp(min_u + 0.1, 1.0);
-            crop.1 = (min_v + uv_delta_y).clamp(0.0, max_v - 0.1);
+            crop.2 = high_u(max_u + uv_delta_x);
+            crop.1 = low_v(min_v + uv_delta_y);
         }
         ResizeHandle::Left => {
-            crop.0 = (min_u + uv_delta_x).clamp(0.0, max_u - 0.1);
+            crop.0 = low_u(min_u + uv_delta_x);
         }
         ResizeHandle::Right => {
-            crop.2 = (max_u + uv_delta_x).clamp(min_u + 0.1, 1.0);
+            crop.2 = high_u(max_u + uv_delta_x);
         }
         ResizeHandle::BottomLeft => {
-            crop.0 = (min_u + uv_delta_x).clamp(0.0, max_u - 0.1);
-            crop.3 = (max_v + uv_delta_y).clamp(min_v + 0.1, 1.0);
+            crop.0 = low_u(min_u + uv_delta_x);
+            crop.3 = high_v(max_v + uv_delta_y);
         }
         ResizeHandle::Bottom => {
-            crop.3 = (max_v + uv_delta_y).clamp(min_v + 0.1, 1.0);
+            crop.3 = high_v(max_v + uv_delta_y);
         }
         ResizeHandle::BottomRight => {
-            crop.2 = (max_u + uv_delta_x).clamp(min_u + 0.1, 1.0);
-            crop.3 = (max_v + uv_delta_y).clamp(min_v + 0.1, 1.0);
+            crop.2 = high_u(max_u + uv_delta_x);
+            crop.3 = high_v(max_v + uv_delta_y);
         }
     }
 
     (crop, rect_for_crop_change(start_crop, crop, start_rect))
+}
+
+/// Smallest crop span a handle drag can create.
+const MIN_HANDLE_CROP_SPAN: f32 = 0.1;
+
+/// Clamps a dragged left/top crop edge. Fit to Video can leave a crop
+/// narrower than `MIN_HANDLE_CROP_SPAN`; such an edge may grow but never
+/// jumps or shrinks further (and the bounds can never cross).
+fn clamp_low_crop_edge(value: f32, start: f32, opposite: f32) -> f32 {
+    let upper = (opposite - MIN_HANDLE_CROP_SPAN)
+        .max(start.min(opposite))
+        .clamp(0.0, 1.0);
+    // max/min rather than clamp: clamp panics on inverted or NaN bounds.
+    value.max(0.0).min(upper)
+}
+
+/// Right/bottom counterpart of [`clamp_low_crop_edge`].
+fn clamp_high_crop_edge(value: f32, start: f32, opposite: f32) -> f32 {
+    let lower = (opposite + MIN_HANDLE_CROP_SPAN)
+        .min(start.max(opposite))
+        .clamp(0.0, 1.0);
+    value.max(lower).min(1.0)
 }
 
 fn rect_for_crop_change(

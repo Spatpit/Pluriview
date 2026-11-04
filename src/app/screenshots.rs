@@ -31,6 +31,18 @@ pub(super) struct ScreenshotState {
     pub(super) landings: Vec<super::screenshot_drop::Landing>,
 }
 
+impl ScreenshotState {
+    /// Forget shots still waiting for a tile's frame, and landings flying to
+    /// a tile, before a workspace change. Tile ids restart at 1 there, so
+    /// they would otherwise capture or target an unrelated tile. Files
+    /// already being saved finish normally.
+    pub(super) fn forget_tile_requests(&mut self) {
+        self.pending.clear();
+        self.pending_combined.clear();
+        self.landings.clear();
+    }
+}
+
 struct SavingShot {
     receiver: mpsc::Receiver<Result<PathBuf, String>>,
     /// Reused as the panel thumbnail once the file exists.
