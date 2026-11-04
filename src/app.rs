@@ -101,6 +101,9 @@ const WALLPAPER_HIBERNATE_AFTER: Duration = Duration::from_secs(10);
 const MAX_RECENT_URLS: usize = 8;
 /// Persist a changed workspace at most this long after the previous check.
 const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
+/// On exit, the longest wait for recordings and screenshots still being
+/// written to finish.
+const EXIT_SAVE_WAIT: Duration = Duration::from_secs(15);
 /// Recoverable deletion window for a named canvas view.
 const CANVAS_VIEW_UNDO_SECS: f32 = 4.0;
 const CANVAS_NOTICE_SECS: f32 = 4.0;
@@ -1142,6 +1145,9 @@ pub struct PluriviewApp {
     /// Per-window process loopbacks for tiles with SA enabled.
     #[cfg(windows)]
     window_audio_monitors: HashMap<u32, crate::audio::AudioMonitor>,
+    /// Output devices offered by the Stream Audio Monitor menu.
+    #[cfg(windows)]
+    render_devices: crate::audio::RenderDeviceList,
 
     /// Last scan for applications backing inactive saved window tiles.
     #[cfg(windows)]
@@ -1342,6 +1348,8 @@ impl PluriviewApp {
             audio_monitor_checked: None,
             #[cfg(windows)]
             window_audio_monitors: HashMap::new(),
+            #[cfg(windows)]
+            render_devices: Default::default(),
             #[cfg(windows)]
             last_inactive_window_scan: None,
             last_privacy_check: None,
@@ -2485,26 +2493,35 @@ impl PluriviewApp {
             if !still_needed {
                 continue;
             }
-            let ToolStatus::Available { path: mpv_path, .. } =
-                self.external_tools.status(ToolKind::Mpv)
-            else {
-                if let Some(entry) = self
-                    .preview_manager
-                    .get_mut(playlist_id)
-                    .and_then(|preview| preview.folder_playlist.as_mut())
-                    .and_then(|playlist| {
-                        playlist.entries.iter_mut().find(|entry| entry.path == path)
-                    })
-                {
-                    entry.thumbnail_state = ThumbnailState::Failed;
-                }
-                continue;
-            };
+            let mpv_path =
+                match available_tool_path(self.external_tools.status(ToolKind::Mpv), "mpv") {
+                    Ok(Some(mpv_path)) => mpv_path,
+                    // Still looking for mpv, as right after launch: wait for it
+                    // rather than failing every thumbnail for the session.
+                    Ok(None) => {
+                        self.playlist_thumbnail_queue
+                            .push_front((playlist_id, path));
+                        break;
+                    }
+                    Err(_) => {
+                        if let Some(entry) = self
+                            .preview_manager
+                            .get_mut(playlist_id)
+                            .and_then(|preview| preview.folder_playlist.as_mut())
+                            .and_then(|playlist| {
+                                playlist.entries.iter_mut().find(|entry| entry.path == path)
+                            })
+                        {
+                            entry.thumbnail_state = ThumbnailState::Failed;
+                        }
+                        continue;
+                    }
+                };
             self.playlist_thumbnail_jobs.push(PlaylistThumbnailJob {
                 playlist_id,
                 path: path.clone(),
                 receiver: video::spawn_video_thumbnail(
-                    mpv_path.clone(),
+                    mpv_path,
                     video::VideoThumbnailSource::LocalFile(path),
                     1.0,
                 ),
@@ -2733,10 +2750,13 @@ impl PluriviewApp {
 
         self.browser.poll_adblock_settle();
 
-        if matches!(status, ExtensionPreparationStatus::Preparing(_))
-            || self.browser.adblock_settling()
-        {
-            ctx.request_repaint();
+        // Unpacking runs on a worker; check its progress a few times a second.
+        if matches!(status, ExtensionPreparationStatus::Preparing(_)) {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        // Nothing changes while the rules settle; wake when held tiles can go.
+        if let Some(remaining) = self.browser.adblock_settle_remaining() {
+            ctx.request_repaint_after(remaining);
         }
     }
 
@@ -2853,6 +2873,14 @@ impl PluriviewApp {
             self.add_browser = None;
         } else if let Some((url, position, target)) = submit {
             let result = match target {
+                Some(id)
+                    if !self
+                        .preview_manager
+                        .get(id)
+                        .is_some_and(|preview| preview.is_browser()) =>
+                {
+                    Err("This browser tile no longer exists.".to_owned())
+                }
                 // Retarget an existing tile: navigate its WebView in place.
                 Some(id) => normalize_url(&url).map_err(str::to_owned).map(|url| {
                     if let Some(host) = self.browser.get(id) {
@@ -4564,7 +4592,12 @@ impl PluriviewApp {
                     .inner_margin(egui::Margin::symmetric(12.0, 7.0))
                     .show(ui, |ui| ui.label(message.as_str()));
             });
-        ctx.request_repaint();
+        ctx.request_repaint_after(crate::ui_theme::toast_repaint_after(
+            age,
+            CANVAS_NOTICE_SECS,
+            0.15,
+            0.5,
+        ));
     }
 
     fn canvas_view_undo_toast_ui(&mut self, ctx: &egui::Context) {
@@ -4620,7 +4653,12 @@ impl PluriviewApp {
                         });
                     });
             });
-        ctx.request_repaint();
+        ctx.request_repaint_after(crate::ui_theme::toast_repaint_after(
+            age,
+            CANVAS_VIEW_UNDO_SECS,
+            0.15,
+            0.5,
+        ));
 
         if undo {
             let deleted = self
@@ -4769,7 +4807,7 @@ impl PluriviewApp {
                 self.monitor_device = None;
                 ui.close_menu();
             }
-            for device in crate::audio::render_devices() {
+            for device in self.render_devices.get(Instant::now()) {
                 if device.is_default {
                     // Monitoring to the device you're hearing = double audio.
                     continue;
@@ -4779,7 +4817,7 @@ impl PluriviewApp {
                     .as_ref()
                     .is_some_and(|(id, _)| *id == device.id);
                 if ui.radio(selected, &device.name).clicked() {
-                    self.monitor_device = Some((device.id, device.name));
+                    self.monitor_device = Some((device.id.clone(), device.name.clone()));
                     ui.close_menu();
                 }
             }
@@ -5013,12 +5051,12 @@ mod tests {
                     let id = test.previews.add_media(
                         PathBuf::from("fixture.png"),
                         "Fixture".into(),
-                        vec![crate::media::MediaFrame {
-                            width: 2,
-                            height: 2,
-                            rgba: vec![255; 16],
-                            duration: Duration::ZERO,
-                        }],
+                        vec![crate::media::MediaFrame::from_rgba(
+                            2,
+                            2,
+                            &[255; 16],
+                            Duration::ZERO,
+                        )],
                         Pos2::new(100.0, 100.0),
                         Vec2::new(200.0, 100.0),
                     );
@@ -5851,6 +5889,9 @@ impl eframe::App for PluriviewApp {
         if let Err(error) = self.save_active_workspace() {
             eprintln!("{error}");
         }
+        // A recording in progress is finished like any other stop, so it
+        // shares the wait below.
+        self.stop_recording_for_layout_change();
         #[cfg(windows)]
         self.drop_live_window();
         self.capture_coordinator.stop_all();
@@ -5862,6 +5903,11 @@ impl eframe::App for PluriviewApp {
         } else {
             self.video_manager.clear();
         }
+        // Their workers would be cut off when the process ends, leaving a
+        // broken file. Bounded, so a stuck disk cannot keep Pluriview open.
+        let deadline = Instant::now() + EXIT_SAVE_WAIT;
+        self.recording.wait_for_files(deadline);
+        self.screenshots.wait_for_saves(deadline);
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {

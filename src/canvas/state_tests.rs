@@ -887,6 +887,103 @@ fn left_drag_repositions_a_pinned_tile() {
 }
 
 #[test]
+fn pinned_tiles_follow_a_drag_started_on_an_unpinned_tile() {
+    let context = Context::default();
+    let mut canvas = CanvasState::default();
+    let mut previews = PreviewManager::new();
+    let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0));
+    let pinned = previews.add_for_spout(
+        "pinned".to_owned(),
+        Pos2::new(60.0, 60.0),
+        Vec2::new(160.0, 120.0),
+        FpsPreset::Medium,
+    );
+    previews.get_mut(pinned).unwrap().viewport_pin = Some(crate::preview::ViewportPin::from_rect(
+        Rect::from_min_size(Pos2::new(60.0, 60.0), Vec2::new(160.0, 120.0)),
+        screen_rect,
+    ));
+    let free = previews.add_for_spout(
+        "free".to_owned(),
+        Pos2::new(500.0, 300.0),
+        Vec2::new(200.0, 150.0),
+        FpsPreset::Medium,
+    );
+    let mut captures = CaptureCoordinator::new();
+    let mut run_frame = |canvas: &mut CanvasState, previews: &mut PreviewManager, events| {
+        let _ = context.run(
+            RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(context, |ui| {
+                        canvas.ui(ui, previews, &mut captures, context, true);
+                    });
+            },
+        );
+    };
+    run_frame(&mut canvas, &mut previews, vec![]);
+    canvas.selection = vec![pinned, free];
+    let viewport = canvas.last_screen_rect.unwrap();
+    let screen_of = |canvas: &CanvasState, previews: &PreviewManager, id| {
+        canvas.preview_screen_rect(previews.get(id).unwrap(), viewport)
+    };
+    let pinned_before = screen_of(&canvas, &previews, pinned);
+    let free_before = screen_of(&canvas, &previews, free);
+    assert!(!free_before.intersects(pinned_before));
+
+    let mut pointer = free_before.center();
+    run_frame(
+        &mut canvas,
+        &mut previews,
+        vec![Event::PointerMoved(pointer)],
+    );
+    run_frame(
+        &mut canvas,
+        &mut previews,
+        vec![Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    for _ in 0..6 {
+        pointer += Vec2::new(15.0, 10.0);
+        run_frame(
+            &mut canvas,
+            &mut previews,
+            vec![Event::PointerMoved(pointer)],
+        );
+    }
+    run_frame(
+        &mut canvas,
+        &mut previews,
+        vec![Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+
+    let free_moved = screen_of(&canvas, &previews, free).min - free_before.min;
+    let pinned_moved = screen_of(&canvas, &previews, pinned).min - pinned_before.min;
+    assert!(
+        free_moved.x > 60.0 && free_moved.y > 40.0,
+        "the drag should move the free tile: {free_moved:?}"
+    );
+    assert!(
+        (pinned_moved - free_moved).length() < 0.5,
+        "pinned tile moved {pinned_moved:?}, free tile moved {free_moved:?}"
+    );
+    assert!(previews.get(pinned).unwrap().viewport_pin.is_some());
+}
+
+#[test]
 fn unpinning_preserves_the_current_screen_rect() {
     let mut canvas = CanvasState {
         pan: Vec2::new(-60.0, 25.0),
@@ -1245,6 +1342,70 @@ fn repeated_crop_uses_the_visible_crop_span_as_its_drag_scale() {
     assert_eq!(rect.size(), Vec2::new(75.0, 50.0));
 }
 
+#[test]
+fn crop_handles_on_crops_narrower_than_the_handle_minimum_never_panic() {
+    // Fit to Video accepts video spans down to 0.01, so a narrow video at a
+    // page edge leaves a crop thinner than the 0.1 handle minimum.
+    let start = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(40.0, 300.0));
+    let crops = [
+        (0.0, 0.0, 0.05, 1.0),
+        (0.95, 0.0, 1.0, 1.0),
+        (0.0, 0.0, 1.0, 0.05),
+        (0.0, 0.95, 1.0, 1.0),
+        (0.45, 0.45, 0.5, 0.5),
+    ];
+    let handles = [
+        ResizeHandle::TopLeft,
+        ResizeHandle::Top,
+        ResizeHandle::TopRight,
+        ResizeHandle::Left,
+        ResizeHandle::Right,
+        ResizeHandle::BottomLeft,
+        ResizeHandle::Bottom,
+        ResizeHandle::BottomRight,
+    ];
+    let deltas = [Vec2::ZERO, Vec2::new(-30.0, -30.0), Vec2::new(30.0, 30.0)];
+    for start_crop in crops {
+        for handle in handles {
+            for delta in deltas {
+                let (crop, _) = apply_crop(handle, start_crop, start, delta);
+                assert!(
+                    (0.0..=1.0).contains(&crop.0)
+                        && (0.0..=1.0).contains(&crop.1)
+                        && crop.0 < crop.2
+                        && crop.1 < crop.3
+                        && crop.2 <= 1.0
+                        && crop.3 <= 1.0,
+                    "{handle:?} {start_crop:?} {delta:?} -> {crop:?}"
+                );
+                if delta == Vec2::ZERO {
+                    assert_eq!(crop, start_crop, "{handle:?} jumped at rest");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn narrow_crop_edges_can_still_grow() {
+    let start = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(40.0, 300.0));
+    let (crop, _) = apply_crop(
+        ResizeHandle::Right,
+        (0.0, 0.0, 0.05, 1.0),
+        start,
+        Vec2::new(40.0, 0.0),
+    );
+    assert!((crop.2 - 0.1).abs() < 1e-6, "{crop:?}");
+
+    let (crop, _) = apply_crop(
+        ResizeHandle::Left,
+        (0.95, 0.0, 1.0, 1.0),
+        start,
+        Vec2::new(-40.0, 0.0),
+    );
+    assert!((crop.0 - 0.9).abs() < 1e-6, "{crop:?}");
+}
+
 struct CropUiTest {
     context: Context,
     canvas: CanvasState,
@@ -1271,11 +1432,13 @@ impl CropUiTest {
                 PathBuf::from("fixture.png"),
                 "image".into(),
                 (0..if kind == 3 { 2 } else { 1 })
-                    .map(|_| crate::media::MediaFrame {
-                        width: 200,
-                        height: 100,
-                        rgba: vec![0; 200 * 100 * 4],
-                        duration: Duration::from_millis(100),
+                    .map(|_| {
+                        crate::media::MediaFrame::from_rgba(
+                            200,
+                            100,
+                            &[0; 200 * 100 * 4],
+                            Duration::from_millis(100),
+                        )
                     })
                     .collect(),
                 position,
@@ -1785,6 +1948,42 @@ fn crop_mode_keeps_tile_still_and_empty_canvas_restores_normal_resize() {
 }
 
 #[test]
+fn workspace_change_forgets_selection_focus_and_gestures() {
+    // Tile ids restart at 1 in the next workspace, so any of this state
+    // would otherwise land on whichever new tile reuses the id.
+    let (mut test, id) = CropUiTest::new(2, false);
+    test.frame(vec![]);
+    test.canvas.selection = vec![id];
+    test.canvas
+        .focus_on_tile(id, test.previews.get(id).unwrap().rect(), test.viewport);
+    assert_eq!(test.canvas.focused_tile(), Some(id));
+    let start_rect = test.previews.get(id).unwrap().rect();
+    test.canvas.drag_state = Some(DragState::Resizing {
+        id,
+        handle: ResizeHandle::Right,
+        start_rect,
+        start_mouse: start_rect.right_center(),
+        aspect_ratio: None,
+        screen_space: false,
+    });
+    test.canvas.pending_show_window = Some(id);
+    test.canvas.pending_picture_in_picture = Some(id);
+    test.canvas.interactive_browser = Some(id);
+
+    test.canvas.clear_preview_interactions();
+
+    assert!(test.canvas.selection.is_empty());
+    assert_eq!(test.canvas.focused_tile(), None);
+    assert!(test.canvas.drag_state.is_none());
+    assert!(test.canvas.pending_show_window.is_none());
+    assert!(test.canvas.pending_picture_in_picture.is_none());
+    assert!(test.canvas.interactive_browser.is_none());
+    // Leaving focus later must not bring back the old selection.
+    assert!(!test.canvas.exit_focus());
+    assert!(test.canvas.selection.is_empty());
+}
+
+#[test]
 fn crop_mode_exits_on_escape_removal_workspace_change_and_focus() {
     let (mut test, id) = CropUiTest::new(2, false);
     test.canvas.begin_crop(id, &test.previews);
@@ -1905,12 +2104,12 @@ fn alt_crop_drag_crops_an_image_tile() {
     let id = previews.add_media(
         PathBuf::from("image.png"),
         "image".to_owned(),
-        vec![crate::media::MediaFrame {
-            width: 200,
-            height: 100,
-            rgba: vec![0; 200 * 100 * 4],
-            duration: Duration::from_millis(100),
-        }],
+        vec![crate::media::MediaFrame::from_rgba(
+            200,
+            100,
+            &[0; 200 * 100 * 4],
+            Duration::from_millis(100),
+        )],
         Pos2::new(100.0, 100.0),
         Vec2::new(200.0, 100.0),
     );

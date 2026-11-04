@@ -1,32 +1,38 @@
 //! Receive frames from a Spout2 sender into the same RGBA capture pipeline
 //! used for window tiles.
 
+// The same Direct3D bindings as the window capture workers, so Spout frames
+// go through the shared GPU resize and readback.
 use crate::privacy;
 use crate::spout::{self, share_handle_from_u32};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
-use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+use capture_windows::core::Interface;
+use capture_windows::Win32::Foundation::{HANDLE, HMODULE};
+use capture_windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
+use capture_windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+};
+use capture_windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SAMPLE_DESC,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
+use capture_windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
 
-use super::coordinator::{CaptureWorkerState, CapturedFrame};
+use super::coordinator::{CaptureWorkerState, CapturedFrame, WorkerSignal};
 use super::downsample::{fitted_capture_size, RgbaDownsampler};
+use super::gpu_downsample::GpuDownsampler;
+use super::readback::StagingReadback;
 
 pub fn capture_spout_loop(
     sender_name: String,
     worker_state: CaptureWorkerState,
-    stop_receiver: Receiver<()>,
+    stop_receiver: Receiver<WorkerSignal>,
 ) {
     let CaptureWorkerState {
         target_fps,
@@ -58,7 +64,9 @@ pub fn capture_spout_loop(
     let mut last_error: Option<String> = None;
     while active.load(Ordering::Relaxed) {
         match stop_receiver.recv_timeout(frame_interval(&target_fps)) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(WorkerSignal::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+            // Spout sessions are never retargeted; wait for the next tick.
+            Ok(WorkerSignal::Retarget) => continue,
             Err(RecvTimeoutError::Timeout) => {}
         }
         if !active.load(Ordering::Relaxed) {
@@ -102,11 +110,16 @@ struct SpoutGpuReceiver {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     shared: Option<ID3D11Texture2D>,
-    staging: Option<ID3D11Texture2D>,
+    /// This worker's copy of the sender's frame, taken while holding the
+    /// sender's lock. Its format has no sRGB conversion, so reading it gives
+    /// the sender's bytes, as the CPU path always did.
+    copy: Option<ID3D11Texture2D>,
     share_handle: u32,
     width: u32,
     height: u32,
-    format: DXGI_FORMAT,
+    bgra: bool,
+    readback: StagingReadback,
+    gpu_downsampler: GpuDownsampler,
     downsampler: RgbaDownsampler,
 }
 
@@ -129,16 +142,22 @@ impl SpoutGpuReceiver {
             )
         }
         .map_err(|error| format!("Could not create a Direct3D 11 device ({error})"))?;
+        let device: ID3D11Device =
+            device.ok_or_else(|| "Direct3D 11 device was not created".to_owned())?;
+        let context: ID3D11DeviceContext =
+            context.ok_or_else(|| "Direct3D 11 context was not created".to_owned())?;
 
         Ok(Self {
-            device: device.ok_or_else(|| "Direct3D 11 device was not created".to_owned())?,
-            context: context.ok_or_else(|| "Direct3D 11 context was not created".to_owned())?,
+            readback: StagingReadback::new(device.clone(), context.clone()),
+            gpu_downsampler: GpuDownsampler::new(device.clone(), context.clone()),
+            device,
+            context,
             shared: None,
-            staging: None,
+            copy: None,
             share_handle: 0,
             width: 0,
             height: 0,
-            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            bgra: true,
             downsampler: RgbaDownsampler::default(),
         })
     }
@@ -172,99 +191,80 @@ impl SpoutGpuReceiver {
             .shared
             .as_ref()
             .ok_or_else(|| "Spout shared texture is missing".to_owned())?;
-        let staging = self
-            .staging
-            .as_ref()
-            .ok_or_else(|| "Spout staging texture is missing".to_owned())?;
+        let copy = self
+            .copy
+            .clone()
+            .ok_or_else(|| "Spout copy texture is missing".to_owned())?;
 
         let keyed = shared.cast::<IDXGIKeyedMutex>().ok();
         if let Some(mutex) = keyed.as_ref() {
             unsafe { mutex.AcquireSync(0, 67) }
                 .map_err(|error| format!("Could not lock the Spout texture ({error})"))?;
         }
-        let dst: ID3D11Resource = staging
-            .cast()
-            .map_err(|error| format!("Could not copy the Spout texture ({error})"))?;
-        let src: ID3D11Resource = shared
-            .cast()
-            .map_err(|error| format!("Could not copy the Spout texture ({error})"))?;
         unsafe {
-            self.context.CopyResource(&dst, &src);
+            self.context.CopyResource(&copy, shared);
         }
         if let Some(mutex) = keyed.as_ref() {
             let _ = unsafe { mutex.ReleaseSync(0) };
         }
+        self.frame_from_copy(&copy, target_width, target_height)
+            .map(Some)
+    }
 
-        let staging_resource = staging
-            .cast::<ID3D11Resource>()
-            .map_err(|error| format!("Could not map the Spout staging texture ({error})"))?;
-        let mut mapped = windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context
-                .Map(&staging_resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-        }
-        .map_err(|error| format!("Could not read the Spout texture ({error})"))?;
-
-        let row_pitch = mapped.RowPitch as usize;
+    /// The tile's frame from this worker's copy of the sender's texture.
+    fn frame_from_copy(
+        &mut self,
+        copy: &ID3D11Texture2D,
+        target_width: u32,
+        target_height: u32,
+    ) -> Result<CapturedFrame, String> {
+        let (width, height, bgra) = (self.width, self.height, self.bgra);
         let (out_width, out_height) =
-            fitted_capture_size(self.width, self.height, target_width, target_height);
-        let data = if out_width == self.width && out_height == self.height {
-            Ok(unsafe {
-                copy_mapped_to_rgba(
-                    mapped.pData.cast(),
-                    row_pitch,
-                    self.width,
-                    self.height,
-                    is_bgra(self.format),
-                )
-            })
-        } else {
-            let source_len = row_pitch
-                .checked_mul(self.height as usize)
-                .ok_or_else(|| "The Spout texture is too large to read".to_owned());
-            match source_len {
-                Ok(source_len) => {
-                    let source = unsafe {
-                        std::slice::from_raw_parts(mapped.pData.cast::<u8>(), source_len)
+            fitted_capture_size(width, height, target_width, target_height);
+        if out_width == width && out_height == height {
+            return self
+                .readback
+                .read(copy, width, height, |rows, row_pitch| {
+                    let rgba = unsafe {
+                        copy_mapped_to_rgba(rows.as_ptr(), row_pitch as usize, width, height, bgra)
                     };
-                    match self.downsampler.downsample(
-                        source,
-                        self.width,
-                        self.height,
-                        mapped.RowPitch,
-                        out_width,
-                        out_height,
-                    ) {
-                        Some(mut data) => {
-                            if is_bgra(self.format) {
-                                swap_red_blue(&mut data);
-                            }
-                            Ok(data)
-                        }
-                        None => Err("Could not downscale the Spout frame".to_owned()),
-                    }
+                    CapturedFrame::from_rgba(width, height, width, height, &rgba)
+                })
+                .map_err(|error| format!("Could not read the Spout texture ({error})"));
+        }
+
+        // Resize on the GPU and read back only the tile-sized result. The
+        // shader reads channels by name, so it returns RGBA for BGRA too.
+        let data = match self
+            .gpu_downsampler
+            .downsample(copy, [width, height, out_width, out_height])
+        {
+            Some(data) => data,
+            None => {
+                let downsampler = &mut self.downsampler;
+                let mut data = self
+                    .readback
+                    .read(copy, width, height, |rows, row_pitch| {
+                        downsampler
+                            .downsample(rows, width, height, row_pitch, out_width, out_height)
+                    })
+                    .map_err(|error| format!("Could not read the Spout texture ({error})"))?
+                    .ok_or_else(|| "Could not downscale the Spout frame".to_owned())?;
+                if bgra {
+                    swap_red_blue(&mut data);
                 }
-                Err(error) => Err(error),
+                data
             }
         };
-        unsafe {
-            self.context.Unmap(&staging_resource, 0);
-        }
-        let data = data?;
-
-        Ok(Some(CapturedFrame::from_rgba(
-            out_width,
-            out_height,
-            self.width,
-            self.height,
-            &data,
-        )))
+        Ok(CapturedFrame::from_rgba(
+            out_width, out_height, width, height, &data,
+        ))
     }
 
     fn open_shared(&mut self, info: &spout::SpoutSender) -> Result<(), String> {
         self.shared = None;
-        self.staging = None;
-        let handle = share_handle_from_u32(info.share_handle);
+        self.copy = None;
+        let handle = HANDLE(share_handle_from_u32(info.share_handle).0);
         let mut texture: Option<ID3D11Texture2D> = None;
         unsafe {
             self.device
@@ -285,43 +285,41 @@ impl SpoutGpuReceiver {
 
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc) };
-        let staging_desc = D3D11_TEXTURE2D_DESC {
-            Width: desc.Width,
-            Height: desc.Height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: desc.Format,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-        };
-        let mut staging: Option<ID3D11Texture2D> = None;
-        unsafe {
-            self.device
-                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
-                .map_err(|error| format!("Could not create a Spout staging texture ({error})"))?;
-        }
-        let staging =
-            staging.ok_or_else(|| "Could not create a Spout staging texture".to_owned())?;
-
-        if !is_8bit_rgba(desc.Format) {
+        let Some(copy_format) = raw_copy_format(desc.Format) else {
             return Err(format!(
                 "Spout sender '{}' uses an unsupported pixel format",
                 info.name
             ));
+        };
+        let copy_desc = D3D11_TEXTURE2D_DESC {
+            Width: desc.Width,
+            Height: desc.Height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: copy_format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut copy: Option<ID3D11Texture2D> = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&copy_desc, None, Some(&mut copy))
+                .map_err(|error| format!("Could not create a Spout copy texture ({error})"))?;
         }
+        let copy = copy.ok_or_else(|| "Could not create a Spout copy texture".to_owned())?;
 
         self.share_handle = info.share_handle;
         self.width = desc.Width;
         self.height = desc.Height;
-        self.format = desc.Format;
+        self.bgra = is_bgra(desc.Format);
         self.shared = Some(texture);
-        self.staging = Some(staging);
+        self.copy = Some(copy);
         Ok(())
     }
 }
@@ -330,10 +328,17 @@ fn is_bgra(format: DXGI_FORMAT) -> bool {
     format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
 }
 
-fn is_8bit_rgba(format: DXGI_FORMAT) -> bool {
-    is_bgra(format)
-        || format == DXGI_FORMAT_R8G8B8A8_UNORM
-        || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+/// The format a copy of a sender's texture uses: the same bytes without
+/// sRGB conversion (a copy may change format within one type group), or
+/// `None` for a format Pluriview cannot read.
+fn raw_copy_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    if is_bgra(format) {
+        Some(DXGI_FORMAT_B8G8R8A8_UNORM)
+    } else if format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB {
+        Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+    } else {
+        None
+    }
 }
 
 fn swap_red_blue(rgba: &mut [u8]) {
@@ -374,7 +379,96 @@ unsafe fn copy_mapped_to_rgba(
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_mapped_to_rgba, swap_red_blue};
+    use super::{copy_mapped_to_rgba, swap_red_blue, SpoutGpuReceiver};
+    use crate::capture::downsample::RgbaDownsampler;
+    use capture_windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT,
+    };
+    use capture_windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+    };
+
+    #[test]
+    #[ignore = "requires a Direct3D 11 GPU; reads a BGRA texture as a Spout copy"]
+    fn spout_frames_resize_on_the_gpu_and_come_out_rgba() {
+        let mut receiver = SpoutGpuReceiver::new().unwrap();
+        let (width, height) = (97_u32, 41_u32);
+        // Opaque pixels, so egui's premultiplied frame keeps the exact bytes.
+        let bgra: Vec<u8> = (0..width * height)
+            .flat_map(|index| {
+                [
+                    (index * 7 % 256) as u8,
+                    (index * 13 % 256) as u8,
+                    (index * 29 % 256) as u8,
+                    255,
+                ]
+            })
+            .collect();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let initial = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bgra.as_ptr().cast(),
+            SysMemPitch: width * 4,
+            ..Default::default()
+        };
+        let mut copy = None;
+        unsafe {
+            receiver
+                .device
+                .CreateTexture2D(&desc, Some(&initial), Some(&mut copy))
+                .unwrap();
+        }
+        let copy = copy.unwrap();
+        receiver.width = width;
+        receiver.height = height;
+        receiver.bgra = true;
+        let bytes = |frame: &super::CapturedFrame| -> Vec<u8> {
+            frame
+                .image
+                .pixels
+                .iter()
+                .flat_map(|pixel| pixel.to_array())
+                .collect()
+        };
+
+        let mut rgba = bgra.clone();
+        swap_red_blue(&mut rgba);
+        let native = receiver.frame_from_copy(&copy, 0, 0).unwrap();
+        assert_eq!(native.image.size, [width as usize, height as usize]);
+        assert_eq!(bytes(&native), rgba);
+
+        let small = receiver.frame_from_copy(&copy, 48, 20).unwrap();
+        let [out_width, out_height] = small.image.size;
+        let mut expected = RgbaDownsampler::default()
+            .downsample(
+                &bgra,
+                width,
+                height,
+                width * 4,
+                out_width as u32,
+                out_height as u32,
+            )
+            .unwrap();
+        swap_red_blue(&mut expected);
+        assert_eq!(bytes(&small), expected);
+        assert!(
+            !receiver.gpu_downsampler.is_disabled(),
+            "the resize must run on the GPU"
+        );
+    }
 
     #[test]
     fn bgra_rows_swap_to_rgba_and_drop_pitch_padding() {

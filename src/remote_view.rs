@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -600,12 +600,23 @@ impl RemoteView {
 }
 
 impl Host {
-    /// Replace the QR/link secret. A phone still using the old link loses
-    /// access on its next request; approved nearby pairings are unaffected.
+    /// Replace the QR/link secret and disconnect the phone using the old
+    /// link, as the dialog promises. Its open video, control and audio streams
+    /// never re-authenticate, so its watch ends here; later requests signed
+    /// with the old link are refused. A phone approved through nearby pairing
+    /// may reconnect with that approval.
     fn refresh_invite(&mut self) -> io::Result<()> {
         let invite = Invite::new()?;
         let (link, qr) = invite_link(self.address, &invite.token)?;
-        *self.shared.invite.lock() = invite;
+        let previous = std::mem::replace(&mut *self.shared.invite.lock(), invite);
+        if let Some(client) = previous.client {
+            let mut peer = self.shared.peer.lock();
+            if peer.as_ref().is_some_and(|peer| peer.id == client) {
+                *peer = None;
+                drop(peer);
+                self.shared.invalidate();
+            }
+        }
         self.invite = link;
         self.qr = qr;
         Ok(())
@@ -801,36 +812,109 @@ impl Host {
         // exclusive video, control and optional audio streams are active, and
         // per-address pre-auth limits stop one device from occupying the rest.
         // No per-request thread creation or unbounded connection/task queue.
+        // One thread accepts and hands each connection to an idle worker, so
+        // idle workers sleep instead of each polling the listener.
+        let (connections, incoming) = mpsc::sync_channel::<(TcpStream, SocketAddr)>(1);
+        let incoming = Arc::new(Mutex::new(incoming));
         for index in 0..NETWORK_WORKERS {
-            let listener = listener.try_clone()?;
-            // Windows socket duplicates need their own nonblocking mode;
-            // otherwise Stop leaves accept() waiting until another client calls.
-            listener.set_nonblocking(true)?;
+            let incoming = incoming.clone();
             let state = shared.clone();
             let commands = command_tx.clone();
             let ctx = ctx.clone();
             std::thread::Builder::new()
                 .name(format!("viewer-network-{index}"))
-                .spawn(move || {
-                    while state.running.load(Ordering::Relaxed) {
-                        match listener.accept() {
-                            Ok((mut stream, address)) => {
-                                // Over the limit: close at once instead of
-                                // spending a worker on reading its headers.
-                                if let Some(slot) = PreAuthSlot::acquire(&state, address.ip()) {
-                                    let _ = serve(&mut stream, &state, slot, &commands, &ctx);
-                                }
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                std::thread::sleep(Duration::from_millis(10))
-                            }
-                            Err(_) => break,
-                        }
+                .spawn(move || loop {
+                    // Ends once the acceptor stops and the queue is empty.
+                    let next = incoming.lock().recv();
+                    let Ok((mut stream, address)) = next else {
+                        break;
+                    };
+                    if !state.running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // Over the limit: close at once instead of spending a
+                    // worker on reading its headers.
+                    if let Some(slot) = PreAuthSlot::acquire(&state, address.ip()) {
+                        let _ = serve(&mut stream, &state, slot, &commands, &ctx);
                     }
                 })?;
         }
+        let state = shared.clone();
+        std::thread::Builder::new()
+            .name("viewer-accept".into())
+            .spawn(move || accept_connections(&listener, &state, &connections))?;
         Ok(host)
     }
+}
+
+/// How often the acceptor checks whether sharing stopped while no phone is
+/// connecting. Stopping closes the listener within this time.
+const ACCEPT_WAIT: Duration = Duration::from_millis(50);
+
+/// Accept connections until sharing stops, passing each to a network worker.
+/// Dropping `listener` on return closes the port.
+fn accept_connections(
+    listener: &TcpListener,
+    state: &Shared,
+    connections: &mpsc::SyncSender<(TcpStream, SocketAddr)>,
+) {
+    while state.running.load(Ordering::Relaxed) {
+        if !wait_for_connection(listener, ACCEPT_WAIT) {
+            continue;
+        }
+        match listener.accept() {
+            Ok(mut connection) => loop {
+                // Every worker busy: keep the connection, as the listen
+                // backlog would, until one is free or sharing stops.
+                match connections.try_send(connection) {
+                    Ok(()) => break,
+                    Err(mpsc::TrySendError::Full(waiting)) => {
+                        if !state.running.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        connection = waiting;
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => return,
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            // A phone that drops before its connection is accepted, or a
+            // brief socket shortage, fails one accept. The pause stops a
+            // lasting error from spinning.
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// Wait up to `timeout` for a connection to arrive. Returns whether one may
+/// be waiting; the listener is nonblocking, so a false alarm costs one
+/// `WouldBlock` accept.
+#[cfg(windows)]
+fn wait_for_connection(listener: &TcpListener, timeout: Duration) -> bool {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, SOCKET, WSAPOLLFD};
+    let mut socket = WSAPOLLFD {
+        fd: SOCKET(listener.as_raw_socket() as usize),
+        events: POLLRDNORM,
+        revents: Default::default(),
+    };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    match unsafe { WSAPoll(&mut socket, 1, millis) } {
+        0 => false,
+        ready if ready > 0 => true,
+        // Polling failed: fall back to trying accept at a gentle pace.
+        _ => {
+            std::thread::sleep(Duration::from_millis(10));
+            true
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_connection(_listener: &TcpListener, _timeout: Duration) -> bool {
+    std::thread::sleep(Duration::from_millis(10));
+    true
 }
 
 fn encode_frame(job: &CaptureJob, rgb: &mut Vec<u8>) -> Option<Vec<u8>> {
@@ -1444,6 +1528,37 @@ mod tests {
     }
 
     #[test]
+    fn a_new_pairing_link_disconnects_only_the_phone_using_the_old_one() {
+        let mut host = Host::start(Ipv4Addr::LOCALHOST, egui::Context::default()).unwrap();
+        let watch = |host: &Host, id: &str| {
+            *host.shared.peer.lock() = Some(Peer {
+                id: id.into(),
+                seen: Instant::now(),
+            });
+        };
+        // The link's phone is watching: a new link ends its watch.
+        host.shared.invite.lock().client = Some("link-phone".into());
+        watch(&host, "link-phone");
+        let epoch = host.shared.epoch.load(Ordering::Relaxed);
+        host.refresh_invite().unwrap();
+        assert!(host.shared.peer.lock().is_none());
+        assert!(!host.shared.watching());
+        assert!(host.shared.epoch.load(Ordering::Relaxed) > epoch);
+        assert!(host.shared.invite.lock().client.is_none());
+
+        // A nearby-paired phone watching while an unrelated link is replaced
+        // keeps watching.
+        host.shared.invite.lock().client = Some("link-phone".into());
+        watch(&host, "paired-phone");
+        host.refresh_invite().unwrap();
+        assert!(host.shared.watching());
+
+        // An unused link has no phone to disconnect.
+        host.refresh_invite().unwrap();
+        assert!(host.shared.watching());
+    }
+
+    #[test]
     fn queue_discards_stale_other_peer_resized_and_blocked_commands() {
         let ctx = egui::Context::default();
         let mut host = Host::start(Ipv4Addr::LOCALHOST, ctx.clone()).unwrap();
@@ -1817,6 +1932,21 @@ mod tests {
             started.elapsed(),
             host.shared.hardware.load(Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn the_acceptor_sleeps_until_a_phone_connects() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        assert!(!wait_for_connection(&listener, Duration::from_millis(120)));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+
+        let _phone = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let started = Instant::now();
+        assert!(wait_for_connection(&listener, Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(listener.accept().is_ok());
     }
 
     #[test]

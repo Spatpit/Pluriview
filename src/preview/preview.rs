@@ -900,16 +900,14 @@ impl Preview {
     pub fn get_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         self.advance_media_animation(ctx);
 
-        // Media frames already own their RGBA bytes, so build the upload
-        // image directly from that slice instead of cloning a second buffer.
+        // Media frames are stored ready to upload; the texture shares them.
         let media_image = if self.media_frame_dirty {
             self.media_frame_dirty = false;
-            let image = self.media_frames.get(self.media_frame_index).map(|frame| {
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                )
-            });
+            let max_side = ctx.input(|input| input.max_texture_side);
+            let image = self
+                .media_frames
+                .get(self.media_frame_index)
+                .map(|frame| crate::media::frame_upload(frame, max_side));
             // A still image never uploads again, so its decoded copy would
             // only double its memory. GIF frames stay for animation.
             if image.is_some() && self.media_frames.len() == 1 {
@@ -1533,12 +1531,12 @@ mod tests {
         );
         preview.set_media(
             PathBuf::from("test.gif"),
-            vec![MediaFrame {
-                width: 1,
-                height: 1,
-                rgba: vec![255, 0, 0, 255],
-                duration: Duration::from_millis(100),
-            }],
+            vec![MediaFrame::from_rgba(
+                1,
+                1,
+                &[255, 0, 0, 255],
+                Duration::from_millis(100),
+            )],
         );
 
         assert!(preview.frame_buffer.is_none());
@@ -1551,11 +1549,13 @@ mod tests {
     #[test]
     fn still_images_release_decoded_pixels_after_upload_but_gifs_keep_them() {
         let ctx = eframe::egui::Context::default();
-        let frame = |duration_ms| MediaFrame {
-            width: 2,
-            height: 1,
-            rgba: vec![255; 8],
-            duration: std::time::Duration::from_millis(duration_ms),
+        let frame = |duration_ms| {
+            MediaFrame::from_rgba(
+                2,
+                1,
+                &[255; 8],
+                std::time::Duration::from_millis(duration_ms),
+            )
         };
         let mut still = Preview::new(
             PreviewId(1),
@@ -1601,18 +1601,8 @@ mod tests {
         preview.set_media(
             PathBuf::from("test.gif"),
             vec![
-                MediaFrame {
-                    width: 1,
-                    height: 1,
-                    rgba: vec![255, 0, 0, 255],
-                    duration: Duration::from_millis(10),
-                },
-                MediaFrame {
-                    width: 1,
-                    height: 1,
-                    rgba: vec![0, 255, 0, 255],
-                    duration: Duration::from_millis(10),
-                },
+                MediaFrame::from_rgba(1, 1, &[255, 0, 0, 255], Duration::from_millis(10)),
+                MediaFrame::from_rgba(1, 1, &[0, 255, 0, 255], Duration::from_millis(10)),
             ],
         );
         preview.manually_frozen = true;

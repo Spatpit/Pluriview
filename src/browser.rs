@@ -2510,10 +2510,17 @@ impl BrowserManager {
     }
 
     /// True while uBOL is rebuilding its rules and browser tiles must not
-    /// navigate. Callers should keep repainting so the wait actually ends.
+    /// navigate. See [`Self::adblock_settle_remaining`] for ending the wait.
     pub fn adblock_settling(&self) -> bool {
         self.adblock_settle_until
             .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// How long until [`Self::poll_adblock_settle`] can release held tiles.
+    /// Callers repaint then, so the wait actually ends.
+    pub fn adblock_settle_remaining(&self) -> Option<Duration> {
+        self.adblock_settle_until
+            .map(|until| until.saturating_duration_since(Instant::now()))
     }
 
     /// Send held tiles to their address once filtering is live again, and

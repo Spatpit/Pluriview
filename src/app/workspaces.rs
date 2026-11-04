@@ -113,6 +113,9 @@ impl PluriviewApp {
                 );
             }
             Err(error) => {
+                // Reload Workspace failed: the recovery screen takes over,
+                // and what was running must not carry on behind it.
+                self.close_running_workspace();
                 self.workspace_error = Some(error);
             }
         }
@@ -640,10 +643,13 @@ impl PluriviewApp {
             active_view: self.active_canvas_view,
         };
 
-        // Save all previews
-        layout.previews = self
-            .preview_manager
-            .all()
+        // Save all previews in the order they were added, which is the saved
+        // order for a loaded workspace. Hash-map order would make the first
+        // autosave after every load rewrite a workspace that has not changed.
+        let mut previews: Vec<&Preview> = self.preview_manager.all().collect();
+        previews.sort_by_key(|preview| preview.id.0);
+        layout.previews = previews
+            .into_iter()
             .map(|p| {
                 let mut saved = PreviewLayout::from(p);
                 #[cfg(windows)]
@@ -687,9 +693,34 @@ impl PluriviewApp {
 
     /// Apply a SavedLayout to restore state
     pub(super) fn apply_layout(&mut self, layout: &SavedLayout) {
+        self.close_running_workspace();
+        #[cfg(windows)]
+        {
+            self.next_playlist_group = layout
+                .previews
+                .iter()
+                .filter_map(|preview| preview.playlist_group)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+        }
+
+        // Restore canvas state
+        self.apply_layout_contents(layout);
+    }
+
+    /// Stop everything the current workspace runs: tiles and their
+    /// captures, videos, browsers, audio, recording, wallpaper, picture in
+    /// picture and the window in use. Before a layout replaces it, and when a
+    /// reload fails, so nothing keeps playing behind the recovery screen.
+    fn close_running_workspace(&mut self) {
         #[cfg(windows)]
         self.drop_live_window();
         self.close_picture_in_picture();
+        self.stop_recording_for_layout_change();
+        self.screenshots.forget_tile_requests();
+        // "Change URL..." targets a tile id that the next layout reuses.
+        self.add_browser = None;
         self.source_loads.clear();
         self.canvas_view_dialog = None;
         self.active_canvas_view = None;
@@ -709,13 +740,6 @@ impl PluriviewApp {
             self.seek_preview_manager.clear();
             self.playlist_thumbnail_queue.clear();
             self.playlist_thumbnail_jobs.clear();
-            self.next_playlist_group = layout
-                .previews
-                .iter()
-                .filter_map(|preview| preview.playlist_group)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
         }
         self.preview_manager.clear();
         self.canvas.clear_preview_interactions();
@@ -729,8 +753,10 @@ impl PluriviewApp {
             self.window_audio_monitors.clear();
             self.last_inactive_window_scan = None;
         }
+    }
 
-        // Restore canvas state
+    /// Restore `layout` into the cleared app: canvas, wallpaper and tiles.
+    fn apply_layout_contents(&mut self, layout: &SavedLayout) {
         self.canvas.pan = Vec2::new(layout.canvas.pan.0, layout.canvas.pan.1);
         self.canvas.zoom = layout.canvas.zoom;
         self.canvas.show_grid = layout.canvas.show_grid;
@@ -753,18 +779,6 @@ impl PluriviewApp {
         // `pending_maximize` (read once, in `new`) in sync.
         self.window_layout = layout.window.unwrap_or(self.window_layout);
 
-        #[cfg(windows)]
-        {
-            self.recent_urls = layout
-                .recent_browser_urls
-                .iter()
-                .filter_map(|url| scrub_url_for_storage(url))
-                .collect();
-        }
-        #[cfg(not(windows))]
-        {
-            self.recent_urls = layout.recent_browser_urls.clone();
-        }
         #[cfg(windows)]
         {
             self.monitor_device = layout.monitor_device.clone();
@@ -950,6 +964,21 @@ impl PluriviewApp {
                     privacy::redact_title(&preview_layout.window_title)
                 );
             }
+        }
+
+        // Restored after the tiles: recreating each browser tile remembers
+        // its URL, which would otherwise push the saved recent sites out.
+        #[cfg(windows)]
+        {
+            self.recent_urls = layout
+                .recent_browser_urls
+                .iter()
+                .filter_map(|url| scrub_url_for_storage(url))
+                .collect();
+        }
+        #[cfg(not(windows))]
+        {
+            self.recent_urls = layout.recent_browser_urls.clone();
         }
 
         #[cfg(windows)]

@@ -58,6 +58,9 @@ const WINDOW_CONNECTING_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 /// Browser overlays may stay transparent until their external data arrives.
 /// Their loading card needs motion, but not an uncapped canvas repaint loop.
 const TRANSPARENT_BROWSER_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+/// The video and browser loading cards pulse slowly; 30 frames a second keeps
+/// them smooth without redrawing every tile at the monitor's refresh rate.
+const LOADING_CARD_REPAINT_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Represents the current drag operation
 #[derive(Clone, Debug)]
@@ -1303,8 +1306,13 @@ pub struct CanvasState {
     preview_dragging: bool,
 
     /// Original viewport placements for pinned tiles in the active
-    /// drag, paired with their IDs so egui's cumulative drag delta is stable.
+    /// drag, paired with their IDs. Pinned tiles are placed from these plus
+    /// `pinned_drag_offset`, so clamping never accumulates.
     pinned_drag_origins: Vec<(PreviewId, ViewportPin)>,
+
+    /// Screen distance the current tile drag has moved so far. egui's
+    /// `drag_delta` is per frame, so this sums it for pinned tiles.
+    pinned_drag_offset: Vec2,
 
     /// Direct left-button capture for repositioning one pinned tile.
     /// This does not depend on egui's general tile-drag ownership.
@@ -1457,6 +1465,7 @@ impl Default for CanvasState {
             tile_scratch: Vec::new(),
             preview_dragging: false,
             pinned_drag_origins: Vec::new(),
+            pinned_drag_offset: Vec2::ZERO,
             pinned_pointer_drag: None,
             canvas_panning: false,
             pan_drag_tracker: DragTracker::new(),
@@ -1587,6 +1596,10 @@ impl CanvasState {
         });
 
         self.prune_preview_interactions(preview_manager);
+        let pointer_held = ui
+            .ctx()
+            .input(|i| i.pointer.any_down() || i.pointer.any_released());
+        self.end_orphaned_handle_drag(pointer_held, preview_manager);
         self.update_layout_animation(input.time);
         if input.alt
             || input.middle_down
@@ -2470,6 +2483,7 @@ impl CanvasState {
         let mut any_spawn_or_remove_animating = false;
         let mut window_capture_connecting = false;
         let mut transparent_browser_waiting = false;
+        let mut loading_card_animating = false;
         self.browser_chrome_holds_interaction = false;
 
         for info in &preview_info {
@@ -2730,10 +2744,10 @@ impl CanvasState {
                         browser_status,
                         input.time as f32,
                     );
-                    any_spawn_or_remove_animating |=
+                    loading_card_animating |=
                         !matches!(browser_status, BrowserTileStatus::Failed(_));
                 } else if is_video {
-                    any_spawn_or_remove_animating |= paint_video_placeholder(
+                    loading_card_animating |= paint_video_placeholder(
                         &painter,
                         anim_rect,
                         video_status,
@@ -3553,6 +3567,7 @@ impl CanvasState {
                 self.preview_dragging = true;
                 self.remember_current_tile(id);
                 self.pinned_drag_origins.clear();
+                self.pinned_drag_offset = Vec2::ZERO;
                 if !self.selection.contains(&id) {
                     self.select_group_tile(id, preview_manager);
                 }
@@ -3593,9 +3608,11 @@ impl CanvasState {
                     } else {
                         vec![id]
                     };
-                    // Pinned tiles derive every frame from their original pin
-                    // because egui reports a cumulative drag delta. Ordinary
-                    // canvas tiles retain their existing movement behavior.
+                    // egui's drag delta is per frame. Canvas tiles add it each
+                    // frame; pinned tiles are placed from their original pin
+                    // plus the running total, so edge clamping can't drift.
+                    self.pinned_drag_offset += screen_delta;
+                    let pinned_offset = self.pinned_drag_offset;
                     for sel_id in dragged_ids {
                         let pinned_origin = self
                             .pinned_drag_origins
@@ -3605,7 +3622,7 @@ impl CanvasState {
                         if let Some(pin) = pinned_origin {
                             let moved_pin = self.moved_pin(
                                 sel_id,
-                                pin.rect(canvas_rect).translate(screen_delta),
+                                pin.rect(canvas_rect).translate(pinned_offset),
                                 canvas_rect,
                                 preview_manager,
                             );
@@ -3623,6 +3640,7 @@ impl CanvasState {
             if preview_response.drag_stopped() && self.preview_dragging {
                 self.preview_dragging = false;
                 self.pinned_drag_origins.clear();
+                self.pinned_drag_offset = Vec2::ZERO;
             }
 
             // Context menu for preview. The toolbar and tabs have their own
@@ -3654,10 +3672,13 @@ impl CanvasState {
         self.follow_tab_drag(ctx, canvas_rect, preview_manager);
         self.tile_scratch = preview_info;
 
-        // Keep repainting while any preview is spawning in, fading out, or
-        // still waiting on its first frame so the animations stay smooth.
+        // Keep repainting while any preview is spawning in or fading out so
+        // the animations stay smooth.
         if any_spawn_or_remove_animating {
             ctx.request_repaint();
+        }
+        if loading_card_animating {
+            ctx.request_repaint_after(LOADING_CARD_REPAINT_INTERVAL);
         }
         if window_capture_connecting {
             ctx.request_repaint_after(WINDOW_CONNECTING_REPAINT_INTERVAL);
@@ -4275,8 +4296,14 @@ impl CanvasState {
             ui.ctx().request_repaint();
         }
 
-        // Keep repainting while the toast is visible so it can fade out.
-        ui.ctx().request_repaint();
+        // Repaint for the fades; hovering Undo repaints by itself.
+        ui.ctx()
+            .request_repaint_after(crate::ui_theme::toast_repaint_after(
+                age,
+                UNDO_TOAST_SECS,
+                0.15,
+                0.5,
+            ));
     }
 
     /// Draw selection indicators and interactive resize handles
@@ -4573,38 +4600,65 @@ fn apply_crop(
     let uv_delta_y = delta.y / start_rect.height().max(0.001) * v_span;
     let mut crop = start_crop;
 
+    let low_u = |value: f32| clamp_low_crop_edge(value, min_u, max_u);
+    let low_v = |value: f32| clamp_low_crop_edge(value, min_v, max_v);
+    let high_u = |value: f32| clamp_high_crop_edge(value, max_u, min_u);
+    let high_v = |value: f32| clamp_high_crop_edge(value, max_v, min_v);
+
     match handle {
         ResizeHandle::TopLeft => {
-            crop.0 = (min_u + uv_delta_x).clamp(0.0, max_u - 0.1);
-            crop.1 = (min_v + uv_delta_y).clamp(0.0, max_v - 0.1);
+            crop.0 = low_u(min_u + uv_delta_x);
+            crop.1 = low_v(min_v + uv_delta_y);
         }
         ResizeHandle::Top => {
-            crop.1 = (min_v + uv_delta_y).clamp(0.0, max_v - 0.1);
+            crop.1 = low_v(min_v + uv_delta_y);
         }
         ResizeHandle::TopRight => {
-            crop.2 = (max_u + uv_delta_x).clamp(min_u + 0.1, 1.0);
-            crop.1 = (min_v + uv_delta_y).clamp(0.0, max_v - 0.1);
+            crop.2 = high_u(max_u + uv_delta_x);
+            crop.1 = low_v(min_v + uv_delta_y);
         }
         ResizeHandle::Left => {
-            crop.0 = (min_u + uv_delta_x).clamp(0.0, max_u - 0.1);
+            crop.0 = low_u(min_u + uv_delta_x);
         }
         ResizeHandle::Right => {
-            crop.2 = (max_u + uv_delta_x).clamp(min_u + 0.1, 1.0);
+            crop.2 = high_u(max_u + uv_delta_x);
         }
         ResizeHandle::BottomLeft => {
-            crop.0 = (min_u + uv_delta_x).clamp(0.0, max_u - 0.1);
-            crop.3 = (max_v + uv_delta_y).clamp(min_v + 0.1, 1.0);
+            crop.0 = low_u(min_u + uv_delta_x);
+            crop.3 = high_v(max_v + uv_delta_y);
         }
         ResizeHandle::Bottom => {
-            crop.3 = (max_v + uv_delta_y).clamp(min_v + 0.1, 1.0);
+            crop.3 = high_v(max_v + uv_delta_y);
         }
         ResizeHandle::BottomRight => {
-            crop.2 = (max_u + uv_delta_x).clamp(min_u + 0.1, 1.0);
-            crop.3 = (max_v + uv_delta_y).clamp(min_v + 0.1, 1.0);
+            crop.2 = high_u(max_u + uv_delta_x);
+            crop.3 = high_v(max_v + uv_delta_y);
         }
     }
 
     (crop, rect_for_crop_change(start_crop, crop, start_rect))
+}
+
+/// Smallest crop span a handle drag can create.
+const MIN_HANDLE_CROP_SPAN: f32 = 0.1;
+
+/// Clamps a dragged left/top crop edge. Fit to Video can leave a crop
+/// narrower than `MIN_HANDLE_CROP_SPAN`; such an edge may grow but never
+/// jumps or shrinks further (and the bounds can never cross).
+fn clamp_low_crop_edge(value: f32, start: f32, opposite: f32) -> f32 {
+    let upper = (opposite - MIN_HANDLE_CROP_SPAN)
+        .max(start.min(opposite))
+        .clamp(0.0, 1.0);
+    // max/min rather than clamp: clamp panics on inverted or NaN bounds.
+    value.max(0.0).min(upper)
+}
+
+/// Right/bottom counterpart of [`clamp_low_crop_edge`].
+fn clamp_high_crop_edge(value: f32, start: f32, opposite: f32) -> f32 {
+    let lower = (opposite + MIN_HANDLE_CROP_SPAN)
+        .min(start.max(opposite))
+        .clamp(0.0, 1.0);
+    value.max(lower).min(1.0)
 }
 
 fn rect_for_crop_change(

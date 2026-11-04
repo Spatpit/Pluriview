@@ -433,8 +433,19 @@ unsafe fn node_string(node: &MpvNode) -> Option<String> {
 struct GlTarget {
     framebuffer: glow::NativeFramebuffer,
     texture: glow::NativeTexture,
+    /// Allocated texture size, padded to 32-pixel steps.
     width: i32,
     height: i32,
+    /// Size libmpv last rendered at, in the texture's bottom-left corner.
+    content_width: i32,
+    content_height: i32,
+}
+
+/// The frame size libmpv renders for a tile and the texture that holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoRenderSize {
+    content: (i32, i32),
+    texture: (i32, i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,23 +481,32 @@ fn valid_crop_uv(crop_uv: Option<(f32, f32, f32, f32)>) -> (f32, f32, f32, f32) 
         .unwrap_or((0.0, 0.0, 1.0, 1.0))
 }
 
-fn video_render_target_size(
+/// The texture grows in 32-pixel steps so an interactive resize does not
+/// reallocate it every frame, but libmpv renders at the exact uncropped tile
+/// size inside it. Letting libmpv fill the padding made it letterbox the
+/// video there, and the blit then squashed those bars into the tile.
+fn video_render_size(
     viewport_width: i32,
     viewport_height: i32,
     crop_uv: Option<(f32, f32, f32, f32)>,
-) -> (i32, i32) {
+) -> VideoRenderSize {
     let (min_u, min_v, max_u, max_v) = valid_crop_uv(crop_uv);
     let full_width = viewport_width as f32 / (max_u - min_u);
     let full_height = viewport_height as f32 / (max_v - min_v);
     let cap_scale = (MAX_VIDEO_RENDER_WIDTH / full_width)
         .min(MAX_VIDEO_RENDER_HEIGHT / full_height)
         .min(1.0);
-    let full_width = (full_width * cap_scale).ceil() as i32;
-    let full_height = (full_height * cap_scale).ceil() as i32;
-    (
-        (((full_width.max(1) + 31) / 32) * 32).min(MAX_VIDEO_RENDER_WIDTH as i32),
-        (((full_height.max(1) + 31) / 32) * 32).min(MAX_VIDEO_RENDER_HEIGHT as i32),
-    )
+    let content_width =
+        ((full_width * cap_scale).ceil() as i32).clamp(1, MAX_VIDEO_RENDER_WIDTH as i32);
+    let content_height =
+        ((full_height * cap_scale).ceil() as i32).clamp(1, MAX_VIDEO_RENDER_HEIGHT as i32);
+    VideoRenderSize {
+        content: (content_width, content_height),
+        texture: (
+            (((content_width + 31) / 32) * 32).min(MAX_VIDEO_RENDER_WIDTH as i32),
+            (((content_height + 31) / 32) * 32).min(MAX_VIDEO_RENDER_HEIGHT as i32),
+        ),
+    }
 }
 
 fn video_blit_source(
@@ -544,6 +564,21 @@ fn flip_rgba_rows(rgba: &mut [u8], width: usize, height: usize) {
     }
 }
 
+/// Options that stop mpv's built-in Lua scripts. `load-scripts=no` only skips
+/// script folders, so without these every player, including each timeline
+/// preview core, starts a Lua thread per script that Pluriview never uses.
+/// `load-osd-console` is the older name of `load-console`.
+const BUILT_IN_SCRIPTS: [&str; 8] = [
+    "load-stats-overlay",
+    "load-console",
+    "load-osd-console",
+    "load-select",
+    "load-positioning",
+    "load-commands",
+    "load-context-menu",
+    "load-auto-profiles",
+];
+
 struct MpvCore {
     api: Arc<MpvApi>,
     handle: *mut MpvHandle,
@@ -593,8 +628,9 @@ impl MpvCore {
             ("terminal", "no"),
             ("osc", "no"),
             ("input-default-bindings", "no"),
-            // Match the seek-preview core: no built-in or user scripts, and
-            // no yt-dlp lookup on PATH. Streams are resolved by Streamlink.
+            // Match the seek-preview core: no user scripts (built-in ones are
+            // turned off below), and no yt-dlp lookup on PATH. Streams are
+            // resolved by Streamlink.
             ("load-scripts", "no"),
             ("ytdl", "no"),
             ("keep-open", "yes"),
@@ -614,6 +650,10 @@ impl MpvCore {
                 core.destroy_without_render_context();
                 return Err(error);
             }
+        }
+        for name in BUILT_IN_SCRIPTS {
+            // Best-effort: another libmpv build may not know every name.
+            let _ = core.set_option(name, "no");
         }
         if wallpaper {
             // Background video should fill its rectangle, loop, and never
@@ -931,6 +971,8 @@ impl MpvCore {
             texture,
             width,
             height,
+            content_width: width,
+            content_height: height,
         });
         Ok(true)
     }
@@ -938,27 +980,36 @@ impl MpvCore {
     unsafe fn render_to_fbo(
         &mut self,
         gl: &glow::Context,
-        width: i32,
-        height: i32,
+        size: VideoRenderSize,
     ) -> Result<(), String> {
         if self.destroyed {
             return Ok(());
         }
-        let width = width.max(1);
-        let height = height.max(1);
+        let texture_width = size.texture.0.max(1);
+        let texture_height = size.texture.1.max(1);
+        let content_width = size.content.0.clamp(1, texture_width);
+        let content_height = size.content.1.clamp(1, texture_height);
         let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
         let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
         let mut previous_viewport = [0; 4];
         gl.get_parameter_i32_slice(glow::VIEWPORT, &mut previous_viewport);
         let scissor_enabled = gl.is_enabled(glow::SCISSOR_TEST);
         self.ensure_render_context()?;
-        let target_changed = self.ensure_target(gl, width, height)?;
-        let target = self.target.as_ref().expect("target was just created");
+        let texture_changed = self.ensure_target(gl, texture_width, texture_height)?;
+        let target = self.target.as_mut().expect("target was just created");
+        let target_changed = texture_changed
+            || target.content_width != content_width
+            || target.content_height != content_height;
+        // libmpv sees only the content rectangle at the FBO origin
+        // (bottom-left in OpenGL) and never draws into the padding.
+        target.content_width = content_width;
+        target.content_height = content_height;
+        let target = &*target;
 
         let mut fbo = MpvOpenGlFbo {
             fbo: target.framebuffer.0.get() as c_int,
-            w: target.width,
-            h: target.height,
+            w: content_width,
+            h: content_height,
             internal_format: glow::RGBA8 as c_int,
         };
         let mut flip_y: c_int = 1;
@@ -984,7 +1035,7 @@ impl MpvCore {
         // egui_glow sets the window viewport to the callback rect. libmpv
         // must render into our FBO at (0,0), not into that window rectangle.
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
-        gl.viewport(0, 0, target.width, target.height);
+        gl.viewport(0, 0, content_width, content_height);
         if scissor_enabled {
             gl.disable(glow::SCISSOR_TEST);
         }
@@ -1054,10 +1105,9 @@ impl MpvCore {
         // During an interactive resize, only reallocate at 32-pixel steps.
         // A cropped tile keeps the full uncropped render target, then selects
         // only its requested source region during the final blit.
-        let (target_width, target_height) =
-            video_render_target_size(viewport_width, viewport_height, crop_uv);
+        let size = video_render_size(viewport_width, viewport_height, crop_uv);
 
-        self.render_to_fbo(gl, target_width, target_height)?;
+        self.render_to_fbo(gl, size)?;
         self.blit_target(&info, gl, crop_uv, destination);
         Ok(())
     }
@@ -1094,7 +1144,7 @@ impl MpvCore {
         let Some(target) = self.target.as_ref() else {
             return;
         };
-        let source = video_blit_source(target.width, target.height, crop_uv);
+        let source = video_blit_source(target.content_width, target.content_height, crop_uv);
         let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
         let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
 
@@ -1139,8 +1189,8 @@ impl MpvCore {
             return None;
         }
         let target = self.target.as_ref()?;
-        let width = usize::try_from(target.width).ok()?;
-        let height = usize::try_from(target.height).ok()?;
+        let width = usize::try_from(target.content_width).ok()?;
+        let height = usize::try_from(target.content_height).ok()?;
         let byte_len = width.checked_mul(height)?.checked_mul(4)?;
         let mut rgba = vec![0; byte_len];
 
@@ -1149,8 +1199,8 @@ impl MpvCore {
         gl.read_pixels(
             0,
             0,
-            target.width,
-            target.height,
+            target.content_width,
+            target.content_height,
             glow::RGBA,
             glow::UNSIGNED_BYTE,
             glow::PixelPackData::Slice(&mut rgba),
@@ -1162,8 +1212,8 @@ impl MpvCore {
         flip_rgba_rows(&mut rgba, width, height);
 
         Some(VideoSnapshot {
-            width: target.width as u32,
-            height: target.height as u32,
+            width: target.content_width as u32,
+            height: target.content_height as u32,
             rgba,
         })
     }
@@ -1886,6 +1936,9 @@ impl ThumbnailCore {
                 core.destroy();
                 return Err(error);
             }
+        }
+        for name in BUILT_IN_SCRIPTS {
+            let _ = core.set_option(name, "no");
         }
         if network_source {
             for (name, value) in [
@@ -2672,11 +2725,12 @@ mod tests {
     #[test]
     fn cropped_video_keeps_a_full_render_target_and_blits_only_the_crop() {
         let crop = Some((0.25, 0.25, 0.75, 0.75));
-        let target = video_render_target_size(160, 96, crop);
+        let size = video_render_size(160, 96, crop);
 
-        assert_eq!(target, (320, 192));
+        assert_eq!(size.content, (320, 192));
+        assert_eq!(size.texture, (320, 192));
         assert_eq!(
-            video_blit_source(target.0, target.1, crop),
+            video_blit_source(size.content.0, size.content.1, crop),
             BlitSource {
                 left: 80,
                 bottom: 48,
@@ -2689,24 +2743,52 @@ mod tests {
     #[test]
     fn invalid_video_crop_falls_back_to_the_full_frame() {
         let crop = Some((0.8, 0.0, 0.2, 1.0));
-        assert_eq!(video_render_target_size(320, 180, crop), (320, 192));
+        let size = video_render_size(320, 180, crop);
+        assert_eq!(size.content, (320, 180));
         assert_eq!(
-            video_blit_source(320, 192, crop),
+            video_blit_source(size.content.0, size.content.1, crop),
             BlitSource {
                 left: 0,
                 bottom: 0,
                 right: 320,
-                top: 192,
+                top: 180,
             }
         );
     }
 
     #[test]
     fn deep_video_crop_respects_the_render_target_cap() {
-        let target = video_render_target_size(1000, 1000, Some((0.0, 0.0, 0.1, 0.1)));
-        assert!(target.0 <= MAX_VIDEO_RENDER_WIDTH as i32);
-        assert!(target.1 <= MAX_VIDEO_RENDER_HEIGHT as i32);
-        assert_eq!(target, (2176, 2160));
+        let size = video_render_size(1000, 1000, Some((0.0, 0.0, 0.1, 0.1)));
+        assert!(size.texture.0 <= MAX_VIDEO_RENDER_WIDTH as i32);
+        assert!(size.texture.1 <= MAX_VIDEO_RENDER_HEIGHT as i32);
+        assert_eq!(size.content, (2160, 2160));
+        assert_eq!(size.texture, (2176, 2160));
+    }
+
+    #[test]
+    fn video_renders_at_the_exact_tile_size_inside_a_padded_texture() {
+        // A 16:9 tile whose height is not a multiple of 32: libmpv used to
+        // render 320x192 and letterbox the video into it, then the blit
+        // squashed those bars into the 320x180 tile.
+        let size = video_render_size(320, 180, None);
+        assert_eq!(size.content, (320, 180));
+        assert_eq!(size.texture, (320, 192));
+        assert_eq!(
+            video_blit_source(size.content.0, size.content.1, None),
+            BlitSource {
+                left: 0,
+                bottom: 0,
+                right: 320,
+                top: 180,
+            }
+        );
+        // Small resizes reuse the texture.
+        assert_eq!(video_render_size(317, 178, None).texture, (320, 192));
+        for (width, height) in [(1, 1), (33, 65), (1279, 719), (5000, 3000)] {
+            let size = video_render_size(width, height, None);
+            assert!(size.content.0 <= size.texture.0 && size.content.1 <= size.texture.1);
+            assert!(size.content.0 >= 1 && size.content.1 >= 1);
+        }
     }
 
     #[test]
@@ -2853,6 +2935,16 @@ mod tests {
         core.set_property("pause", "no").expect("resume");
         core.set_property("pause", "yes").expect("pause");
         core.set_property("volume", "37").expect("set volume");
+        core.destroy_without_render_context();
+    }
+
+    #[test]
+    fn bundled_runtime_starts_without_built_in_scripts() {
+        let api = MpvApi::load().expect("load bundled libmpv");
+        let mut core = MpvCore::new(api, true, false, false).expect("initialize libmpv");
+        for name in BUILT_IN_SCRIPTS {
+            assert_eq!(core.property(name).as_deref(), Some("no"), "{name}");
+        }
         core.destroy_without_render_context();
     }
 
@@ -3123,6 +3215,19 @@ mod tests {
                 .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
             "video frame was not copied to the destination framebuffer"
         );
+        if std::env::var_os("PLURIVIEW_TEST_VIDEO_FILLS_FRAME").is_some() {
+            // A 16:9 video with no bars of its own must reach every edge of
+            // a 16:9 tile; a padded render target used to add black rows.
+            assert_eq!((snapshot.width, snapshot.height), (320, 180));
+            for row in [0_usize, 1, 178, 179] {
+                let line = &presented[row * 320 * 4..(row + 1) * 320 * 4];
+                assert!(
+                    line.chunks_exact(4)
+                        .all(|pixel| pixel[0] > 48 || pixel[1] > 48 || pixel[2] > 48),
+                    "presented row {row} has black padding"
+                );
+            }
+        }
         let partially_offscreen = egui::PaintCallbackInfo {
             viewport: egui::Rect::from_min_size(egui::pos2(-80.0, 0.0), egui::vec2(320.0, 180.0)),
             clip_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 180.0)),

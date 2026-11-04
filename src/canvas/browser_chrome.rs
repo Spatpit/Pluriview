@@ -246,7 +246,9 @@ impl CanvasState {
 
         if preview.browser_loading && enabled {
             paint_loading_bar(painter, layout.toolbar, time);
-            ui.ctx().request_repaint();
+            // A thin sweeping bar needs no more than 30 frames a second.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
         }
         self.paint_toolbar(ui, painter, preview, layout, enabled, &mut output);
         self.paint_tab_strip(ui, painter, preview, layout, enabled, &mut output);

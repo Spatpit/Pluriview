@@ -38,16 +38,29 @@ impl CanvasState {
         self.cancel_camera_transition();
     }
 
-    /// Drop transient tile interaction state from a previous layout.
+    /// Drop transient tile interaction state from a previous layout. Tile
+    /// ids restart at 1 in the next layout, so anything still holding an old
+    /// id (selection, focus, a gesture, a queued action) would otherwise act
+    /// on an unrelated tile there.
     pub fn clear_preview_interactions(&mut self) {
+        self.cancel_pointer_interaction();
         self.groups = GroupState::default();
-        self.finish_crop();
+        self.selection.clear();
+        self.focus = None;
+        self.browser_tab_scroll.clear();
         self.last_removed = None;
         self.removed_undo_requested = false;
         self.pending_removed_restore = None;
+        self.pending_stream_audio_toggles.clear();
+        self.pending_browser_actions.clear();
+        self.pending_browser_scrolls.clear();
+        self.pending_browser_navigations.clear();
+        self.pending_video_actions.clear();
+        self.pending_tile_activity_actions.clear();
+        self.pending_playlist_actions.clear();
         self.pending_media_actions.clear();
-        self.pinned_drag_origins.clear();
-        self.pinned_pointer_drag = None;
+        self.pending_show_window = None;
+        self.pending_picture_in_picture = None;
         self.video_volume_hover = None;
         self.live_window = LiveWindow::default();
     }
@@ -64,6 +77,26 @@ impl CanvasState {
             .is_some_and(|drag| preview_manager.get(drag.id).is_none())
         {
             self.pinned_pointer_drag = None;
+        }
+    }
+
+    /// End a resize or crop handle drag whose handle stopped being drawn
+    /// before the button came up: letting go of Alt over a group swaps the
+    /// tile handles for the group outline, and a removed tile takes its
+    /// handles with it. Without this the stale drag blocks pan, zoom, inertia
+    /// and box selection. `pointer_held` is any button down or released this
+    /// frame; a live handle clears its own drag on the release frame.
+    pub(super) fn end_orphaned_handle_drag(
+        &mut self,
+        pointer_held: bool,
+        preview_manager: &PreviewManager,
+    ) {
+        let Some(DragState::Resizing { id, .. } | DragState::Cropping { id, .. }) = self.drag_state
+        else {
+            return;
+        };
+        if !pointer_held || preview_manager.get(id).is_none() {
+            self.drag_state = None;
         }
     }
 

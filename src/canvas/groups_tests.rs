@@ -1197,6 +1197,90 @@ fn pointer_drag_moves_all_group_members_with_and_without_pins() {
 }
 
 #[test]
+fn letting_go_of_alt_before_the_button_ends_a_group_tile_crop() {
+    let mut ui = UiFixture::new(Free, false);
+    for id in ui.ids.clone() {
+        ui.previews
+            .get_mut(id)
+            .unwrap()
+            .update_frame(300, 180, vec![0; 300 * 180 * 4]);
+    }
+    ui.select_group();
+    let tile = ui.screen(&[ui.ids[0]])[0];
+    // The left edge handle: no other member sits to the left of tile 0.
+    let start = tile.left_center();
+    let alt = egui::Modifiers::ALT;
+    let press = |pos, pressed, modifiers| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers,
+    };
+    let step = |ui: &mut UiFixture, events, modifiers| {
+        frame_with(
+            &ui.context,
+            &mut ui.canvas,
+            &mut ui.previews,
+            &mut ui.captures,
+            events,
+            modifiers,
+        );
+    };
+    step(&mut ui, vec![egui::Event::PointerMoved(start)], alt);
+    step(&mut ui, vec![press(start, true, alt)], alt);
+    for x in [10.0, 20.0, 30.0] {
+        step(
+            &mut ui,
+            vec![egui::Event::PointerMoved(start + Vec2::new(x, 0.0))],
+            alt,
+        );
+    }
+    assert!(
+        matches!(ui.canvas.drag_state, Some(DragState::Cropping { .. })),
+        "the Alt drag should crop the tile: {:?}",
+        ui.canvas.drag_state.is_some()
+    );
+    // Alt comes up first, which swaps the tile handles for the group outline.
+    let end = start + Vec2::new(40.0, 0.0);
+    step(
+        &mut ui,
+        vec![egui::Event::PointerMoved(end)],
+        egui::Modifiers::NONE,
+    );
+    step(
+        &mut ui,
+        vec![press(end, false, egui::Modifiers::NONE)],
+        egui::Modifiers::NONE,
+    );
+    ui.frame();
+
+    assert!(
+        ui.canvas.drag_state.is_none(),
+        "a finished crop must not keep blocking pan, zoom and box selection"
+    );
+}
+
+#[test]
+fn a_handle_drag_on_a_removed_tile_ends() {
+    let (mut canvas, mut previews, ids, _) = fixture();
+    let rect = previews.get(ids[0]).unwrap().rect();
+    canvas.drag_state = Some(DragState::Resizing {
+        id: ids[0],
+        handle: ResizeHandle::Right,
+        start_rect: rect,
+        start_mouse: rect.right_center(),
+        aspect_ratio: None,
+        screen_space: false,
+    });
+    canvas.end_orphaned_handle_drag(true, &previews);
+    assert!(canvas.drag_state.is_some(), "a live drag keeps going");
+
+    previews.clear();
+    canvas.end_orphaned_handle_drag(true, &previews);
+    assert!(canvas.drag_state.is_none());
+}
+
+#[test]
 fn shift_drag_swaps_two_tiles_and_an_outside_drop_cancels() {
     for pinned in [false, true] {
         let mut ui = UiFixture::new(Main(1), pinned);

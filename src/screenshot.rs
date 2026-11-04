@@ -118,16 +118,12 @@ impl CapturedPixels {
         let scale = (max_side.max(1) as f32 / crop_width.max(crop_height) as f32).min(1.0);
         let out_width = ((crop_width as f32 * scale).round() as u32).max(1);
         let out_height = ((crop_height as f32 * scale).round() as u32).max(1);
-        let mut pixels = Vec::with_capacity((out_width * out_height) as usize);
-        for y in 0..out_height {
-            let source_y =
-                top + (u64::from(y) * u64::from(crop_height) / u64::from(out_height)) as u32;
-            for x in 0..out_width {
-                let source_x =
-                    left + (u64::from(x) * u64::from(crop_width) / u64::from(out_width)) as u32;
-                pixels.push(self.pixel(source_x, source_y));
-            }
-        }
+        let pixels = box_downscale(
+            (crop_width, crop_height),
+            (out_width, out_height),
+            THUMBNAIL_TAPS,
+            |x, y| self.pixel(left + x, top + y).to_array(),
+        );
         Some(egui::ColorImage {
             size: [out_width as usize, out_height as usize],
             pixels,
@@ -278,6 +274,53 @@ pub fn combined_thumbnail(parts: &[CombinedPart], max_side: u32) -> Option<egui:
         [width as usize, height as usize],
         &rgba,
     ))
+}
+
+/// Pixels read across and down for each thumbnail pixel. Enough to smooth
+/// the jagged edges of picking one pixel, while a 4K frame stays at about
+/// half a million reads on the UI thread.
+const THUMBNAIL_TAPS: u32 = 4;
+
+/// Shrink a `width` x `height` picture to `out_width` x `out_height`,
+/// averaging the pixels each output pixel covers. At most `max_taps` pixels
+/// are read across and down per output pixel, spread evenly over its box;
+/// `u32::MAX` reads them all. `pixel` returns premultiplied RGBA.
+pub(crate) fn box_downscale(
+    (width, height): (u32, u32),
+    (out_width, out_height): (u32, u32),
+    max_taps: u32,
+    pixel: impl Fn(u32, u32) -> [u8; 4],
+) -> Vec<egui::Color32> {
+    let taps = |out: u32, out_size: u32, size: u32| -> Vec<u32> {
+        let at = |index: u32| (u64::from(index) * u64::from(size) / u64::from(out_size)) as u32;
+        let start = at(out);
+        let span = at(out + 1).max(start + 1).min(size) - start;
+        let count = span.min(max_taps.max(1));
+        (0..count)
+            .map(|tap| {
+                start + ((2 * u64::from(tap) + 1) * u64::from(span) / (2 * u64::from(count))) as u32
+            })
+            .collect()
+    };
+    let columns: Vec<Vec<u32>> = (0..out_width).map(|x| taps(x, out_width, width)).collect();
+    let mut pixels = Vec::with_capacity(out_width as usize * out_height as usize);
+    for y in 0..out_height {
+        let rows = taps(y, out_height, height);
+        for xs in &columns {
+            let mut sum = [0u64; 4];
+            for &source_y in &rows {
+                for &source_x in xs {
+                    for (total, value) in sum.iter_mut().zip(pixel(source_x, source_y)) {
+                        *total += u64::from(value);
+                    }
+                }
+            }
+            let count = (rows.len() * xs.len()) as u64;
+            let [r, g, b, a] = sum.map(|total| ((total + count / 2) / count) as u8);
+            pixels.push(egui::Color32::from_rgba_premultiplied(r, g, b, a));
+        }
+    }
+    pixels
 }
 
 /// Pixel rectangle `(left, top, right, bottom)` covered by a normalized crop.
@@ -571,6 +614,62 @@ mod tests {
         assert_eq!(cropped.size, [50, 100]);
         let small = CapturedPixels::Straight(numbered(20, 10));
         assert_eq!(small.thumbnail(None, 100).unwrap().size, [20, 10]);
+    }
+
+    #[test]
+    fn thumbnails_average_fine_detail_instead_of_picking_pixels() {
+        // One-pixel black and white columns: picking pixels would keep
+        // only one of the two colors.
+        let stripes: Vec<u8> = (0..400 * 200)
+            .flat_map(|index| {
+                if index % 2 == 0 {
+                    [0, 0, 0, 255]
+                } else {
+                    [255; 4]
+                }
+            })
+            .collect();
+        let pixels = CapturedPixels::Straight(
+            ScreenshotImage::from_straight_rgba(400, 200, stripes).unwrap(),
+        );
+        let thumbnail = pixels.thumbnail(None, 100).unwrap();
+        assert!(thumbnail
+            .pixels
+            .iter()
+            .all(|pixel| (100..=155).contains(&pixel.r())));
+    }
+
+    #[test]
+    fn box_downscale_spreads_its_reads_over_each_box() {
+        let reads = std::cell::RefCell::new(Vec::new());
+        let pixels = box_downscale((8, 4), (2, 1), 2, |x, y| {
+            reads.borrow_mut().push((x, y));
+            [x as u8 * 10, 0, 0, 255]
+        });
+        assert_eq!(
+            reads.into_inner(),
+            [
+                (1, 1),
+                (3, 1),
+                (1, 3),
+                (3, 3),
+                (5, 1),
+                (7, 1),
+                (5, 3),
+                (7, 3)
+            ]
+        );
+        assert_eq!(
+            pixels[0],
+            egui::Color32::from_rgba_premultiplied(20, 0, 0, 255)
+        );
+        assert_eq!(
+            pixels[1],
+            egui::Color32::from_rgba_premultiplied(60, 0, 0, 255)
+        );
+        // Without a limit every pixel is read, and a 1:1 size copies.
+        let all = box_downscale((3, 2), (3, 2), u32::MAX, |x, y| [x as u8, y as u8, 0, 255]);
+        assert_eq!(all[4], egui::Color32::from_rgba_premultiplied(1, 1, 0, 255));
     }
 
     #[test]
