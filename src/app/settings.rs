@@ -52,7 +52,7 @@ impl PluriviewApp {
         let mut close = false;
         let mut action = None;
         // Leave room for the tabs and the Close row on short screens.
-        let scroll_height = (ctx.screen_rect().height() - 260.0).clamp(220.0, 560.0);
+        let scroll_height = (ctx.content_rect().height() - 260.0).clamp(220.0, 560.0);
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
@@ -61,7 +61,7 @@ impl PluriviewApp {
             .min_width(520.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(
-                egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 28)),
+                egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_rgb(25, 25, 28)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {

@@ -4,7 +4,7 @@ use crate::capture::CaptureCoordinator;
 use crate::preview::{FpsPreset, PreviewManager};
 use crate::spout::{self, SpoutDetection, SpoutSender};
 use crate::ui_theme;
-use eframe::egui::{self, Pos2, RichText, Rounding, Stroke, Vec2};
+use eframe::egui::{self, CornerRadius, Pos2, RichText, Stroke, Vec2};
 use std::borrow::Cow;
 
 #[derive(Clone, Copy)]
@@ -96,11 +96,11 @@ impl WindowPicker {
         ui.add_space(12.0);
 
         // Modern search box with rounded corners
-        let search_frame = egui::Frame::none()
+        let search_frame = egui::Frame::NONE
             .fill(search_bg)
             .stroke(Stroke::new(1.0, ui_theme::BORDER))
-            .rounding(Rounding::same(8.0))
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 8));
 
         search_frame.show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -120,7 +120,7 @@ impl WindowPicker {
                             (ui.available_width() - if show_clear { 28.0 } else { 0.0 }).max(20.0),
                         )
                         .hint_text(RichText::new("Search sources…").color(text_secondary))
-                        .frame(false),
+                        .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2))),
                 );
                 if response.changed() {
                     self.filter_dirty = true;
@@ -187,16 +187,7 @@ impl WindowPicker {
                 if refresh_btn.clicked() {
                     self.refresh();
                 }
-                if refresh_btn.hovered() {
-                    egui::show_tooltip(
-                        ui.ctx(),
-                        ui.layer_id(),
-                        egui::Id::new("refresh_tooltip"),
-                        |ui| {
-                            ui.label("Refresh window list");
-                        },
-                    );
-                }
+                refresh_btn.on_hover_text("Refresh window list");
             });
         });
 
@@ -247,14 +238,15 @@ impl WindowPicker {
 
                     // Draw card background
                     ui.painter()
-                        .rect_filled(rect, Rounding::same(6.0), bg_color);
+                        .rect_filled(rect, CornerRadius::same(6), bg_color);
 
                     // Draw subtle border on hover
                     if is_hovered {
                         ui.painter().rect_stroke(
                             rect,
-                            Rounding::same(6.0),
+                            CornerRadius::same(6),
                             Stroke::new(1.0, ui_theme::BORDER),
+                            egui::StrokeKind::Middle,
                         );
                     }
 
@@ -527,14 +519,15 @@ fn draw_spout_sender_row(
     let is_hovered = response.hovered();
     ui.painter().rect_filled(
         rect,
-        Rounding::same(6.0),
+        CornerRadius::same(6),
         if is_hovered { card_hover } else { card_bg },
     );
     if is_hovered {
         ui.painter().rect_stroke(
             rect,
-            Rounding::same(6.0),
+            CornerRadius::same(6),
             Stroke::new(1.0, ui_theme::BORDER),
+            egui::StrokeKind::Middle,
         );
     }
 
@@ -651,7 +644,7 @@ mod tests {
     ) -> egui::FullOutput {
         // Keep fixtures independent of applications open on the test machine.
         picker.last_refresh = std::time::Instant::now();
-        ctx.run(
+        ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     Pos2::ZERO,
@@ -660,8 +653,8 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     picker.ui(
                         ui,
                         &mut PreviewManager::new(),

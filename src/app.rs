@@ -486,7 +486,7 @@ fn quick_add_popup_ui(popup: &mut QuickAddPopup, ctx: &egui::Context) -> (bool, 
         .constrain(true)
         .show(ctx, |ui| {
             egui::Frame::menu(ui.style())
-                .inner_margin(egui::Margin::same(10.0))
+                .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
                     crate::ui_theme::menu(ui);
                     ui.set_width(288.0);
@@ -504,7 +504,9 @@ fn quick_add_popup_ui(popup: &mut QuickAddPopup, ctx: &egui::Context) -> (bool, 
                             egui::TextEdit::singleline(&mut popup.search)
                                 .desired_width(ui.available_width())
                                 .hint_text("Search windows...")
-                                .frame(false),
+                                .frame(
+                                    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2)),
+                                ),
                         );
                         resp.request_focus();
                     });
@@ -678,7 +680,7 @@ fn canvas_views_menu_contents(
             .clicked()
         {
             action = Some(CanvasViewMenuAction::Previous);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if ui
             .add(crate::ui_theme::shortcut_button(
@@ -688,7 +690,7 @@ fn canvas_views_menu_contents(
             .clicked()
         {
             action = Some(CanvasViewMenuAction::Next);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         ui.separator();
         for (index, view) in canvas_views.iter().enumerate() {
@@ -729,21 +731,21 @@ fn canvas_views_menu_contents(
                         .clicked()
                     {
                         action = Some(CanvasViewMenuAction::Jump(index));
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
-                    ui.menu_button(egui_phosphor::regular::DOTS_THREE, |ui| {
+                    crate::ui_theme::menu_button(ui, egui_phosphor::regular::DOTS_THREE, |ui| {
                         crate::ui_theme::menu(ui);
                         if ui.button("Update from Current Viewpoint").clicked() {
                             action = Some(CanvasViewMenuAction::Update(index));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                         if ui.button("Rename...").clicked() {
                             action = Some(CanvasViewMenuAction::OpenRenameDialog(index));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                         if ui.button("Delete").clicked() {
                             action = Some(CanvasViewMenuAction::Delete(index));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     });
                 });
@@ -753,7 +755,7 @@ fn canvas_views_menu_contents(
     }
     if ui.button("Save Current Viewpoint...").clicked() {
         action = Some(CanvasViewMenuAction::OpenCreateDialog);
-        ui.close_menu();
+        ui.close_kind(egui::UiKind::Menu);
     }
     action
 }
@@ -1170,7 +1172,7 @@ impl PluriviewApp {
             || self.external_tool_error.is_some()
             || self.video_action_error.is_some()
             || self.workspace_error.is_some()
-            || ctx.memory(|memory| memory.any_popup_open())
+            || egui::Popup::is_any_open(ctx)
             || ctx.input(|input| input.viewport().minimized.unwrap_or(false));
         #[cfg(windows)]
         let blocked = blocked
@@ -2844,7 +2846,7 @@ impl PluriviewApp {
                     crate::ui_theme::section(ui, "RECENT WEBSITES");
                     egui::ScrollArea::vertical()
                         .id_salt("recent_browser_urls")
-                        .max_height((ctx.screen_rect().height() - 290.0).clamp(50.0, 194.0))
+                        .max_height((ctx.content_rect().height() - 290.0).clamp(50.0, 194.0))
                         .show(ui, |ui| {
                             for url in recent_urls.iter().take(5) {
                                 if crate::source_dialog::recent_url(ui, url).clicked() {
@@ -3899,7 +3901,7 @@ impl PluriviewApp {
             self.canvas.cancel_pointer_interaction();
             self.hotkey_recording = None;
             self.hotkey_recording_first = None;
-            ctx.memory_mut(|memory| memory.close_popup());
+            egui::Popup::close_all(ctx);
             #[cfg(windows)]
             {
                 // The live WebView is a separate native window. Park it before
@@ -3917,7 +3919,8 @@ impl PluriviewApp {
 
     /// Custom title bar (we run with `with_decorations(false)` so the OS
     /// doesn't draw its own white title bar over our dark theme).
-    fn title_bar_ui(&mut self, ctx: &egui::Context) {
+    fn title_bar_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         let bg = crate::ui_theme::PANEL;
         let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let workspace_name = self
@@ -3926,7 +3929,7 @@ impl PluriviewApp {
             .map(|workspace| workspace.name.clone())
             .unwrap_or_else(|| "Default".to_owned());
 
-        let screen = ctx.input(|i| i.screen_rect());
+        let screen = ctx.input(|i| i.content_rect());
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         let hover_zone = TITLE_BAR_HOVER_ZONE.max(self.title_bar_shown_height);
         let hovering = pointer.is_some_and(|pos| {
@@ -3946,10 +3949,10 @@ impl PluriviewApp {
         let height = egui::lerp(TITLE_BAR_COLLAPSED_HEIGHT..=TITLE_BAR_HEIGHT, t);
         self.title_bar_shown_height = height;
 
-        egui::TopBottomPanel::top("custom_title_bar")
-            .frame(egui::Frame::none().fill(bg))
-            .exact_height(height)
-            .show(ctx, |ui| {
+        egui::Panel::top("custom_title_bar")
+            .frame(egui::Frame::NONE.fill(bg))
+            .exact_size(height)
+            .show(ui, |ui| {
                 let panel_rect = ui.max_rect();
                 ui.set_clip_rect(panel_rect);
                 ui.painter().hline(
@@ -3978,7 +3981,7 @@ impl PluriviewApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_bar_rect), |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(title_bar_rect), |ui| {
                     ui.horizontal_centered(|ui| {
                         ui.add_space(10.0);
                         ui.image((self.brand_icon.id(), Vec2::splat(20.0)));
@@ -4008,7 +4011,7 @@ impl PluriviewApp {
                     });
                 });
 
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_bar_rect), |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(title_bar_rect), |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
@@ -4068,7 +4071,7 @@ impl PluriviewApp {
                 });
             });
 
-        self.title_bar_menu_open = want_visible && ctx.memory(|m| m.any_popup_open());
+        self.title_bar_menu_open = want_visible && egui::Popup::is_any_open(ctx);
     }
 
     /// The File / Workspace / View / Tools / Help menus. Rendered inline in the title bar next
@@ -4086,11 +4089,13 @@ impl PluriviewApp {
         ui.visuals_mut().widgets.hovered.weak_bg_fill = crate::ui_theme::HOVER;
         ui.visuals_mut().widgets.active.weak_bg_fill = crate::ui_theme::GOLD_DARK;
 
-        egui::menu::bar(ui, |ui| {
+        egui::MenuBar::new()
+            .config(crate::ui_theme::menu_config())
+            .ui(ui, |ui| {
             ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.spacing_mut().interact_size.y = 28.0;
-            ui.menu_button("File", |ui| {
+            crate::ui_theme::menu_button(ui, "File", |ui| {
                 crate::ui_theme::menu(ui);
                 crate::ui_theme::section(ui, "ADD TO CANVAS");
                 if crate::ui_theme::action(ui, egui_phosphor::regular::IMAGE, "Add Image...")
@@ -4102,7 +4107,7 @@ impl PluriviewApp {
                         .map(|rect| self.canvas.screen_to_canvas(rect.center(), rect))
                         .unwrap_or(Pos2::ZERO);
                     self.canvas.pending_media_add = Some(position);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 #[cfg(windows)]
                 if crate::ui_theme::action(ui, egui_phosphor::regular::FILM_STRIP, "Add Video...")
@@ -4114,7 +4119,7 @@ impl PluriviewApp {
                         .map(|rect| self.canvas.screen_to_canvas(rect.center(), rect))
                         .unwrap_or(Pos2::ZERO);
                     self.canvas.pending_video_add = Some(position);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 #[cfg(windows)]
                 if crate::ui_theme::action(ui, egui_phosphor::regular::BROADCAST, "Add Stream...")
@@ -4126,7 +4131,7 @@ impl PluriviewApp {
                         .map(|rect| self.canvas.screen_to_canvas(rect.center(), rect))
                         .unwrap_or(Pos2::ZERO);
                     self.canvas.pending_stream_add = Some(position);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 ui.separator();
                 if crate::ui_theme::action(
@@ -4139,7 +4144,7 @@ impl PluriviewApp {
                     if let Err(error) = self.save_active_workspace() {
                         self.workspace_error = Some(error);
                     }
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if crate::ui_theme::action(
                     ui,
@@ -4149,13 +4154,13 @@ impl PluriviewApp {
                 .clicked()
                 {
                     self.load_active_workspace();
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 ui.separator();
                 if self.tray_manager.is_some() {
                     if ui.button("Minimize to Tray").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                     ui.separator();
                 }
@@ -4164,7 +4169,7 @@ impl PluriviewApp {
                 }
             });
 
-            let workspace_menu = ui.menu_button("Workspace", |ui| {
+            let workspace_menu = crate::ui_theme::menu_button(ui, "Workspace", |ui| {
                 workspace_action = self.workspace_menu_contents(ui);
             });
             if workspace_menu.inner.is_none() && self.workspace_rename.is_some() {
@@ -4172,20 +4177,20 @@ impl PluriviewApp {
                 self.workspace_menu_closed(escape);
             }
 
-            ui.menu_button("View", |ui| {
+            crate::ui_theme::menu_button(ui, "View", |ui| {
                 crate::ui_theme::menu(ui);
                 crate::ui_theme::section(ui, "PANELS");
                 if crate::ui_theme::shortcut_toggle(ui, &mut self.picker_open, "Window Picker",
                     self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleWindowPicker)).clicked()
                 {
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 let mut screenshots_open = self.app_config.screenshots_panel_open;
                 if crate::ui_theme::shortcut_toggle(ui, &mut screenshots_open, "Screenshots Panel",
                     self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleScreenshotsPanel)).clicked()
                 {
                     self.set_screenshots_panel_open(screenshots_open);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if crate::ui_theme::toggle(
                     ui,
@@ -4198,14 +4203,14 @@ impl PluriviewApp {
                     .clicked()
                 {
                     self.save_app_config();
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 ui.separator();
                 crate::ui_theme::section(ui, "CANVAS");
                 if crate::ui_theme::shortcut_toggle(ui, &mut self.canvas.show_grid, "Show Grid",
                     self.app_config.keyboard_shortcuts.get(HotkeySlot::ToggleGrid)).clicked()
                 {
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 #[cfg(windows)]
                 if crate::ui_theme::toggle(ui, &mut self.app_config.show_sound_badges, "Show Sound Badges")
@@ -4214,10 +4219,10 @@ impl PluriviewApp {
                 {
                     self.canvas.show_sound_badges = self.app_config.show_sound_badges;
                     self.save_app_config();
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 ui.separator();
-                ui.menu_button("Saved Viewpoints", |ui| {
+                crate::ui_theme::menu_button(ui, "Saved Viewpoints", |ui| {
                     crate::ui_theme::menu(ui);
                     canvas_view_action = canvas_views_menu_contents(
                         ui,
@@ -4229,24 +4234,24 @@ impl PluriviewApp {
                 });
                 if ui.button("Reset View").clicked() {
                     self.canvas.reset();
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui.button("Set Wallpaper...").clicked() {
                     self.canvas.pending_wallpaper_pick = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if self.canvas.wallpaper.is_some() && ui.button("Clear Wallpaper").clicked() {
                     self.canvas.pending_wallpaper_clear = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             });
 
-            ui.menu_button("Tools", |ui| {
+            crate::ui_theme::menu_button(ui, "Tools", |ui| {
                 crate::ui_theme::menu(ui);
                 crate::ui_theme::section(ui, "SHARING");
                 if ui.button("Phone Viewer...").clicked() {
                     self.remote_view.show_dialog = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 #[cfg(windows)]
                 self.stream_audio_menu(ui);
@@ -4269,7 +4274,7 @@ impl PluriviewApp {
                                 self.workspace_error = Some(error);
                             }
                         }
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                     ui.label(
                         egui::RichText::new(self.browser.adblock_status_text())
@@ -4283,11 +4288,11 @@ impl PluriviewApp {
                     .clicked()
                 {
                     self.show_settings = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             });
 
-            ui.menu_button("Help", |ui| {
+            crate::ui_theme::menu_button(ui, "Help", |ui| {
                 crate::ui_theme::menu(ui);
                 if crate::ui_theme::action(
                     ui,
@@ -4297,7 +4302,7 @@ impl PluriviewApp {
                 .clicked()
                 {
                     self.open_welcome_tour();
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui
                     .add(crate::ui_theme::shortcut_button(
@@ -4309,12 +4314,12 @@ impl PluriviewApp {
                     .clicked()
                 {
                     self.show_shortcuts = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 ui.separator();
                 if crate::ui_theme::action(ui, egui_phosphor::regular::INFO, "About").clicked() {
                     self.show_about = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             });
         });
@@ -4586,10 +4591,10 @@ impl PluriviewApp {
             .interactable(false)
             .show(ctx, |ui| {
                 ui.multiply_opacity(fade);
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(24, 24, 28))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::symmetric(12, 7))
                     .show(ui, |ui| ui.label(message.as_str()));
             });
         ctx.request_repaint_after(crate::ui_theme::toast_repaint_after(
@@ -4634,10 +4639,10 @@ impl PluriviewApp {
             .fixed_pos(position)
             .show(ctx, |ui| {
                 ui.multiply_opacity(fade);
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(24, 24, 28))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::symmetric(12, 7))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(format!("Deleted “{name}”"));
@@ -4784,28 +4789,35 @@ impl PluriviewApp {
             Some(name) => format!("Stream Audio Monitor: {name}"),
             None => "Stream Audio Monitor: Off".to_owned(),
         };
-        ui.menu_button(label, |ui| {
+        crate::ui_theme::menu_button(ui, label, |ui| {
             crate::ui_theme::menu(ui);
             ui.label("Replay tile audio to a device so Discord/OBS\nwindow shares carry sound. Pick one you don't\nlisten to (virtual cable, unused output).\nBrowser tiles replay automatically; window\ntiles use the Stream Audio toggle on hover.");
             if let Some(monitor) = &self.audio_monitor {
                 let status = monitor.status();
-                ui.label(format!("Browser audio: {}", status.label())).on_hover_text(status.detail());
+                ui.label(format!("Browser audio: {}", status.label()))
+                    .on_hover_text(status.detail());
             }
             for (pid, monitor) in &self.window_audio_monitors {
-                let name = self.preview_manager.all().find(|preview| {
-                    preview.is_window_capture() && preview.window_handle.as_ref()
-                        .is_some_and(|handle| handle.process_id == *pid)
-                }).map(|preview| preview.title.as_str()).unwrap_or("Window audio");
+                let name = self
+                    .preview_manager
+                    .all()
+                    .find(|preview| {
+                        preview.is_window_capture()
+                            && preview
+                                .window_handle
+                                .as_ref()
+                                .is_some_and(|handle| handle.process_id == *pid)
+                    })
+                    .map(|preview| preview.title.as_str())
+                    .unwrap_or("Window audio");
                 let status = monitor.status();
-                ui.label(format!("{name}: {}", status.label())).on_hover_text(status.detail());
+                ui.label(format!("{name}: {}", status.label()))
+                    .on_hover_text(status.detail());
             }
             ui.separator();
-            if ui
-                .radio(self.monitor_device.is_none(), "Off")
-                .clicked()
-            {
+            if ui.radio(self.monitor_device.is_none(), "Off").clicked() {
                 self.monitor_device = None;
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             for device in self.render_devices.get(Instant::now()) {
                 if device.is_default {
@@ -4818,7 +4830,7 @@ impl PluriviewApp {
                     .is_some_and(|(id, _)| *id == device.id);
                 if ui.radio(selected, &device.name).clicked() {
                     self.monitor_device = Some((device.id.clone(), device.name.clone()));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
         });
@@ -4846,7 +4858,7 @@ impl PluriviewApp {
         } else {
             self.title_bar_shown_height
         };
-        let rect = ctx.input(|i| i.screen_rect());
+        let rect = ctx.input(|i| i.content_rect());
         let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
             return;
         };
@@ -4957,7 +4969,7 @@ mod tests {
                     self.focused = *focused;
                 }
             }
-            self.ctx.run(
+            self.ctx.run_ui(
                 RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 750.0))),
                     time: Some(self.time),
@@ -4965,8 +4977,9 @@ mod tests {
                     focused: self.focused,
                     ..Default::default()
                 },
-                |ctx| {
-                    CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
+                    CentralPanel::default().show(ui, |ui| {
                         self.canvas
                             .ui(ui, &mut self.previews, &mut self.captures, ctx, true);
                     });
@@ -5196,16 +5209,16 @@ mod tests {
         let render = |events| {
             let mut bounds = None;
             let mut action = None;
-            let output = ctx.run(
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         let response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
-                        response.context_menu(|ui| {
+                        crate::ui_theme::context_menu(&response, |ui| {
                             crate::ui_theme::menu(ui);
                             action = super::canvas_views_menu_contents(
                                 ui, &views, None, false, &bindings,
@@ -5910,7 +5923,33 @@ impl eframe::App for PluriviewApp {
         self.screenshots.wait_for_saves(deadline);
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // eframe only calls `ui` while the main window is visible. Tray
+        // actions, the picture-in-picture and Tile Control windows (drawn
+        // from this frame), recordings and capture upkeep must keep running
+        // while it is minimized or in the tray, so run the frame here then.
+        // eframe does not paint a hidden window.
+        if ctx.input(|input| input.viewport().visible()) == Some(false) {
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("pluriview_hidden_frame"),
+                egui::UiBuilder::new()
+                    .layer_id(egui::LayerId::background())
+                    .max_rect(ctx.content_rect()),
+            );
+            self.frame_ui(&mut ui, frame);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.frame_ui(ui, frame);
+    }
+}
+
+impl PluriviewApp {
+    /// One frame of the main window: upkeep, then its UI on `ui`.
+    fn frame_ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         // Cache our window handle once; used by the tray and for positioning
         // browser host windows (no more FindWindowW-by-title every frame).
         if self.main_hwnd.is_none() {
@@ -5944,7 +5983,7 @@ impl eframe::App for PluriviewApp {
 
         if !self.workspace_persistence_ready || !self.workspace_save.is_ready() {
             self.remote_view.stop();
-            self.workspace_recovery_ui(ctx);
+            self.workspace_recovery_ui(ui);
             return;
         }
 
@@ -5959,7 +5998,7 @@ impl eframe::App for PluriviewApp {
         );
         let shortcut_listening = owns_foreground
             && !self.window_controls.click_through
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
             && !self.show_settings
             && !self.show_shortcuts
             && !self.show_about
@@ -6103,7 +6142,7 @@ impl eframe::App for PluriviewApp {
         self.handle_frameless_resize(ctx);
         self.screenshots.button_rect = None;
         if !self.canvas_only {
-            self.title_bar_ui(ctx);
+            self.title_bar_ui(ui);
         }
 
         #[cfg(windows)]
@@ -6126,16 +6165,16 @@ impl eframe::App for PluriviewApp {
 
         // Minimal Void: Dark sidebar
         if self.picker_open && !self.canvas_only {
-            egui::SidePanel::left("window_picker_panel")
-                .default_width(292.0)
-                .min_width(240.0)
-                .max_width(400.0)
+            egui::Panel::left("window_picker_panel")
+                .default_size(292.0)
+                .min_size(240.0)
+                .max_size(400.0)
                 .frame(
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(crate::ui_theme::PANEL)
-                        .inner_margin(egui::Margin::same(12.0)),
+                        .inner_margin(egui::Margin::same(12)),
                 )
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     self.window_picker.ui(
                         ui,
                         &mut self.preview_manager,
@@ -6146,7 +6185,7 @@ impl eframe::App for PluriviewApp {
         }
 
         // Right-side panel: before the central canvas claims the remaining space.
-        self.screenshots_panel_ui(ctx);
+        self.screenshots_panel_ui(ui);
 
         // Minimal Void: No status bar - floating indicator is drawn in the canvas
 
@@ -6177,8 +6216,8 @@ impl eframe::App for PluriviewApp {
         let capture_coordinator = &mut self.capture_coordinator;
         let mut canvas_view_action = None;
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(13, 13, 13)))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(13, 13, 13)))
+            .show(ui, |ui| {
                 canvas.ui_with_canvas_views_menu(
                     ui,
                     preview_manager,
@@ -6519,7 +6558,10 @@ impl eframe::App for PluriviewApp {
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 28)))
+                .frame(
+                    egui::Frame::window(&ctx.global_style())
+                        .fill(egui::Color32::from_rgb(25, 25, 28)),
+                )
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(10.0);
@@ -6555,10 +6597,13 @@ impl eframe::App for PluriviewApp {
             egui::Window::new("Keyboard Shortcuts")
                 .collapsible(false)
                 .resizable(false)
-                .max_height((ctx.screen_rect().height() - 100.0).max(200.0))
+                .max_height((ctx.content_rect().height() - 100.0).max(200.0))
                 .vscroll(true)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(25, 25, 28)))
+                .frame(
+                    egui::Frame::window(&ctx.global_style())
+                        .fill(egui::Color32::from_rgb(25, 25, 28)),
+                )
                 .show(ctx, |ui| {
                     ui.add_space(5.0);
 

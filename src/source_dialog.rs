@@ -3,7 +3,7 @@ use crate::ui_theme::{self, BORDER, GOLD, GOLD_DARK, HOVER, PANEL, SECONDARY, TE
 use eframe::egui::{self, RichText};
 
 pub fn window(ctx: &egui::Context, title: &str) -> egui::Window<'static> {
-    let width = (ctx.screen_rect().width() - 64.0).clamp(220.0, 440.0);
+    let width = (ctx.content_rect().width() - 64.0).clamp(220.0, 440.0);
     egui::Window::new(title.to_owned())
         .title_bar(false)
         .collapsible(false)
@@ -11,7 +11,7 @@ pub fn window(ctx: &egui::Context, title: &str) -> egui::Window<'static> {
         .min_width(width)
         .max_width(width)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .frame(egui::Frame::window(&ctx.style()).inner_margin(20.0))
+        .frame(egui::Frame::window(&ctx.global_style()).inner_margin(20.0))
 }
 
 pub fn header(ui: &mut egui::Ui, icon: &str, title: &str, description: &str) -> bool {
@@ -62,11 +62,11 @@ pub fn url_input(ui: &mut egui::Ui, url: &mut String, hint: &str) -> (egui::Resp
             response
         })
         .inner;
-    response.context_menu(|ui| {
+    crate::ui_theme::context_menu(&response, |ui| {
         ui_theme::menu(ui);
         if ui.button("Paste").clicked() {
             paste = true;
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     });
     (response, paste)
@@ -129,6 +129,7 @@ pub fn recent_url(ui: &mut egui::Ui, url: &str) -> egui::Response {
             6.0,
             if active { HOVER } else { PANEL },
             egui::Stroke::new(1.0, if active { GOLD } else { BORDER }),
+            egui::StrokeKind::Middle,
         );
         ui.painter().text(
             egui::pos2(rect.left() + 19.0, rect.center().y),
@@ -239,10 +240,11 @@ mod tests {
     ) -> (egui::FullOutput, egui::Rect, (bool, bool)) {
         let mut bounds = egui::Rect::NOTHING;
         let mut action = (false, false);
-        let output = ctx.run(egui::RawInput {
+        let output = ctx.run_ui(egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 640.0))),
             events, ..Default::default()
-        }, |ctx| {
+        }, |ui| {
+let ctx = &ui.ctx().clone();
             let title = if stream { "Add Stream" } else { "Add Browser" };
             let result = window(ctx, title).show(ctx, |ui| {
                 header(ui, if stream { egui_phosphor::regular::BROADCAST } else { egui_phosphor::regular::GLOBE },

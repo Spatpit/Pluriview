@@ -3,9 +3,10 @@ use super::*;
 impl PluriviewApp {
     /// Keep source editing out of a failed-load canvas until the user recovers
     /// it or explicitly opens a different workspace.
-    pub(super) fn workspace_recovery_ui(&mut self, ctx: &egui::Context) {
+    pub(super) fn workspace_recovery_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         self.handle_frameless_resize(ctx);
-        egui::TopBottomPanel::top("workspace_recovery_title").show(ctx, |ui| {
+        egui::Panel::top("workspace_recovery_title").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let title = ui.label("Pluriview — Workspace Recovery");
                 if title.interact(egui::Sense::drag()).drag_started() {
@@ -25,7 +26,7 @@ impl PluriviewApp {
         let mut recover = false;
         let mut create = false;
         let mut switch = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(24.0);
                 ui.heading("This workspace could not be opened");
@@ -463,7 +464,7 @@ impl PluriviewApp {
             match row_action {
                 WorkspaceRowAction::Open => {
                     action = Some(WorkspaceMenuAction::Switch(id));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 WorkspaceRowAction::Duplicate => match self.duplicate_workspace(&id) {
                     Ok(copy_id) => {
@@ -478,7 +479,7 @@ impl PluriviewApp {
                     }
                     Err(error) => {
                         self.workspace_error = Some(error);
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                 },
                 WorkspaceRowAction::Rename => {
@@ -486,7 +487,7 @@ impl PluriviewApp {
                 }
                 WorkspaceRowAction::Delete => {
                     self.confirm_workspace_delete = Some(id);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
         }
@@ -495,7 +496,7 @@ impl PluriviewApp {
             && self.commit_workspace_rename()
         {
             action = Some(WorkspaceMenuAction::New);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         action
     }
@@ -1225,8 +1226,8 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            let output = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     for (row, name) in ["Default", "Main"].into_iter().enumerate() {
                         let id = format!("workspace-{row}");
                         if let Some(action) = workspace_row(ui, &id, name, row == 0, can_delete) {
@@ -1251,7 +1252,7 @@ mod tests {
     fn workspace_rows_fit_the_panel_this_test_assumes() {
         let ctx = egui::Context::default();
         let mut rects = Vec::new();
-        let _ = ctx.run(
+        let _ = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -1259,8 +1260,8 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     for _ in 0..2 {
                         let top = ui.cursor().min;
                         workspace_row(ui, "id", "Name", false, true);

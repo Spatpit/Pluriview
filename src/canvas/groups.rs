@@ -812,6 +812,7 @@ impl CanvasState {
                 self.preview_screen_rect(preview, viewport).expand(2.0),
                 4.0,
                 Stroke::new(3.0, Color32::from_rgb(207, 161, 57)),
+                egui::StrokeKind::Middle,
             );
         }
     }
@@ -1777,7 +1778,7 @@ impl CanvasState {
         shortcuts: &HotkeyBindings,
     ) {
         let group = previews.get(id).and_then(|p| p.tile_group.clone());
-        ui.menu_button("Group", |ui| {
+        crate::ui_theme::menu_button(ui, "Group", |ui| {
             crate::ui_theme::menu(ui);
             if ui
                 .add_enabled(
@@ -1790,7 +1791,7 @@ impl CanvasState {
                 .clicked()
             {
                 self.create_group(viewport, previews);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if let Some(group) = &group {
                 let mut name = group.name.clone();
@@ -1809,13 +1810,13 @@ impl CanvasState {
                     self.remember_current_tile(id);
                     self.groups.editing = Some(id);
                     self.selection = vec![id];
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui.button("Select Whole Group").clicked() {
                     self.remember_current_tile(id);
                     self.groups.editing = None;
                     self.selection = self.group_members(id, previews);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui.button("Remove This Tile from Group").clicked() {
                     if let Some(p) = previews.get_mut(id) {
@@ -1825,7 +1826,7 @@ impl CanvasState {
                     previews.bring_to_front(id);
                     self.groups.editing = None;
                     self.selection = vec![id];
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui
                     .add(crate::ui_theme::shortcut_button(
@@ -1837,10 +1838,10 @@ impl CanvasState {
                     self.groups.editing = None;
                     self.selection = self.group_members(id, previews);
                     self.ungroup_selection(previews);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
-            ui.menu_button("Add Selected to Group", |ui| {
+            crate::ui_theme::menu_button(ui, "Add Selected to Group", |ui| {
                 crate::ui_theme::menu(ui);
                 let mut groups: Vec<_> = previews
                     .all()
@@ -1864,7 +1865,7 @@ impl CanvasState {
                             }
                         }
                         self.assign_group(&ids, group, viewport, previews);
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                 }
             });
@@ -1894,7 +1895,7 @@ impl CanvasState {
                 .clicked()
             {
                 self.set_group_arrangement(id, GroupArrangement::Free, None, viewport, previews);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             for (arrangement, slot, label) in PRESETS {
                 let mut chosen = settings.arrangement == arrangement;
@@ -1902,7 +1903,7 @@ impl CanvasState {
                     .clicked()
                 {
                     self.set_group_arrangement(id, arrangement, Some(id), viewport, previews);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
             if ui
@@ -1914,10 +1915,10 @@ impl CanvasState {
                 .clicked()
             {
                 self.make_main_tile(id, viewport, previews);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if settings.arrangement != GroupArrangement::Free {
-                ui.menu_button("Gap", |ui| {
+                crate::ui_theme::menu_button(ui, "Gap", |ui| {
                     crate::ui_theme::menu(ui);
                     for (gap, label) in [
                         (GroupGap::None, "None"),
@@ -1927,24 +1928,24 @@ impl CanvasState {
                         let mut chosen = settings.gap == gap;
                         if crate::ui_theme::toggle(ui, &mut chosen, label).clicked() {
                             self.set_group_gap(id, gap, viewport, previews);
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     }
                 });
             }
             if ui.button("Fit Group to View").clicked() {
                 self.fit_group_to_view(id, viewport, previews);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             ui.separator();
         }
         if ui.button("Bring to Front").clicked() {
             self.restack_group(id, true, previews);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if ui.button("Send to Back").clicked() {
             self.restack_group(id, false, previews);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 
@@ -1956,7 +1957,7 @@ impl CanvasState {
         previews: &mut PreviewManager,
         shortcuts: &HotkeyBindings,
     ) {
-        ui.menu_button("Size", |ui| {
+        crate::ui_theme::menu_button(ui, "Size", |ui| {
             crate::ui_theme::menu(ui);
             for (width, slot, label) in SIZES {
                 if ui
@@ -1964,7 +1965,7 @@ impl CanvasState {
                     .clicked()
                 {
                     self.resize_selection(width, viewport, previews);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
         });
@@ -2193,6 +2194,7 @@ impl CanvasState {
                         outline.expand(3.0),
                         5.0,
                         Stroke::new(1.0, crate::ui_theme::GOLD.gamma_multiply(0.5)),
+                        egui::StrokeKind::Middle,
                     );
                 }
             }
@@ -2206,13 +2208,18 @@ impl CanvasState {
         };
         let color = crate::ui_theme::GOLD;
         let outline = outline.expand(3.0);
-        ui.painter()
-            .rect_stroke(outline, 5.0, Stroke::new(1.5, color));
+        ui.painter().rect_stroke(
+            outline,
+            5.0,
+            Stroke::new(1.5, color),
+            egui::StrokeKind::Middle,
+        );
         if let Some(active) = self.current_tile(previews).and_then(|id| previews.get(id)) {
             ui.painter().rect_stroke(
                 self.preview_screen_rect(active, viewport),
                 3.0,
                 Stroke::new(1.5, color),
+                egui::StrokeKind::Middle,
             );
         }
         for (at, handle) in Self::group_handles(outline, arranged) {
@@ -2306,10 +2313,10 @@ impl CanvasState {
             .fixed_pos(position)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(crate::ui_theme::PANEL)
-                    .rounding(6.0)
-                    .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(6, 3))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;

@@ -204,17 +204,47 @@ fn paint_browser_status_badges(
     painter.galley(badge.center() - galley.size() / 2.0, galley, Color32::WHITE);
 }
 
+/// egui 0.29's `InputState::raw_scroll_delta`, which egui 0.34 removed: this
+/// frame's unsmoothed wheel movement in points, with Shift scrolling
+/// horizontally. The canvas applies its own pan and zoom speeds to it.
+fn raw_scroll_delta(input: &egui::InputState, line_scroll_speed: f32) -> Vec2 {
+    input
+        .raw
+        .events
+        .iter()
+        .fold(Vec2::ZERO, |sum, event| match event {
+            egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                ..
+            } => {
+                let delta = match unit {
+                    egui::MouseWheelUnit::Point => *delta,
+                    egui::MouseWheelUnit::Line => line_scroll_speed * *delta,
+                    egui::MouseWheelUnit::Page => input.content_rect().height() * *delta,
+                };
+                sum + if modifiers.shift {
+                    Vec2::new(delta.x + delta.y, 0.0)
+                } else {
+                    delta
+                }
+            }
+            _ => sum,
+        })
+}
+
 fn show_context_menu_if(
     response: &egui::Response,
     active: bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
     if active {
-        let _ = response.context_menu(|ui| {
+        let _ = crate::ui_theme::context_menu(response, |ui| {
             crate::ui_theme::menu(ui);
             // Source-specific controls can exceed a short viewport. Keep the
             // entire menu reachable instead of clipping its final actions.
-            let max_height = (ui.ctx().screen_rect().height() - 32.0).max(100.0);
+            let max_height = (ui.ctx().content_rect().height() - 32.0).max(100.0);
             egui::ScrollArea::vertical()
                 .max_height(max_height)
                 // A popup's first frame only offers egui's default 400
@@ -227,113 +257,18 @@ fn show_context_menu_if(
 
 /// Close `response`'s context menu if it is the one open.
 fn close_context_menu_of(response: &egui::Response) {
-    let menu_id = egui::Id::new(EGUI_CONTEXT_MENU_ID);
-    let mut bar_state = egui::menu::BarState::load(&response.ctx, menu_id);
-    if bar_state
-        .as_ref()
-        .is_some_and(|root| root.id == response.id)
-    {
-        egui::menu::MenuRoot::handle_menu_response(&mut bar_state, egui::menu::MenuResponse::Close);
-        bar_state.store(&response.ctx, menu_id);
-    }
+    egui::Popup::close_id(&response.ctx, egui::Popup::default_response_id(response));
 }
 
-const EGUI_CONTEXT_MENU_ID: &str = "__egui::context_menu";
-const SAVED_VIEWPOINTS_SUBMENU_ID: &str = "canvas_saved_viewpoints_submenu";
-const SAVED_VIEWPOINTS_SUBMENU_WIDTH: f32 = 280.0;
-
-#[derive(Clone, Copy, Default)]
-struct LeftSubmenuState {
-    open: bool,
-    rect: Option<Rect>,
-    parent_rect: Option<Rect>,
-    close_parent: bool,
-}
-
-fn submenu_should_open_left(parent_right: f32, screen_right: f32, submenu_width: f32) -> bool {
-    screen_right - parent_right < submenu_width
-}
-
+/// egui places submenus on whichever side of the menu has room, so this no
+/// longer needs its own left-opening variant near the right screen edge.
 fn saved_viewpoints_submenu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> bool) {
-    let state_id = egui::Id::new(SAVED_VIEWPOINTS_SUBMENU_ID);
-    let open_left = submenu_should_open_left(
-        ui.min_rect().right(),
-        ui.ctx().screen_rect().right(),
-        SAVED_VIEWPOINTS_SUBMENU_WIDTH,
-    );
-    if !open_left {
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(state_id, LeftSubmenuState::default()));
-        ui.menu_button("Saved Viewpoints", |ui| {
-            crate::ui_theme::menu(ui);
-            add_contents(ui)
-        });
-        return;
-    }
-
-    let mut state = ui.ctx().data_mut(|data| {
-        data.get_temp::<LeftSubmenuState>(state_id)
-            .unwrap_or_default()
+    crate::ui_theme::menu_button(ui, "Saved Viewpoints", |ui| {
+        crate::ui_theme::menu(ui);
+        if add_contents(ui) {
+            ui.close_kind(egui::UiKind::Menu);
+        }
     });
-    let button = ui.button("◀  Saved Viewpoints");
-    let pointer = ui.ctx().pointer_hover_pos();
-    let hovering_submenu = pointer
-        .zip(state.rect)
-        .is_some_and(|(pointer, rect)| rect.contains(pointer));
-    let crossing_gap = pointer.zip(state.rect).is_some_and(|(pointer, rect)| {
-        Rect::from_min_max(
-            Pos2::new(rect.right(), button.rect.top()),
-            Pos2::new(button.rect.left(), button.rect.bottom()),
-        )
-        .contains(pointer)
-    });
-
-    if button.hovered() {
-        state.open = true;
-    } else if state.open && !hovering_submenu && !crossing_gap {
-        state.open = false;
-    }
-
-    state.close_parent = false;
-    if state.open {
-        let frame_margin = egui::Frame::menu(ui.style()).total_margin();
-        let position = Pos2::new(
-            button.rect.left() - ui.spacing().menu_spacing,
-            button.rect.top() - frame_margin.top,
-        );
-        let area = egui::Area::new(state_id.with("area"))
-            .kind(egui::UiKind::Menu)
-            .order(egui::Order::Foreground)
-            .pivot(egui::Align2::RIGHT_TOP)
-            .fixed_pos(position)
-            .default_width(ui.spacing().menu_width)
-            .sense(Sense::hover())
-            .show(ui.ctx(), |ui| {
-                let style = ui.style_mut();
-                style.spacing.button_padding = egui::vec2(9.0, 4.0);
-                style.visuals.widgets.active.bg_stroke = Stroke::NONE;
-                style.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
-                style.visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-                style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-
-                egui::Frame::menu(ui.style())
-                    .show(ui, |ui| {
-                        crate::ui_theme::menu(ui);
-                        ui.with_layout(
-                            egui::Layout::top_down_justified(egui::Align::LEFT),
-                            add_contents,
-                        )
-                        .inner
-                    })
-                    .inner
-            });
-        state.rect = Some(area.response.rect);
-        state.close_parent = area.inner;
-    } else {
-        state.rect = None;
-    }
-
-    ui.ctx().data_mut(|data| data.insert_temp(state_id, state));
 }
 
 fn show_canvas_context_menu_if(
@@ -341,59 +276,12 @@ fn show_canvas_context_menu_if(
     active: bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
-    if !active {
-        return;
+    if active {
+        let _ = crate::ui_theme::context_menu(response, |ui| {
+            crate::ui_theme::menu(ui);
+            add_contents(ui);
+        });
     }
-
-    let state_id = egui::Id::new(SAVED_VIEWPOINTS_SUBMENU_ID);
-    let mut state = response.ctx.data_mut(|data| {
-        data.get_temp::<LeftSubmenuState>(state_id)
-            .unwrap_or_default()
-    });
-    let menu_id = egui::Id::new(EGUI_CONTEXT_MENU_ID);
-    let mut bar_state = egui::menu::BarState::load(&response.ctx, menu_id);
-    let menu_response = egui::menu::MenuRoot::context_interaction(response, &mut bar_state);
-
-    if matches!(menu_response, egui::menu::MenuResponse::Create(_, _)) {
-        state = LeftSubmenuState::default();
-    }
-    egui::menu::MenuRoot::handle_menu_response(&mut bar_state, menu_response);
-
-    // The expanded rectangle keeps clicks in the custom left submenu from
-    // dismissing the root. Restore the root's real rectangle before drawing,
-    // because egui also uses its minimum corner as the popup anchor.
-    if let (Some(root), Some(parent_rect)) = (bar_state.as_mut(), state.parent_rect) {
-        root.menu_state.write().rect = parent_rect;
-    }
-
-    let _ = bar_state.show(response, |ui| {
-        crate::ui_theme::menu(ui);
-        add_contents(ui);
-    });
-    state = response.ctx.data_mut(|data| {
-        data.get_temp::<LeftSubmenuState>(state_id)
-            .unwrap_or_default()
-    });
-
-    if state.close_parent {
-        egui::menu::MenuRoot::handle_menu_response(&mut bar_state, egui::menu::MenuResponse::Close);
-        state = LeftSubmenuState::default();
-    } else if let Some(root) = bar_state.as_mut() {
-        let parent_rect = root.menu_state.read().rect;
-        state.parent_rect = Some(parent_rect);
-        if state.open {
-            if let Some(submenu_rect) = state.rect {
-                root.menu_state.write().rect = parent_rect.union(submenu_rect);
-            }
-        }
-    } else {
-        state = LeftSubmenuState::default();
-    }
-
-    bar_state.store(&response.ctx, menu_id);
-    response
-        .ctx
-        .data_mut(|data| data.insert_temp(state_id, state));
 }
 
 fn browser_control_colors(
@@ -1567,24 +1455,28 @@ impl CanvasState {
 
         // Snapshot the input fields we need once, instead of cloning the
         // whole InputState in every interaction pass.
-        let mut input = ui.input(|i| FrameInput {
-            hover_pos: i.pointer.hover_pos(),
-            interact_pos: i.pointer.interact_pos(),
-            pointer_delta: i.pointer.delta(),
-            scroll_x: i.raw_scroll_delta.x,
-            scroll_y: i.raw_scroll_delta.y,
-            alt: i.modifiers.alt,
-            ctrl: i.modifiers.ctrl,
-            shift: i.modifiers.shift,
-            middle_down: i.pointer.middle_down(),
-            primary_down: i.pointer.primary_down(),
-            primary_pressed: i.pointer.primary_pressed(),
-            primary_released: i.pointer.primary_released(),
-            pointer_blocked: false,
-            time: i.time,
-            delete_pressed,
-            select_all,
-            escape_pressed,
+        let line_scroll_speed = ui.ctx().options(|o| o.input_options.line_scroll_speed);
+        let mut input = ui.input(|i| {
+            let scroll = raw_scroll_delta(i, line_scroll_speed);
+            FrameInput {
+                hover_pos: i.pointer.hover_pos(),
+                interact_pos: i.pointer.interact_pos(),
+                pointer_delta: i.pointer.delta(),
+                scroll_x: scroll.x,
+                scroll_y: scroll.y,
+                alt: i.modifiers.alt,
+                ctrl: i.modifiers.ctrl,
+                shift: i.modifiers.shift,
+                middle_down: i.pointer.middle_down(),
+                primary_down: i.pointer.primary_down(),
+                primary_pressed: i.pointer.primary_pressed(),
+                primary_released: i.pointer.primary_released(),
+                pointer_blocked: false,
+                time: i.time,
+                delete_pressed,
+                select_all,
+                escape_pressed,
+            }
         });
         // Canvas gestures intentionally read raw pointer input so zoom and pan
         // also work over tiles. Do not let that bypass a menu, popup, or other
@@ -2007,7 +1899,12 @@ impl CanvasState {
         };
         let rect = marquee.rect().intersect(canvas_rect);
         painter.rect_filled(rect, 2.0, Color32::from_rgba_unmultiplied(74, 158, 255, 34));
-        painter.rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::from_rgb(74, 158, 255)));
+        painter.rect_stroke(
+            rect,
+            2.0,
+            Stroke::new(1.0, Color32::from_rgb(74, 158, 255)),
+            egui::StrokeKind::Middle,
+        );
     }
 
     fn update_marquee_selection(
@@ -2272,10 +2169,13 @@ impl CanvasState {
         let mut background_context_response = bg_response.clone();
         if background_secondary_target {
             background_context_response.sense = Sense::click();
-            background_context_response.contains_pointer = true;
-            background_context_response.hovered = true;
-            background_context_response.clicked = true;
-            background_context_response.interact_pointer_pos = input.interact_pos;
+            background_context_response.flags.insert(
+                egui::response::Flags::CONTAINS_POINTER
+                    | egui::response::Flags::HOVERED
+                    | egui::response::Flags::CLICKED,
+            );
+            background_context_response.interact_pointer_pos_or_nan =
+                input.interact_pos.unwrap_or(Pos2::NAN);
             self.last_secondary_click = input.interact_pos;
         }
 
@@ -2293,7 +2193,7 @@ impl CanvasState {
                         let canvas_pos = self.screen_to_canvas(screen_pos, canvas_rect);
                         self.pending_quick_add = Some((canvas_pos, screen_pos));
                     }
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if crate::ui_theme::action(ui, egui_phosphor::regular::GLOBE, "Add Browser...")
                     .clicked()
@@ -2302,7 +2202,7 @@ impl CanvasState {
                         self.pending_browser_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if crate::ui_theme::action(ui, egui_phosphor::regular::IMAGE, "Add Image...")
                     .clicked()
@@ -2311,7 +2211,7 @@ impl CanvasState {
                         self.pending_media_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if crate::ui_theme::action(ui, egui_phosphor::regular::FILM_STRIP, "Add Video...")
                     .clicked()
@@ -2320,7 +2220,7 @@ impl CanvasState {
                         self.pending_video_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if crate::ui_theme::action(ui, egui_phosphor::regular::BROADCAST, "Add Stream...")
                     .clicked()
@@ -2329,7 +2229,7 @@ impl CanvasState {
                         self.pending_stream_add =
                             Some(self.screen_to_canvas(screen_pos, canvas_rect));
                     }
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 ui.separator();
                 if ui
@@ -2343,13 +2243,13 @@ impl CanvasState {
                     .clicked()
                 {
                     self.pending_tile_control = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 self.show_hidden_items(ui, preview_manager);
                 saved_viewpoints_submenu(ui, |ui| canvas_views_menu(ui));
                 if ui.button("Reset View").clicked() {
                     self.reset();
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 ui.separator();
                 crate::ui_theme::shortcut_toggle(
@@ -2360,15 +2260,15 @@ impl CanvasState {
                 );
                 if crate::ui_theme::toggle(ui, &mut self.always_on_top, "Always on Top").changed() {
                     self.pending_always_on_top = Some(self.always_on_top);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui.button("Set Wallpaper...").clicked() {
                     self.pending_wallpaper_pick = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if self.wallpaper.is_some() && ui.button("Clear Wallpaper").clicked() {
                     self.pending_wallpaper_clear = true;
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 ui.separator();
                 if !self.selection.is_empty() {
@@ -2385,11 +2285,11 @@ impl CanvasState {
                     });
                     if any_live && ui.button("Freeze Selected").clicked() {
                         self.queue_activity_for_selection(&selected, TileActivityAction::Freeze);
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                     if any_frozen && ui.button("Resume Selected").clicked() {
                         self.queue_activity_for_selection(&selected, TileActivityAction::Resume);
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                     ui.separator();
                     if ui
@@ -2404,7 +2304,7 @@ impl CanvasState {
                         }
                         preview_manager.start_removal_batch(&self.selection);
                         self.selection.clear();
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                 }
             },
@@ -2603,10 +2503,13 @@ impl CanvasState {
             let mut context_response = preview_response.clone();
             if secondary_target {
                 context_response.sense = Sense::click();
-                context_response.contains_pointer = true;
-                context_response.hovered = true;
-                context_response.clicked = true;
-                context_response.interact_pointer_pos = input.interact_pos.or(input.hover_pos);
+                context_response.flags.insert(
+                    egui::response::Flags::CONTAINS_POINTER
+                        | egui::response::Flags::HOVERED
+                        | egui::response::Flags::CLICKED,
+                );
+                context_response.interact_pointer_pos_or_nan =
+                    input.interact_pos.or(input.hover_pos).unwrap_or(Pos2::NAN);
             }
 
             let pinned_pointer_active = viewport_pin.is_some_and(|pin| {
@@ -2845,11 +2748,11 @@ impl CanvasState {
                         Rect::from_min_size(screen_rect.min, Vec2::new(screen_rect.width(), 40.0));
                     painter.rect_filled(
                         overlay_rect,
-                        egui::Rounding {
-                            nw: 8.0,
-                            ne: 8.0,
-                            sw: 0.0,
-                            se: 0.0,
+                        egui::CornerRadius {
+                            nw: 8,
+                            ne: 8,
+                            sw: 0,
+                            se: 0,
                         },
                         Color32::from_rgba_unmultiplied(0, 0, 0, 120),
                     );
@@ -3012,11 +2915,11 @@ impl CanvasState {
                     );
                     painter.rect_filled(
                         bottom_overlay,
-                        egui::Rounding {
-                            nw: 0.0,
-                            ne: 0.0,
-                            sw: 8.0,
-                            se: 8.0,
+                        egui::CornerRadius {
+                            nw: 0,
+                            ne: 0,
+                            sw: 8,
+                            se: 8,
                         },
                         Color32::from_rgba_unmultiplied(0, 0, 0, 120),
                     );
@@ -3089,11 +2992,11 @@ impl CanvasState {
                     );
                     painter.rect_filled(
                         bottom_overlay,
-                        egui::Rounding {
-                            nw: 0.0,
-                            ne: 0.0,
-                            sw: 8.0,
-                            se: 8.0,
+                        egui::CornerRadius {
+                            nw: 0,
+                            ne: 0,
+                            sw: 8,
+                            se: 8,
                         },
                         Color32::from_rgba_unmultiplied(0, 0, 0, 155),
                     );
@@ -3233,6 +3136,7 @@ impl CanvasState {
                             volume_popover,
                             7.0,
                             Stroke::new(1.0, Color32::from_rgb(70, 70, 78)),
+                            egui::StrokeKind::Middle,
                         );
 
                         let mut volume = video_playback.volume;
@@ -3249,7 +3153,7 @@ impl CanvasState {
                         );
                         let slider_rect = video_volume_slider_rect(volume_popover);
                         let volume_response = ui
-                            .allocate_new_ui(
+                            .scope_builder(
                                 egui::UiBuilder::new().max_rect(slider_rect).layout(
                                     egui::Layout::centered_and_justified(egui::Direction::TopDown),
                                 ),
@@ -3352,6 +3256,7 @@ impl CanvasState {
                                     popup_rect,
                                     6.0,
                                     Stroke::new(1.0, Color32::from_rgb(90, 90, 98)),
+                                    egui::StrokeKind::Middle,
                                 );
 
                                 let image_rect = Rect::from_min_max(
@@ -3475,6 +3380,7 @@ impl CanvasState {
                     badge_rect,
                     7.0,
                     Stroke::new(1.0, Color32::from_rgb(104, 174, 255)),
+                    egui::StrokeKind::Middle,
                 );
                 painter.text(
                     badge_rect.center(),
@@ -3494,12 +3400,14 @@ impl CanvasState {
                         screen_rect,
                         8.0,
                         Stroke::new(2.0, Color32::from_rgb(207, 161, 57)),
+                        egui::StrokeKind::Middle,
                     );
                 } else if self.selection.contains(&id) {
                     painter.rect_stroke(
                         screen_rect,
                         8.0,
                         Stroke::new(2.0, Color32::from_rgb(74, 158, 255)),
+                        egui::StrokeKind::Middle,
                     );
                 }
             }
@@ -3539,7 +3447,7 @@ impl CanvasState {
             // page enters interaction.
             let on_page = chrome_layout.is_none_or(|layout| {
                 preview_response
-                    .interact_pointer_pos
+                    .interact_pointer_pos()
                     .is_some_and(|pointer| layout.page.contains(pointer))
             });
             if preview_response.double_clicked()
@@ -3711,7 +3619,7 @@ impl CanvasState {
         let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_height));
         clipped.rect_filled(
             header,
-            egui::Rounding {
+            egui::epaint::CornerRadiusF32 {
                 nw: corner,
                 ne: corner,
                 sw: 0.0,
@@ -4382,6 +4290,7 @@ impl CanvasState {
                 screen_rect,
                 8.0, // Rounded corners
                 Stroke::new(2.0, border_color),
+                egui::StrokeKind::Middle,
             );
 
             // Minimal Void: Smaller, more subtle resize handles

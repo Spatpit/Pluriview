@@ -13,14 +13,14 @@ pub const GOLD_DARK: Color32 = Color32::from_rgb(65, 53, 30);
 pub const DANGER: Color32 = Color32::from_rgb(244, 151, 146);
 
 pub fn install(ctx: &egui::Context) {
-    ctx.style_mut(|style| {
+    ctx.global_style_mut(|style| {
         style.visuals = egui::Visuals::dark();
         let v = &mut style.visuals;
         v.panel_fill = PANEL;
         v.window_fill = SURFACE;
         v.window_stroke = Stroke::new(1.0, BORDER);
-        v.menu_rounding = egui::Rounding::same(9.0);
-        v.window_rounding = egui::Rounding::same(10.0);
+        v.menu_corner_radius = egui::CornerRadius::same(9);
+        v.window_corner_radius = egui::CornerRadius::same(10);
         v.extreme_bg_color = PANEL;
         v.faint_bg_color = PANEL;
         v.selection.bg_fill = GOLD_DARK;
@@ -44,10 +44,10 @@ pub fn install(ctx: &egui::Context) {
             &mut v.widgets.hovered,
             &mut v.widgets.active,
         ] {
-            widget.rounding = egui::Rounding::same(5.0);
+            widget.corner_radius = egui::CornerRadius::same(5);
             widget.expansion = 0.0;
         }
-        style.spacing.menu_margin = egui::Margin::same(8.0);
+        style.spacing.menu_margin = egui::Margin::same(8);
         style.spacing.menu_width = 280.0;
     });
 }
@@ -68,6 +68,41 @@ pub fn menu(ui: &mut egui::Ui) {
     style
         .text_styles
         .insert(egui::TextStyle::Body, FontId::proportional(14.0));
+}
+
+/// Menus stay open until an item closes them with
+/// `ui.close_kind(egui::UiKind::Menu)`, so toggles, sliders and steppers can be
+/// adjusted in place. egui closes menus on any inside click by default since
+/// 0.32; submenus inherit this from their root.
+pub fn menu_config() -> egui::containers::menu::MenuConfig {
+    egui::containers::menu::MenuConfig::new()
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+}
+
+/// `Response::context_menu` with [`menu_config`]'s close behavior.
+pub fn context_menu<R>(
+    response: &egui::Response,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<egui::InnerResponse<R>> {
+    egui::Popup::context_menu(response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(add_contents)
+}
+
+/// `Ui::menu_button` with [`menu_config`]'s close behavior when it is a menu
+/// root. Inside a menu it opens a submenu, which inherits the root's config.
+pub fn menu_button<'a, R>(
+    ui: &mut egui::Ui,
+    atoms: impl egui::IntoAtoms<'a>,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    if egui::containers::menu::is_in_menu(ui) {
+        return ui.menu_button(atoms, add_contents);
+    }
+    let (response, inner) = egui::containers::menu::MenuButton::new(atoms)
+        .config(menu_config())
+        .ui(ui, add_contents);
+    egui::InnerResponse::new(inner.map(|inner| inner.inner), response)
 }
 
 pub fn section(ui: &mut egui::Ui, title: &str) {
@@ -123,7 +158,7 @@ fn toggle_row(
     title: &str,
     hint: Option<std::sync::Arc<egui::Galley>>,
 ) -> egui::Response {
-    let title_width = ui.fonts(|fonts| {
+    let title_width = ui.fonts_mut(|fonts| {
         fonts
             .layout_no_wrap(title.to_owned(), FontId::proportional(14.0), TEXT)
             .size()
@@ -157,6 +192,7 @@ fn toggle_row(
             3.0,
             if *value { GOLD_DARK } else { PANEL },
             Stroke::new(1.0, if response.hovered() { GOLD } else { BORDER }),
+            egui::StrokeKind::Middle,
         );
         if *value {
             let mark = icon.shrink(3.0);
@@ -199,7 +235,7 @@ pub fn clipped_text(ui: &egui::Ui, rect: egui::Rect, text: &str, size: f32, colo
     job.wrap.max_width = rect.width().max(0.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
-    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
     ui.painter()
         .with_clip_rect(rect.intersect(ui.clip_rect()))
         .galley(rect.min, galley, color);
@@ -239,14 +275,13 @@ mod tests {
     }
 
     #[test]
-    fn real_popup_with_shortcut_toggles_stays_compact_across_frames() {
+    fn context_menu_stays_open_for_toggles_and_closes_on_an_outside_click() {
         let ctx = egui::Context::default();
         install(&ctx);
         let mut checked = false;
-        let pointer = egui::pos2(600.0, 100.0);
         let mut render = |events| {
-            let mut bounds = None;
-            let output = ctx.run(
+            let mut toggle = None;
+            let _ = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -255,10 +290,74 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         let response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
-                        response.context_menu(|ui| {
+                        context_menu(&response, |ui| {
+                            menu(ui);
+                            toggle = Some(
+                                shortcut_toggle(ui, &mut checked, "Show Grid", Hotkey::key(0x47))
+                                    .rect,
+                            );
+                        });
+                    });
+                },
+            );
+            toggle
+        };
+        let click = |render: &mut dyn FnMut(Vec<egui::Event>) -> Option<egui::Rect>,
+                     pos: egui::Pos2,
+                     button: egui::PointerButton| {
+            render(vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                render(vec![egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }]);
+            }
+            render(vec![])
+        };
+
+        let toggle = click(
+            &mut render,
+            egui::pos2(300.0, 100.0),
+            egui::PointerButton::Secondary,
+        )
+        .expect("menu opens");
+        let after_toggle = click(&mut render, toggle.center(), egui::PointerButton::Primary);
+        assert!(after_toggle.is_some(), "toggling must keep the menu open");
+        let after_outside = click(
+            &mut render,
+            egui::pos2(700.0, 550.0),
+            egui::PointerButton::Primary,
+        );
+        assert!(after_outside.is_none(), "a click outside closes the menu");
+        assert!(checked, "the toggle click reached the toggle");
+    }
+
+    #[test]
+    fn real_popup_with_shortcut_toggles_stays_compact_across_frames() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut checked = false;
+        let pointer = egui::pos2(600.0, 100.0);
+        let mut render = |events| {
+            let mut bounds = None;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
+                        context_menu(&response, |ui| {
                             menu(ui);
                             shortcut_toggle(ui, &mut checked, "Window Picker", Hotkey::key(0x57));
                             shortcut_toggle(ui, &mut checked, "Show Grid", Hotkey::key(0x47));
@@ -316,7 +415,7 @@ mod tests {
         let mut bindings = HotkeyBindings::default();
         bindings.set(HotkeySlot::ToggleGrid, Hotkey::pair(0x11, 0x22));
         let mut checked = false;
-        let output = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -324,8 +423,8 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.set_width(360.0);
                     menu(ui);
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
@@ -372,13 +471,13 @@ mod tests {
         let mut checked = false;
         let mut render = |events| {
             let mut result = None;
-            let _ = ctx.run(
+            let _ = ctx.run_ui(
                 egui::RawInput {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         menu(ui);
                         result = Some(shortcut_toggle(
                             ui,
@@ -441,8 +540,8 @@ mod tests {
     fn long_unicode_source_text_is_elided_and_clipped_before_controls() {
         let ctx = egui::Context::default();
         let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(100.0, 20.0));
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 clipped_text(
                     ui,
                     rect,

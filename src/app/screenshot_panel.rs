@@ -503,7 +503,8 @@ impl PluriviewApp {
         Some(directory)
     }
 
-    pub(super) fn screenshots_panel_ui(&mut self, ctx: &egui::Context) {
+    pub(super) fn screenshots_panel_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         self.screenshots.panel.landing_rect = None;
         if !self.app_config.screenshots_panel_open || self.canvas_only {
             self.screenshots.panel.release();
@@ -527,16 +528,16 @@ impl PluriviewApp {
         let mut close = false;
         let mut edit_outcome = EditOutcome::Editing;
 
-        egui::SidePanel::right("screenshots_panel")
-            .default_width(292.0)
-            .min_width(240.0)
-            .max_width(420.0)
+        egui::Panel::right("screenshots_panel")
+            .default_size(292.0)
+            .min_size(240.0)
+            .max_size(420.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(crate::ui_theme::PANEL)
-                    .inner_margin(egui::Margin::same(12.0)),
+                    .inner_margin(egui::Margin::same(12)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let state = &mut self.screenshots.panel;
                 ui.add_space(4.0);
                 let title = ui
@@ -704,18 +705,18 @@ impl PluriviewApp {
                                         state.selection.paths.remove(&shot.path);
                                     }
                                 }
-                                header.context_menu(|ui| {
+                                crate::ui_theme::context_menu(&header, |ui| {
                                     crate::ui_theme::menu(ui);
                                     if folder.name != save_folder
                                         && ui.button("Save New Screenshots Here").clicked()
                                     {
                                         actions.push(PanelAction::SaveTo(folder.name.clone()));
-                                        ui.close_menu();
+                                        ui.close_kind(egui::UiKind::Menu);
                                     }
                                     if let Some(name) = &folder.name {
                                         if ui.button("Rename").clicked() {
                                             actions.push(PanelAction::RenameFolder(name.clone()));
-                                            ui.close_menu();
+                                            ui.close_kind(egui::UiKind::Menu);
                                         }
                                     }
                                     if !folder.shots.is_empty()
@@ -730,7 +731,7 @@ impl PluriviewApp {
                                             paths,
                                             vec![header.rect],
                                         ));
-                                        ui.close_menu();
+                                        ui.close_kind(egui::UiKind::Menu);
                                     }
                                     if ui.button("Select All in Folder").clicked() {
                                         state.collapsed.remove(&folder.name);
@@ -738,11 +739,11 @@ impl PluriviewApp {
                                         state.selection.paths.extend(
                                             folder.shots.iter().map(|shot| shot.path.clone()),
                                         );
-                                        ui.close_menu();
+                                        ui.close_kind(egui::UiKind::Menu);
                                     }
                                     if ui.button("Open in Explorer").clicked() {
                                         actions.push(PanelAction::OpenFolder(folder.name.clone()));
-                                        ui.close_menu();
+                                        ui.close_kind(egui::UiKind::Menu);
                                     }
                                 });
                             }
@@ -765,6 +766,7 @@ impl PluriviewApp {
                                         section.shrink(1.0),
                                         8.0,
                                         egui::Stroke::new(1.5, crate::ui_theme::GOLD),
+                                        egui::StrokeKind::Middle,
                                     );
                                     if released {
                                         actions.push(PanelAction::Move(
@@ -996,11 +998,11 @@ fn selection_bar(
     actions: &mut Vec<PanelAction>,
     selection: &mut Selection,
 ) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(crate::ui_theme::GOLD_DARK)
         .stroke(egui::Stroke::new(1.0, crate::ui_theme::GOLD))
-        .rounding(7.0)
-        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .corner_radius(7.0)
+        .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1040,7 +1042,8 @@ fn selection_bar(
                     {
                         actions.push(PanelAction::AddToCanvas(selected.to_vec(), Vec::new()));
                     }
-                    ui.menu_button(
+                    crate::ui_theme::menu_button(
+                        ui,
                         egui::RichText::new(egui_phosphor::regular::FOLDER_SIMPLE_PLUS).size(14.0),
                         |ui| {
                             crate::ui_theme::menu(ui);
@@ -1069,12 +1072,12 @@ fn move_menu(
         }
         if ui.button(folder_label(target.name.as_deref())).clicked() {
             actions.push(PanelAction::Move(paths.to_vec(), target.name.clone()));
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
     if crate::ui_theme::action(ui, egui_phosphor::regular::FOLDER_PLUS, "New Folder").clicked() {
         actions.push(PanelAction::NewFolder(paths.to_vec()));
-        ui.close_menu();
+        ui.close_kind(egui::UiKind::Menu);
     }
 }
 
@@ -1082,11 +1085,11 @@ fn move_menu(
 /// saves, Escape or the cross cancels.
 fn folder_name_row(ui: &mut egui::Ui, edit: &mut FolderEdit) -> EditOutcome {
     let mut outcome = EditOutcome::Editing;
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(crate::ui_theme::SURFACE)
         .stroke(egui::Stroke::new(1.0, crate::ui_theme::GOLD))
-        .rounding(7.0)
-        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .corner_radius(7.0)
+        .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_min_height(ROW_HEIGHT - 6.0);
@@ -1105,7 +1108,7 @@ fn folder_name_row(ui: &mut egui::Ui, edit: &mut FolderEdit) -> EditOutcome {
                             "New folder name"
                         })
                         .desired_width(field_width)
-                        .frame(false),
+                        .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2))),
                 );
                 if edit.focus {
                     response.request_focus();
@@ -1184,6 +1187,7 @@ fn folder_header(
             rect,
             7.0,
             egui::Stroke::new(1.0, crate::ui_theme::GOLD_DARK),
+            egui::StrokeKind::Middle,
         );
     }
     let caret = if expanded {
@@ -1333,6 +1337,7 @@ fn shot_grid(
                         image_rect.expand(1.5),
                         7.5,
                         egui::Stroke::new(2.5, crate::ui_theme::GOLD),
+                        egui::StrokeKind::Middle,
                     );
                     let badge = image_rect.right_top() + egui::vec2(-12.0, 12.0);
                     painter.circle_filled(badge, 9.0, crate::ui_theme::GOLD);
@@ -1348,12 +1353,14 @@ fn shot_grid(
                         image_rect.expand(1.0),
                         7.0,
                         egui::Stroke::new(2.0, crate::ui_theme::GOLD.gamma_multiply(alpha)),
+                        egui::StrokeKind::Middle,
                     );
                 } else if response.hovered() {
                     painter.rect_stroke(
                         image_rect,
                         6.0,
                         egui::Stroke::new(1.0, crate::ui_theme::SECONDARY),
+                        egui::StrokeKind::Middle,
                     );
                 }
                 let label_rect = egui::Rect::from_min_max(
@@ -1402,7 +1409,7 @@ fn shot_grid(
                     vec![shot.path.clone()]
                 };
                 let response = response.on_hover_text(&shot.name);
-                response.context_menu(|ui| {
+                crate::ui_theme::context_menu(&response, |ui| {
                     crate::ui_theme::menu(ui);
                     if crate::ui_theme::action(
                         ui,
@@ -1412,7 +1419,7 @@ fn shot_grid(
                     .clicked()
                     {
                         actions.push(PanelAction::AddToCanvas(targets.clone(), Vec::new()));
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                     ui.separator();
                     if targets.len() > 1 {
@@ -1420,21 +1427,21 @@ fn shot_grid(
                     } else {
                         if ui.button("Open").clicked() {
                             actions.push(PanelAction::OpenShot(shot.path.clone()));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                         if ui.button("Show in Explorer").clicked() {
                             actions.push(PanelAction::ShowShot(shot.path.clone()));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     }
-                    ui.menu_button("Move to", |ui| {
+                    crate::ui_theme::menu_button(ui, "Move to", |ui| {
                         crate::ui_theme::menu(ui);
                         move_menu(ui, &targets, Some(&folder.name), folders, actions);
                     });
                     ui.separator();
                     if crate::ui_theme::destructive(ui, "Move to Recycle Bin").clicked() {
                         actions.push(PanelAction::Delete(targets.clone()));
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                 });
             }
@@ -1513,7 +1520,12 @@ fn drag_ghost(ctx: &egui::Context, panel: &PanelState, payload: &ShotDrag) {
                 egui::Color32::WHITE.gamma_multiply(0.9),
             );
         }
-        painter.rect_stroke(card, 6.0, egui::Stroke::new(1.5, crate::ui_theme::GOLD));
+        painter.rect_stroke(
+            card,
+            6.0,
+            egui::Stroke::new(1.5, crate::ui_theme::GOLD),
+            egui::StrokeKind::Middle,
+        );
     }
     if payload.paths.len() > 1 {
         let badge = rect.right_top() + egui::vec2(0.0, 0.0);

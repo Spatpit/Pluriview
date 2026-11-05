@@ -275,7 +275,12 @@ impl CanvasState {
             .unwrap_or_else(|| window_rect_for_tile(tile, crop));
         let bar = grab_bar_rect(window, canvas_rect);
         let painter = ui.painter_at(canvas_rect);
-        painter.rect_stroke(window.expand(1.0), 4.0, Stroke::new(2.0, ui_theme::GOLD));
+        painter.rect_stroke(
+            window.expand(1.0),
+            4.0,
+            Stroke::new(2.0, ui_theme::GOLD),
+            egui::StrokeKind::Middle,
+        );
 
         let response = ui
             .interact(
@@ -302,18 +307,18 @@ impl CanvasState {
         painter.rect_filled(
             bar,
             if below {
-                egui::Rounding {
-                    nw: 0.0,
-                    ne: 0.0,
-                    sw: 8.0,
-                    se: 8.0,
+                egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 8,
+                    se: 8,
                 }
             } else {
-                egui::Rounding {
-                    nw: 8.0,
-                    ne: 8.0,
-                    sw: 0.0,
-                    se: 0.0,
+                egui::CornerRadius {
+                    nw: 8,
+                    ne: 8,
+                    sw: 0,
+                    se: 0,
                 }
             },
             if response.hovered() || self.live_window.drag.is_some() {

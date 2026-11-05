@@ -644,7 +644,7 @@ impl PluriviewApp {
         if gallery.clicked() {
             self.set_screenshots_panel_open(!panel_open);
         }
-        ui.menu_button("Capture", |ui| {
+        crate::ui_theme::menu_button(ui, "Capture", |ui| {
             crate::ui_theme::menu(ui);
             crate::ui_theme::section(ui, "SCREENSHOTS");
             if ui
@@ -658,7 +658,7 @@ impl PluriviewApp {
                 .clicked()
             {
                 self.request_tile_screenshots(ctx, false);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if self.canvas.capture_targets().len() > 1
                 && crate::ui_theme::action(
@@ -669,7 +669,7 @@ impl PluriviewApp {
                 .clicked()
             {
                 self.request_tile_screenshots(ctx, true);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             let mut panel_open = self.app_config.screenshots_panel_open;
             if crate::ui_theme::shortcut_toggle(
@@ -681,7 +681,7 @@ impl PluriviewApp {
             .clicked()
             {
                 self.set_screenshots_panel_open(panel_open);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if crate::ui_theme::action(
                 ui,
@@ -691,7 +691,7 @@ impl PluriviewApp {
             .clicked()
             {
                 self.open_screenshots_folder();
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             self.recording_menu_ui(ui);
         });
@@ -743,7 +743,7 @@ impl PluriviewApp {
             painter.rect_filled(*rect, 6.0, egui::Color32::WHITE.gamma_multiply(alpha));
         }
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         // The open panel's save folder first, else the camera button.
         let landing = state.panel.landing_rect.or(state.button_rect);
         let target = landing
@@ -769,13 +769,16 @@ impl PluriviewApp {
                 rounding,
                 egui::Color32::WHITE.gamma_multiply(fade),
             );
-            image.fill_texture_id = flight.texture.id();
-            image.uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+            image = image.with_texture(
+                flight.texture.id(),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            );
             painter.add(image);
             painter.rect_stroke(
                 rect,
                 rounding,
                 egui::Stroke::new(2.0, egui::Color32::WHITE.gamma_multiply(0.9 * fade)),
+                egui::StrokeKind::Middle,
             );
             true
         });
@@ -795,6 +798,7 @@ impl PluriviewApp {
                         rect.expand(3.0 * t),
                         8.0,
                         egui::Stroke::new(2.0, crate::ui_theme::GOLD.gamma_multiply(alpha)),
+                        egui::StrokeKind::Middle,
                     );
                 } else {
                     painter.circle_stroke(

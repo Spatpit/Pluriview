@@ -263,7 +263,7 @@ gh attestation verify .\Pluriview-vX.Y.Z-windows-x64-full.zip --repo Spatpit/Plu
 <details>
 <summary><strong>Build from source</strong></summary>
 
-Requires **Rust 1.88 or newer** on Windows.
+Requires **Rust 1.92 or newer** on Windows.
 
 ```powershell
 git clone https://github.com/Spatpit/Pluriview.git

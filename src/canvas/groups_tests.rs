@@ -1029,17 +1029,18 @@ fn frame_with(
     events: Vec<egui::Event>,
     modifiers: egui::Modifiers,
 ) {
-    let _ = context.run(
+    let _ = context.run_ui(
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
             events,
             modifiers,
             ..Default::default()
         },
-        |ctx| {
+        |ui| {
+            let ctx = &ui.ctx().clone();
             egui::CentralPanel::default()
-                .frame(egui::Frame::none())
-                .show(ctx, |ui| {
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
                     canvas.ui(ui, previews, captures, ctx, true);
                 });
         },

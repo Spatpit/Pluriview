@@ -530,11 +530,9 @@ impl RemoteView {
             return;
         };
         let image = events.iter().find_map(|event| match event {
-            egui::Event::Screenshot { viewport_id, image }
-                if *viewport_id == egui::ViewportId::ROOT =>
-            {
-                Some(image.clone())
-            }
+            egui::Event::Screenshot {
+                viewport_id, image, ..
+            } if *viewport_id == egui::ViewportId::ROOT => Some(image.clone()),
             _ => None,
         });
         if let Some(image) = image {
@@ -588,7 +586,7 @@ impl RemoteView {
                 Instant::now(),
             ));
             self.next_capture = cadence::next(self.next_capture, Instant::now(), interval);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
         crate::media::request_animation_repaint(
             ctx,
@@ -1483,7 +1481,7 @@ mod tests {
 
     #[test]
     fn frame_encoding_crops_chrome_and_caps_dimensions() {
-        let mut image = ColorImage::new([1600, 1000], Color32::RED);
+        let mut image = ColorImage::filled([1600, 1000], Color32::RED);
         image.pixels[..1600 * 100].fill(Color32::BLUE);
         let job = CaptureJob {
             image: Arc::new(image),
@@ -1625,32 +1623,35 @@ mod tests {
             ..Default::default()
         };
         let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
-        let output = ctx.run(Default::default(), |ctx| {
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             viewer.capture(ctx, Some(rect), false)
         });
-        assert!(!output
-            .viewport_output
-            .values()
-            .any(|v| v.commands.contains(&egui::ViewportCommand::Screenshot)));
+        assert!(!output.viewport_output.values().any(|v| v
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Screenshot(_)))));
         assert!(viewer.pending.is_none());
         *viewer.host.as_ref().unwrap().shared.peer.lock() = Some(Peer {
             id: "phone".into(),
             seen: Instant::now(),
         });
-        let output = ctx.run(Default::default(), |ctx| {
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             viewer.capture(ctx, Some(rect), true)
         });
-        assert!(!output
-            .viewport_output
-            .values()
-            .any(|v| v.commands.contains(&egui::ViewportCommand::Screenshot)));
-        let output = ctx.run(Default::default(), |ctx| {
+        assert!(!output.viewport_output.values().any(|v| v
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Screenshot(_)))));
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             viewer.capture(ctx, Some(rect), false)
         });
-        assert!(output
-            .viewport_output
-            .values()
-            .any(|v| v.commands.contains(&egui::ViewportCommand::Screenshot)));
+        assert!(output.viewport_output.values().any(|v| v
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Screenshot(_)))));
         assert!(viewer.pending.is_some());
     }
 
@@ -1827,7 +1828,7 @@ mod tests {
         let shared = host.shared.clone();
         let sender = host.encoder.clone();
         let producer = std::thread::spawn(move || {
-            let image = Arc::new(ColorImage::new(
+            let image = Arc::new(ColorImage::filled(
                 [1280, 720],
                 Color32::from_rgb(50, 100, 200),
             ));

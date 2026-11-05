@@ -14,7 +14,7 @@ const MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
 /// scaled to fit (long full-page screenshots exceed it).
 const MAX_TEXTURE_SIDE: u32 = 16_384;
 
-/// egui 0.29 subtracts its predicted frame time from repaint delays. GIF deadlines
+/// egui subtracts its predicted frame time from repaint delays. GIF deadlines
 /// already use wall-clock time, so compensate to avoid repeatedly waking early.
 #[track_caller]
 pub fn request_animation_repaint(ctx: &eframe::egui::Context, remaining: Duration) {
@@ -364,10 +364,11 @@ mod tests {
     fn animation_repaint_preserves_wall_clock_deadline() {
         let ctx = eframe::egui::Context::default();
         for _ in 0..2 {
-            let _ = ctx.run(Default::default(), |_| {});
+            let _ = ctx.run_ui(Default::default(), |_| {});
         }
         for remaining in [Duration::from_millis(3), Duration::from_millis(83)] {
-            let output = ctx.run(Default::default(), |ctx| {
+            let output = ctx.run_ui(Default::default(), |ui| {
+                let ctx = &ui.ctx().clone();
                 super::request_animation_repaint(ctx, remaining);
             });
             assert_eq!(
