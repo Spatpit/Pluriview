@@ -1180,7 +1180,8 @@ fn is_sensitive_stream_parameter(name: &str) -> bool {
             | "sig"
             | "signature"
             | "token"
-    ) || name.ends_with("_token")
+    ) || crate::browser::PRIVATE_QUERY_KEYS.contains(&name.as_str())
+        || name.ends_with("_token")
         || name.ends_with("_key")
         || name.ends_with("_password")
         || name.ends_with("_signature")
@@ -2044,7 +2045,7 @@ mod tests {
             Vec2::splat(1.0),
         );
         preview.video_source = Some(VideoSource::Stream {
-            url: "https://user:password@youtube.com/watch?v=abc123&token=secret&sig=private&api_key=hidden&password=hidden&expire=1&X-Amz-Credential=hidden&X-Amz-Signature=hidden#chat".to_owned(),
+            url: "https://user:password@youtube.com/watch?v=abc123&token=secret&sig=private&api_key=hidden&password=hidden&expire=1&X-Amz-Credential=hidden&X-Amz-Signature=hidden&pwd=hidden&otp=123456&ticket=hidden#chat".to_owned(),
             quality: "best".to_owned(),
         });
 

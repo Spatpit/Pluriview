@@ -161,13 +161,7 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
         return BOOL(1);
     }
 
-    // Skip our own window
-    if title.contains("Pluriview") {
-        return BOOL(1);
-    }
-
-    // Skip sensitive windows (Password managers, browsers with "private" in title, etc.)
-    if privacy::is_sensitive_window(&exe_name, &title) {
+    if is_hidden_source(process_id, &exe_name, &title) {
         return BOOL(1);
     }
 
@@ -179,6 +173,14 @@ unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BO
     ));
 
     BOOL(1) // Continue enumeration
+}
+
+/// Pluriview's own windows (main window, Control Tile Center, Picture in
+/// Picture, parked browser hosts) by process, so another app's window that
+/// merely mentions Pluriview in its title can still be picked. Also hides
+/// sensitive windows such as password managers and private browsing.
+fn is_hidden_source(process_id: u32, exe_name: &str, title: &str) -> bool {
+    process_id == std::process::id() || privacy::is_sensitive_window(exe_name, title)
 }
 
 /// Get the process name from a process ID
@@ -249,6 +251,28 @@ mod tests {
         let title = super::window_title(id).unwrap();
         assert!(crate::privacy::is_sensitive_window("msedge.exe", &title));
         unsafe { DestroyWindow(hwnd) }.unwrap();
+    }
+
+    #[test]
+    fn only_pluriview_s_own_windows_are_hidden_not_titles_that_mention_it() {
+        let own = std::process::id();
+        let other = own.wrapping_add(1);
+        assert!(super::is_hidden_source(own, "pluriview.exe", "Notes"));
+        assert!(!super::is_hidden_source(
+            other,
+            "msedge.exe",
+            "Spatpit/pluriview: Pluriview - GitHub - Microsoft Edge"
+        ));
+        assert!(!super::is_hidden_source(
+            other,
+            "notepad.exe",
+            "pluriview notes.txt - Notepad"
+        ));
+        assert!(super::is_hidden_source(
+            other,
+            "msedge.exe",
+            "InPrivate - Microsoft Edge"
+        ));
     }
 
     #[test]

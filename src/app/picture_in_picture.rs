@@ -1,6 +1,5 @@
 use super::*;
 
-/// Contains "Pluriview" so the window picker never lists it as a source.
 const TITLE: &str = "Pluriview Picture in Picture";
 const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(13, 13, 13);
 /// The longer side of a newly opened window, in points.
