@@ -161,23 +161,32 @@ fn runtime_library_candidates(executable: Option<&std::path::Path>) -> Vec<std::
     let mut candidates = Vec::new();
     if let Some(directory) = executable.and_then(std::path::Path::parent) {
         candidates.push(directory.join("lib"));
-
-        let is_build_profile = directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| matches!(name, "debug" | "release"));
-        let target_directory = directory.parent();
-        let is_target_directory = target_directory
-            .and_then(std::path::Path::file_name)
-            .and_then(|name| name.to_str())
-            == Some("target");
-        if is_build_profile && is_target_directory {
-            if let Some(workspace) = target_directory.and_then(std::path::Path::parent) {
-                candidates.push(workspace.join("vendor"));
-            }
+        if let Some(workspace) = source_workspace(directory) {
+            candidates.push(workspace.join("vendor"));
         }
     }
     candidates
+}
+
+/// The source folder when `directory` holds a Cargo build of it:
+/// `target/debug` or `target/release`, or their `deps` folder where test
+/// executables run.
+pub(crate) fn source_workspace(directory: &std::path::Path) -> Option<&std::path::Path> {
+    fn is_named(path: &std::path::Path, names: &[&str]) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| names.contains(&name))
+    }
+    let profile = if is_named(directory, &["deps"]) {
+        directory.parent()?
+    } else {
+        directory
+    };
+    let target = profile.parent()?;
+    if !is_named(profile, &["debug", "release"]) || !is_named(target, &["target"]) {
+        return None;
+    }
+    target.parent()
 }
 
 /// Geometry the main window was last closed at, if a layout has one.
@@ -228,8 +237,27 @@ fn create_window_icon() -> egui::IconData {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::runtime_library_candidates;
+    use super::{runtime_library_candidates, source_workspace};
     use std::path::Path;
+
+    #[test]
+    fn only_cargo_build_folders_count_as_the_source_folder() {
+        let workspace = Some(Path::new(r"S:\src\pluriview"));
+        assert_eq!(
+            source_workspace(Path::new(r"S:\src\pluriview\target\release")),
+            workspace
+        );
+        assert_eq!(
+            source_workspace(Path::new(r"S:\src\pluriview\target\debug\deps")),
+            workspace
+        );
+        assert_eq!(
+            source_workspace(Path::new(r"C:\Program Files\Pluriview")),
+            None
+        );
+        assert_eq!(source_workspace(Path::new(r"C:\Downloads\release")), None);
+        assert_eq!(source_workspace(Path::new(r"C:\Downloads\deps")), None);
+    }
 
     #[test]
     fn packaged_lib_folder_precedes_development_fallbacks() {

@@ -389,24 +389,40 @@ pub fn scrub_tabs_for_storage(tabs: &[BrowserTab], active: usize) -> (Vec<Browse
     (kept, kept_active)
 }
 
+/// Query names that carry a password, a one-time code or a share secret,
+/// matched exactly (lowercase). Saved browser and stream addresses both drop
+/// them. `rlkey` and `resourcekey` are the secrets in Dropbox and Google
+/// Drive share links.
+pub(crate) const PRIVATE_QUERY_KEYS: [&str; 10] = [
+    "pwd",
+    "otp",
+    "jwt",
+    "ticket",
+    "auth",
+    "authkey",
+    "rlkey",
+    "resourcekey",
+    "session",
+    "sessionid",
+];
+
 fn is_sensitive_query_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    matches!(
-        key.as_str(),
-        "code" | "state" | "key" | "sig" | "session" | "sessionid"
-    ) || [
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "authorization",
-        "credential",
-        "signature",
-        "api_key",
-        "apikey",
-    ]
-    .iter()
-    .any(|marker| key.contains(marker))
+    matches!(key.as_str(), "code" | "state" | "key" | "sig")
+        || PRIVATE_QUERY_KEYS.contains(&key.as_str())
+        || [
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "authorization",
+            "credential",
+            "signature",
+            "api_key",
+            "apikey",
+        ]
+        .iter()
+        .any(|marker| key.contains(marker))
 }
 
 /// Ordinary new-tab links keep navigating inside the tile. A sized popup
@@ -3724,6 +3740,40 @@ mod tests {
             )
             .unwrap(),
             "https://example.com/watch?v=42"
+        );
+    }
+
+    #[test]
+    fn persisted_urls_drop_share_secrets_and_one_time_codes() {
+        for key in super::PRIVATE_QUERY_KEYS {
+            let url = format!(
+                "https://example.com/page?id=7&{}=secret",
+                key.to_uppercase()
+            );
+            assert_eq!(
+                scrub_url_for_storage(&url).unwrap(),
+                "https://example.com/page?id=7",
+                "{key}"
+            );
+        }
+        assert_eq!(
+            scrub_url_for_storage(
+                "https://www.dropbox.com/scl/fi/abc/notes.txt?rlkey=private&dl=0"
+            )
+            .unwrap(),
+            "https://www.dropbox.com/scl/fi/abc/notes.txt?dl=0"
+        );
+        assert_eq!(
+            scrub_url_for_storage(
+                "https://drive.google.com/file/d/abc/view?usp=sharing&resourcekey=0-private"
+            )
+            .unwrap(),
+            "https://drive.google.com/file/d/abc/view?usp=sharing"
+        );
+        // Ordinary names that merely contain these words are kept.
+        assert_eq!(
+            scrub_url_for_storage("https://example.com/?author=me&tickets=2").unwrap(),
+            "https://example.com/?author=me&tickets=2"
         );
     }
 

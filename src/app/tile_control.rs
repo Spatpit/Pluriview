@@ -4,7 +4,6 @@ use egui::{Color32, Rect, Stroke};
 use egui_phosphor::regular as icons;
 use std::sync::Arc;
 
-/// Contains "Pluriview" so the window picker never lists it as a source.
 const TITLE: &str = "Pluriview Control Tile Center";
 /// Wide enough for three cards in a row (three of the narrowest cards and
 /// their gaps, the side margins and the scroll bar).

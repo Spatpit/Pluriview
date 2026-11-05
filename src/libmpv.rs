@@ -272,19 +272,25 @@ pub fn runtime_is_available() -> bool {
 }
 
 fn find_libmpv() -> Option<PathBuf> {
+    libmpv_candidates(std::env::current_exe().ok().as_deref())
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+/// Where `libmpv-2.dll` may be, all fixed by where the executable is: never
+/// the current folder, which a shortcut or a downloads folder could point at
+/// a planted DLL. A build inside this repository's `target` folder (tests
+/// included) also finds the prepared copy under `vendor/`.
+fn libmpv_candidates(executable: Option<&std::path::Path>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            candidates.push(directory.join("lib").join("libmpv-2.dll"));
-            candidates.push(directory.join("libmpv-2.dll"));
+    if let Some(directory) = executable.and_then(std::path::Path::parent) {
+        candidates.push(directory.join("lib").join("libmpv-2.dll"));
+        candidates.push(directory.join("libmpv-2.dll"));
+        if let Some(workspace) = crate::source_workspace(directory) {
+            candidates.push(workspace.join("vendor").join("libmpv-2.dll"));
         }
     }
-    if let Ok(directory) = std::env::current_dir() {
-        candidates.push(directory.join("lib").join("libmpv-2.dll"));
-        candidates.push(directory.join("vendor").join("libmpv-2.dll"));
-        candidates.push(directory.join("libmpv-2.dll"));
-    }
-    candidates.into_iter().find(|path| path.is_file())
+    candidates
 }
 
 #[derive(Default)]
@@ -2688,6 +2694,28 @@ unsafe extern "C" fn get_gl_proc_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn libmpv_is_looked_for_beside_the_executable_never_in_the_current_folder() {
+        let installed = libmpv_candidates(Some(std::path::Path::new(
+            r"C:\Program Files\Pluriview\pluriview.exe",
+        )));
+        assert_eq!(
+            installed,
+            [
+                PathBuf::from(r"C:\Program Files\Pluriview\lib\libmpv-2.dll"),
+                PathBuf::from(r"C:\Program Files\Pluriview\libmpv-2.dll"),
+            ]
+        );
+        let test_build = libmpv_candidates(Some(std::path::Path::new(
+            r"S:\src\pluriview\target\debug\deps\pluriview-1234.exe",
+        )));
+        assert_eq!(
+            test_build.last().unwrap(),
+            &PathBuf::from(r"S:\src\pluriview\vendor\libmpv-2.dll")
+        );
+        assert!(libmpv_candidates(None).is_empty());
+    }
 
     #[test]
     fn seek_preview_idle_timeout_has_a_warm_grace_period() {
