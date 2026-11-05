@@ -1081,6 +1081,50 @@ fn move_menu(
     }
 }
 
+/// Whether the "Move to" flyout fits to the right of the open context menu.
+/// egui always opens submenus rightward and slides them back inside the
+/// window, so in a narrow panel the flyout would cover the rows below it.
+fn move_flyout_fits(ui: &egui::Ui, current: &Option<String>, folders: &[ScreenshotFolder]) -> bool {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widest_label = ui.fonts_mut(|fonts| {
+        folders
+            .iter()
+            .filter(|target| &target.name != current)
+            .map(|target| {
+                let label = folder_label(target.name.as_deref()).to_owned();
+                fonts
+                    .layout_no_wrap(label, font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .fold(0.0, f32::max)
+    });
+    let spacing = ui.spacing();
+    flyout_fits(
+        ui.max_rect().left() - f32::from(spacing.menu_margin.left),
+        widest_label + 2.0 * spacing.button_padding.x,
+        spacing.menu_margin.sum().x,
+        spacing.menu_spacing,
+        ui.ctx().content_rect().right(),
+    )
+}
+
+/// Whether a flyout whose widest row is `widest_row` fits between a menu that
+/// starts at `menu_left` and `screen_right`. The menu's own rows all fit the
+/// minimum width, which keeps the answer independent of the flyout's choice.
+fn flyout_fits(
+    menu_left: f32,
+    widest_row: f32,
+    frame_margin: f32,
+    gap: f32,
+    screen_right: f32,
+) -> bool {
+    use crate::ui_theme::{MENU_MAX_WIDTH, MENU_MIN_WIDTH};
+    let menu = MENU_MIN_WIDTH + frame_margin;
+    let flyout = widest_row.clamp(MENU_MIN_WIDTH, MENU_MAX_WIDTH) + frame_margin;
+    menu_left + menu + gap + flyout <= screen_right
+}
+
 /// Folder name field drawn in place of a folder row: Enter or the check
 /// saves, Escape or the cross cancels.
 fn folder_name_row(ui: &mut egui::Ui, edit: &mut FolderEdit) -> EditOutcome {
@@ -1434,10 +1478,19 @@ fn shot_grid(
                             ui.close_kind(egui::UiKind::Menu);
                         }
                     }
-                    crate::ui_theme::menu_button(ui, "Move to", |ui| {
-                        crate::ui_theme::menu(ui);
+                    if move_flyout_fits(ui, &folder.name, folders) {
+                        crate::ui_theme::menu_button(ui, "Move to", |ui| {
+                            crate::ui_theme::menu(ui);
+                            move_menu(ui, &targets, Some(&folder.name), folders, actions);
+                        });
+                    } else {
+                        // No room beside this menu: list the folders in it
+                        // rather than let the flyout cover the rows below.
+                        if targets.len() == 1 {
+                            ui.separator();
+                        }
                         move_menu(ui, &targets, Some(&folder.name), folders, actions);
-                    });
+                    }
                     ui.separator();
                     if crate::ui_theme::destructive(ui, "Move to Recycle Bin").clicked() {
                         actions.push(PanelAction::Delete(targets.clone()));
@@ -1543,6 +1596,17 @@ fn drag_ghost(ctx: &egui::Context, panel: &PanelState, payload: &ShotDrag) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_flyout_goes_inline_when_it_would_cover_the_menu() {
+        // Menu 200 wide plus a 200-wide flyout and a 2 px gap: 402 px.
+        assert!(flyout_fits(0.0, 50.0, 16.0, 2.0, 402.0));
+        assert!(!flyout_fits(0.0, 50.0, 16.0, 2.0, 401.0));
+        assert!(!flyout_fits(200.0, 50.0, 16.0, 2.0, 500.0));
+        // Long folder names widen the flyout, up to the menu's cap.
+        assert!(!flyout_fits(0.0, 250.0, 16.0, 2.0, 450.0));
+        assert!(flyout_fits(0.0, 900.0, 16.0, 2.0, 498.0));
+    }
 
     #[test]
     fn hiding_the_panel_releases_its_caches_but_keeps_collapsed_folders() {
