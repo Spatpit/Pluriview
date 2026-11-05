@@ -1081,9 +1081,9 @@ fn move_menu(
     }
 }
 
-/// Whether the "Move to" flyout fits to the right of the open context menu.
-/// egui always opens submenus rightward and slides them back inside the
-/// window, so in a narrow panel the flyout would cover the rows below it.
+/// Whether the "Move to" flyout fits beside the open context menu. egui opens
+/// a submenu on the right, or on the left when the right has no room; when
+/// neither side fits it slides the flyout over the rows below it.
 fn move_flyout_fits(ui: &egui::Ui, current: &Option<String>, folders: &[ScreenshotFolder]) -> bool {
     let font = egui::TextStyle::Button.resolve(ui.style());
     let widest_label = ui.fonts_mut(|fonts| {
@@ -1100,29 +1100,31 @@ fn move_flyout_fits(ui: &egui::Ui, current: &Option<String>, folders: &[Screensh
             .fold(0.0, f32::max)
     });
     let spacing = ui.spacing();
+    let screen = ui.ctx().content_rect();
     flyout_fits(
         ui.max_rect().left() - f32::from(spacing.menu_margin.left),
         widest_label + 2.0 * spacing.button_padding.x,
         spacing.menu_margin.sum().x,
         spacing.menu_spacing,
-        ui.ctx().content_rect().right(),
+        (screen.left(), screen.right()),
     )
 }
 
-/// Whether a flyout whose widest row is `widest_row` fits between a menu that
-/// starts at `menu_left` and `screen_right`. The menu's own rows all fit the
-/// minimum width, which keeps the answer independent of the flyout's choice.
+/// Whether a flyout whose widest row is `widest_row` fits on either side of a
+/// menu that starts at `menu_left`, within the screen's `(left, right)` edges.
+/// The menu's own rows all fit the minimum width, which keeps the answer
+/// independent of the flyout's choice.
 fn flyout_fits(
     menu_left: f32,
     widest_row: f32,
     frame_margin: f32,
     gap: f32,
-    screen_right: f32,
+    (screen_left, screen_right): (f32, f32),
 ) -> bool {
     use crate::ui_theme::{MENU_MAX_WIDTH, MENU_MIN_WIDTH};
     let menu = MENU_MIN_WIDTH + frame_margin;
     let flyout = widest_row.clamp(MENU_MIN_WIDTH, MENU_MAX_WIDTH) + frame_margin;
-    menu_left + menu + gap + flyout <= screen_right
+    menu_left + menu + gap + flyout <= screen_right || menu_left - gap - flyout >= screen_left
 }
 
 /// Folder name field drawn in place of a folder row: Enter or the check
@@ -1598,14 +1600,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn move_flyout_goes_inline_when_it_would_cover_the_menu() {
+    fn move_flyout_goes_inline_only_when_neither_side_fits() {
         // Menu 200 wide plus a 200-wide flyout and a 2 px gap: 402 px.
-        assert!(flyout_fits(0.0, 50.0, 16.0, 2.0, 402.0));
-        assert!(!flyout_fits(0.0, 50.0, 16.0, 2.0, 401.0));
-        assert!(!flyout_fits(200.0, 50.0, 16.0, 2.0, 500.0));
+        assert!(flyout_fits(0.0, 50.0, 16.0, 2.0, (0.0, 402.0)));
+        assert!(!flyout_fits(0.0, 50.0, 16.0, 2.0, (0.0, 401.0)));
+        // No room on the right, but 202 px on the left: egui flips it there.
+        assert!(flyout_fits(202.0, 50.0, 16.0, 2.0, (0.0, 500.0)));
+        assert!(!flyout_fits(200.0, 50.0, 16.0, 2.0, (0.0, 500.0)));
         // Long folder names widen the flyout, up to the menu's cap.
-        assert!(!flyout_fits(0.0, 250.0, 16.0, 2.0, 450.0));
-        assert!(flyout_fits(0.0, 900.0, 16.0, 2.0, 498.0));
+        assert!(!flyout_fits(0.0, 250.0, 16.0, 2.0, (0.0, 450.0)));
+        assert!(flyout_fits(0.0, 900.0, 16.0, 2.0, (0.0, 498.0)));
+        assert!(!flyout_fits(250.0, 250.0, 16.0, 2.0, (0.0, 450.0)));
+        assert!(flyout_fits(298.0, 900.0, 16.0, 2.0, (0.0, 498.0)));
     }
 
     #[test]
