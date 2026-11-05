@@ -431,7 +431,7 @@ impl WelcomeTour {
     ) -> bool {
         let last = PAGES.len() - 1;
         let mut close = false;
-        if !ctx.wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() {
             let tips = PAGES[self.page].tips.len();
             ctx.input(|input| {
                 if input.key_pressed(Key::Escape) {
@@ -466,7 +466,7 @@ impl WelcomeTour {
             ctx.request_repaint();
         }
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let width = WIDTH.min(screen.width() - 96.0).max(320.0);
         let body_height = BODY_HEIGHT.min(screen.height() - CHROME_HEIGHT).max(140.0);
         let stage_width = (width * 0.5)
@@ -487,10 +487,10 @@ impl WelcomeTour {
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(
-                egui::Frame::window(&ctx.style())
+                egui::Frame::window(&ctx.global_style())
                     .fill(ui_theme::PANEL)
                     .stroke(Stroke::new(1.0, ui_theme::BORDER))
-                    .rounding(ROUNDING)
+                    .corner_radius(ROUNDING)
                     .inner_margin(WINDOW_MARGIN),
             )
             .show(ctx, |ui| {
@@ -736,7 +736,7 @@ impl WelcomeTour {
                     .color(ui_theme::PANEL),
             )
             .fill(ui_theme::GOLD)
-            .rounding(6.0),
+            .corner_radius(6.0),
         );
         if next.clicked() {
             if self.page == last {
@@ -752,7 +752,7 @@ impl WelcomeTour {
                 Vec2::new(BACK_WIDTH, BUTTON_HEIGHT),
             );
             if ui
-                .put(back, egui::Button::new("Back").rounding(6.0))
+                .put(back, egui::Button::new("Back").corner_radius(6.0))
                 .clicked()
             {
                 self.go_to(self.page - 1);
@@ -808,14 +808,13 @@ fn paint_banner(
     );
     let mut shape = egui::epaint::RectShape::filled(
         art,
-        egui::Rounding {
+        egui::epaint::CornerRadiusF32 {
             ne: ROUNDING - 1.0,
             ..Default::default()
         },
         Color32::WHITE,
     );
-    shape.fill_texture_id = texture;
-    shape.uv = uv;
+    shape = shape.with_texture(texture, uv);
     // Starts just outside the art so its anti-aliased edge doesn't show.
     let left = egui::Rect::from_min_size(
         art.min - Vec2::new(2.0, 0.0),
@@ -874,13 +873,13 @@ fn tip_row(
     active: bool,
 ) -> egui::Response {
     let keys = tip.keys.map(|keys| {
-        ui.fonts(|fonts| {
+        ui.fonts_mut(|fonts| {
             fonts.layout_no_wrap(keys.label(bindings), FontId::monospace(12.0), KEY_TEXT)
         })
     });
-    let frame = egui::Frame::none()
-        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-        .rounding(8.0)
+    let frame = egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .corner_radius(8.0)
         .fill(if active {
             ui_theme::SURFACE
         } else {
@@ -929,6 +928,7 @@ fn tip_row(
                                 5.0,
                                 ui_theme::PANEL,
                                 Stroke::new(1.0, ui_theme::BORDER),
+                                egui::StrokeKind::Middle,
                             );
                             ui.painter()
                                 .galley(chip.center() - keys.size() / 2.0, keys, KEY_TEXT);
@@ -963,8 +963,12 @@ fn tip_row(
             ui_theme::GOLD,
         );
     } else if response.hovered() {
-        ui.painter()
-            .rect_stroke(rect, 8.0, Stroke::new(1.0, ui_theme::BORDER));
+        ui.painter().rect_stroke(
+            rect,
+            8.0,
+            Stroke::new(1.0, ui_theme::BORDER),
+            egui::StrokeKind::Middle,
+        );
     }
     response
 }
@@ -1015,14 +1019,17 @@ mod tests {
         events: Vec<egui::Event>,
     ) -> (bool, Rect) {
         let mut close = false;
-        let _ = ctx.run(
+        let _ = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
                 time: Some(time),
                 events,
                 ..Default::default()
             },
-            |ctx| close = tour.ui(ctx, &HotkeyBindings::default(), None),
+            |ui| {
+                let ctx = &ui.ctx().clone();
+                close = tour.ui(ctx, &HotkeyBindings::default(), None)
+            },
         );
         let window = ctx
             .memory(|memory| memory.area_rect(egui::Id::new("welcome_tour")))
@@ -1174,8 +1181,8 @@ mod tests {
         for demo in Demo::ALL {
             for step in 0..=40 {
                 let time = step as f32 * demo.length() / 40.0;
-                let output = ctx.run(egui::RawInput::default(), |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         let texture = Some(spout.id());
                         demos::paint(ui.painter(), area, demo, time, &bindings, texture);
                     });

@@ -124,10 +124,10 @@ impl CapturedPixels {
             THUMBNAIL_TAPS,
             |x, y| self.pixel(left + x, top + y).to_array(),
         );
-        Some(egui::ColorImage {
-            size: [out_width as usize, out_height as usize],
+        Some(egui::ColorImage::new(
+            [out_width as usize, out_height as usize],
             pixels,
-        })
+        ))
     }
 }
 
@@ -578,13 +578,13 @@ mod tests {
 
     #[test]
     fn premultiplied_frames_are_saved_with_straight_alpha() {
-        let image = egui::ColorImage {
-            size: [2, 1],
-            pixels: vec![
+        let image = egui::ColorImage::new(
+            [2, 1],
+            vec![
                 egui::Color32::from_rgba_premultiplied(10, 20, 30, 255),
                 egui::Color32::from_rgba_unmultiplied(200, 100, 50, 128),
             ],
-        };
+        );
         let image = ScreenshotImage::from_color_image(&image).unwrap();
         assert_eq!(&image.rgba[..4], &[10, 20, 30, 255]);
         let half = &image.rgba[4..];
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn premultiplied_capture_frames_save_through_the_worker() {
-        let frame = Arc::new(egui::ColorImage::new(
+        let frame = Arc::new(egui::ColorImage::filled(
             [4, 2],
             egui::Color32::from_rgb(1, 2, 3),
         ));

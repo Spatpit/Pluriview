@@ -325,7 +325,7 @@ fn live_video_cadence_with_persistent_gestures_and_receive_jitter() {
     let shared = host.shared.clone();
     let sender = host.encoder.clone();
     let producer = std::thread::spawn(move || {
-        let mut image = Arc::new(ColorImage::new([1280, 720], Color32::BLACK));
+        let mut image = Arc::new(ColorImage::filled([1280, 720], Color32::BLACK));
         let mut frame = 0usize;
         let started = Instant::now();
         let mut deadline = started;

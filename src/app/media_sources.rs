@@ -520,6 +520,7 @@ impl PluriviewApp {
             rect.shrink(8.0),
             8.0,
             egui::Stroke::new(2.0, egui::Color32::from_rgb(107, 200, 110)),
+            egui::StrokeKind::Middle,
         );
         painter.text(
             rect.center(),

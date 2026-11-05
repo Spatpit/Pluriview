@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Updated the interface library, egui, from 0.29 to 0.35. Text is drawn with a new font renderer, with sharper small text and better letter spacing, and submenus open on whichever side of the screen has room. Menus still stay open while you flip a toggle and close when you pick an action or click elsewhere. Building from source now needs Rust 1.92 or newer.
 - Window tiles shown at the window's own size reuse one GPU copy buffer instead of creating a new one, up to 33 MB, for every frame.
 - Spout tiles are now shrunk to the tile's size on the graphics card, as window tiles are, and only that smaller picture is read back. They used to read back every full frame and shrink it on the processor.
 - GIF frames are prepared for display once, when the GIF loads, instead of being converted again every time the animation moves on. A 1080p GIF wallpaper used to convert about 240 MB a second. Recording or screenshotting a GIF tile reuses the prepared frames too.

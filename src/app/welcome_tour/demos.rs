@@ -6,9 +6,9 @@
 
 use crate::hotkeys::{HotkeyBindings, HotkeySlot};
 use crate::ui_theme;
+use eframe::egui;
 use eframe::egui::{
-    pos2, vec2, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Rounding, Shape, Stroke,
-    TextureId, Vec2,
+    pos2, vec2, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, TextureId, Vec2,
 };
 use egui_phosphor::regular as icon;
 use std::f32::consts::TAU;
@@ -202,10 +202,14 @@ pub(super) fn paint(
         frame.expand(radius * 0.75),
         radius * 1.75,
         Stroke::new(radius * 1.5, ui_theme::PANEL),
+        egui::StrokeKind::Middle,
     );
-    stage
-        .painter
-        .rect_stroke(frame, radius, Stroke::new(1.0, ui_theme::BORDER));
+    stage.painter.rect_stroke(
+        frame,
+        radius,
+        Stroke::new(1.0, ui_theme::BORDER),
+        egui::StrokeKind::Middle,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +345,7 @@ impl Stage<'_> {
             self.rect(rect.expand(1.0)),
             self.s(5.0),
             Stroke::new(self.s(1.6), color),
+            egui::StrokeKind::Middle,
         );
     }
 
@@ -354,8 +359,12 @@ impl Stage<'_> {
             let handle = Rect::from_center_size(self.pt(corner), Vec2::splat(self.s(6.0)));
             self.painter
                 .rect_filled(handle, self.s(1.5), Color32::WHITE);
-            self.painter
-                .rect_stroke(handle, self.s(1.5), Stroke::new(self.s(1.0), SELECT));
+            self.painter.rect_stroke(
+                handle,
+                self.s(1.5),
+                Stroke::new(self.s(1.0), SELECT),
+                egui::StrokeKind::Middle,
+            );
         }
     }
 
@@ -405,13 +414,13 @@ impl Stage<'_> {
         let area = |x0: f32, y0: f32, x1: f32, y1: f32| Rect::from_min_max(at(x0, y0), at(x1, y1));
         let unit = self.s(full.height().min(full.width()));
         let round = self.s(5.0);
-        let top = Rounding {
+        let top = egui::epaint::CornerRadiusF32 {
             nw: round,
             ne: round,
             sw: 0.0,
             se: 0.0,
         };
-        let bottom = Rounding {
+        let bottom = egui::epaint::CornerRadiusF32 {
             nw: 0.0,
             ne: 0.0,
             sw: round,
@@ -432,9 +441,9 @@ impl Stage<'_> {
                 painter.rect_filled(visible_rect, round, Color32::from_rgb(30, 32, 38));
                 painter.rect_filled(
                     area(0.0, 0.13, 0.24, 1.0),
-                    Rounding {
+                    egui::epaint::CornerRadiusF32 {
                         sw: round,
-                        ..Rounding::ZERO
+                        ..egui::epaint::CornerRadiusF32::ZERO
                     },
                     accent.gamma_multiply(0.22),
                 );
@@ -706,6 +715,7 @@ impl Stage<'_> {
             self.s(6.0),
             ui_theme::PANEL,
             Stroke::new(self.s(1.2), ui_theme::GOLD),
+            egui::StrokeKind::Middle,
         );
         painter.galley(rect.center() - galley.size() / 2.0, galley, ui_theme::TEXT);
     }
@@ -724,6 +734,7 @@ impl Stage<'_> {
             self.s(6.0),
             ui_theme::PANEL,
             Stroke::new(self.s(1.0), ui_theme::BORDER),
+            egui::StrokeKind::Middle,
         );
         for (i, item) in items.iter().enumerate() {
             let row = r(at.x + 4.0, at.y + 4.0 + i as f32 * ROW, WIDTH - 8.0, ROW);
@@ -748,6 +759,7 @@ impl Stage<'_> {
             self.s(8.0),
             ui_theme::SURFACE,
             Stroke::new(self.s(1.0), ui_theme::BORDER),
+            egui::StrokeKind::Middle,
         );
         self.text(
             rect.left_center() + vec2(14.0, 0.0),
@@ -777,6 +789,7 @@ impl Stage<'_> {
             self.s(7.0),
             ui_theme::PANEL,
             Stroke::new(self.s(1.0), ui_theme::BORDER),
+            egui::StrokeKind::Middle,
         );
         self.text(
             rect.min + vec2(9.0, 10.0),
@@ -1253,8 +1266,12 @@ fn select(s: &mut Stage, t: f32) {
     }
     if dragging {
         s.fill(selection, 2.0, SELECT.gamma_multiply(0.12));
-        s.painter
-            .rect_stroke(s.rect(selection), s.s(2.0), Stroke::new(s.s(1.0), SELECT));
+        s.painter.rect_stroke(
+            s.rect(selection),
+            s.s(2.0),
+            Stroke::new(s.s(1.0), SELECT),
+            egui::StrokeKind::Middle,
+        );
     }
     let cursor = if t < 0.4 {
         track(t, &[(0.0, pos2(200.0, 270.0)), (0.35, anchor)])
@@ -1346,6 +1363,7 @@ fn use_app(s: &mut Stage, t: f32) {
             s.rect(tile.expand(1.5)),
             s.s(5.0),
             Stroke::new(s.s(2.0), INTERACT),
+            egui::StrokeKind::Middle,
         );
         let bar = r(tile.min.x, tile.min.y - 22.0, tile.width(), 18.0);
         s.fill(bar, 4.0, ui_theme::PANEL);
@@ -1393,6 +1411,7 @@ fn use_page(s: &mut Stage, t: f32) {
             s.rect(tile.expand(1.5)),
             s.s(5.0),
             Stroke::new(s.s(2.0), INTERACT),
+            egui::StrokeKind::Middle,
         );
     }
     let cursor = track(t, &[(0.0, pos2(350.0, 270.0)), (0.9, pos2(210.0, 170.0))]);
@@ -1415,10 +1434,10 @@ fn hover(s: &mut Stage, t: f32) {
     s.faded(alpha, |s| {
         s.painter.rect_filled(
             s.rect(bar),
-            Rounding {
+            egui::epaint::CornerRadiusF32 {
                 sw: s.s(5.0),
                 se: s.s(5.0),
-                ..Rounding::ZERO
+                ..egui::epaint::CornerRadiusF32::ZERO
             },
             Color32::from_black_alpha(170),
         );
@@ -1565,6 +1584,7 @@ fn group(s: &mut Stage, t: f32) {
                 s.rect(frame.expand(5.0)),
                 s.s(6.0),
                 Stroke::new(s.s(1.5), ui_theme::GOLD.gamma_multiply(0.8)),
+                egui::StrokeKind::Middle,
             );
             let bar = r(frame.min.x - 5.0, frame.min.y - 27.0, 92.0, 18.0);
             s.painter.rect(
@@ -1572,6 +1592,7 @@ fn group(s: &mut Stage, t: f32) {
                 s.s(5.0),
                 ui_theme::PANEL,
                 Stroke::new(s.s(1.0), ui_theme::BORDER),
+                egui::StrokeKind::Middle,
             );
             s.text(
                 bar.left_center() + vec2(8.0, 0.0),
@@ -1644,6 +1665,7 @@ fn tile_center(s: &mut Stage, t: f32) {
                 s.rect(rect),
                 s.s(4.0),
                 Stroke::new(s.s(1.2), ui_theme::GOLD),
+                egui::StrokeKind::Middle,
             );
         }
         s.tile(r(rect.min.x + 4.0, rect.min.y + 4.0, 60.0, 40.0), *art, 0.0);
@@ -1711,6 +1733,7 @@ fn pip(s: &mut Stage, t: f32) {
                 s.rect(from),
                 s.s(5.0),
                 Stroke::new(s.s(1.0), ui_theme::BORDER),
+                egui::StrokeKind::Middle,
             );
             s.text(
                 from.center(),
@@ -1733,6 +1756,7 @@ fn pip(s: &mut Stage, t: f32) {
             s.rect(rect),
             s.s(5.0),
             Stroke::new(s.s(1.0), ui_theme::BORDER),
+            egui::StrokeKind::Middle,
         );
     }
     let label = s.slot(HotkeySlot::PictureInPicture);
@@ -1804,6 +1828,7 @@ fn record(s: &mut Stage, t: f32) {
             s.rect(tile.expand(2.0)),
             s.s(6.0),
             Stroke::new(s.s(2.5), REC.gamma_multiply(pulse)),
+            egui::StrokeKind::Middle,
         );
         let badge = r(tile.min.x + 8.0, tile.min.y + 8.0, 66.0, 18.0);
         s.fill(badge, 9.0, Color32::from_black_alpha(170));
@@ -1918,6 +1943,7 @@ fn stream_audio(s: &mut Stage, t: f32) {
             s.s(8.0),
             ui_theme::SURFACE,
             Stroke::new(s.s(1.0), ui_theme::BORDER),
+            egui::StrokeKind::Middle,
         );
         s.text(
             rect.center() - vec2(0.0, 8.0),
@@ -1967,6 +1993,7 @@ fn phone(s: &mut Stage, t: f32) {
         s.s(12.0),
         Color32::from_rgb(8, 8, 10),
         Stroke::new(s.s(2.0), ui_theme::BORDER),
+        egui::StrokeKind::Middle,
     );
     let screen = phone.shrink(6.0);
     s.fill(screen, 8.0, CANVAS);
@@ -2149,6 +2176,7 @@ fn overlay(s: &mut Stage, t: f32) {
                 s.rect(lens),
                 s.s(5.0),
                 Stroke::new(s.s(1.4), ui_theme::GOLD),
+                egui::StrokeKind::Middle,
             );
         });
     }
@@ -2171,6 +2199,7 @@ fn overlay(s: &mut Stage, t: f32) {
                 ui_theme::BORDER
             },
         ),
+        egui::StrokeKind::Middle,
     );
     s.text(
         chip.left_center() + vec2(12.0, 0.0),

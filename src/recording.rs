@@ -914,10 +914,7 @@ mod mf {
                             [bytes[at + 2], bytes[at + 1], bytes[at], 255]
                         },
                     );
-                    eframe::egui::ColorImage {
-                        size: [out_width, out_height],
-                        pixels,
-                    }
+                    eframe::egui::ColorImage::new([out_width, out_height], pixels)
                 });
             let _ = buffer.Unlock();
             image

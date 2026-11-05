@@ -954,7 +954,7 @@ impl MpvCore {
             0,
             glow::RGBA,
             glow::UNSIGNED_BYTE,
-            None,
+            glow::PixelUnpackData::Slice(None),
         );
         let framebuffer = gl
             .create_framebuffer()
@@ -1209,7 +1209,7 @@ impl MpvCore {
             target.content_height,
             glow::RGBA,
             glow::UNSIGNED_BYTE,
-            glow::PixelPackData::Slice(&mut rgba),
+            glow::PixelPackData::Slice(Some(&mut rgba)),
         );
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
 
@@ -1729,7 +1729,7 @@ impl VideoManager {
         let renderer = self.tiles.get(&id)?.session.renderer.clone();
         let (sender, receiver) = mpsc::channel();
         let callback = egui::PaintCallback {
-            rect: ctx.screen_rect(),
+            rect: ctx.content_rect(),
             callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_info, painter| {
                 let _ = sender.send(renderer.snapshot(painter.gl()));
             })),
@@ -1749,7 +1749,7 @@ impl VideoManager {
         }
         let queue = self.cleanup_queue.clone();
         let callback = egui::PaintCallback {
-            rect: ctx.screen_rect(),
+            rect: ctx.content_rect(),
             callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_info, painter| {
                 let retired = std::mem::take(&mut *queue.lock());
                 for renderer in retired {
@@ -3234,7 +3234,7 @@ mod tests {
                 180,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(&mut presented),
+                glow::PixelPackData::Slice(Some(&mut presented)),
             );
         }
         assert!(

@@ -581,6 +581,7 @@ impl PluriviewApp {
                 rect.expand(3.0),
                 8.0,
                 egui::Stroke::new(3.0, color.gamma_multiply(strength)),
+                egui::StrokeKind::Middle,
             );
         }
         let shown = visible.into_iter().reduce(|a, b| a.union(b));
@@ -623,7 +624,12 @@ impl PluriviewApp {
         );
         let badge = egui::Rect::from_min_size(egui::pos2(x, corner.y), size);
         painter.rect_filled(badge, size.y / 2.0, egui::Color32::from_black_alpha(215));
-        painter.rect_stroke(badge, size.y / 2.0, egui::Stroke::new(1.5, color));
+        painter.rect_stroke(
+            badge,
+            size.y / 2.0,
+            egui::Stroke::new(1.5, color),
+            egui::StrokeKind::Middle,
+        );
         let mark = egui::pos2(badge.left() + 15.0, badge.center().y);
         if paused {
             for offset in [-3.0, 3.0] {
@@ -743,7 +749,7 @@ impl PluriviewApp {
             .clicked()
         {
             self.toggle_recording(ui.ctx(), Format::Mp4);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if ui
             .add_enabled(
@@ -760,7 +766,7 @@ impl PluriviewApp {
             .clicked()
         {
             self.toggle_recording(ui.ctx(), Format::Gif);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         let (icon, title) = if recording == Some(true) {
             (egui_phosphor::regular::PLAY, "Resume Recording")
@@ -775,7 +781,7 @@ impl PluriviewApp {
             .clicked()
         {
             self.toggle_recording_pause();
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 }

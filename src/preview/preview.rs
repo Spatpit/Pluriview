@@ -1351,7 +1351,7 @@ mod tests {
     }
 
     fn frame(preview: &mut Preview, width: u32, height: u32) {
-        let image = eframe::egui::ColorImage::new([16, 16], eframe::egui::Color32::WHITE);
+        let image = eframe::egui::ColorImage::filled([16, 16], eframe::egui::Color32::WHITE);
         preview.update_capture_frame(width, height, image);
     }
 

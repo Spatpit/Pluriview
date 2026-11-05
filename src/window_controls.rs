@@ -78,7 +78,8 @@ mod tests {
     use super::*;
 
     fn commands(state: &mut WindowControls, ctx: &Context) -> Vec<ViewportCommand> {
-        let output = ctx.run(Default::default(), |ctx| {
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             state.apply(ctx);
         });
         output.viewport_output[&eframe::egui::ViewportId::ROOT]

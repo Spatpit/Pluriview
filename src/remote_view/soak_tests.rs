@@ -56,7 +56,7 @@ fn sustained_video_uses_the_same_transport_after_qr_and_approval() {
         let producer = std::thread::spawn(move || {
             let images: Vec<_> = (0..2)
                 .map(|phase| {
-                    let mut image = ColorImage::new([1280, 720], Color32::BLACK);
+                    let mut image = ColorImage::filled([1280, 720], Color32::BLACK);
                     for (index, pixel) in image.pixels.iter_mut().enumerate() {
                         let x = index % 1280;
                         let y = index / 1280;

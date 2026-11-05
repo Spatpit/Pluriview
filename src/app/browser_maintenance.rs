@@ -170,7 +170,7 @@ impl PluriviewApp {
             .clicked()
         {
             self.restart_browser_tiles();
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
 
         let can_clear =
@@ -182,7 +182,7 @@ impl PluriviewApp {
             .clicked()
         {
             self.browser_maintenance.confirm_clear = true;
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 

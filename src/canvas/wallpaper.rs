@@ -294,11 +294,12 @@ mod tests {
         wallpaper.error = Some("Video unavailable".into());
         let ctx = eframe::egui::Context::default();
         for _ in 0..3 {
-            let _ = ctx.run(Default::default(), |_| {});
+            let _ = ctx.run_ui(Default::default(), |_| {});
         }
-        let output = ctx.run(Default::default(), |ctx| {
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             eframe::egui::CentralPanel::default()
-                .show(ctx, |ui| wallpaper.paint(ui.painter(), ui.max_rect(), ctx));
+                .show(ui, |ui| wallpaper.paint(ui.painter(), ui.max_rect(), ctx));
         });
         assert!(
             output.viewport_output[&eframe::egui::ViewportId::ROOT].repaint_delay

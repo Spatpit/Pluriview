@@ -267,11 +267,11 @@ impl PluriviewApp {
         slots: &[HotkeySlot],
         defaults: &HotkeyBindings,
     ) {
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(crate::ui_theme::PANEL)
             .stroke(egui::Stroke::new(1.0, crate::ui_theme::BORDER))
-            .rounding(8.0)
-            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 for (index, slot) in slots.iter().enumerate() {

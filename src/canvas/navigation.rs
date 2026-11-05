@@ -181,7 +181,7 @@ impl CanvasState {
             return;
         }
         let mut show = None;
-        ui.menu_button("Show Hidden Tiles", |ui| {
+        crate::ui_theme::menu_button(ui, "Show Hidden Tiles", |ui| {
             crate::ui_theme::menu(ui);
             for entry in &entries {
                 if ui.button(&entry.label).clicked() {
@@ -197,7 +197,7 @@ impl CanvasState {
         });
         if let Some(ids) = show {
             self.set_tiles_hidden(&ids, false, previews);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 
@@ -670,7 +670,7 @@ impl CanvasState {
             } else {
                 self.begin_crop(id, preview_manager);
             }
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         let has_crop = preview_manager
             .get(id)
@@ -680,7 +680,7 @@ impl CanvasState {
             .clicked()
         {
             self.set_preview_crop(id, None, canvas_rect, preview_manager);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 
