@@ -52,12 +52,16 @@ pub fn install(ctx: &egui::Context) {
     });
 }
 
+/// Popup content width bounds applied by [`menu`].
+pub const MENU_MIN_WIDTH: f32 = 184.0;
+pub const MENU_MAX_WIDTH: f32 = 280.0;
+
 /// Apply inside each popup: egui resets button padding when opening a submenu.
 pub fn menu(ui: &mut egui::Ui) {
-    ui.set_min_width(184.0);
+    ui.set_min_width(MENU_MIN_WIDTH);
     // Only cap the remembered width; expanding it makes justified rows grow
     // again after the popup's initial measurement.
-    ui.set_max_width(ui.available_width().min(280.0));
+    ui.set_max_width(ui.available_width().min(MENU_MAX_WIDTH));
     let style = ui.style_mut();
     style.spacing.button_padding = egui::vec2(9.0, 4.0);
     style.spacing.interact_size.y = 28.0;
