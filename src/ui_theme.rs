@@ -100,13 +100,30 @@ pub fn menu_button<'a, R>(
     atoms: impl egui::IntoAtoms<'a>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
+    let mut inner = None;
+    let response = menu_button_dyn(
+        ui,
+        atoms.into_atoms(),
+        Box::new(|ui| inner = Some(add_contents(ui))),
+    );
+    egui::InnerResponse::new(inner, response)
+}
+
+/// egui's menu code is large and generic over the contents closure, so
+/// calling it directly would put a copy of it in the executable for every
+/// menu. Boxing the contents keeps a single copy.
+fn menu_button_dyn<'a>(
+    ui: &mut egui::Ui,
+    atoms: egui::Atoms<'a>,
+    add_contents: Box<dyn FnOnce(&mut egui::Ui) + '_>,
+) -> egui::Response {
     if egui::containers::menu::is_in_menu(ui) {
-        return ui.menu_button(atoms, add_contents);
+        return ui.menu_button(atoms, add_contents).response;
     }
-    let (response, inner) = egui::containers::menu::MenuButton::new(atoms)
+    egui::containers::menu::MenuButton::new(atoms)
         .config(menu_config())
-        .ui(ui, add_contents);
-    egui::InnerResponse::new(inner.map(|inner| inner.inner), response)
+        .ui(ui, add_contents)
+        .0
 }
 
 pub fn section(ui: &mut egui::Ui, title: &str) {
