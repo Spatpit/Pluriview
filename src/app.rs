@@ -115,6 +115,14 @@ const TITLE_BAR_HEIGHT: f32 = 40.0;
 const TITLE_BAR_COLLAPSED_HEIGHT: f32 = 2.0;
 /// How close the pointer must be to the top of the window to reveal the bar.
 const TITLE_BAR_HOVER_ZONE: f32 = 12.0;
+/// A Ui for title bar content over `rect` that does not grow the panel. egui
+/// sizes panels from their content, so the full-height content kept above a
+/// collapsed bar would otherwise push the panel, and the canvas below it,
+/// above the top of the window.
+fn title_bar_content_ui(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Ui {
+    ui.new_child(egui::UiBuilder::new().max_rect(rect))
+}
+
 /// Slide/fade duration when the title bar auto-hides or comes back.
 const TITLE_BAR_ANIM_SECS: f32 = 0.16;
 
@@ -3981,7 +3989,9 @@ impl PluriviewApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
-                ui.scope_builder(egui::UiBuilder::new().max_rect(title_bar_rect), |ui| {
+                {
+                    let mut bar_ui = title_bar_content_ui(ui, title_bar_rect);
+                    let ui = &mut bar_ui;
                     ui.horizontal_centered(|ui| {
                         ui.add_space(10.0);
                         ui.image((self.brand_icon.id(), Vec2::splat(20.0)));
@@ -4009,9 +4019,11 @@ impl PluriviewApp {
                         ui.add_space(6.0);
                         self.capture_section_ui(ui, ctx);
                     });
-                });
+                }
 
-                ui.scope_builder(egui::UiBuilder::new().max_rect(title_bar_rect), |ui| {
+                {
+                    let mut bar_ui = title_bar_content_ui(ui, title_bar_rect);
+                    let ui = &mut bar_ui;
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
@@ -4068,7 +4080,7 @@ impl PluriviewApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
                     });
-                });
+                }
             });
 
         self.title_bar_menu_open = want_visible && egui::Popup::is_any_open(ctx);
@@ -4948,6 +4960,51 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn title_bar_content_keeps_the_canvas_below_the_bar_while_collapsed() {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        for height in [super::TITLE_BAR_COLLAPSED_HEIGHT, super::TITLE_BAR_HEIGHT] {
+            let mut canvas = None;
+            for _ in 0..2 {
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::Panel::top("title_bar_fixture")
+                            .frame(egui::Frame::NONE)
+                            .exact_size(height)
+                            .show(ui, |ui| {
+                                // Full-height content above a collapsed bar,
+                                // as `title_bar_ui` lays it out to slide in.
+                                let panel = ui.max_rect();
+                                let content = Rect::from_min_size(
+                                    Pos2::new(
+                                        panel.left(),
+                                        panel.bottom() - super::TITLE_BAR_HEIGHT,
+                                    ),
+                                    Vec2::new(panel.width(), super::TITLE_BAR_HEIGHT),
+                                );
+                                let mut bar_ui = super::title_bar_content_ui(ui, content);
+                                bar_ui.horizontal_centered(|ui| ui.label("Pluriview"));
+                            });
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ui, |ui| canvas = Some(ui.max_rect()));
+                    },
+                );
+            }
+            assert_eq!(
+                canvas.unwrap().top(),
+                height,
+                "the canvas must start right below a {height} px title bar"
+            );
+        }
+    }
 
     struct QuickAddUiTest {
         ctx: eframe::egui::Context,
