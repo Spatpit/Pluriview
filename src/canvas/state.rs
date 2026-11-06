@@ -2159,9 +2159,13 @@ impl CanvasState {
         // Canvas context menu (right-click on empty space). Disabled tiles do
         // not own primary interaction, so the background response may also
         // report their secondary click; exclude every visible tile explicitly.
+        // The click is read from raw input, so also require the pointer to be
+        // on the canvas itself: panels such as Screenshots share this layer
+        // and have their own menus.
         let background_secondary_target = ui
             .input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary))
             && !input.pointer_blocked
+            && bg_response.contains_pointer()
             && input.interact_pos.is_some_and(|pointer| {
                 self.preview_at_screen(pointer, canvas_rect, preview_manager)
                     .is_none()
@@ -2476,13 +2480,17 @@ impl CanvasState {
 
             let secondary_clicked_raw =
                 ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary));
+            // Raw input also reports clicks on panels beside the canvas, over
+            // the hidden part of a tile that runs on under them.
             let secondary_target = !input.pointer_blocked
                 && secondary_clicked_raw
                 && input
                     .interact_pos
                     .or(input.hover_pos)
                     .is_some_and(|pointer| {
-                        self.preview_at_screen(pointer, canvas_rect, preview_manager) == Some(id)
+                        canvas_rect.contains(pointer)
+                            && self.preview_at_screen(pointer, canvas_rect, preview_manager)
+                                == Some(id)
                     });
 
             // Create interactive area for primary input. A disabled tile uses

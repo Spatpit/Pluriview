@@ -3287,3 +3287,132 @@ fn saved_viewpoints_submenu_stays_on_screen_at_the_right_edge() {
         "with no room on the right, the submenu opens to the left"
     );
 }
+
+#[test]
+fn right_click_on_a_side_panel_opens_its_menu_not_the_canvas_menu() {
+    let (mut test, _) = CropUiTest::new(0, false);
+    let viewport = test.viewport;
+    let render = |test: &mut CropUiTest, events: Vec<Event>| {
+        test.time += 0.1;
+        let time = test.time;
+        let CropUiTest {
+            context,
+            canvas,
+            previews,
+            captures,
+            ..
+        } = test;
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(viewport),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let context = &ui.ctx().clone();
+                // Like the Screenshots panel: drawn before the canvas, with
+                // its own right-click menu on each card.
+                egui::Panel::right("side_panel_fixture")
+                    .exact_size(160.0)
+                    .show(ui, |ui| {
+                        let card = ui.add(
+                            egui::Button::new("Card fixture")
+                                .min_size(Vec2::new(140.0, 80.0))
+                                .sense(egui::Sense::click()),
+                        );
+                        crate::ui_theme::context_menu(&card, |ui| {
+                            ui.label("Card menu fixture");
+                        });
+                    });
+                CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        canvas.ui_with_canvas_views_menu(
+                            ui,
+                            previews,
+                            captures,
+                            context,
+                            true,
+                            &crate::hotkeys::HotkeyBindings::default(),
+                            |_| false,
+                        );
+                    });
+            },
+        )
+    };
+    let has_text = |output: &egui::FullOutput, label: &str| {
+        output
+            .shapes
+            .iter()
+            .any(|shape| matches!(&shape.shape, Shape::Text(text) if text.galley.text() == label))
+    };
+    let right_click = |test: &mut CropUiTest, at: Pos2| {
+        render(test, vec![Event::PointerMoved(at)]);
+        for pressed in [true, false] {
+            render(
+                test,
+                vec![Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Secondary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+        }
+        render(test, vec![])
+    };
+
+    let card = Pos2::new(viewport.right() - 80.0, 60.0);
+    let output = right_click(&mut test, card);
+    assert!(
+        has_text(&output, "Card menu fixture"),
+        "the card's menu must open"
+    );
+    assert!(
+        !has_text(&output, "ADD TO CANVAS"),
+        "a right-click on the panel must not open the canvas menu"
+    );
+
+    // Empty canvas still gets its own menu.
+    let output = right_click(&mut test, Pos2::new(40.0, viewport.bottom() - 40.0));
+    assert!(
+        has_text(&output, "ADD TO CANVAS"),
+        "empty canvas opens its menu"
+    );
+    render(
+        &mut test,
+        vec![Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+
+    // A tile that runs on under the panel (screen x 650..850, y 40..140)
+    // must not take the card's right-click either.
+    test.canvas.zoom = 1.0;
+    test.canvas.pan = Vec2::new(550.0, -60.0);
+    let output = right_click(&mut test, Pos2::new(700.0, 60.0));
+    assert!(
+        has_text(&output, "Remove"),
+        "the tile's visible part opens its menu"
+    );
+    render(
+        &mut test,
+        vec![Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    let output = right_click(&mut test, card);
+    assert!(
+        has_text(&output, "Card menu fixture"),
+        "the card's menu must open over a tile hidden under the panel"
+    );
+}
