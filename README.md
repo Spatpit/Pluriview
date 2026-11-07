@@ -189,22 +189,6 @@ Pluriview window can leave it out. **Stream Audio Monitor** fixes that:
 Web pages are included automatically. For app windows, turn on their **Stream
 Audio** button.
 
-## Phone viewer (preview)
-
-The **Pluriview Viewer** Android app (Android 8.0+) shows your canvas on your
-phone over Wi-Fi. Pan, pinch to zoom, and double-tap a tile to focus it; the PC
-follows along. Phone audio is optional. The app isn't on the Play Store yet:
-[build it yourself](android/README.md).
-
-1. Connect the PC and phone to the same private Wi-Fi.
-2. In Pluriview, choose **Tools → Phone Viewer... → Start sharing**.
-3. In the app, tap your PC under **Nearby PCs**.
-4. Check the six-digit number matches on both screens, then choose **Allow
-   connection** on the PC.
-
-Sharing is off every time Pluriview starts and allows one phone at a time. The
-connection isn't encrypted, so only use it on a network you trust.
-
 ## Shortcuts
 
 All keyboard shortcuts can be changed in **Tools → Settings → Keyboard

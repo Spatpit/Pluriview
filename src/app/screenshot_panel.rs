@@ -477,6 +477,20 @@ fn shell_open(file: &std::ffi::OsStr, parameters: Option<&std::ffi::OsStr>) {
     }
 }
 
+/// Explorer's full path in the Windows folder. Starting it by bare name could
+/// run a stray `explorer.exe` from the current folder instead.
+#[cfg(windows)]
+fn explorer_path() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+
+    let mut buffer = [0u16; 260];
+    let length = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
+    (length > 0 && length < buffer.len()).then(|| {
+        PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])).join("explorer.exe")
+    })
+}
+
 impl PluriviewApp {
     pub(super) fn set_screenshots_panel_open(&mut self, open: bool) {
         if self.app_config.screenshots_panel_open == open {
@@ -869,7 +883,9 @@ impl PluriviewApp {
                     let mut select = std::ffi::OsString::from("/select,\"");
                     select.push(path.as_os_str());
                     select.push("\"");
-                    shell_open(std::ffi::OsStr::new("explorer.exe"), Some(&select));
+                    if let Some(explorer) = explorer_path() {
+                        shell_open(explorer.as_os_str(), Some(&select));
+                    }
                 }
             }
             PanelAction::OpenFolder(folder) => {
@@ -1598,6 +1614,14 @@ fn drag_ghost(ctx: &egui::Context, panel: &PanelState, payload: &ShotDrag) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn show_in_folder_starts_explorer_by_its_full_path() {
+        let explorer = super::explorer_path().expect("Windows folder");
+        assert!(explorer.is_absolute(), "{}", explorer.display());
+        assert!(explorer.is_file(), "{}", explorer.display());
+    }
 
     #[test]
     fn move_flyout_goes_inline_only_when_neither_side_fits() {

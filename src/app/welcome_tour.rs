@@ -319,6 +319,7 @@ const PAGES: [Page; 8] = [
                  Pluriview window.",
                 Demo::StreamAudio,
             ),
+            #[cfg(feature = "phone-viewer")]
             tip(
                 icon::DEVICE_MOBILE,
                 "Phone viewer",
@@ -1178,7 +1179,7 @@ mod tests {
         let bindings = HotkeyBindings::default();
         let spout = load_art(&ctx, "spout", SPOUT).unwrap();
         let area = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(400.0, 300.0));
-        for demo in Demo::ALL {
+        for &demo in Demo::ALL {
             for step in 0..=40 {
                 let time = step as f32 * demo.length() / 40.0;
                 let output = ctx.run_ui(egui::RawInput::default(), |ui| {

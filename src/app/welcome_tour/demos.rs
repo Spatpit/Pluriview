@@ -59,6 +59,7 @@ pub(super) enum Demo {
     Record,
     ScreenshotPanel,
     StreamAudio,
+    #[cfg(feature = "phone-viewer")]
     Phone,
     Viewpoints,
     Wallpaper,
@@ -70,7 +71,7 @@ pub(super) enum Demo {
 
 impl Demo {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 32] = [
+    pub(super) const ALL: &[Self] = &[
         Self::Tiles,
         Self::Live,
         Self::Saved,
@@ -96,6 +97,7 @@ impl Demo {
         Self::Record,
         Self::ScreenshotPanel,
         Self::StreamAudio,
+        #[cfg(feature = "phone-viewer")]
         Self::Phone,
         Self::Viewpoints,
         Self::Wallpaper,
@@ -185,6 +187,7 @@ pub(super) fn paint(
         Demo::Record => record(s, t),
         Demo::ScreenshotPanel => screenshot_panel(s, t),
         Demo::StreamAudio => stream_audio(s, t),
+        #[cfg(feature = "phone-viewer")]
         Demo::Phone => phone(s, t),
         Demo::Viewpoints => viewpoints(s, t),
         Demo::Wallpaper => wallpaper(s, t),
@@ -1974,6 +1977,7 @@ fn stream_audio(s: &mut Stage, t: f32) {
     }
 }
 
+#[cfg(feature = "phone-viewer")]
 fn phone(s: &mut Stage, t: f32) {
     let moved = vec2(40.0, 70.0) * ease(t, 1.2, 2.2);
     let tiles = [

@@ -4261,6 +4261,7 @@ impl PluriviewApp {
             crate::ui_theme::menu_button(ui, "Tools", |ui| {
                 crate::ui_theme::menu(ui);
                 crate::ui_theme::section(ui, "SHARING");
+                #[cfg(feature = "phone-viewer")]
                 if ui.button("Phone Viewer...").clicked() {
                     self.remote_view.show_dialog = true;
                     ui.close_kind(egui::UiKind::Menu);
