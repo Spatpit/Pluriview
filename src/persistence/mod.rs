@@ -11,4 +11,4 @@ pub use layout::{
 };
 pub use session::WorkspaceSaveState;
 pub use storage::Storage;
-pub use workspace::WorkspaceIndex;
+pub use workspace::{WorkspaceIndex, WorkspaceSummary};

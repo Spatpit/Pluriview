@@ -4,7 +4,7 @@ impl CanvasState {
     /// Cancel a gesture when the app switches to passing input through.
     pub fn cancel_pointer_interaction(&mut self) {
         self.groups.resize = None;
-        self.groups.spotlight_drag = None;
+        self.groups.reorder = None;
         self.finish_crop();
         self.drag_state = None;
         self.marquee = None;
@@ -38,16 +38,29 @@ impl CanvasState {
         self.cancel_camera_transition();
     }
 
-    /// Drop transient tile interaction state from a previous layout.
+    /// Drop transient tile interaction state from a previous layout. Tile
+    /// ids restart at 1 in the next layout, so anything still holding an old
+    /// id (selection, focus, a gesture, a queued action) would otherwise act
+    /// on an unrelated tile there.
     pub fn clear_preview_interactions(&mut self) {
+        self.cancel_pointer_interaction();
         self.groups = GroupState::default();
-        self.finish_crop();
+        self.selection.clear();
+        self.focus = None;
+        self.browser_tab_scroll.clear();
         self.last_removed = None;
         self.removed_undo_requested = false;
         self.pending_removed_restore = None;
+        self.pending_stream_audio_toggles.clear();
+        self.pending_browser_actions.clear();
+        self.pending_browser_scrolls.clear();
+        self.pending_browser_navigations.clear();
+        self.pending_video_actions.clear();
+        self.pending_tile_activity_actions.clear();
+        self.pending_playlist_actions.clear();
         self.pending_media_actions.clear();
-        self.pinned_drag_origins.clear();
-        self.pinned_pointer_drag = None;
+        self.pending_show_window = None;
+        self.pending_picture_in_picture = None;
         self.video_volume_hover = None;
         self.live_window = LiveWindow::default();
     }
@@ -67,9 +80,29 @@ impl CanvasState {
         }
     }
 
+    /// End a resize or crop handle drag whose handle stopped being drawn
+    /// before the button came up: letting go of Alt over a group swaps the
+    /// tile handles for the group outline, and a removed tile takes its
+    /// handles with it. Without this the stale drag blocks pan, zoom, inertia
+    /// and box selection. `pointer_held` is any button down or released this
+    /// frame; a live handle clears its own drag on the release frame.
+    pub(super) fn end_orphaned_handle_drag(
+        &mut self,
+        pointer_held: bool,
+        preview_manager: &PreviewManager,
+    ) {
+        let Some(DragState::Resizing { id, .. } | DragState::Cropping { id, .. }) = self.drag_state
+        else {
+            return;
+        };
+        if !pointer_held || preview_manager.get(id).is_none() {
+            self.drag_state = None;
+        }
+    }
+
     /// Fit one tile in the current canvas without changing its saved geometry.
     pub fn focus_on_tile(&mut self, id: PreviewId, tile_rect: Rect, canvas_rect: Rect) {
-        self.groups.spotlight_drag = None;
+        self.groups.reorder = None;
         self.remember_current_tile(id);
         self.finish_crop();
         self.cancel_camera_transition();
@@ -112,9 +145,6 @@ impl CanvasState {
         hidden: bool,
         previews: &mut PreviewManager,
     ) {
-        if hidden && self.spotlight_includes(ids) {
-            self.exit_spotlight(previews);
-        }
         for id in ids {
             if let Some(preview) = previews.get_mut(*id) {
                 preview.hidden = hidden;
@@ -140,6 +170,78 @@ impl CanvasState {
         {
             self.forget_current_tile();
         }
+    }
+
+    /// Bring hidden tiles back from the empty-canvas menu without opening
+    /// the Control Tile Center. Hovering "Show Hidden Tiles" lists them by
+    /// name to the side, with Show All when there are several.
+    pub(super) fn show_hidden_items(&mut self, ui: &mut egui::Ui, previews: &mut PreviewManager) {
+        let entries = Self::hidden_entries(previews);
+        if entries.is_empty() {
+            return;
+        }
+        let mut show = None;
+        crate::ui_theme::menu_button(ui, "Show Hidden Tiles", |ui| {
+            crate::ui_theme::menu(ui);
+            for entry in &entries {
+                if ui.button(&entry.label).clicked() {
+                    show = Some(entry.members.clone());
+                }
+            }
+            if entries.len() > 1 {
+                ui.separator();
+                if ui.button("Show All").clicked() {
+                    show = Some(entries.iter().flat_map(|e| e.members.clone()).collect());
+                }
+            }
+        });
+        if let Some(ids) = show {
+            self.set_tiles_hidden(&ids, false, previews);
+            ui.close_kind(egui::UiKind::Menu);
+        }
+    }
+
+    /// Hidden tiles in the user's list order, for the empty-canvas menu. A
+    /// hidden group is one entry, as hiding one member hides them all.
+    pub(super) fn hidden_entries(previews: &PreviewManager) -> Vec<HiddenEntry> {
+        let mut hidden: Vec<_> = previews
+            .all()
+            .filter(|p| p.hidden && p.removing.is_none())
+            .collect();
+        hidden.sort_by_key(|p| (p.list_order, p.id.0));
+        let mut entries = Vec::new();
+        let mut groups_seen = Vec::new();
+        for preview in hidden {
+            let entry = match &preview.tile_group {
+                Some(group) => {
+                    if groups_seen.contains(&group.id) {
+                        continue;
+                    }
+                    groups_seen.push(group.id);
+                    let members: Vec<_> = Self::members_of(group.id, previews)
+                        .into_iter()
+                        .filter(|id| previews.get(*id).is_some_and(|p| p.hidden))
+                        .collect();
+                    let name = match group.name.trim() {
+                        "" => "Group",
+                        name => name,
+                    };
+                    HiddenEntry {
+                        label: format!("{} · {} tiles", compact_title(name, 30), members.len()),
+                        members,
+                    }
+                }
+                None => HiddenEntry {
+                    label: match preview.title.trim() {
+                        "" => "Untitled Tile".to_owned(),
+                        title => compact_title(title, 40),
+                    },
+                    members: vec![preview.id],
+                },
+            };
+            entries.push(entry);
+        }
+        entries
     }
 
     /// Select `id` with its group, as a click on it would, showing it first
@@ -187,9 +289,6 @@ impl CanvasState {
             return;
         }
         let members = self.group_members(id, previews);
-        if self.spotlight_includes(&members) {
-            self.exit_spotlight(previews);
-        }
         let screen = self.last_screen_rect;
         let pinned: Vec<(PreviewId, ViewportPin)> = members
             .iter()
@@ -315,9 +414,6 @@ impl CanvasState {
             let members = self.group_members(id, previews);
             self.set_tiles_hidden(&members, false, previews);
         }
-        if self.is_spotlighting() && !self.spotlight_includes(&[id]) {
-            self.exit_spotlight(previews);
-        }
         match self.last_screen_rect {
             Some(viewport) if !pinned => self.focus_on_tile(id, rect, viewport),
             _ => {
@@ -330,9 +426,6 @@ impl CanvasState {
 
     /// Remote focus uses canvas hit testing, never tile clicks or source input.
     pub fn focus_viewer_at(&mut self, at: [f32; 2], previews: &PreviewManager) {
-        if self.is_spotlighting() {
-            return;
-        }
         let Some(rect) = self.last_screen_rect else {
             return;
         };
@@ -577,7 +670,7 @@ impl CanvasState {
             } else {
                 self.begin_crop(id, preview_manager);
             }
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         let has_crop = preview_manager
             .get(id)
@@ -587,7 +680,7 @@ impl CanvasState {
             .clicked()
         {
             self.set_preview_crop(id, None, canvas_rect, preview_manager);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 
@@ -789,6 +882,7 @@ impl CanvasState {
         // Focus mode owns the canvas zoom, so restore the user's normal view
         // before calculating a persistent 1:1 tile size.
         self.exit_focus();
+        self.release_partial_groups(&[id], preview_manager);
 
         let Some((screen_rect, crop_uv, is_pinned)) = preview_manager.get(id).map(|preview| {
             (
@@ -841,9 +935,6 @@ impl CanvasState {
         preview_manager: &PreviewManager,
         alt: bool,
     ) -> Option<(PreviewId, ResizeHandle)> {
-        if self.is_spotlighting() {
-            return None;
-        }
         if self.has_selected_group(preview_manager) && !alt {
             return self.group_handle_at(screen_pos, canvas_rect, preview_manager);
         }
@@ -961,7 +1052,7 @@ impl CanvasState {
             keyboard_shortcuts: _,
         } = frame;
         if input.pointer_blocked
-            || self.is_spotlighting()
+            || self.groups.reorder.is_some()
             || self.groups.resize.is_some()
             || self.crop_mode == Some(id)
             || preview_manager
@@ -1023,13 +1114,16 @@ impl CanvasState {
             return false;
         }
 
-        if input.ctrl {
+        // Ctrl toggles selection; Shift+drag swaps places in a group.
+        if input.ctrl || (input.shift && self.is_arranged(id, preview_manager)) {
             return false;
         }
         self.remember_current_tile(id);
         if !self.selection.contains(&id) {
             self.select_group_tile(id, preview_manager);
         }
+        let selection = self.selection.clone();
+        self.release_partial_groups(&selection, preview_manager);
         self.pinned_drag_origins = self
             .selection
             .iter()
@@ -1045,4 +1139,11 @@ impl CanvasState {
         });
         true
     }
+}
+
+/// One line of the empty-canvas menu's hidden-tile list.
+#[derive(Debug, PartialEq)]
+pub(super) struct HiddenEntry {
+    pub label: String,
+    pub members: Vec<PreviewId>,
 }

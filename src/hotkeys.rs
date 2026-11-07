@@ -65,13 +65,13 @@ pub enum HotkeySlot {
     ShowShortcutHelp,
     GroupTiles,
     UngroupTiles,
-    LayoutGrid,
-    LayoutRow,
-    LayoutColumn,
-    LayoutSideStack,
-    ToggleSpotlight,
-    PreviousSpotlight,
-    NextSpotlight,
+    LayoutOneLarge,
+    LayoutTwoLarge,
+    LayoutThreeLarge,
+    LayoutEqual,
+    MakeMainTile,
+    PreviousMainTile,
+    NextMainTile,
     SizeMedium,
     SizeLarge,
     ScreenshotTile,
@@ -121,13 +121,13 @@ impl HotkeySlot {
         Self::ShowShortcutHelp,
         Self::GroupTiles,
         Self::UngroupTiles,
-        Self::LayoutGrid,
-        Self::LayoutRow,
-        Self::LayoutColumn,
-        Self::LayoutSideStack,
-        Self::ToggleSpotlight,
-        Self::PreviousSpotlight,
-        Self::NextSpotlight,
+        Self::LayoutOneLarge,
+        Self::LayoutTwoLarge,
+        Self::LayoutThreeLarge,
+        Self::LayoutEqual,
+        Self::MakeMainTile,
+        Self::PreviousMainTile,
+        Self::NextMainTile,
         Self::SizeMedium,
         Self::SizeLarge,
         Self::ScreenshotTile,
@@ -165,13 +165,13 @@ impl HotkeySlot {
             Self::ShowShortcutHelp => "Show shortcut help",
             Self::GroupTiles => "Group selected tiles",
             Self::UngroupTiles => "Ungroup selected tiles",
-            Self::LayoutGrid => "Layout: one large tile",
-            Self::LayoutRow => "Layout: two large tiles",
-            Self::LayoutColumn => "Layout: three large tiles",
-            Self::LayoutSideStack => "Layout: equal tiles",
-            Self::ToggleSpotlight => "Toggle group Spotlight",
-            Self::PreviousSpotlight => "Previous Spotlight tile",
-            Self::NextSpotlight => "Next Spotlight tile",
+            Self::LayoutOneLarge => "Layout: one large tile",
+            Self::LayoutTwoLarge => "Layout: two large tiles",
+            Self::LayoutThreeLarge => "Layout: three large tiles",
+            Self::LayoutEqual => "Layout: equal tiles",
+            Self::MakeMainTile => "Make current tile the main tile",
+            Self::PreviousMainTile => "Previous main tile",
+            Self::NextMainTile => "Next main tile",
             Self::SizeMedium => "Medium group size",
             Self::SizeLarge => "Large group size",
             Self::ScreenshotTile => "Screenshot selected tiles",
@@ -212,6 +212,8 @@ pub struct HotkeyBindings {
     pub show_shortcut_help: Hotkey,
     pub group_tiles: Hotkey,
     pub ungroup_tiles: Hotkey,
+    // These field names predate the current group actions. They stay so
+    // saved shortcuts keep loading.
     pub layout_grid: Hotkey,
     pub layout_row: Hotkey,
     pub layout_column: Hotkey,
@@ -304,13 +306,13 @@ impl HotkeyBindings {
             HotkeySlot::ShowShortcutHelp => self.show_shortcut_help,
             HotkeySlot::GroupTiles => self.group_tiles,
             HotkeySlot::UngroupTiles => self.ungroup_tiles,
-            HotkeySlot::LayoutGrid => self.layout_grid,
-            HotkeySlot::LayoutRow => self.layout_row,
-            HotkeySlot::LayoutColumn => self.layout_column,
-            HotkeySlot::LayoutSideStack => self.layout_side_stack,
-            HotkeySlot::ToggleSpotlight => self.toggle_spotlight,
-            HotkeySlot::PreviousSpotlight => self.previous_spotlight,
-            HotkeySlot::NextSpotlight => self.next_spotlight,
+            HotkeySlot::LayoutOneLarge => self.layout_grid,
+            HotkeySlot::LayoutTwoLarge => self.layout_row,
+            HotkeySlot::LayoutThreeLarge => self.layout_column,
+            HotkeySlot::LayoutEqual => self.layout_side_stack,
+            HotkeySlot::MakeMainTile => self.toggle_spotlight,
+            HotkeySlot::PreviousMainTile => self.previous_spotlight,
+            HotkeySlot::NextMainTile => self.next_spotlight,
             HotkeySlot::SizeMedium => self.size_medium,
             HotkeySlot::SizeLarge => self.size_large,
             HotkeySlot::ScreenshotTile => self.screenshot_tile,
@@ -349,13 +351,13 @@ impl HotkeyBindings {
             HotkeySlot::ShowShortcutHelp => self.show_shortcut_help = hotkey,
             HotkeySlot::GroupTiles => self.group_tiles = hotkey,
             HotkeySlot::UngroupTiles => self.ungroup_tiles = hotkey,
-            HotkeySlot::LayoutGrid => self.layout_grid = hotkey,
-            HotkeySlot::LayoutRow => self.layout_row = hotkey,
-            HotkeySlot::LayoutColumn => self.layout_column = hotkey,
-            HotkeySlot::LayoutSideStack => self.layout_side_stack = hotkey,
-            HotkeySlot::ToggleSpotlight => self.toggle_spotlight = hotkey,
-            HotkeySlot::PreviousSpotlight => self.previous_spotlight = hotkey,
-            HotkeySlot::NextSpotlight => self.next_spotlight = hotkey,
+            HotkeySlot::LayoutOneLarge => self.layout_grid = hotkey,
+            HotkeySlot::LayoutTwoLarge => self.layout_row = hotkey,
+            HotkeySlot::LayoutThreeLarge => self.layout_column = hotkey,
+            HotkeySlot::LayoutEqual => self.layout_side_stack = hotkey,
+            HotkeySlot::MakeMainTile => self.toggle_spotlight = hotkey,
+            HotkeySlot::PreviousMainTile => self.previous_spotlight = hotkey,
+            HotkeySlot::NextMainTile => self.next_spotlight = hotkey,
             HotkeySlot::SizeMedium => self.size_medium = hotkey,
             HotkeySlot::SizeLarge => self.size_large = hotkey,
             HotkeySlot::ScreenshotTile => self.screenshot_tile = hotkey,
@@ -746,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn spotlight_presets_keep_saved_bindings_and_remove_alt_five() {
+    fn group_layout_presets_keep_saved_bindings_and_remove_alt_five() {
         let old = serde_json::json!({
             "layout_row": {"first_key": 17, "second_key": 81},
             "size_small": {"first_key": 18, "second_key": 53}
@@ -755,10 +757,10 @@ mod tests {
         assert_eq!(restored.layout_row, Hotkey::pair(0x11, 0x51));
         let defaults = HotkeyBindings::default();
         for (slot, number) in [
-            (HotkeySlot::LayoutGrid, 0x31),
-            (HotkeySlot::LayoutRow, 0x32),
-            (HotkeySlot::LayoutColumn, 0x33),
-            (HotkeySlot::LayoutSideStack, 0x34),
+            (HotkeySlot::LayoutOneLarge, 0x31),
+            (HotkeySlot::LayoutTwoLarge, 0x32),
+            (HotkeySlot::LayoutThreeLarge, 0x33),
+            (HotkeySlot::LayoutEqual, 0x34),
         ] {
             assert_eq!(defaults.get(slot), Hotkey::pair(0x12, number));
         }
@@ -787,11 +789,11 @@ mod tests {
         tracker.held[0x46] = true;
         tracker.newly_pressed.push(0x46);
         let presses = tracker.presses(&defaults, true);
-        assert!(presses.pressed(HotkeySlot::ToggleSpotlight));
+        assert!(presses.pressed(HotkeySlot::MakeMainTile));
         assert!(!presses.pressed(HotkeySlot::FocusCurrentTile));
         assert!(!tracker
             .presses(&defaults, false)
-            .pressed(HotkeySlot::ToggleSpotlight));
+            .pressed(HotkeySlot::MakeMainTile));
     }
 
     #[test]

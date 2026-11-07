@@ -409,8 +409,9 @@ pub fn mp4_duration(path: &std::path::Path) -> Option<Duration> {
     (timescale > 0).then(|| Duration::from_secs_f64(duration as f64 / timescale as f64))
 }
 
-/// First picture of a video file, scaled to fit `max_side`, for the
-/// Screenshots panel. Decoded by Windows, like recordings are encoded.
+/// Preview picture of a video file, scaled to fit `max_side`, for the
+/// Screenshots panel: the keyframe before 1.5 s, or the first picture of a
+/// clip shorter than 3 s. Decoded by Windows, like recordings are encoded.
 #[cfg(windows)]
 pub fn video_thumbnail(path: &std::path::Path, max_side: u32) -> Option<eframe::egui::ColorImage> {
     mf::thumbnail(path, max_side)
@@ -773,6 +774,12 @@ mod mf {
         }
     }
 
+    /// Where a video's preview is taken from, in 100 ns units, for videos at
+    /// least twice as long.
+    const PREVIEW_AT: u64 = 15_000_000;
+    /// Pictures decoded at most to get there from the keyframe before it.
+    const PREVIEW_READS: usize = 150;
+
     pub(super) fn thumbnail(
         path: &std::path::Path,
         max_side: u32,
@@ -820,27 +827,69 @@ mod mf {
             let current = reader.GetCurrentMediaType(video).ok()?;
             let size = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
             let (width, height) = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
-            let stride = current
-                .GetUINT32(&MF_MT_DEFAULT_STRIDE)
-                .map_or(width as isize * 4, |stride| stride as i32 as isize);
+            // The encoder spends little on the very first frame, so it comes
+            // out soft; a picture a moment in looks like the rest of the
+            // video. Seeking lands on the keyframe before the position, so
+            // decode on from there.
+            let long_enough = reader
+                .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
+                .ok()
+                .and_then(|duration| u64::try_from(&duration).ok())
+                .is_some_and(|duration| duration >= 2 * PREVIEW_AT);
+            let wanted_time = if long_enough
+                && reader
+                    .SetCurrentPosition(
+                        &GUID::zeroed(),
+                        &windows::core::PROPVARIANT::from(PREVIEW_AT as i64),
+                    )
+                    .is_ok()
+            {
+                PREVIEW_AT as i64
+            } else {
+                0
+            };
             let mut sample = None;
-            for _ in 0..8 {
-                let mut flags = 0;
+            for _ in 0..PREVIEW_READS {
+                let (mut flags, mut time, mut next) = (0, 0, None);
                 reader
-                    .ReadSample(video, 0, None, Some(&mut flags), None, Some(&mut sample))
+                    .ReadSample(
+                        video,
+                        0,
+                        None,
+                        Some(&mut flags),
+                        Some(&mut time),
+                        Some(&mut next),
+                    )
                     .ok()?;
-                if sample.is_some() || flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                let found = next.is_some();
+                if found {
+                    sample = next;
+                }
+                if (found && time >= wanted_time)
+                    || flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0
+                {
                     break;
                 }
             }
+            // Once decoding starts the frames can switch to the padded size
+            // the video was coded at, with the picture at the top left.
+            let current = reader.GetCurrentMediaType(video).ok()?;
+            let coded = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
+            let (coded_width, coded_height) =
+                ((coded >> 32) as usize, (coded & 0xffff_ffff) as usize);
+            let stride = current
+                .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+                .map_or(coded_width as isize * 4, |stride| stride as i32 as isize);
             let buffer = sample?.ConvertToContiguousBuffer().ok()?;
             let mut data = std::ptr::null_mut();
             let mut length = 0;
             buffer.Lock(&mut data, None, Some(&mut length)).ok()?;
             let image = (width > 0
                 && height > 0
-                && stride.unsigned_abs() >= width * 4
-                && length as usize >= stride.unsigned_abs() * height)
+                && coded_width >= width
+                && coded_height >= height
+                && stride.unsigned_abs() >= coded_width * 4
+                && length as usize >= stride.unsigned_abs() * coded_height)
                 .then(|| {
                     let bytes = std::slice::from_raw_parts(data, length as usize);
                     let scale = (max_side as f32 / width.max(height) as f32).min(1.0);
@@ -849,28 +898,23 @@ mod mf {
                     // A negative stride means the rows are stored bottom-up.
                     let row_start = |y: usize| {
                         if stride < 0 {
-                            (height - 1 - y) * stride.unsigned_abs()
+                            (coded_height - 1 - y) * stride.unsigned_abs()
                         } else {
                             y * stride as usize
                         }
                     };
-                    let pixels = (0..out_height)
-                        .flat_map(|y| {
-                            let row = row_start(y * height / out_height);
-                            (0..out_width).map(move |x| {
-                                let at = row + x * width / out_width * 4;
-                                eframe::egui::Color32::from_rgb(
-                                    bytes[at + 2],
-                                    bytes[at + 1],
-                                    bytes[at],
-                                )
-                            })
-                        })
-                        .collect();
-                    eframe::egui::ColorImage {
-                        size: [out_width, out_height],
-                        pixels,
-                    }
+                    // Average every pixel: this runs off the UI thread, and
+                    // picking single pixels left the preview jagged.
+                    let pixels = crate::screenshot::box_downscale(
+                        (width as u32, height as u32),
+                        (out_width as u32, out_height as u32),
+                        u32::MAX,
+                        |x, y| {
+                            let at = row_start(y as usize) + x as usize * 4;
+                            [bytes[at + 2], bytes[at + 1], bytes[at], 255]
+                        },
+                    );
+                    eframe::egui::ColorImage::new([out_width, out_height], pixels)
                 });
             let _ = buffer.Unlock();
             image
@@ -1470,6 +1514,45 @@ mod tests {
         assert_eq!(&bytes[4..8], b"ftyp");
         assert!(bytes.windows(4).any(|w| w == b"mp4a"), "no audio track");
         assert!((1.8..2.4).contains(&seconds), "recorded {seconds} s");
+    }
+
+    /// Through the real encoder; run with `--ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn a_long_recording_is_previewed_from_a_later_keyframe() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("pluriview-preview-test-{}.mp4", std::process::id()));
+        let start = Instant::now();
+        let recorder = Recorder::start(path.clone(), Format::Mp4, Vec::new(), None, start);
+        let solid = |rgba: [u8; 4]| {
+            Arc::new(CapturedPixels::Straight(
+                ScreenshotImage::from_straight_rgba(320, 180, rgba.repeat(320 * 180)).unwrap(),
+            ))
+        };
+        let (blue, red) = (solid([0, 0, 255, 255]), solid([255, 0, 0, 255]));
+        let tick = Duration::from_millis(1000 / u64::from(MAX_FPS));
+        // Blue for the first second, then red until 3.3 s.
+        for index in 0..MAX_FPS * 33 / 10 {
+            let pixels = if index < MAX_FPS { &blue } else { &red };
+            let frame = || Frame {
+                layers: vec![Layer {
+                    pixels: pixels.clone(),
+                    crop_uv: None,
+                    place: None,
+                }],
+                at: start + tick * index,
+            };
+            while !recorder.push(frame()) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let path = recorder.stop().recv().unwrap().unwrap();
+        let thumbnail = video_thumbnail(&path, 160).expect("a picture decodes");
+        std::fs::remove_file(&path).unwrap();
+        let pixel = thumbnail.pixels[45 * 160 + 80];
+        assert!(pixel.r() > 200 && pixel.b() < 60, "{pixel:?}");
     }
 
     /// Two tiles side by side through the real encoder; run with `--ignored`.

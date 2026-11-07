@@ -14,6 +14,8 @@ import java.util.concurrent.TimeUnit;
 /** Decode and presentation run independently, with bounded network backpressure. */
 final class VideoDecoder implements AutoCloseable {
     interface Listener { void output(VideoPacket packet); }
+    // Fixed failure messages; ViewerActivity maps them to safe status labels.
+    static final String BACKLOG = "Video decoder backlog", STALLED = "Video decoder stalled", RESTART = "Restart video decoder";
     static final class Unavailable extends IOException { Unavailable() { super("Video codec unavailable"); } }
     private final ArrayBlockingQueue<VideoPacket> packets = new ArrayBlockingQueue<>(6);
     private final Thread worker;
@@ -32,7 +34,7 @@ final class VideoDecoder implements AutoCloseable {
     void queue(VideoPacket packet) throws IOException {
         if (failure != null) throw failure;
         try {
-            if (closed || !packets.offer(packet, initialized ? 250 : 750, TimeUnit.MILLISECONDS)) throw new IOException("Video decoder backlog");
+            if (closed || !packets.offer(packet, initialized ? 250 : 750, TimeUnit.MILLISECONDS)) throw new IOException(BACKLOG);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt(); throw new IOException("Viewer stopped", interrupted);
         }
@@ -103,7 +105,7 @@ final class VideoDecoder implements AutoCloseable {
                 // silent socket is not evidence of a hung driver; apply the
                 // decoder deadline only while fresh input is waiting to enter.
                 if (watchdog.stalled(now, !packets.isEmpty(), advanced))
-                    throw new IOException("Video decoder stalled");
+                    throw new IOException(STALLED);
                 if (!worked) Thread.sleep(2);
             }
         } catch (InterruptedException interrupted) {
@@ -111,7 +113,7 @@ final class VideoDecoder implements AutoCloseable {
         } catch (Exception error) {
             // Buffer pressure is recoverable. Only codec creation/configuration
             // failure means that video is unavailable on this device.
-            failure = started ? (error instanceof IOException ? (IOException) error : new IOException("Restart video decoder", error)) : new Unavailable();
+            failure = started ? (error instanceof IOException ? (IOException) error : new IOException(RESTART, error)) : new Unavailable();
         } finally {
             packets.clear();
             if (codec != null) { try { codec.release(); } catch (RuntimeException ignored) {} }

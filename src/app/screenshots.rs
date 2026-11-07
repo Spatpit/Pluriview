@@ -31,6 +31,28 @@ pub(super) struct ScreenshotState {
     pub(super) landings: Vec<super::screenshot_drop::Landing>,
 }
 
+impl ScreenshotState {
+    /// Forget shots still waiting for a tile's frame, and landings flying to
+    /// a tile, before a workspace change. Tile ids restart at 1 there, so
+    /// they would otherwise capture or target an unrelated tile. Files
+    /// already being saved finish normally.
+    pub(super) fn forget_tile_requests(&mut self) {
+        self.pending.clear();
+        self.pending_combined.clear();
+        self.landings.clear();
+    }
+
+    /// On exit: give screenshots still being written until `deadline` to
+    /// finish, so none is left as a cut-off file.
+    pub(super) fn wait_for_saves(&mut self, deadline: Instant) {
+        for shot in self.saving.drain(..) {
+            let _ = shot
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+}
+
 struct SavingShot {
     receiver: mpsc::Receiver<Result<PathBuf, String>>,
     /// Reused as the panel thumbnail once the file exists.
@@ -70,7 +92,7 @@ enum CombinedFrame {
 
 enum PendingSource {
     /// Rereading a still image whose decoded pixels were released.
-    ImageFile(mpsc::Receiver<Option<ScreenshotImage>>),
+    ImageFile(mpsc::Receiver<Option<CapturedPixels>>),
     /// Waiting for a live capture to deliver one frame at its full size.
     NativeFrame {
         fallback: Option<Arc<egui::ColorImage>>,
@@ -102,7 +124,7 @@ fn poll_source(
     match (source, preview) {
         (_, None) => Some(None),
         (PendingSource::ImageFile(receiver), Some(_)) => match receiver.try_recv() {
-            Ok(image) => Some(image.map(CapturedPixels::Straight)),
+            Ok(pixels) => Some(pixels),
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some(None),
         },
@@ -148,16 +170,27 @@ fn combined_title<'a>(titles: impl ExactSizeIterator<Item = &'a str>) -> String 
 }
 
 /// Decode a still image's file again on a worker thread.
-pub(super) fn reread_image(path: PathBuf) -> mpsc::Receiver<Option<ScreenshotImage>> {
+pub(super) fn reread_image(path: PathBuf) -> mpsc::Receiver<Option<CapturedPixels>> {
     let (sender, receiver) = mpsc::channel();
     let _ = std::thread::Builder::new()
         .name("pluriview-screenshot-reread".to_owned())
         .spawn(move || {
-            let image = crate::media::load(&path).ok().and_then(|asset| {
-                let frame = asset.frames.into_iter().next()?;
-                ScreenshotImage::from_straight_rgba(frame.width, frame.height, frame.rgba)
-            });
-            let _ = sender.send(image);
+            let pixels = match crate::media::load_still_rgba(&path) {
+                Ok(Some(image)) => ScreenshotImage::from_straight_rgba(
+                    image.width(),
+                    image.height(),
+                    image.into_raw(),
+                )
+                .map(CapturedPixels::Straight),
+                // A one-frame GIF: its transparency is all or nothing, so the
+                // premultiplied frame loses nothing.
+                Ok(None) => crate::media::load(&path)
+                    .ok()
+                    .and_then(|asset| asset.frames.into_iter().next())
+                    .map(|frame| CapturedPixels::Premultiplied(frame.image)),
+                Err(_) => None,
+            };
+            let _ = sender.send(pixels);
         });
     receiver
 }
@@ -395,10 +428,8 @@ impl PluriviewApp {
             return ShotStart::Unavailable("Playlist tiles can't be captured.");
         }
         if preview.is_media() {
-            if let Some(image) = preview.current_media_frame().and_then(|frame| {
-                ScreenshotImage::from_straight_rgba(frame.width, frame.height, frame.rgba.clone())
-            }) {
-                return ShotStart::Ready(CapturedPixels::Straight(image));
+            if let Some(frame) = preview.current_media_frame() {
+                return ShotStart::Ready(CapturedPixels::Premultiplied(Arc::clone(&frame.image)));
             }
             return match preview.media_path.clone() {
                 Some(path) if preview.media_pixels_released() => {
@@ -613,7 +644,7 @@ impl PluriviewApp {
         if gallery.clicked() {
             self.set_screenshots_panel_open(!panel_open);
         }
-        ui.menu_button("Capture", |ui| {
+        crate::ui_theme::menu_button(ui, "Capture", |ui| {
             crate::ui_theme::menu(ui);
             crate::ui_theme::section(ui, "SCREENSHOTS");
             if ui
@@ -627,7 +658,7 @@ impl PluriviewApp {
                 .clicked()
             {
                 self.request_tile_screenshots(ctx, false);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if self.canvas.capture_targets().len() > 1
                 && crate::ui_theme::action(
@@ -638,7 +669,7 @@ impl PluriviewApp {
                 .clicked()
             {
                 self.request_tile_screenshots(ctx, true);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             let mut panel_open = self.app_config.screenshots_panel_open;
             if crate::ui_theme::shortcut_toggle(
@@ -650,7 +681,7 @@ impl PluriviewApp {
             .clicked()
             {
                 self.set_screenshots_panel_open(panel_open);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if crate::ui_theme::action(
                 ui,
@@ -660,7 +691,7 @@ impl PluriviewApp {
             .clicked()
             {
                 self.open_screenshots_folder();
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             self.recording_menu_ui(ui);
         });
@@ -712,7 +743,7 @@ impl PluriviewApp {
             painter.rect_filled(*rect, 6.0, egui::Color32::WHITE.gamma_multiply(alpha));
         }
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         // The open panel's save folder first, else the camera button.
         let landing = state.panel.landing_rect.or(state.button_rect);
         let target = landing
@@ -738,13 +769,16 @@ impl PluriviewApp {
                 rounding,
                 egui::Color32::WHITE.gamma_multiply(fade),
             );
-            image.fill_texture_id = flight.texture.id();
-            image.uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+            image = image.with_texture(
+                flight.texture.id(),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            );
             painter.add(image);
             painter.rect_stroke(
                 rect,
                 rounding,
                 egui::Stroke::new(2.0, egui::Color32::WHITE.gamma_multiply(0.9 * fade)),
+                egui::StrokeKind::Middle,
             );
             true
         });
@@ -764,6 +798,7 @@ impl PluriviewApp {
                         rect.expand(3.0 * t),
                         8.0,
                         egui::Stroke::new(2.0, crate::ui_theme::GOLD.gamma_multiply(alpha)),
+                        egui::StrokeKind::Middle,
                     );
                 } else {
                     painter.circle_stroke(

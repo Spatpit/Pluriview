@@ -184,6 +184,7 @@ impl PluriviewApp {
             rect.shrink(6.0),
             10.0,
             egui::Stroke::new(2.0, crate::ui_theme::GOLD.gamma_multiply(0.8)),
+            egui::StrokeKind::Middle,
         );
         let label = if count == 1 {
             "Drop to add the screenshot to the canvas".to_owned()
@@ -257,6 +258,7 @@ impl PluriviewApp {
                 rect,
                 6.0,
                 egui::Stroke::new(1.5, crate::ui_theme::GOLD.gamma_multiply(alpha)),
+                egui::StrokeKind::Middle,
             );
             true
         });

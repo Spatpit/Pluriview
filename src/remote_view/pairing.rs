@@ -356,7 +356,10 @@ mod tests {
             ..Default::default()
         };
         assert!(viewer.is_blocking());
-        let _ = ctx.run(Default::default(), |ctx| viewer.ui(ctx));
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            viewer.ui(ctx)
+        });
         assert!(viewer.approval_drawn);
         viewer.host.as_ref().unwrap().shared.pairing.lock().decide(
             &id,
@@ -368,7 +371,10 @@ mod tests {
             viewer.is_blocking(),
             "Painted approval UI must never enter the video stream"
         );
-        let _ = ctx.run(Default::default(), |ctx| viewer.ui(ctx));
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            viewer.ui(ctx)
+        });
         assert!(!viewer.is_blocking());
     }
     fn input(id: &str) -> PairRequest {

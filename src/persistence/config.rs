@@ -31,6 +31,9 @@ pub struct AppConfig {
     /// The Control Tile Center lists tiles by name instead of in the user's
     /// own order.
     pub control_tile_center_sort_by_name: bool,
+    /// The Getting Started tour was closed once, so it no longer opens at
+    /// startup. Help → Getting Started still shows it.
+    pub welcome_tour_seen: bool,
 }
 
 impl Default for AppConfig {
@@ -46,6 +49,7 @@ impl Default for AppConfig {
             show_sound_badges: false,
             control_tile_center_rect: None,
             control_tile_center_sort_by_name: false,
+            welcome_tour_seen: false,
         }
     }
 }
@@ -76,6 +80,7 @@ mod tests {
         assert!(!config.show_sound_badges);
         assert!(config.control_tile_center_rect.is_none());
         assert!(!config.control_tile_center_sort_by_name);
+        assert!(!config.welcome_tour_seen);
     }
 
     #[test]

@@ -4,7 +4,6 @@ use egui::{Color32, Rect, Stroke};
 use egui_phosphor::regular as icons;
 use std::sync::Arc;
 
-/// Contains "Pluriview" so the window picker never lists it as a source.
 const TITLE: &str = "Pluriview Control Tile Center";
 /// Wide enough for three cards in a row (three of the narrowest cards and
 /// their gaps, the side margins and the scroll bar).
@@ -32,8 +31,8 @@ enum View {
 /// What dragging on the map does. A click on a tile focuses it either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum MapMode {
-    #[default]
     Camera,
+    #[default]
     Tiles,
 }
 
@@ -671,13 +670,13 @@ impl PluriviewApp {
             .with_position(initial.min)
             .with_window_level(egui::WindowLevel::AlwaysOnTop);
         let shared = &mut self.tile_control.shared;
-        ctx.show_viewport_immediate(viewport_id(), builder, |ctx, _class| {
-            if ctx.input(|input| input.viewport().close_requested()) {
+        ctx.show_viewport_immediate(viewport_id(), builder, |ui, _class| {
+            if ui.input(|input| input.viewport().close_requested()) {
                 shared.close_requested = true;
             }
             // Reopen at the frame's position with the content's size: the
             // builder takes an outer position but an inner size.
-            shared.window_rect = ctx
+            shared.window_rect = ui
                 .input(|input| {
                     let viewport = input.viewport();
                     viewport
@@ -686,7 +685,7 @@ impl PluriviewApp {
                         .map(|(outer, inner)| Rect::from_min_size(outer.min, inner.size()))
                 })
                 .or(shared.window_rect);
-            window_ui(ctx, &mut shared.ui, &shared.snapshot, &mut shared.actions);
+            window_ui(ui, &mut shared.ui, &shared.snapshot, &mut shared.actions);
         });
 
         if let Some(rect) = self.tile_control.shared.window_rect {
@@ -811,15 +810,15 @@ impl PluriviewApp {
 }
 
 fn window_ui(
-    ctx: &egui::Context,
+    ui: &mut egui::Ui,
     ui_state: &mut UiState,
     snapshot: &Snapshot,
     actions: &mut Vec<Action>,
 ) {
     let on_top = ui_state.on_top;
-    header(ctx, ui_state, snapshot, actions);
+    header(ui, ui_state, snapshot, actions);
     if ui_state.on_top != on_top {
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if ui_state.on_top {
+        ui.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if ui_state.on_top {
             egui::WindowLevel::AlwaysOnTop
         } else {
             egui::WindowLevel::Normal
@@ -827,11 +826,11 @@ fn window_ui(
     }
     egui::CentralPanel::default()
         .frame(
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(ui_theme::PANEL)
-                .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
+                .inner_margin(egui::Margin::symmetric(12, 10)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             let searching = !ui_state.search.trim().is_empty();
             let sections = sections(&snapshot.tiles, &ui_state.search, ui_state.sort_by_name);
             if sections.is_empty() {
@@ -848,21 +847,21 @@ fn window_ui(
 }
 
 fn header(
-    ctx: &egui::Context,
+    ui: &mut egui::Ui,
     ui_state: &mut UiState,
     snapshot: &Snapshot,
     actions: &mut Vec<Action>,
 ) {
     let total = snapshot.tiles.len();
     let hidden = snapshot.tiles.iter().filter(|tile| tile.hidden).count();
-    egui::TopBottomPanel::top("tile_control_header")
+    egui::Panel::top("tile_control_header")
         .frame(
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(ui_theme::SURFACE)
-                .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
+                .inner_margin(egui::Margin::symmetric(12, 10)),
         )
         .show_separator_line(false)
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Tiles").size(17.0).strong());
                 let summary = match (total, hidden) {
@@ -1088,6 +1087,7 @@ fn drag_ghost(ctx: &egui::Context, title: &str, pointer: Pos2) {
         6.0,
         ui_theme::SURFACE,
         Stroke::new(1.0, ui_theme::GOLD),
+        egui::StrokeKind::Middle,
     );
     painter.galley(rect.min + Vec2::new(8.0, 5.0), galley, ui_theme::TEXT);
 }
@@ -1231,7 +1231,13 @@ fn card(
     } else {
         (ui_theme::SURFACE, Stroke::new(1.0, ui_theme::BORDER))
     };
-    painter.rect(rect.shrink(0.5), 8.0, fill, stroke);
+    painter.rect(
+        rect.shrink(0.5),
+        8.0,
+        fill,
+        stroke,
+        egui::StrokeKind::Middle,
+    );
 
     let thumbnail = Rect::from_min_size(
         rect.min + Vec2::splat(CARD_PADDING),
@@ -1399,7 +1405,7 @@ fn card(
     if response.clicked() {
         actions.push(Action::Focus(id));
     }
-    response.context_menu(|ui| tile_menu(ui, tile, snapshot, actions));
+    crate::ui_theme::context_menu(&response, |ui| tile_menu(ui, tile, snapshot, actions));
 }
 
 fn tile_menu(ui: &mut egui::Ui, tile: &TileView, snapshot: &Snapshot, actions: &mut Vec<Action>) {
@@ -1419,11 +1425,11 @@ fn tile_menu(ui: &mut egui::Ui, tile: &TileView, snapshot: &Snapshot, actions: &
         .clicked()
     {
         actions.push(Action::Focus(id));
-        ui.close_menu();
+        ui.close_kind(egui::UiKind::Menu);
     }
     if ui.button("Select on Canvas").clicked() {
         actions.push(Action::Select(id));
-        ui.close_menu();
+        ui.close_kind(egui::UiKind::Menu);
     }
     let label = match (tile.hidden, tile.group.is_some()) {
         (true, true) => "Show Group",
@@ -1433,7 +1439,7 @@ fn tile_menu(ui: &mut egui::Ui, tile: &TileView, snapshot: &Snapshot, actions: &
     };
     if ui.button(label).clicked() {
         actions.push(set_hidden_with_group(tile, snapshot, !tile.hidden));
-        ui.close_menu();
+        ui.close_kind(egui::UiKind::Menu);
     }
     if let Some(sound) = tile.sound {
         ui.separator();
@@ -1445,14 +1451,14 @@ fn tile_menu(ui: &mut egui::Ui, tile: &TileView, snapshot: &Snapshot, actions: &
                     .clicked()
                 {
                     actions.push(Action::ToggleStreamAudio(id));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
             _ => {
                 let mut muted = sound.muted() == Some(true);
                 if ui_theme::toggle(ui, &mut muted, "Mute").clicked() {
                     actions.push(Action::ToggleMute(id));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
         }
@@ -1474,7 +1480,7 @@ fn tile_menu(ui: &mut egui::Ui, tile: &TileView, snapshot: &Snapshot, actions: &
         let mut popped_out = tile.in_picture_in_picture;
         if ui_theme::toggle(ui, &mut popped_out, "Picture in Picture").clicked() {
             actions.push(Action::PictureInPicture(id));
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
     let mut pinned = tile.pinned;
@@ -1483,19 +1489,19 @@ fn tile_menu(ui: &mut egui::Ui, tile: &TileView, snapshot: &Snapshot, actions: &
         .clicked()
     {
         actions.push(Action::TogglePin(id));
-        ui.close_menu();
+        ui.close_kind(egui::UiKind::Menu);
     }
     ui.separator();
     if ui.button("Bring to Front").clicked() {
         actions.push(Action::BringToFront(id));
-        ui.close_menu();
+        ui.close_kind(egui::UiKind::Menu);
     }
     if ui.button("Send to Back").clicked() {
         actions.push(Action::SendToBack(id));
-        ui.close_menu();
+        ui.close_kind(egui::UiKind::Menu);
     }
     if let Some(current) = tile.fps {
-        ui.menu_button(format!("Frame Rate: {}", current.label()), |ui| {
+        crate::ui_theme::menu_button(ui, format!("Frame Rate: {}", current.label()), |ui| {
             ui_theme::menu(ui);
             for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
                 if ui
@@ -1503,7 +1509,7 @@ fn tile_menu(ui: &mut egui::Ui, tile: &TileView, snapshot: &Snapshot, actions: &
                     .clicked()
                 {
                     actions.push(Action::SetFps(id, preset));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
         });
@@ -1543,16 +1549,16 @@ fn map(
     ui.horizontal(|ui| {
         for (mode, icon, label, hint) in [
             (
-                MapMode::Camera,
-                icons::HAND,
-                "Move camera",
-                "Drag to move the canvas view; click empty space to jump there",
-            ),
-            (
                 MapMode::Tiles,
                 icons::ARROWS_OUT_CARDINAL,
                 "Move tiles",
                 "Drag tiles to move them on the canvas; a group moves together",
+            ),
+            (
+                MapMode::Camera,
+                icons::HAND,
+                "Move camera",
+                "Drag to move the canvas view; click empty space to jump there",
             ),
         ] {
             if ui
@@ -1593,6 +1599,7 @@ fn map(
         6.0,
         Color32::from_rgb(17, 17, 20),
         Stroke::new(1.0, ui_theme::BORDER),
+        egui::StrokeKind::Middle,
     );
 
     // The background's own hint only shows away from tiles: with both it and a
@@ -1707,12 +1714,18 @@ fn map(
             );
         }
         if focused || response.hovered() {
-            painter.rect_stroke(rect, 2.0, Stroke::new(1.5, ui_theme::GOLD));
+            painter.rect_stroke(
+                rect,
+                2.0,
+                Stroke::new(1.5, ui_theme::GOLD),
+                egui::StrokeKind::Middle,
+            );
         } else if snapshot.selection.contains(&id) {
             painter.rect_stroke(
                 rect,
                 2.0,
                 Stroke::new(1.0, ui_theme::GOLD.gamma_multiply(0.6)),
+                egui::StrokeKind::Middle,
             );
         }
         // A pinned tile has no place on the canvas to resize it from when it
@@ -1781,14 +1794,19 @@ fn map(
         if response.clicked() {
             actions.push(Action::Focus(id));
         }
-        response.context_menu(|ui| tile_menu(ui, tile, snapshot, actions));
+        crate::ui_theme::context_menu(&response, |ui| tile_menu(ui, tile, snapshot, actions));
     }
 
     // The part of the canvas the main window shows right now.
     if let Some(viewport) = snapshot.viewport {
         let rect = transform.map_rect(viewport);
         painter.rect_filled(rect, 3.0, ui_theme::GOLD.gamma_multiply(0.06));
-        painter.rect_stroke(rect, 3.0, Stroke::new(1.5, ui_theme::GOLD));
+        painter.rect_stroke(
+            rect,
+            3.0,
+            Stroke::new(1.5, ui_theme::GOLD),
+            egui::StrokeKind::Middle,
+        );
     }
 
     if moving_tiles {
@@ -1954,8 +1972,8 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| draw(ui, &mut actions));
+            let _ = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| draw(ui, &mut actions));
             });
         }
         actions
@@ -2176,6 +2194,11 @@ mod tests {
         // Moving the camera leaves no grip to catch the pointer.
         let actions = run_map_with(pinned_over_another(), MapMode::Camera, click(grip));
         assert_eq!(actions, vec![Action::Focus(PreviewId(2))]);
+    }
+
+    #[test]
+    fn the_map_moves_tiles_by_default() {
+        assert_eq!(UiState::default().map_mode, MapMode::Tiles);
     }
 
     #[test]

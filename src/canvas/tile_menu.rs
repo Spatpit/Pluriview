@@ -1,6 +1,6 @@
 //! A tile's right-click menu. Every kind of tile lists the same sections in
-//! the same order: what its content does, how it is viewed, where it sits,
-//! its settings, then Remove.
+//! the same order: what its content does ending with Tile Settings, how it is
+//! viewed, its group, then Remove.
 use super::*;
 use crate::preview::VideoSource;
 use crate::ui_theme;
@@ -27,36 +27,29 @@ impl CanvasState {
         ui.set_max_width(280.0);
         tile_menu_header(ui, info, preview_manager, selected.len());
         ui.separator();
-        if self.is_spotlighting() {
-            self.spotlight_menu(ui, canvas_rect, preview_manager);
-            return;
-        }
 
         // A frozen tile's own controls are unavailable until it resumes.
         if info.manually_frozen {
             self.activity_items(ui, &selected, preview_manager);
             ui.separator();
         }
-        if self.content_items(
+        // Tile Settings closes the tile's own actions (after Native Size on
+        // window tiles).
+        self.content_items(
             ui,
             info,
             canvas_rect,
             pixels_per_point,
             preview_manager,
             keyboard_shortcuts,
-        ) {
-            ui.separator();
-        }
+        );
+        self.tile_settings_menu(ui, info, canvas_rect, preview_manager, keyboard_shortcuts);
+        ui.separator();
 
         self.view_items(ui, info, canvas_rect, preview_manager, keyboard_shortcuts);
         ui.separator();
 
-        self.arrange_menu(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
         self.group_menu(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
-        self.spotlight_item(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
-        ui.separator();
-
-        self.tile_settings_menu(ui, info, canvas_rect, preview_manager);
         if !info.manually_frozen {
             self.activity_items(ui, &selected, preview_manager);
         }
@@ -72,7 +65,7 @@ impl CanvasState {
             capture_coordinator.stop_capture(id);
             preview_manager.start_removal(id);
             self.selection.retain(|&x| x != id);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 
@@ -97,7 +90,7 @@ impl CanvasState {
                 .clicked()
         {
             self.queue_activity_for_selection(selected, TileActivityAction::Resume);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if any_live
             && ui
@@ -109,11 +102,11 @@ impl CanvasState {
                 .clicked()
         {
             self.queue_activity_for_selection(selected, TileActivityAction::Freeze);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 
-    /// The actions of the tile's own content. Returns whether there are any.
+    /// The actions of the tile's own content, if it has any.
     fn content_items(
         &mut self,
         ui: &mut egui::Ui,
@@ -122,7 +115,7 @@ impl CanvasState {
         pixels_per_point: f32,
         preview_manager: &mut PreviewManager,
         keyboard_shortcuts: &HotkeyBindings,
-    ) -> bool {
+    ) {
         if info.is_playlist {
             self.playlist_items(ui, info.id, preview_manager);
         } else if info.is_media {
@@ -133,10 +126,7 @@ impl CanvasState {
             self.video_items(ui, info);
         } else if info.is_window_capture {
             self.window_items(ui, info, canvas_rect, pixels_per_point, preview_manager);
-        } else {
-            return false;
         }
-        true
     }
 
     fn browser_items(
@@ -167,12 +157,12 @@ impl CanvasState {
             .clicked()
         {
             self.last_double_clicked = Some(id);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if ui.add_enabled(ready, egui::Button::new("Reload")).clicked() {
             self.pending_browser_actions
                 .push((id, BrowserAction::Reload));
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if ui
             .add_enabled(
@@ -183,11 +173,11 @@ impl CanvasState {
         {
             self.pending_browser_actions
                 .push((id, BrowserAction::ToggleMute));
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         page_zoom_row(ui, id, ready, preview_manager);
 
-        ui.menu_button("Page", |ui| {
+        crate::ui_theme::menu_button(ui, "Page", |ui| {
             ui_theme::menu(ui);
             for (label, action) in [
                 ("Change URL…", BrowserAction::EditUrl),
@@ -196,7 +186,7 @@ impl CanvasState {
             ] {
                 if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
                     self.pending_browser_actions.push((id, action));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
             ui.separator();
@@ -207,7 +197,7 @@ impl CanvasState {
             {
                 self.pending_browser_actions
                     .push((id, BrowserAction::FitToVideo));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             let (mut show_frame, has_tabs) = preview_manager
                 .get(id)
@@ -225,7 +215,7 @@ impl CanvasState {
                 if let Some(preview) = preview_manager.get_mut(id) {
                     preview.browser_chrome = show_frame;
                 }
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
         });
     }
@@ -246,7 +236,7 @@ impl CanvasState {
             {
                 self.pending_video_actions
                     .push((id, VideoAction::SetPaused(!playback.paused)));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if ui
                 .button(if playback.muted { "Unmute" } else { "Mute" })
@@ -254,7 +244,7 @@ impl CanvasState {
             {
                 self.pending_video_actions
                     .push((id, VideoAction::ToggleMute));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             let mut volume = playback.volume;
             if ui
@@ -264,26 +254,26 @@ impl CanvasState {
                 self.pending_video_actions
                     .push((id, VideoAction::SetVolume(volume)));
             }
-            ui.menu_button("Playback", |ui| {
+            crate::ui_theme::menu_button(ui, "Playback", |ui| {
                 ui_theme::menu(ui);
                 let mut looping = playback.looping;
                 if ui_theme::toggle(ui, &mut looping, "Loop").clicked() {
                     self.pending_video_actions
                         .push((id, VideoAction::ToggleLoop));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
-                ui.menu_button(format!("Speed: {}×", playback.speed), |ui| {
+                crate::ui_theme::menu_button(ui, format!("Speed: {}×", playback.speed), |ui| {
                     ui_theme::menu(ui);
                     for speed in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
                         let selected = (playback.speed - speed).abs() < 0.001;
                         if ui.selectable_label(selected, format!("{speed}×")).clicked() {
                             self.pending_video_actions
                                 .push((id, VideoAction::SetSpeed(speed)));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     }
                 });
-                ui.menu_button("Audio Track", |ui| {
+                crate::ui_theme::menu_button(ui, "Audio Track", |ui| {
                     ui_theme::menu(ui);
                     let mut any = false;
                     for track in playback.tracks.iter().filter(|track| track.kind == "audio") {
@@ -297,14 +287,14 @@ impl CanvasState {
                         {
                             self.pending_video_actions
                                 .push((id, VideoAction::SelectAudioTrack(track.id)));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     }
                     if !any {
                         ui.label(egui::RichText::new("No audio tracks").weak());
                     }
                 });
-                ui.menu_button("Subtitles", |ui| {
+                crate::ui_theme::menu_button(ui, "Subtitles", |ui| {
                     ui_theme::menu(ui);
                     if ui
                         .selectable_label(playback.subtitle_track.is_none(), "Off")
@@ -312,7 +302,7 @@ impl CanvasState {
                     {
                         self.pending_video_actions
                             .push((id, VideoAction::SelectSubtitleTrack(None)));
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                     for track in playback.tracks.iter().filter(|track| track.kind == "sub") {
                         if ui
@@ -324,7 +314,7 @@ impl CanvasState {
                         {
                             self.pending_video_actions
                                 .push((id, VideoAction::SelectSubtitleTrack(Some(track.id))));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     }
                 });
@@ -335,12 +325,12 @@ impl CanvasState {
             .clicked()
         {
             self.pending_video_actions.push((id, VideoAction::Reload));
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if video_status_needs_settings(&info.video_status) && ui.button("Open Settings").clicked() {
             self.pending_video_actions
                 .push((id, VideoAction::OpenSettings));
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 
@@ -356,7 +346,7 @@ impl CanvasState {
         ] {
             if ui.button(label).clicked() {
                 self.pending_playlist_actions.push((id, action));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
         }
         let (autoplay, shuffle, repeat) = preview_manager
@@ -364,12 +354,12 @@ impl CanvasState {
             .and_then(|preview| preview.folder_playlist.as_ref())
             .map(|playlist| (playlist.autoplay, playlist.shuffle, playlist.repeat))
             .unwrap_or((true, false, false));
-        ui.menu_button("Playlist", |ui| {
+        crate::ui_theme::menu_button(ui, "Playlist", |ui| {
             ui_theme::menu(ui);
             if ui.button("Rescan Folder").clicked() {
                 self.pending_playlist_actions
                     .push((id, PlaylistAction::Rescan));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             ui.separator();
             for (mut on, label, action) in [
@@ -379,7 +369,7 @@ impl CanvasState {
             ] {
                 if ui_theme::toggle(ui, &mut on, label).clicked() {
                     self.pending_playlist_actions.push((id, action));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
         });
@@ -398,7 +388,7 @@ impl CanvasState {
         ] {
             if ui.button(label).clicked() {
                 self.pending_media_actions.push((id, action));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
         }
     }
@@ -428,7 +418,7 @@ impl CanvasState {
             .clicked()
         {
             self.last_double_clicked = Some(info.id);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if ui
             .add_enabled(
@@ -439,7 +429,7 @@ impl CanvasState {
             .clicked()
         {
             self.pending_show_window = Some(info.id);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if ui
             .add_enabled(
@@ -460,7 +450,7 @@ impl CanvasState {
                     preview_manager,
                 );
             }
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 
@@ -486,7 +476,7 @@ impl CanvasState {
             .clicked()
         {
             self.focus_on_tile(id, info.rect, canvas_rect);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if !info.is_playlist {
             let mut popped_out = preview_manager
@@ -504,7 +494,7 @@ impl CanvasState {
             .clicked()
             {
                 self.pending_picture_in_picture = Some(id);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
         }
         let mut pinned = info.viewport_pin.is_some();
@@ -513,7 +503,7 @@ impl CanvasState {
             .clicked()
         {
             self.toggle_viewport_pin(id, canvas_rect, preview_manager);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         let members = self.group_members(id, preview_manager);
         let label = if members.len() > 1 {
@@ -524,46 +514,55 @@ impl CanvasState {
         if ui
             .button(label)
             .on_hover_text(
-                "Take it off the canvas while it keeps running. Show it again from the Control Tile Center",
+                "Take it off the canvas while it keeps running. Show it again by right-clicking empty canvas, or from the Control Tile Center",
             )
             .clicked()
         {
             self.set_tiles_hidden(&members, true, preview_manager);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 
-    /// Options set once and rarely changed.
+    /// Frame rate first, then arrangement and stacking, crop and options set
+    /// once and rarely changed, then size last.
     fn tile_settings_menu(
         &mut self,
         ui: &mut egui::Ui,
         info: &TileInfo,
         canvas_rect: Rect,
         preview_manager: &mut PreviewManager,
+        keyboard_shortcuts: &HotkeyBindings,
     ) {
         let id = info.id;
-        ui.menu_button("Tile Settings", |ui| {
+        crate::ui_theme::menu_button(ui, "Tile Settings", |ui| {
             ui_theme::menu(ui);
+            if !info.is_media && !info.is_playlist {
+                crate::ui_theme::menu_button(
+                    ui,
+                    format!("Frame Rate: {}", info.fps_preset.label()),
+                    |ui| {
+                        ui_theme::menu(ui);
+                        for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
+                            if ui
+                                .selectable_label(info.fps_preset == preset, preset.label())
+                                .clicked()
+                            {
+                                self.pending_fps_changes.push(PendingFpsChange {
+                                    preview_id: id,
+                                    new_fps: preset,
+                                });
+                                ui.close_kind(egui::UiKind::Menu);
+                            }
+                        }
+                    },
+                );
+                ui.separator();
+            }
+            self.arrange_items(ui, id, canvas_rect, preview_manager, keyboard_shortcuts);
+            ui.separator();
             if !info.is_playlist {
                 self.crop_items(ui, id, canvas_rect, preview_manager);
                 ui.separator();
-            }
-            if !info.is_media && !info.is_playlist {
-                ui.menu_button(format!("Frame Rate: {}", info.fps_preset.label()), |ui| {
-                    ui_theme::menu(ui);
-                    for preset in [FpsPreset::Low, FpsPreset::Medium, FpsPreset::High] {
-                        if ui
-                            .selectable_label(info.fps_preset == preset, preset.label())
-                            .clicked()
-                        {
-                            self.pending_fps_changes.push(PendingFpsChange {
-                                preview_id: id,
-                                new_fps: preset,
-                            });
-                            ui.close_menu();
-                        }
-                    }
-                });
             }
             if info.is_browser {
                 let mut locked = info.lock_aspect_ratio;
@@ -574,7 +573,7 @@ impl CanvasState {
                     .clicked()
                 {
                     self.toggle_aspect_ratio_lock(id, preview_manager);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             }
             let mut passes_through = info.left_click_disabled;
@@ -583,8 +582,10 @@ impl CanvasState {
                 .clicked()
             {
                 self.toggle_left_click_disabled(id, preview_manager);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
+            ui.separator();
+            self.size_menu(ui, canvas_rect, preview_manager, keyboard_shortcuts);
         });
     }
 }

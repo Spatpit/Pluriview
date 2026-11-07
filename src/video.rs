@@ -237,11 +237,30 @@ pub(crate) fn resolve_stream_url(
         .ok_or_else(|| "Streamlink returned no preview URL".to_owned())?
         .read_to_string(&mut stdout)
         .map_err(|error| format!("Could not read Streamlink preview URL: {error}"))?;
-    let resolved = stdout.trim();
+    validate_resolved_stream_url(&stdout).map(OsString::from)
+}
+
+/// Streamlink's output goes straight to libmpv, which also opens local files
+/// and protocols such as `av://lavfi:` or `edl://`. Only accept a single
+/// plain HTTP(S) URL so a hostile plugin or redirect cannot reach those.
+fn validate_resolved_stream_url(output: &str) -> Result<&str, String> {
+    let resolved = output.trim();
     if resolved.is_empty() {
-        Err("Streamlink returned an empty preview URL".to_owned())
+        return Err("Streamlink returned an empty preview URL".to_owned());
+    }
+    let plain_http = resolved.starts_with("https://") || resolved.starts_with("http://");
+    let single_token = !resolved
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control());
+    let parsed_host = url::Url::parse(resolved)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .and_then(|url| url.host_str().map(|host| !host.is_empty()))
+        .unwrap_or(false);
+    if plain_http && single_token && parsed_host {
+        Ok(resolved)
     } else {
-        Ok(OsString::from(resolved))
+        Err("Streamlink returned an unsupported preview URL".to_owned())
     }
 }
 
@@ -332,7 +351,7 @@ impl Drop for VideoHost {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_video_thumbnail, VideoThumbnailSource};
+    use super::{extract_video_thumbnail, validate_resolved_stream_url, VideoThumbnailSource};
     use std::path::Path;
 
     #[test]
@@ -343,5 +362,32 @@ mod tests {
             -1.0,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolved_stream_urls_must_be_single_http_urls() {
+        assert_eq!(
+            validate_resolved_stream_url("https://cdn.example/live/index.m3u8?sig=abc\r\n"),
+            Ok("https://cdn.example/live/index.m3u8?sig=abc")
+        );
+        assert!(validate_resolved_stream_url("http://cdn.example/v.mp4").is_ok());
+        for rejected in [
+            "",
+            "   ",
+            "av://lavfi:color=c=red",
+            "edl://C:/Windows/win.ini",
+            "file:///C:/Windows/win.ini",
+            r"C:\Windows\win.ini",
+            "hls://https://cdn.example/a.m3u8",
+            "HTTPS://cdn.example/a.m3u8",
+            "https://",
+            "https://cdn.example/a.m3u8 av://lavfi:color",
+            "https://cdn.example/a.m3u8\nav://lavfi:color",
+        ] {
+            assert!(
+                validate_resolved_stream_url(rejected).is_err(),
+                "{rejected:?} should be rejected"
+            );
+        }
     }
 }

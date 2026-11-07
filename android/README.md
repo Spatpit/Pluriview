@@ -3,7 +3,22 @@
 Development preview of a **shared PC canvas camera**. Requires Android 8.0+
 and a running Windows Pluriview build with Tools → Phone Viewer. There is no
 cloud service or account. Use only trusted private Wi-Fi: the LAN transport is
-unencrypted. Version 0.3.11 fixes audio queue-full reconnects and retains
+unencrypted.
+
+Version 0.3.14 redesigns the screens in the desktop's dark and gold style, with
+an adaptive launcher icon. Nearby PCs appear as cards, the comparison number is
+shown large with a countdown, and tips appear when no PC is found. A **Paste**
+button fills in a pairing link and confirms it before connecting. While viewing,
+one set of controls (Fit/Fill, audio, connection details, full screen,
+disconnect) serves both full screen and windowed viewing. A status chip and a
+centre panel keep connection messages visible even when the controls are hidden.
+Back and **Disconnect** ask before ending the session, and a session whose access
+ended on the PC returns to pairing instead of retrying forever. Split screen,
+folding and dark-mode changes no longer drop the connection. Gesture commands are
+sent when they happen instead of being polled every 8 ms, and double-tap focus
+gives haptic and visual feedback. Protocol and streaming are unchanged.
+
+Version 0.3.11 fixes audio queue-full reconnects and retains
 the optional tile audio introduced in 0.3.9. Use the updated Windows 0.7.1 build
 for simultaneous phone audio and desktop Stream Audio Monitor support.
 Version 0.3.8 uses a dedicated video socket with
@@ -23,7 +38,7 @@ It retains the removal of the 10 FPS JPEG fallback and the interrupted decoder
 cleanup fix when backgrounding and returning.
 It retains double-tap focus and fixed 720p H.264 quality,
 fullscreen Fill/Fit and PC hardware encoding with software encoding as backup.
-The status bar shows video resolution and **Received / Shown FPS**. Video failures
+Connection details show video resolution and **Received / Shown FPS**. Video failures
 show a status and retry H.264; the Android client no longer downloads JPEGs.
 Video remains compatible with Windows preview 0.3.6; audio requires 0.3.9.
 Nearby discovery requires Windows preview 0.3.6 or newer. QR/link pairing
@@ -48,8 +63,8 @@ Preparation is cancellable and has a three-second deadline. Decoder stall
 timing excludes idle network waits. Reconnect status includes a fixed, safe
 failure label rather than hiding every failure behind “Reconnecting.”
 
-Tap the canvas to reveal **Audio off**, then tap it to enable sound. The control
-is also available outside fullscreen. Audio is off for each new connection;
+Tap the canvas to show the controls, then tap the speaker button to enable sound;
+it turns gold while audio is on. Audio is off for each new connection;
 turning it off closes the audio socket and releases the PC capture/encoder and
 phone decoder/output. It is not just a speaker mute. The stream is AAC-LC,
 48 kHz stereo, at a 128 kbps target (roughly 16 KB/s plus transport overhead).
@@ -84,6 +99,8 @@ the pairing screen is installed before system-bar configuration, and controller
 access initializes the window decor before querying it.
 
 The app uses Android platform APIs only, with no third-party Java dependencies.
+The theme, launcher icon and vector icons live in `android/res`; the script links
+them first, generating the `R` class the Java sources use.
 Install JDK 17+ and Android SDK Platform 35 / Build Tools 35.0.0, then put the
 JDK `bin` directory on PATH. From the repository root:
 
@@ -100,6 +117,12 @@ It produces `target/android-viewer/pluriview-viewer-debug.apk`. The local test
 signing key and all outputs remain in ignored `target/`; this is not a Play
 Store release build. Production distribution needs a separately managed signing key.
 
+**Keep `target/android-viewer/debug.keystore`.** Android installs an update only
+when it is signed with the same key as the installed app. If the file is deleted
+(for example by cleaning `target/`), the script creates a new key, and phones
+must uninstall the old viewer before installing the next build. The key changed
+in 0.3.14 for this reason; back the file up somewhere outside the repository.
+
 Install the APK on a connected Android device:
 
 ```powershell
@@ -107,13 +130,14 @@ adb install -r target/android-viewer/pluriview-viewer-debug.apk
 ```
 
 Or copy the APK to the phone and install it there. Start sharing in the PC's
-Phone Viewer dialog, select its name nearby on Android and tap **Request connection**.
+Phone Viewer dialog, then tap the PC's card under **Nearby PCs** on Android.
 Compare the six-digit number on both screens, then choose **Allow connection**
 on the PC. Requests can be denied or cancelled and expire after one minute.
 Busy PCs cannot accept another viewer. Discovery requires a LAN that allows
 devices to communicate; use Refresh after switching networks.
 
-QR/link pairing remains a backup: scan the QR or paste the link, tap Connect,
+QR/link pairing remains a backup: scan the QR, or copy the link and tap **Paste**.
+The app confirms a valid link before you tap **Connect**;
 then close the PC dialog. Treat that link as a secret: it grants access without
 further approval. Some camera apps do not open custom QR links; use copy/paste
 in that case. The app keeps pairing information in memory only,
@@ -123,20 +147,29 @@ reconnects 720p video with fresh statistics. There is no lower-quality backgroun
 stream. Cleanup waits for a bounded period even if the outgoing stream worker
 was interrupted. A new decoder cannot start until the previous one has stopped.
 
-Viewing starts fullscreen with **Fill screen**, preserving proportions while
-cropping the PC canvas edges to fill the phone. Tap the canvas to reveal
-**Fit whole canvas** and **Exit fullscreen**. Controls hide after 3.5 seconds;
-Back exits fullscreen, and an edge swipe temporarily reveals Android's system
-bars. Cutout space is used for content while controls avoid the camera cutout.
-Fit shows every edge and may leave bars because phone and PC aspect ratios
-differ. The Fit/Fill preference is saved; pairing credentials are not.
+Viewing starts fullscreen in Fill mode, preserving proportions while cropping
+the PC canvas edges to fill the phone. Tap the canvas to show or hide the
+control bar: Fit/Fill (the icon shows the current mode), phone audio, connection
+details, full screen and disconnect. In fullscreen the controls hide after 3.5
+seconds; in windowed viewing they stay until you tap. A status chip at the top shows Live,
+Connecting, Reconnecting or Paused and stays visible whenever the picture is not
+live; with no picture, a centre panel explains what the viewer is waiting for.
+Back leaves fullscreen first, then asks before disconnecting, as **Disconnect**
+does. An edge swipe temporarily reveals Android's system bars. Cutout space is
+used for content while controls avoid the camera cutout. Fit shows every edge
+and may leave bars because phone and PC aspect ratios differ. The Fit/Fill
+preference is saved; pairing credentials are not. If the PC stops accepting the
+phone (sharing stopped or a new pairing link was made), the app returns to the
+pairing screen with an explanation. Split screen, folding and dark-mode changes
+keep the session.
 
 Double-tap a tile to focus it on both screens; double-tap the focused tile to
 restore the previous camera and selection. Empty canvas and viewport-pinned
 tiles do not enter focus. Pinches, drags and long presses cancel double-tap
-recognition. Single taps reveal controls after the double-tap interval.
+recognition. Single taps toggle the controls after the double-tap interval. A
+double-tap gives a short vibration and a gold ring where you tapped.
 
-Tap once to see **Received / Shown FPS** alongside the fullscreen controls.
+Tap the status chip or the details button to see **Received / Shown FPS**.
 Received counts complete H.264 pictures arriving from the PC; Shown counts
 TextureView updates observed by Android. Both use a rolling second and drop
 during a stall. They measure activity, not the configured target or physical
@@ -318,6 +351,14 @@ Those are deliberately not implemented by duplicating the desktop's tile models.
 
 ## Device smoke checks
 
+- 0.3.14 screens: check the launcher icon (including themed icons on Android
+  13+), PC cards, the large comparison number and countdown, the no-PC tips after
+  about eight seconds, and Paste with valid and invalid links. While viewing,
+  check the control bar in portrait and landscape on a narrow phone, the status
+  chip and centre panel during connecting and PC pauses with controls hidden,
+  Back and Disconnect confirmations, and the return to pairing after
+  **New pairing link** on the PC. Enter split screen, fold or unfold, and switch
+  dark mode while viewing: the session must continue.
 - Find the sharing PC nearby; request, compare numbers and approve. Verify no
   video/control before approval. Deny, cancel, expire, refresh, and try another
   phone while viewing. Stop sharing and check discovery disappears.

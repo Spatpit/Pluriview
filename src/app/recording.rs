@@ -16,6 +16,18 @@ pub(super) struct RecordingState {
     finishing: Vec<FinishingRecording>,
 }
 
+impl RecordingState {
+    /// On exit: give recordings still being finished until `deadline` to
+    /// complete their files, which are unplayable if cut off.
+    pub(super) fn wait_for_files(&mut self, deadline: Instant) {
+        for finishing in self.finishing.drain(..) {
+            let _ = finishing
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+}
+
 struct FinishingRecording {
     receiver: mpsc::Receiver<Result<PathBuf, String>>,
     /// The flight thumbnail, reused by the Screenshots panel.
@@ -33,7 +45,7 @@ struct RecordedTile {
     /// again.
     last_source: usize,
     /// A still image whose decoded pixels were released, read again once.
-    reread: Option<mpsc::Receiver<Option<ScreenshotImage>>>,
+    reread: Option<mpsc::Receiver<Option<CapturedPixels>>>,
     #[cfg(windows)]
     video_readback: Option<mpsc::Receiver<Option<VideoSnapshot>>>,
 }
@@ -281,6 +293,17 @@ impl PluriviewApp {
     /// Finish the file and fly the recording's picture into its folder in
     /// the Screenshots panel (or the Capture button), like a screenshot.
     pub(super) fn stop_recording(&mut self, ctx: &egui::Context) {
+        self.finish_recording(Some(ctx));
+    }
+
+    /// Finish the file before a workspace change discards its tiles. Tile ids
+    /// restart at 1 in the next workspace, so the recording would otherwise
+    /// carry on with whichever new tiles reuse them.
+    pub(super) fn stop_recording_for_layout_change(&mut self) {
+        self.finish_recording(None);
+    }
+
+    fn finish_recording(&mut self, ctx: Option<&egui::Context>) {
         let Some(active) = self.recording.active.take() else {
             return;
         };
@@ -288,8 +311,10 @@ impl PluriviewApp {
         let from = self.recorded_screen_rect(&ids);
         self.release_recorded_tiles(&ids);
         let length = active.clock.media_time(Instant::now());
-        let thumbnail = match (active.thumbnail, from) {
-            (Some((image, _)), Some(from)) => self.launch_capture_flight_from(from, image, ctx),
+        let thumbnail = match (active.thumbnail, from, ctx) {
+            (Some((image, _)), Some(from), Some(ctx)) => {
+                self.launch_capture_flight_from(from, image, ctx)
+            }
             _ => None,
         };
         self.recording.finishing.push(FinishingRecording {
@@ -401,7 +426,7 @@ impl PluriviewApp {
                 match receiver.try_recv() {
                     Ok(image) => {
                         tile.reread = None;
-                        pixels = image.map(CapturedPixels::Straight);
+                        pixels = image;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => tile.reread = None,
                     Err(mpsc::TryRecvError::Empty) => {}
@@ -429,15 +454,10 @@ impl PluriviewApp {
             }
             if preview.is_media() {
                 if let Some(frame) = preview.current_media_frame() {
-                    let source = frame.rgba.as_ptr() as usize;
+                    let source = Arc::as_ptr(&frame.image) as usize;
                     if source != tile.last_source {
                         tile.last_source = source;
-                        pixels = ScreenshotImage::from_straight_rgba(
-                            frame.width,
-                            frame.height,
-                            frame.rgba.clone(),
-                        )
-                        .map(CapturedPixels::Straight);
+                        pixels = Some(CapturedPixels::Premultiplied(Arc::clone(&frame.image)));
                     }
                 }
             } else if let Some(frame) = preview.latest_capture_frame() {
@@ -561,6 +581,7 @@ impl PluriviewApp {
                 rect.expand(3.0),
                 8.0,
                 egui::Stroke::new(3.0, color.gamma_multiply(strength)),
+                egui::StrokeKind::Middle,
             );
         }
         let shown = visible.into_iter().reduce(|a, b| a.union(b));
@@ -603,7 +624,12 @@ impl PluriviewApp {
         );
         let badge = egui::Rect::from_min_size(egui::pos2(x, corner.y), size);
         painter.rect_filled(badge, size.y / 2.0, egui::Color32::from_black_alpha(215));
-        painter.rect_stroke(badge, size.y / 2.0, egui::Stroke::new(1.5, color));
+        painter.rect_stroke(
+            badge,
+            size.y / 2.0,
+            egui::Stroke::new(1.5, color),
+            egui::StrokeKind::Middle,
+        );
         let mark = egui::pos2(badge.left() + 15.0, badge.center().y);
         if paused {
             for offset in [-3.0, 3.0] {
@@ -723,7 +749,7 @@ impl PluriviewApp {
             .clicked()
         {
             self.toggle_recording(ui.ctx(), Format::Mp4);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         if ui
             .add_enabled(
@@ -740,7 +766,7 @@ impl PluriviewApp {
             .clicked()
         {
             self.toggle_recording(ui.ctx(), Format::Gif);
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
         let (icon, title) = if recording == Some(true) {
             (egui_phosphor::regular::PLAY, "Resume Recording")
@@ -755,7 +781,7 @@ impl PluriviewApp {
             .clicked()
         {
             self.toggle_recording_pause();
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
 }
@@ -812,9 +838,57 @@ fn unique_path(directory: &std::path::Path, stem: &str, extension: &str) -> Path
 
 #[cfg(test)]
 mod tests {
-    use super::{format_elapsed, place_in};
+    use super::{format_elapsed, place_in, FinishingRecording, RecordingState};
+    use crate::recording::Format;
     use eframe::egui;
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn finishing(
+        receiver: mpsc::Receiver<Result<std::path::PathBuf, String>>,
+    ) -> FinishingRecording {
+        FinishingRecording {
+            receiver,
+            thumbnail: None,
+            length: Duration::from_secs(3),
+            format: Format::Mp4,
+        }
+    }
+
+    #[test]
+    fn exit_waits_for_a_recording_still_being_finished() {
+        let (done, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            let _ = done.send(Ok("clip.mp4".into()));
+        });
+        let mut state = RecordingState::default();
+        state.finishing.push(finishing(receiver));
+
+        let started = Instant::now();
+        state.wait_for_files(started + Duration::from_secs(10));
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(state.finishing.is_empty());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn exit_stops_waiting_at_the_deadline() {
+        // Never answers: a stuck disk must not keep Pluriview open.
+        let (_done, stuck) = mpsc::channel();
+        let (_done2, stuck2) = mpsc::channel();
+        let mut state = RecordingState::default();
+        state.finishing.push(finishing(stuck));
+        state.finishing.push(finishing(stuck2));
+
+        let started = Instant::now();
+        state.wait_for_files(started + Duration::from_millis(100));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(100));
+        // One shared deadline, not one per file.
+        assert!(waited < Duration::from_millis(1_000), "waited {waited:?}");
+    }
 
     #[test]
     fn elapsed_time_reads_like_a_clock() {

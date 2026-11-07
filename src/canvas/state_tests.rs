@@ -1,8 +1,8 @@
 use super::{
     apply_crop, apply_resize, browser_control_colors, capture_resolution_badge_rect, format_time,
-    live_capture_display_size, media_placeholder_content, native_capture_canvas_size,
-    pixel_aligned_rect, pixel_exact_image, playlist_first_row_center, rect_for_crop_change,
-    stream_audio_badge_rect, submenu_should_open_left, video_placeholder_content, video_time_style,
+    fps_badge_rect, live_capture_display_size, media_placeholder_content,
+    native_capture_canvas_size, pixel_aligned_rect, pixel_exact_image, playlist_first_row_center,
+    rect_for_crop_change, stream_audio_badge_rect, video_placeholder_content, video_time_style,
     video_volume_popover_rect, video_volume_slider_rect, window_capture_placeholder_content,
     window_capture_target, BrowserAction, CanvasState, DragState, PlaylistAction, ResizeHandle,
     TileActivityAction, VideoAction,
@@ -20,12 +20,6 @@ use std::time::{Duration, Instant};
 #[test]
 fn canvas_screen_rect_starts_empty() {
     assert!(CanvasState::default().last_screen_rect.is_none());
-}
-
-#[test]
-fn submenu_opens_left_only_when_the_right_side_is_too_narrow() {
-    assert!(submenu_should_open_left(1850.0, 1920.0, 280.0));
-    assert!(!submenu_should_open_left(800.0, 1920.0, 280.0));
 }
 
 #[test]
@@ -142,14 +136,15 @@ fn configurable_select_all_action_reaches_the_canvas() {
     previews.get_mut(disabled).unwrap().left_click_disabled = true;
     let mut captures = CaptureCoordinator::new();
 
-    let _ = context.run(
+    let _ = context.run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
             events: vec![Event::PointerMoved(Pos2::new(250.0, 250.0))],
             ..Default::default()
         },
-        |context| {
-            CentralPanel::default().show(context, |ui| {
+        |ui| {
+            let context = &ui.ctx().clone();
+            CentralPanel::default().show(ui, |ui| {
                 canvas.ui(ui, &mut previews, &mut captures, context, true);
             });
         },
@@ -202,8 +197,9 @@ fn deleting_a_selection_keeps_the_whole_batch_for_undo() {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
         ..Default::default()
     };
-    let _ = context.run(input(), |context| {
-        CentralPanel::default().show(context, |ui| {
+    let _ = context.run_ui(input(), |ui| {
+        let context = &ui.ctx().clone();
+        CentralPanel::default().show(ui, |ui| {
             canvas.ui(ui, &mut previews, &mut captures, context, true);
         });
     });
@@ -211,16 +207,18 @@ fn deleting_a_selection_keeps_the_whole_batch_for_undo() {
         assert!(previews.get(id).unwrap().removing.is_some());
         previews.get_mut(id).unwrap().removing = Some(Instant::now() - Duration::from_secs(1));
     }
-    let _ = context.run(input(), |context| {
-        CentralPanel::default().show(context, |ui| {
+    let _ = context.run_ui(input(), |ui| {
+        let context = &ui.ctx().clone();
+        CentralPanel::default().show(ui, |ui| {
             canvas.ui(ui, &mut previews, &mut captures, context, true);
         });
     });
     assert_eq!(canvas.last_removed.as_ref().unwrap().1.len(), 2);
     assert_eq!(previews.all().count(), 0);
     canvas.last_removed.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(60);
-    let _ = context.run(input(), |context| {
-        CentralPanel::default().show(context, |ui| {
+    let _ = context.run_ui(input(), |ui| {
+        let context = &ui.ctx().clone();
+        CentralPanel::default().show(ui, |ui| {
             canvas.ui(ui, &mut previews, &mut captures, context, true);
         });
     });
@@ -229,8 +227,9 @@ fn deleting_a_selection_keeps_the_whole_batch_for_undo() {
         "toast expiry must not discard undo"
     );
     canvas.request_removed_undo();
-    let _ = context.run(input(), |context| {
-        CentralPanel::default().show(context, |ui| {
+    let _ = context.run_ui(input(), |ui| {
+        let context = &ui.ctx().clone();
+        CentralPanel::default().show(ui, |ui| {
             canvas.ui(ui, &mut previews, &mut captures, context, false);
         });
     });
@@ -253,8 +252,9 @@ fn undo_during_removal_waits_for_the_current_batch() {
     canvas.request_removed_undo();
     let mut captures = CaptureCoordinator::new();
     let mut render = |canvas: &mut CanvasState, previews: &mut PreviewManager| {
-        let _ = context.run(RawInput::default(), |context| {
-            CentralPanel::default().show(context, |ui| {
+        let _ = context.run_ui(RawInput::default(), |ui| {
+            let context = &ui.ctx().clone();
+            CentralPanel::default().show(ui, |ui| {
                 canvas.ui(ui, previews, &mut captures, context, true);
             });
         });
@@ -311,16 +311,17 @@ fn disabled_tile_passes_primary_drag_to_the_tile_underneath() {
     let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
 
     let mut run_frame = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -385,16 +386,17 @@ fn disabled_tile_keeps_its_right_click_context_menu() {
     let pointer = Pos2::new(200.0, 160.0);
 
     let mut run_frame = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -432,15 +434,15 @@ fn long_tile_menu_scrolls_to_its_final_action_in_a_short_viewport() {
     let mut frame = 0;
     let mut render = |events| {
         frame += 1;
-        ctx.run(
+        ctx.run_ui(
             RawInput {
                 screen_rect: Some(screen),
                 time: Some(frame as f64 / 60.0),
                 events,
                 ..Default::default()
             },
-            |ctx| {
-                CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                CentralPanel::default().show(ui, |ui| {
                     let response = ui.allocate_rect(ui.max_rect(), Sense::click());
                     super::show_context_menu_if(&response, true, |ui| {
                         for index in 0..40 {
@@ -474,6 +476,7 @@ fn long_tile_menu_scrolls_to_its_final_action_in_a_short_viewport() {
             Event::MouseWheel {
                 unit: MouseWheelUnit::Point,
                 delta: Vec2::new(0.0, -150.0),
+                phase: egui::TouchPhase::Move,
                 modifiers: Modifiers::NONE,
             },
         ]);
@@ -500,14 +503,15 @@ fn foreground_menu_blocks_canvas_scroll_and_secondary_click() {
     let menu_pos = Pos2::new(150.0, 150.0);
 
     let mut render = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
-                CentralPanel::default().show(context, |ui| {
+            |ui| {
+                let context = &ui.ctx().clone();
+                CentralPanel::default().show(ui, |ui| {
                     canvas.ui(ui, &mut previews, &mut captures, context, true);
                 });
                 egui::Area::new(Id::new("test_foreground_menu"))
@@ -546,6 +550,7 @@ fn foreground_menu_blocks_canvas_scroll_and_secondary_click() {
         Event::MouseWheel {
             unit: MouseWheelUnit::Point,
             delta: Vec2::new(0.0, 20.0),
+            phase: egui::TouchPhase::Move,
             modifiers: Modifiers::NONE,
         },
     ]);
@@ -555,6 +560,7 @@ fn foreground_menu_blocks_canvas_scroll_and_secondary_click() {
         Event::MouseWheel {
             unit: MouseWheelUnit::Point,
             delta: Vec2::new(0.0, 20.0),
+            phase: egui::TouchPhase::Move,
             modifiers: Modifiers::NONE,
         },
     ]);
@@ -760,16 +766,17 @@ fn enabled_stream_audio_badge_is_visible_only_while_hovering_the_tile() {
         previews.get_mut(id).unwrap().stream_audio = true;
         let mut captures = CaptureCoordinator::new();
 
-        context.run(
+        context.run_ui(
             RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0))),
                 events: vec![Event::PointerMoved(pointer)],
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -842,16 +849,17 @@ fn left_drag_repositions_a_pinned_tile() {
     ));
     let mut captures = CaptureCoordinator::new();
     let mut run_frame = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -883,6 +891,104 @@ fn left_drag_repositions_a_pinned_tile() {
         .rect(canvas.last_screen_rect.unwrap());
     assert_eq!(moved.min, Pos2::new(180.0, 120.0));
     assert!(previews.get(id).unwrap().viewport_pin.is_some());
+}
+
+#[test]
+fn pinned_tiles_follow_a_drag_started_on_an_unpinned_tile() {
+    let context = Context::default();
+    let mut canvas = CanvasState::default();
+    let mut previews = PreviewManager::new();
+    let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0));
+    let pinned = previews.add_for_spout(
+        "pinned".to_owned(),
+        Pos2::new(60.0, 60.0),
+        Vec2::new(160.0, 120.0),
+        FpsPreset::Medium,
+    );
+    previews.get_mut(pinned).unwrap().viewport_pin = Some(crate::preview::ViewportPin::from_rect(
+        Rect::from_min_size(Pos2::new(60.0, 60.0), Vec2::new(160.0, 120.0)),
+        screen_rect,
+    ));
+    let free = previews.add_for_spout(
+        "free".to_owned(),
+        Pos2::new(500.0, 300.0),
+        Vec2::new(200.0, 150.0),
+        FpsPreset::Medium,
+    );
+    let mut captures = CaptureCoordinator::new();
+    let mut run_frame = |canvas: &mut CanvasState, previews: &mut PreviewManager, events| {
+        let _ = context.run_ui(
+            RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let context = &ui.ctx().clone();
+                CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        canvas.ui(ui, previews, &mut captures, context, true);
+                    });
+            },
+        );
+    };
+    run_frame(&mut canvas, &mut previews, vec![]);
+    canvas.selection = vec![pinned, free];
+    let viewport = canvas.last_screen_rect.unwrap();
+    let screen_of = |canvas: &CanvasState, previews: &PreviewManager, id| {
+        canvas.preview_screen_rect(previews.get(id).unwrap(), viewport)
+    };
+    let pinned_before = screen_of(&canvas, &previews, pinned);
+    let free_before = screen_of(&canvas, &previews, free);
+    assert!(!free_before.intersects(pinned_before));
+
+    let mut pointer = free_before.center();
+    run_frame(
+        &mut canvas,
+        &mut previews,
+        vec![Event::PointerMoved(pointer)],
+    );
+    run_frame(
+        &mut canvas,
+        &mut previews,
+        vec![Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    for _ in 0..6 {
+        pointer += Vec2::new(15.0, 10.0);
+        run_frame(
+            &mut canvas,
+            &mut previews,
+            vec![Event::PointerMoved(pointer)],
+        );
+    }
+    run_frame(
+        &mut canvas,
+        &mut previews,
+        vec![Event::PointerButton {
+            pos: pointer,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+
+    let free_moved = screen_of(&canvas, &previews, free).min - free_before.min;
+    let pinned_moved = screen_of(&canvas, &previews, pinned).min - pinned_before.min;
+    assert!(
+        free_moved.x > 60.0 && free_moved.y > 40.0,
+        "the drag should move the free tile: {free_moved:?}"
+    );
+    assert!(
+        (pinned_moved - free_moved).length() < 0.5,
+        "pinned tile moved {pinned_moved:?}, free tile moved {free_moved:?}"
+    );
+    assert!(previews.get(pinned).unwrap().viewport_pin.is_some());
 }
 
 #[test]
@@ -1022,17 +1128,18 @@ fn fast_tile_drag_stops_exactly_at_release_position() {
         time: f64,
         events: Vec<Event>,
     ) {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 time: Some(time),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, previews, captures, context, true);
                     });
             },
@@ -1139,13 +1246,14 @@ fn canvas_only_hides_empty_canvas_overlays() {
     let mut canvas = CanvasState::default();
     let mut previews = PreviewManager::new();
     let mut captures = CaptureCoordinator::new();
-    let output = context.run(
+    let output = context.run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
             ..Default::default()
         },
-        |context| {
-            CentralPanel::default().show(context, |ui| {
+        |ui| {
+            let context = &ui.ctx().clone();
+            CentralPanel::default().show(ui, |ui| {
                 canvas.ui(ui, &mut previews, &mut captures, context, false);
             });
         },
@@ -1174,8 +1282,9 @@ fn canvas_only_cancels_active_handle_drag() {
     let mut previews = PreviewManager::new();
     let mut captures = CaptureCoordinator::new();
 
-    let _ = context.run(RawInput::default(), |context| {
-        CentralPanel::default().show(context, |ui| {
+    let _ = context.run_ui(RawInput::default(), |ui| {
+        let context = &ui.ctx().clone();
+        CentralPanel::default().show(ui, |ui| {
             canvas.ui(ui, &mut previews, &mut captures, context, false);
         });
     });
@@ -1244,6 +1353,70 @@ fn repeated_crop_uses_the_visible_crop_span_as_its_drag_scale() {
     assert_eq!(rect.size(), Vec2::new(75.0, 50.0));
 }
 
+#[test]
+fn crop_handles_on_crops_narrower_than_the_handle_minimum_never_panic() {
+    // Fit to Video accepts video spans down to 0.01, so a narrow video at a
+    // page edge leaves a crop thinner than the 0.1 handle minimum.
+    let start = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(40.0, 300.0));
+    let crops = [
+        (0.0, 0.0, 0.05, 1.0),
+        (0.95, 0.0, 1.0, 1.0),
+        (0.0, 0.0, 1.0, 0.05),
+        (0.0, 0.95, 1.0, 1.0),
+        (0.45, 0.45, 0.5, 0.5),
+    ];
+    let handles = [
+        ResizeHandle::TopLeft,
+        ResizeHandle::Top,
+        ResizeHandle::TopRight,
+        ResizeHandle::Left,
+        ResizeHandle::Right,
+        ResizeHandle::BottomLeft,
+        ResizeHandle::Bottom,
+        ResizeHandle::BottomRight,
+    ];
+    let deltas = [Vec2::ZERO, Vec2::new(-30.0, -30.0), Vec2::new(30.0, 30.0)];
+    for start_crop in crops {
+        for handle in handles {
+            for delta in deltas {
+                let (crop, _) = apply_crop(handle, start_crop, start, delta);
+                assert!(
+                    (0.0..=1.0).contains(&crop.0)
+                        && (0.0..=1.0).contains(&crop.1)
+                        && crop.0 < crop.2
+                        && crop.1 < crop.3
+                        && crop.2 <= 1.0
+                        && crop.3 <= 1.0,
+                    "{handle:?} {start_crop:?} {delta:?} -> {crop:?}"
+                );
+                if delta == Vec2::ZERO {
+                    assert_eq!(crop, start_crop, "{handle:?} jumped at rest");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn narrow_crop_edges_can_still_grow() {
+    let start = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(40.0, 300.0));
+    let (crop, _) = apply_crop(
+        ResizeHandle::Right,
+        (0.0, 0.0, 0.05, 1.0),
+        start,
+        Vec2::new(40.0, 0.0),
+    );
+    assert!((crop.2 - 0.1).abs() < 1e-6, "{crop:?}");
+
+    let (crop, _) = apply_crop(
+        ResizeHandle::Left,
+        (0.95, 0.0, 1.0, 1.0),
+        start,
+        Vec2::new(-40.0, 0.0),
+    );
+    assert!((crop.0 - 0.9).abs() < 1e-6, "{crop:?}");
+}
+
 struct CropUiTest {
     context: Context,
     canvas: CanvasState,
@@ -1270,11 +1443,13 @@ impl CropUiTest {
                 PathBuf::from("fixture.png"),
                 "image".into(),
                 (0..if kind == 3 { 2 } else { 1 })
-                    .map(|_| crate::media::MediaFrame {
-                        width: 200,
-                        height: 100,
-                        rgba: vec![0; 200 * 100 * 4],
-                        duration: Duration::from_millis(100),
+                    .map(|_| {
+                        crate::media::MediaFrame::from_rgba(
+                            200,
+                            100,
+                            &[0; 200 * 100 * 4],
+                            Duration::from_millis(100),
+                        )
                     })
                     .collect(),
                 position,
@@ -1326,17 +1501,18 @@ impl CropUiTest {
 
     fn frame(&mut self, events: Vec<Event>) -> egui::FullOutput {
         self.time += 0.1;
-        self.context.run(
+        self.context.run_ui(
             RawInput {
                 screen_rect: Some(self.viewport),
                 time: Some(self.time),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         self.canvas
                             .ui(ui, &mut self.previews, &mut self.captures, context, true);
                     });
@@ -1401,6 +1577,7 @@ impl CropUiTest {
                 Event::MouseWheel {
                     unit: MouseWheelUnit::Point,
                     delta: Vec2::new(0.0, -150.0),
+                    phase: egui::TouchPhase::Move,
                     modifiers: Modifiers::NONE,
                 },
             ]);
@@ -1515,12 +1692,11 @@ fn tile_menu_puts_the_tiles_own_actions_first_and_remove_last() {
             "Interact",
             "Reload",
             "Page",
+            "Tile Settings",
             "Focus on This Tile",
             "Picture in Picture",
             "Pin to Viewport",
-            "Arrange",
             "Group",
-            "Tile Settings",
             "Remove",
         ];
         if frozen {
@@ -1548,7 +1724,7 @@ fn tile_menu_puts_the_tiles_own_actions_first_and_remove_last() {
         // Group-only items stay out of a lone tile's menu, and settings stay
         // in their submenu until it opens.
         for hidden in [
-            "Spotlight This Tile",
+            "Make Main Tile",
             "Fit Group to View",
             "Edit Crop",
             "Lock Aspect Ratio",
@@ -1560,6 +1736,154 @@ fn tile_menu_puts_the_tiles_own_actions_first_and_remove_last() {
             );
         }
     }
+}
+
+#[test]
+fn tile_settings_starts_with_frame_rate_and_ends_with_size() {
+    let (mut test, id) = CropUiTest::new(1, false);
+    test.frame(vec![]);
+    let output = test.open_crop_menu(id);
+    let top = |label: &str| CropUiTest::label_pos(&output, label).y;
+    for pair in [
+        "Frame Rate: 30 FPS (Medium)",
+        "Bring to Front",
+        "Send to Back",
+        "Edit Crop",
+        "Disable Left Click",
+        "Size",
+    ]
+    .windows(2)
+    {
+        assert!(
+            top(pair[0]) < top(pair[1]),
+            "{} should come before {}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+fn hidden_fixture() -> (CropUiTest, PreviewId, PreviewId) {
+    let (mut test, first) = CropUiTest::new(0, false);
+    let second = test.previews.add_for_window(
+        2,
+        43,
+        "Chat".into(),
+        Pos2::new(100.0, 300.0),
+        Vec2::new(200.0, 100.0),
+    );
+    test.frame(vec![]);
+    (test, first, second)
+}
+
+#[test]
+fn window_tile_menu_puts_tile_settings_right_after_native_size() {
+    let (mut test, id) = CropUiTest::new(0, false);
+    test.frame(vec![]);
+    let rect = test
+        .canvas
+        .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+    test.click(rect.center(), PointerButton::Secondary);
+    test.frame(vec![]);
+    let output = test.frame(vec![]);
+    let top = |label: &str| CropUiTest::label_pos(&output, label).y;
+    assert!(top("Native Size (1:1)") < top("Tile Settings"));
+    assert!(top("Tile Settings") < top("Focus on This Tile"));
+}
+
+#[test]
+fn clicking_the_fps_badge_steps_through_the_rates() {
+    let (mut test, id) = CropUiTest::new(0, false);
+    test.frame(vec![]);
+    let rect = test
+        .canvas
+        .preview_screen_rect(test.previews.get(id).unwrap(), test.viewport);
+    let badge = fps_badge_rect(rect).center();
+    for expected in [
+        FpsPreset::High,
+        FpsPreset::Low,
+        FpsPreset::Medium,
+        FpsPreset::High,
+    ] {
+        test.click(badge, PointerButton::Primary);
+        let preview = test.previews.get(id).unwrap();
+        assert_eq!(preview.fps_preset, expected);
+        assert_eq!(preview.target_fps, expected.as_u32());
+    }
+}
+
+impl CropUiTest {
+    /// Rest the pointer on a menu label for a few frames, so its submenu
+    /// opens the way hovering opens it.
+    fn hover_label(&mut self, output: &egui::FullOutput, label: &str) -> egui::FullOutput {
+        let at = Self::label_pos(output, label);
+        for step in (0..4).rev() {
+            self.frame(vec![Event::PointerMoved(
+                at - Vec2::new(3.0 * step as f32, 0.0),
+            )]);
+        }
+        self.frame(vec![]);
+        self.frame(vec![])
+    }
+}
+
+#[test]
+fn empty_canvas_menu_shows_a_single_hidden_tile_back() {
+    let (mut test, first, second) = hidden_fixture();
+    let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+    assert!(
+        !output.shapes.iter().any(|shape| matches!(&shape.shape,
+            Shape::Text(text) if text.galley.text().starts_with("Show Hidden"))),
+        "nothing is hidden yet"
+    );
+    test.frame(vec![Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    }]);
+    test.canvas
+        .set_tiles_hidden(&[second], true, &mut test.previews);
+    let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+    let output = test.hover_label(&output, "Show Hidden Tiles");
+    assert!(
+        !output.shapes.iter().any(|shape| matches!(&shape.shape,
+            Shape::Text(text) if text.galley.text() == "Show All")),
+        "Show All is only for several hidden tiles"
+    );
+    test.click(
+        CropUiTest::label_pos(&output, "Chat"),
+        PointerButton::Primary,
+    );
+    assert!(!test.previews.get(second).unwrap().hidden);
+    assert!(!test.previews.get(first).unwrap().hidden);
+}
+
+#[test]
+fn empty_canvas_menu_lists_hidden_tiles_to_show_one_or_all() {
+    let (mut test, first, second) = hidden_fixture();
+    test.canvas
+        .set_tiles_hidden(&[first, second], true, &mut test.previews);
+    let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+    let output = test.hover_label(&output, "Show Hidden Tiles");
+    test.click(
+        CropUiTest::label_pos(&output, "Chat"),
+        PointerButton::Primary,
+    );
+    assert!(!test.previews.get(second).unwrap().hidden);
+    assert!(test.previews.get(first).unwrap().hidden);
+
+    test.canvas
+        .set_tiles_hidden(&[second], true, &mut test.previews);
+    let output = test.click(Pos2::new(500.0, 50.0), PointerButton::Secondary);
+    let output = test.hover_label(&output, "Show Hidden Tiles");
+    test.click(
+        CropUiTest::label_pos(&output, "Show All"),
+        PointerButton::Primary,
+    );
+    assert!(!test.previews.get(first).unwrap().hidden);
+    assert!(!test.previews.get(second).unwrap().hidden);
 }
 
 #[test]
@@ -1637,6 +1961,42 @@ fn crop_mode_keeps_tile_still_and_empty_canvas_restores_normal_resize() {
 }
 
 #[test]
+fn workspace_change_forgets_selection_focus_and_gestures() {
+    // Tile ids restart at 1 in the next workspace, so any of this state
+    // would otherwise land on whichever new tile reuses the id.
+    let (mut test, id) = CropUiTest::new(2, false);
+    test.frame(vec![]);
+    test.canvas.selection = vec![id];
+    test.canvas
+        .focus_on_tile(id, test.previews.get(id).unwrap().rect(), test.viewport);
+    assert_eq!(test.canvas.focused_tile(), Some(id));
+    let start_rect = test.previews.get(id).unwrap().rect();
+    test.canvas.drag_state = Some(DragState::Resizing {
+        id,
+        handle: ResizeHandle::Right,
+        start_rect,
+        start_mouse: start_rect.right_center(),
+        aspect_ratio: None,
+        screen_space: false,
+    });
+    test.canvas.pending_show_window = Some(id);
+    test.canvas.pending_picture_in_picture = Some(id);
+    test.canvas.interactive_browser = Some(id);
+
+    test.canvas.clear_preview_interactions();
+
+    assert!(test.canvas.selection.is_empty());
+    assert_eq!(test.canvas.focused_tile(), None);
+    assert!(test.canvas.drag_state.is_none());
+    assert!(test.canvas.pending_show_window.is_none());
+    assert!(test.canvas.pending_picture_in_picture.is_none());
+    assert!(test.canvas.interactive_browser.is_none());
+    // Leaving focus later must not bring back the old selection.
+    assert!(!test.canvas.exit_focus());
+    assert!(test.canvas.selection.is_empty());
+}
+
+#[test]
 fn crop_mode_exits_on_escape_removal_workspace_change_and_focus() {
     let (mut test, id) = CropUiTest::new(2, false);
     test.canvas.begin_crop(id, &test.previews);
@@ -1687,17 +2047,18 @@ fn alt_crop_right_edge(
         .right_center();
     let end = start - Vec2::new(50.0, 0.0);
     let mut run_frame = |events, modifiers| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 modifiers,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -1757,12 +2118,12 @@ fn alt_crop_drag_crops_an_image_tile() {
     let id = previews.add_media(
         PathBuf::from("image.png"),
         "image".to_owned(),
-        vec![crate::media::MediaFrame {
-            width: 200,
-            height: 100,
-            rgba: vec![0; 200 * 100 * 4],
-            duration: Duration::from_millis(100),
-        }],
+        vec![crate::media::MediaFrame::from_rgba(
+            200,
+            100,
+            &[0; 200 * 100 * 4],
+            Duration::from_millis(100),
+        )],
         Pos2::new(100.0, 100.0),
         Vec2::new(200.0, 100.0),
     );
@@ -1851,16 +2212,17 @@ fn canvas_only_does_not_show_resize_cursor_for_hidden_handles() {
     );
     canvas.selection = vec![id];
     let mut captures = CaptureCoordinator::new();
-    let output = context.run(
+    let output = context.run_ui(
         RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
             events: vec![Event::PointerMoved(Pos2::new(200.0, 200.0))],
             ..Default::default()
         },
-        |context| {
+        |ui| {
+            let context = &ui.ctx().clone();
             CentralPanel::default()
-                .frame(egui::Frame::none())
-                .show(context, |ui| {
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
                     canvas.ui(ui, &mut previews, &mut captures, context, false);
                 });
         },
@@ -1884,16 +2246,17 @@ fn tile_focus_hides_zoom_badge_and_resize_cursor() {
     canvas.focus_on_tile(id, tile, screen_rect);
     let mut captures = CaptureCoordinator::new();
     let focused = canvas.canvas_rect_to_screen(tile, screen_rect);
-    let output = context.run(
+    let output = context.run_ui(
         RawInput {
             screen_rect: Some(screen_rect),
             events: vec![Event::PointerMoved(focused.right_bottom())],
             ..Default::default()
         },
-        |context| {
+        |ui| {
+            let context = &ui.ctx().clone();
             CentralPanel::default()
-                .frame(egui::Frame::none())
-                .show(context, |ui| {
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
                     canvas.ui(ui, &mut previews, &mut captures, context, true);
                 });
         },
@@ -1933,16 +2296,17 @@ fn left_drag_on_empty_canvas_marquee_selects_intersecting_tiles() {
     let mut captures = CaptureCoordinator::new();
     let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
     let mut run_frame = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -1985,16 +2349,17 @@ fn resize_handle_outside_tile_wins_over_empty_canvas_marquee() {
     let mut captures = CaptureCoordinator::new();
     let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
     let mut run_frame = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -2133,16 +2498,17 @@ fn tile_close_button_starts_removal() {
     let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
 
     let mut run_frame = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -2191,16 +2557,17 @@ fn paused_video_play_button_queues_explicit_resume() {
     let mut captures = CaptureCoordinator::new();
     let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0));
     let mut run_frame = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -2252,16 +2619,17 @@ fn playlist_row_queues_file_selection() {
     let mut captures = CaptureCoordinator::new();
     let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 550.0));
     let mut run_frame = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -2321,16 +2689,17 @@ fn playlist_row_stays_clickable_after_canvas_zoom() {
     let mut captures = CaptureCoordinator::new();
     let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 1100.0));
     let mut run_frame = |events| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, &mut previews, &mut captures, context, true);
                     });
             },
@@ -2483,7 +2852,7 @@ fn shift_wheel_over_a_browser_tile_scrolls_its_page_instead_of_zooming() {
                  previews: &mut PreviewManager,
                  captures: &mut CaptureCoordinator,
                  modifiers: Modifiers| {
-        let _ = context.run(
+        let _ = context.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events: vec![
@@ -2491,16 +2860,18 @@ fn shift_wheel_over_a_browser_tile_scrolls_its_page_instead_of_zooming() {
                     Event::MouseWheel {
                         unit: MouseWheelUnit::Point,
                         delta: Vec2::new(0.0, -50.0),
+                        phase: egui::TouchPhase::Move,
                         modifiers,
                     },
                 ],
                 modifiers,
                 ..Default::default()
             },
-            |context| {
+            |ui| {
+                let context = &ui.ctx().clone();
                 CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(context, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
                         canvas.ui(ui, previews, captures, context, true);
                     });
             },
@@ -2803,11 +3174,8 @@ fn hidden_tiles_leave_the_selection_and_a_grouped_tile_moves_its_group() {
     let second = previews.add("second".to_owned(), Pos2::new(60.0, 0.0), Vec2::splat(50.0));
     let loose = previews.add("loose".to_owned(), Pos2::new(200.0, 0.0), Vec2::splat(50.0));
     for (order, id) in [first, second].into_iter().enumerate() {
-        previews.get_mut(id).unwrap().tile_group = Some(crate::preview::TileGroup {
-            id: 7,
-            name: "Group".to_owned(),
-            order: order as u32,
-        });
+        previews.get_mut(id).unwrap().tile_group =
+            Some(crate::preview::TileGroup::new(7, "Group", order as u32));
     }
 
     canvas.move_tile_by(second, Vec2::new(10.0, 20.0), &mut previews);
@@ -2827,4 +3195,224 @@ fn hidden_tiles_leave_the_selection_and_a_grouped_tile_moves_its_group() {
     canvas.select_tile(first, &mut previews);
     assert!(!previews.get(first).unwrap().hidden && !previews.get(second).unwrap().hidden);
     assert_eq!(canvas.selection, vec![first, second]);
+}
+
+#[test]
+fn saved_viewpoints_submenu_stays_on_screen_at_the_right_edge() {
+    let (mut test, _) = CropUiTest::new(0, false);
+    let viewport = test.viewport;
+    let render = |test: &mut CropUiTest, events: Vec<Event>| {
+        test.time += 0.1;
+        let time = test.time;
+        let CropUiTest {
+            context,
+            canvas,
+            previews,
+            captures,
+            ..
+        } = test;
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(viewport),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let context = &ui.ctx().clone();
+                CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        canvas.ui_with_canvas_views_menu(
+                            ui,
+                            previews,
+                            captures,
+                            context,
+                            true,
+                            &crate::hotkeys::HotkeyBindings::default(),
+                            |ui| {
+                                // As wide as the real list of saved viewpoints.
+                                ui.set_width(264.0);
+                                ui.label("Viewpoint fixture");
+                                false
+                            },
+                        );
+                    });
+            },
+        )
+    };
+    let text_rect = |output: &egui::FullOutput, label: &str| {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            Shape::Text(text) if text.galley.text() == label => {
+                Some(Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            _ => None,
+        })
+    };
+
+    let anchor = Pos2::new(viewport.right() - 20.0, 50.0);
+    render(&mut test, vec![Event::PointerMoved(anchor)]);
+    for pressed in [true, false] {
+        render(
+            &mut test,
+            vec![Event::PointerButton {
+                pos: anchor,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+    }
+    let output = render(&mut test, vec![]);
+    let button = text_rect(&output, "Saved Viewpoints").expect("canvas menu must open");
+    let mut output = output;
+    for step in (0..4).rev() {
+        output = render(
+            &mut test,
+            vec![Event::PointerMoved(
+                button.center() - Vec2::new(3.0 * step as f32, 0.0),
+            )],
+        );
+    }
+    for _ in 0..2 {
+        output = render(&mut test, vec![]);
+    }
+    let entry = text_rect(&output, "Viewpoint fixture").expect("submenu must open");
+    assert!(
+        viewport.contains_rect(entry),
+        "submenu entry {entry:?} must stay inside {viewport:?}"
+    );
+    assert!(
+        entry.right() < button.left(),
+        "with no room on the right, the submenu opens to the left"
+    );
+}
+
+#[test]
+fn right_click_on_a_side_panel_opens_its_menu_not_the_canvas_menu() {
+    let (mut test, _) = CropUiTest::new(0, false);
+    let viewport = test.viewport;
+    let render = |test: &mut CropUiTest, events: Vec<Event>| {
+        test.time += 0.1;
+        let time = test.time;
+        let CropUiTest {
+            context,
+            canvas,
+            previews,
+            captures,
+            ..
+        } = test;
+        context.run_ui(
+            RawInput {
+                screen_rect: Some(viewport),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let context = &ui.ctx().clone();
+                // Like the Screenshots panel: drawn before the canvas, with
+                // its own right-click menu on each card.
+                egui::Panel::right("side_panel_fixture")
+                    .exact_size(160.0)
+                    .show(ui, |ui| {
+                        let card = ui.add(
+                            egui::Button::new("Card fixture")
+                                .min_size(Vec2::new(140.0, 80.0))
+                                .sense(egui::Sense::click()),
+                        );
+                        crate::ui_theme::context_menu(&card, |ui| {
+                            ui.label("Card menu fixture");
+                        });
+                    });
+                CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        canvas.ui_with_canvas_views_menu(
+                            ui,
+                            previews,
+                            captures,
+                            context,
+                            true,
+                            &crate::hotkeys::HotkeyBindings::default(),
+                            |_| false,
+                        );
+                    });
+            },
+        )
+    };
+    let has_text = |output: &egui::FullOutput, label: &str| {
+        output
+            .shapes
+            .iter()
+            .any(|shape| matches!(&shape.shape, Shape::Text(text) if text.galley.text() == label))
+    };
+    let right_click = |test: &mut CropUiTest, at: Pos2| {
+        render(test, vec![Event::PointerMoved(at)]);
+        for pressed in [true, false] {
+            render(
+                test,
+                vec![Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Secondary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+        }
+        render(test, vec![])
+    };
+
+    let card = Pos2::new(viewport.right() - 80.0, 60.0);
+    let output = right_click(&mut test, card);
+    assert!(
+        has_text(&output, "Card menu fixture"),
+        "the card's menu must open"
+    );
+    assert!(
+        !has_text(&output, "ADD TO CANVAS"),
+        "a right-click on the panel must not open the canvas menu"
+    );
+
+    // Empty canvas still gets its own menu.
+    let output = right_click(&mut test, Pos2::new(40.0, viewport.bottom() - 40.0));
+    assert!(
+        has_text(&output, "ADD TO CANVAS"),
+        "empty canvas opens its menu"
+    );
+    render(
+        &mut test,
+        vec![Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+
+    // A tile that runs on under the panel (screen x 650..850, y 40..140)
+    // must not take the card's right-click either.
+    test.canvas.zoom = 1.0;
+    test.canvas.pan = Vec2::new(550.0, -60.0);
+    let output = right_click(&mut test, Pos2::new(700.0, 60.0));
+    assert!(
+        has_text(&output, "Remove"),
+        "the tile's visible part opens its menu"
+    );
+    render(
+        &mut test,
+        vec![Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    let output = right_click(&mut test, card);
+    assert!(
+        has_text(&output, "Card menu fixture"),
+        "the card's menu must open over a tile hidden under the panel"
+    );
 }

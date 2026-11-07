@@ -1,6 +1,5 @@
 use super::*;
 
-/// Contains "Pluriview" so the window picker never lists it as a source.
 const TITLE: &str = "Pluriview Picture in Picture";
 const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(13, 13, 13);
 /// The longer side of a newly opened window, in points.
@@ -325,12 +324,13 @@ impl PluriviewApp {
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of(TITLE),
             builder,
-            |ctx, _class| {
+            |ui, _class| {
+                let ctx = &ui.ctx().clone();
                 close |= ctx.input(|input| input.viewport().close_requested());
                 window_rect = ctx.input(|input| input.viewport().inner_rect);
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(BACKGROUND))
-                    .show(ctx, |ui| {
+                    .frame(egui::Frame::NONE.fill(BACKGROUND))
+                    .show(ui, |ui| {
                         let area = ui.max_rect();
                         let content = fit(open.aspect, area);
                         let painter = ui.painter_at(area);

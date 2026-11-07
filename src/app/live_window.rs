@@ -356,7 +356,6 @@ impl PluriviewApp {
             || !usable
             || minimized
             || self.window_controls.click_through
-            || self.canvas.is_spotlighting()
             || self.canvas.is_editing_crop(id)
             || self.browser.active_id().is_some()
             || native::is_minimized(session.hwnd)
@@ -608,7 +607,10 @@ impl PluriviewApp {
     /// behind the windows that covered it, and puts Pluriview back over it if
     /// it covered the window before.
     fn release_live_window(&mut self, session: LiveWindowSession, ending: Ending) {
-        if ending == Ending::Restore && !native::is_hung(session.hwnd) {
+        let hung = native::is_hung(session.hwnd);
+        if matches!(ending, Ending::Gone) || (ending == Ending::Restore && hung) {
+            send_home_without_waiting(&session, hung);
+        } else if ending == Ending::Restore {
             if session.phase == Phase::Framing {
                 // Never moved; only a window shown for this goes back down.
                 if let Some(placement) = session.minimized_from {
@@ -640,7 +642,10 @@ impl PluriviewApp {
                 native::place_above(main, session.hwnd);
             }
         }
-        if session.recorded.is_some() {
+        // A frozen app may never act on the posted move: keep the record, so
+        // the next launch still puts the window back if it is where
+        // Pluriview left it.
+        if session.recorded.is_some() && !(ending == Ending::Restore && hung) {
             if let Some(storage) = &self.storage {
                 if let Err(error) = std::fs::remove_file(storage.window_in_use_path()) {
                     if error.kind() != std::io::ErrorKind::NotFound {
@@ -685,6 +690,26 @@ impl PluriviewApp {
         if let Err(error) = write_window_in_use(&storage.window_in_use_path(), &record) {
             log::warn!("Could not record the window in use: {error}");
         }
+    }
+}
+
+/// Send home a window that can't be handed back the usual way, with posted
+/// requests only:
+/// - A frozen app would block Pluriview on anything else. It moves (and
+///   minimizes again, if it was minimized) once it responds.
+/// - An app that hid itself, such as one closing to the tray, would otherwise
+///   reopen over its tile. It moves while hidden and stays hidden.
+fn send_home_without_waiting(session: &LiveWindowSession, hung: bool) {
+    let hwnd = session.hwnd;
+    // Closed, or minimized over its tile: a move would only shift its icon.
+    if !native::exists(hwnd) || native::is_minimized(hwnd) {
+        return;
+    }
+    if session.phase != Phase::Framing {
+        native::move_window(hwnd, session.home);
+    }
+    if hung && session.minimized_from.is_some() && native::is_alive(hwnd) {
+        native::minimize_without_waiting(hwnd);
     }
 }
 
@@ -819,5 +844,57 @@ mod tests {
         assert!(arrives(window.handle(), home));
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    #[ignore = "moves native windows; run with --ignored on a Windows desktop"]
+    fn a_window_that_hides_itself_while_in_use_goes_home_hidden() {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+
+        let window = TestWindow::new(None);
+        pump_messages();
+        let home = native::read_frame(window.handle()).unwrap().outer.origin();
+        let placed = (home.0 + 700, home.1 + 300);
+        assert!(native::move_window(window.handle(), placed));
+        assert!(arrives(window.handle(), placed));
+        let session = LiveWindowSession {
+            id: PreviewId(1),
+            hwnd: window.handle(),
+            pid: std::process::id(),
+            home,
+            known: placed,
+            minimized_from: None,
+            was_below: false,
+            covered_by: Vec::new(),
+            visible_size: (640, 480),
+            dpi: 96,
+            placed_zoom: None,
+            refits: 0,
+            phase: Phase::Live {
+                since: Instant::now(),
+            },
+            moved_at: None,
+            placed_at: None,
+            recorded: None,
+        };
+
+        // Like an app closing to the tray: hidden, not closed.
+        unsafe {
+            let _ = ShowWindow(HWND(window.handle() as *mut _), SW_HIDE);
+        }
+        assert!(native::exists(window.handle()) && !native::is_alive(window.handle()));
+        send_home_without_waiting(&session, false);
+        assert!(arrives(window.handle(), home));
+        assert!(!native::is_alive(window.handle()), "it must stay hidden");
+
+        // Still being set up (never moved): left alone.
+        let framing = LiveWindowSession {
+            phase: Phase::Framing,
+            home: placed,
+            ..session
+        };
+        send_home_without_waiting(&framing, false);
+        assert!(!arrives(window.handle(), placed));
     }
 }

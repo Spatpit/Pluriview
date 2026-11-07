@@ -5,9 +5,10 @@ import java.io.IOException;
 
 /** Fixed AAC-LC stereo profile; framing is bounded before any allocation. */
 final class AudioPacket {
+    static final String UNSUPPORTED = "Unsupported audio format";
     static void header(DataInputStream in) throws IOException {
         if (in.readInt() != 0x50564131 || in.readUnsignedShort() != 0x1190)
-            throw new IOException("Unsupported audio format");
+            throw new IOException(UNSUPPORTED);
     }
     final byte[] bytes;
     final long received = System.nanoTime();

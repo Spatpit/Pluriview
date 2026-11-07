@@ -3,9 +3,10 @@ use super::*;
 impl PluriviewApp {
     /// Keep source editing out of a failed-load canvas until the user recovers
     /// it or explicitly opens a different workspace.
-    pub(super) fn workspace_recovery_ui(&mut self, ctx: &egui::Context) {
+    pub(super) fn workspace_recovery_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         self.handle_frameless_resize(ctx);
-        egui::TopBottomPanel::top("workspace_recovery_title").show(ctx, |ui| {
+        egui::Panel::top("workspace_recovery_title").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let title = ui.label("Pluriview — Workspace Recovery");
                 if title.interact(egui::Sense::drag()).drag_started() {
@@ -25,7 +26,7 @@ impl PluriviewApp {
         let mut recover = false;
         let mut create = false;
         let mut switch = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(24.0);
                 ui.heading("This workspace could not be opened");
@@ -85,7 +86,6 @@ impl PluriviewApp {
             }
         } else if create {
             self.workspace_dialog = Some(WorkspaceDialog {
-                kind: WorkspaceDialogKind::Create,
                 name: "Untitled Workspace".to_owned(),
                 focused: false,
             });
@@ -114,6 +114,9 @@ impl PluriviewApp {
                 );
             }
             Err(error) => {
+                // Reload Workspace failed: the recovery screen takes over,
+                // and what was running must not carry on behind it.
+                self.close_running_workspace();
                 self.workspace_error = Some(error);
             }
         }
@@ -222,17 +225,10 @@ impl PluriviewApp {
         Ok(())
     }
 
-    pub(super) fn create_workspace(&mut self, name: &str, duplicate: bool) -> Result<(), String> {
+    pub(super) fn create_workspace(&mut self, name: &str) -> Result<(), String> {
         let name = self.valid_workspace_name(name, None)?;
-        if duplicate && !self.workspace_save.is_ready() {
-            return Err("Load or recover the workspace before duplicating it.".to_owned());
-        }
         self.save_before_workspace_change()?;
-        let layout = if duplicate {
-            self.create_layout()
-        } else {
-            self.blank_workspace_layout()
-        };
+        let layout = self.blank_workspace_layout();
         let previous_index = self.workspaces.clone();
         let id = self.workspaces.add(name);
         self.workspaces.active_workspace_id = id;
@@ -250,12 +246,11 @@ impl PluriviewApp {
         Ok(())
     }
 
-    pub(super) fn rename_active_workspace(&mut self, name: &str) -> Result<(), String> {
-        let active_id = self.workspaces.active_workspace_id.clone();
-        let name = self.valid_workspace_name(name, Some(&active_id))?;
+    pub(super) fn rename_workspace(&mut self, id: &str, name: &str) -> Result<(), String> {
+        let name = self.valid_workspace_name(name, Some(id))?;
         let previous_index = self.workspaces.clone();
-        if !self.workspaces.rename(&active_id, name) {
-            return Err("The active workspace no longer exists.".to_owned());
+        if !self.workspaces.rename(id, name) {
+            return Err("That workspace no longer exists.".to_owned());
         }
         let result = self
             .storage
@@ -269,7 +264,86 @@ impl PluriviewApp {
         Ok(())
     }
 
-    pub(super) fn delete_active_workspace(&mut self) -> Result<(), String> {
+    /// Copy a workspace, listed right after the original, without switching
+    /// to it. Returns the copy's id.
+    pub(super) fn duplicate_workspace(&mut self, id: &str) -> Result<String, String> {
+        let Some(source) = self
+            .workspaces
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .map(|workspace| workspace.name.clone())
+        else {
+            return Err("That workspace no longer exists.".to_owned());
+        };
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| "Workspace storage is unavailable.".to_owned())?;
+        // The open workspace is copied as it is now, unsaved edits included.
+        let layout = if id == self.workspaces.active_workspace_id {
+            if !self.workspace_save.is_ready() {
+                return Err("Load or recover the workspace before duplicating it.".to_owned());
+            }
+            self.create_layout()
+        } else {
+            storage
+                .load_workspace(id)
+                .map_err(|error| format!("Could not load workspace: {error}"))?
+        };
+        let previous_index = self.workspaces.clone();
+        let name = unique_workspace_name(&self.workspaces.workspaces, &source, "Copy");
+        let copy_id = self.workspaces.add(name);
+        if let Some(position) = self.workspaces.workspaces.iter().position(|w| w.id == id) {
+            let copy = self
+                .workspaces
+                .workspaces
+                .pop()
+                .expect("the copy was just added");
+            self.workspaces.workspaces.insert(position + 1, copy);
+        }
+        // Write the layout first: the catalog must only list durable files.
+        if let Err(error) = storage.save_workspace(&copy_id, &layout) {
+            self.workspaces = previous_index;
+            return Err(format!("Could not duplicate workspace: {error}"));
+        }
+        if let Err(error) = storage.save_workspace_index(&self.workspaces) {
+            self.workspaces = previous_index;
+            let _ = storage.delete_workspace(&copy_id);
+            return Err(format!("Could not duplicate workspace: {error}"));
+        }
+        Ok(copy_id)
+    }
+
+    /// Delete any workspace. The open one hands over to the next in the list.
+    pub(super) fn delete_workspace(&mut self, id: &str) -> Result<(), String> {
+        if id == self.workspaces.active_workspace_id {
+            return self.delete_active_workspace();
+        }
+        if self.workspaces.workspaces.len() <= 1 {
+            return Err("The only workspace cannot be deleted.".to_owned());
+        }
+        let previous_index = self.workspaces.clone();
+        if !self.workspaces.remove(id) {
+            return Err("That workspace no longer exists.".to_owned());
+        }
+        let Some(storage) = &self.storage else {
+            self.workspaces = previous_index;
+            return Err("Workspace storage is unavailable.".to_owned());
+        };
+        if let Err(error) = storage.save_workspace_index(&self.workspaces) {
+            self.workspaces = previous_index;
+            return Err(format!("Could not update the workspace list: {error}"));
+        }
+        if let Err(error) = storage.delete_workspace(id) {
+            self.workspace_error = Some(format!(
+                "The workspace was removed from the list, but its old file could not be deleted: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn delete_active_workspace(&mut self) -> Result<(), String> {
         if self.workspaces.workspaces.len() <= 1 {
             return Err("The only workspace cannot be deleted.".to_owned());
         }
@@ -352,29 +426,152 @@ impl PluriviewApp {
         Ok(())
     }
 
-    pub(super) fn unique_recovered_workspace_name(&self, active_name: &str) -> String {
-        let shortened = active_name.chars().take(38).collect::<String>();
-        let base = format!("{shortened} Recovered");
-        if self
+    /// The Workspace menu: one row per workspace. Hovering a row shows
+    /// Duplicate, Rename and Delete on its right; Rename edits the name in
+    /// place. Switching and creating are returned to run after the menu.
+    pub(super) fn workspace_menu_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<WorkspaceMenuAction> {
+        crate::ui_theme::menu(ui);
+        crate::ui_theme::section(ui, "WORKSPACES");
+        let mut action = None;
+        let can_delete = self.workspaces.workspaces.len() > 1;
+        let entries: Vec<(String, String)> = self
             .workspaces
             .workspaces
             .iter()
-            .all(|workspace| !workspace.name.eq_ignore_ascii_case(&base))
-        {
-            return base;
-        }
-        for suffix in 2.. {
-            let candidate = format!("{shortened} Recovered {suffix}");
+            .map(|workspace| (workspace.id.clone(), workspace.name.clone()))
+            .collect();
+        for (id, name) in entries {
             if self
-                .workspaces
-                .workspaces
-                .iter()
-                .all(|workspace| !workspace.name.eq_ignore_ascii_case(&candidate))
+                .workspace_rename
+                .as_ref()
+                .is_some_and(|rename| rename.id == id)
             {
-                return candidate;
+                self.workspace_rename_row(ui);
+                continue;
+            }
+            let active = id == self.workspaces.active_workspace_id;
+            let Some(row_action) = workspace_row(ui, &id, &name, active, can_delete) else {
+                continue;
+            };
+            // A name still being edited is saved first; if it cannot be,
+            // its field stays open with the reason.
+            if !self.commit_workspace_rename() {
+                continue;
+            }
+            match row_action {
+                WorkspaceRowAction::Open => {
+                    action = Some(WorkspaceMenuAction::Switch(id));
+                    ui.close_kind(egui::UiKind::Menu);
+                }
+                WorkspaceRowAction::Duplicate => match self.duplicate_workspace(&id) {
+                    Ok(copy_id) => {
+                        let name = self
+                            .workspaces
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == copy_id)
+                            .map(|workspace| workspace.name.clone())
+                            .unwrap_or_default();
+                        self.workspace_rename = Some(WorkspaceRename::new(copy_id, name));
+                    }
+                    Err(error) => {
+                        self.workspace_error = Some(error);
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
+                },
+                WorkspaceRowAction::Rename => {
+                    self.workspace_rename = Some(WorkspaceRename::new(id, name));
+                }
+                WorkspaceRowAction::Delete => {
+                    self.confirm_workspace_delete = Some(id);
+                    ui.close_kind(egui::UiKind::Menu);
+                }
             }
         }
-        unreachable!("an unused recovered workspace name always exists")
+        ui.separator();
+        if crate::ui_theme::action(ui, egui_phosphor::regular::PLUS, "New Workspace...").clicked()
+            && self.commit_workspace_rename()
+        {
+            action = Some(WorkspaceMenuAction::New);
+            ui.close_kind(egui::UiKind::Menu);
+        }
+        action
+    }
+
+    /// The name field shown in place of a workspace's row while renaming.
+    fn workspace_rename_row(&mut self, ui: &mut egui::Ui) {
+        let Some(rename) = &mut self.workspace_rename else {
+            return;
+        };
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut rename.name)
+                .char_limit(60)
+                .desired_width(f32::INFINITY)
+                .margin(egui::vec2(8.0, 5.0)),
+        );
+        if !rename.focused {
+            response.request_focus();
+            select_all(ui.ctx(), response.id, rename.name.chars().count());
+            rename.focused = true;
+        }
+        if response.changed() {
+            rename.error = None;
+        }
+        let (hint, color) = match &rename.error {
+            Some(error) => (error.as_str(), crate::ui_theme::DANGER),
+            None => ("Enter to save, Esc to cancel", crate::ui_theme::SECONDARY),
+        };
+        ui.label(egui::RichText::new(hint).size(12.0).color(color));
+        if response.lost_focus() {
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.workspace_rename = None;
+            } else {
+                self.commit_workspace_rename();
+            }
+        }
+    }
+
+    /// Save the name being edited. An invalid name keeps the field open with
+    /// the reason and returns false.
+    pub(super) fn commit_workspace_rename(&mut self) -> bool {
+        let Some(rename) = self.workspace_rename.take() else {
+            return true;
+        };
+        let unchanged = self
+            .workspaces
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == rename.id && workspace.name == rename.name.trim());
+        if unchanged {
+            return true;
+        }
+        match self.rename_workspace(&rename.id, &rename.name) {
+            Ok(()) => true,
+            Err(error) => {
+                self.workspace_rename = Some(WorkspaceRename {
+                    error: Some(error),
+                    focused: false,
+                    ..rename
+                });
+                false
+            }
+        }
+    }
+
+    /// The Workspace menu closed: Esc cancels a rename, clicking away saves it.
+    pub(super) fn workspace_menu_closed(&mut self, escape: bool) {
+        if escape {
+            self.workspace_rename = None;
+        } else if !self.commit_workspace_rename() {
+            self.workspace_error = self.workspace_rename.take().and_then(|rename| rename.error);
+        }
+    }
+
+    pub(super) fn unique_recovered_workspace_name(&self, active_name: &str) -> String {
+        unique_workspace_name(&self.workspaces.workspaces, active_name, "Recovered")
     }
 
     pub(super) fn valid_workspace_name(
@@ -447,12 +644,15 @@ impl PluriviewApp {
             active_view: self.active_canvas_view,
         };
 
-        // Save all previews
-        layout.previews = self
-            .preview_manager
-            .all()
+        // Save all previews in the order they were added, which is the saved
+        // order for a loaded workspace. Hash-map order would make the first
+        // autosave after every load rewrite a workspace that has not changed.
+        let mut previews: Vec<&Preview> = self.preview_manager.all().collect();
+        previews.sort_by_key(|preview| preview.id.0);
+        layout.previews = previews
+            .into_iter()
             .map(|p| {
-                let mut saved = self.canvas.saved_tile_layout(p);
+                let mut saved = PreviewLayout::from(p);
                 #[cfg(windows)]
                 {
                     // Ask the live WebView where it actually is, so the tile
@@ -494,9 +694,34 @@ impl PluriviewApp {
 
     /// Apply a SavedLayout to restore state
     pub(super) fn apply_layout(&mut self, layout: &SavedLayout) {
+        self.close_running_workspace();
+        #[cfg(windows)]
+        {
+            self.next_playlist_group = layout
+                .previews
+                .iter()
+                .filter_map(|preview| preview.playlist_group)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+        }
+
+        // Restore canvas state
+        self.apply_layout_contents(layout);
+    }
+
+    /// Stop everything the current workspace runs: tiles and their
+    /// captures, videos, browsers, audio, recording, wallpaper, picture in
+    /// picture and the window in use. Before a layout replaces it, and when a
+    /// reload fails, so nothing keeps playing behind the recovery screen.
+    fn close_running_workspace(&mut self) {
         #[cfg(windows)]
         self.drop_live_window();
         self.close_picture_in_picture();
+        self.stop_recording_for_layout_change();
+        self.screenshots.forget_tile_requests();
+        // "Change URL..." targets a tile id that the next layout reuses.
+        self.add_browser = None;
         self.source_loads.clear();
         self.canvas_view_dialog = None;
         self.active_canvas_view = None;
@@ -516,13 +741,6 @@ impl PluriviewApp {
             self.seek_preview_manager.clear();
             self.playlist_thumbnail_queue.clear();
             self.playlist_thumbnail_jobs.clear();
-            self.next_playlist_group = layout
-                .previews
-                .iter()
-                .filter_map(|preview| preview.playlist_group)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
         }
         self.preview_manager.clear();
         self.canvas.clear_preview_interactions();
@@ -536,8 +754,10 @@ impl PluriviewApp {
             self.window_audio_monitors.clear();
             self.last_inactive_window_scan = None;
         }
+    }
 
-        // Restore canvas state
+    /// Restore `layout` into the cleared app: canvas, wallpaper and tiles.
+    fn apply_layout_contents(&mut self, layout: &SavedLayout) {
         self.canvas.pan = Vec2::new(layout.canvas.pan.0, layout.canvas.pan.1);
         self.canvas.zoom = layout.canvas.zoom;
         self.canvas.show_grid = layout.canvas.show_grid;
@@ -560,18 +780,6 @@ impl PluriviewApp {
         // `pending_maximize` (read once, in `new`) in sync.
         self.window_layout = layout.window.unwrap_or(self.window_layout);
 
-        #[cfg(windows)]
-        {
-            self.recent_urls = layout
-                .recent_browser_urls
-                .iter()
-                .filter_map(|url| scrub_url_for_storage(url))
-                .collect();
-        }
-        #[cfg(not(windows))]
-        {
-            self.recent_urls = layout.recent_browser_urls.clone();
-        }
         #[cfg(windows)]
         {
             self.monitor_device = layout.monitor_device.clone();
@@ -759,6 +967,21 @@ impl PluriviewApp {
             }
         }
 
+        // Restored after the tiles: recreating each browser tile remembers
+        // its URL, which would otherwise push the saved recent sites out.
+        #[cfg(windows)]
+        {
+            self.recent_urls = layout
+                .recent_browser_urls
+                .iter()
+                .filter_map(|url| scrub_url_for_storage(url))
+                .collect();
+        }
+        #[cfg(not(windows))]
+        {
+            self.recent_urls = layout.recent_browser_urls.clone();
+        }
+
         #[cfg(windows)]
         {
             let group_to_video = self
@@ -779,5 +1002,339 @@ impl PluriviewApp {
                 }
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceRowAction {
+    Open,
+    Duplicate,
+    Rename,
+    Delete,
+}
+
+const WORKSPACE_ROW_HEIGHT: f32 = 28.0;
+const WORKSPACE_TOOL_WIDTH: f32 = 26.0;
+
+/// One workspace in the menu. The open one is highlighted; the row under
+/// the pointer shows its own Duplicate, Rename and Delete buttons on the
+/// right, so it is clear which workspace they act on.
+fn workspace_row(
+    ui: &mut egui::Ui,
+    id: &str,
+    name: &str,
+    active: bool,
+    can_delete: bool,
+) -> Option<WorkspaceRowAction> {
+    use egui_phosphor::regular as icons;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), WORKSPACE_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, name)
+    });
+    let hovered = ui.rect_contains_pointer(rect);
+    let painter = ui.painter().clone();
+    if active {
+        painter.rect_filled(rect, 5.0, crate::ui_theme::GOLD_DARK);
+    } else if hovered {
+        painter.rect_filled(rect, 5.0, crate::ui_theme::HOVER);
+    }
+
+    let mut tools = vec![
+        (
+            icons::COPY,
+            "Duplicate",
+            WorkspaceRowAction::Duplicate,
+            crate::ui_theme::TEXT,
+        ),
+        (
+            icons::PENCIL_SIMPLE,
+            "Rename",
+            WorkspaceRowAction::Rename,
+            crate::ui_theme::TEXT,
+        ),
+    ];
+    if can_delete {
+        tools.push((
+            icons::TRASH,
+            "Delete",
+            WorkspaceRowAction::Delete,
+            crate::ui_theme::DANGER,
+        ));
+    }
+    let padding = ui.spacing().button_padding.x;
+    let tools_left = if hovered {
+        rect.right() - 2.0 - WORKSPACE_TOOL_WIDTH * tools.len() as f32
+    } else {
+        rect.right() - padding
+    };
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + padding, rect.center().y - 9.0),
+        egui::pos2(tools_left - 4.0, rect.center().y + 9.0),
+    );
+    let color = if active {
+        crate::ui_theme::GOLD
+    } else {
+        crate::ui_theme::TEXT
+    };
+    crate::ui_theme::clipped_text(ui, text_rect, name, 14.0, color);
+
+    let mut action = response.clicked().then_some(WorkspaceRowAction::Open);
+    if hovered {
+        for (index, (icon, tip, tool_action, color)) in tools.into_iter().enumerate() {
+            let tool_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    tools_left + WORKSPACE_TOOL_WIDTH * index as f32,
+                    rect.top() + 2.0,
+                ),
+                egui::vec2(WORKSPACE_TOOL_WIDTH, WORKSPACE_ROW_HEIGHT - 4.0),
+            );
+            let tool = ui
+                .interact(
+                    tool_rect,
+                    ui.id().with(("workspace-tool", id, index)),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(tip);
+            tool.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tip));
+            if tool.hovered() {
+                painter.rect_filled(tool_rect, 4.0, crate::ui_theme::BORDER);
+            }
+            painter.text(
+                tool_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(15.0),
+                color,
+            );
+            if tool.clicked() {
+                action = Some(tool_action);
+            }
+        }
+    }
+    action
+}
+
+/// Select the whole name so typing replaces it.
+fn select_all(ctx: &egui::Context, id: egui::Id, chars: usize) {
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(chars),
+        )));
+    state.store(ctx, id);
+}
+
+/// `"{name} {label}"`, numbered from 2 when taken, and short enough for the
+/// 60-character name limit.
+fn unique_workspace_name(
+    workspaces: &[crate::persistence::WorkspaceSummary],
+    name: &str,
+    label: &str,
+) -> String {
+    let shortened = name.chars().take(38).collect::<String>();
+    let free = |candidate: &str| {
+        workspaces
+            .iter()
+            .all(|workspace| !workspace.name.eq_ignore_ascii_case(candidate))
+    };
+    let base = format!("{shortened} {label}");
+    if free(&base) {
+        return base;
+    }
+    (2..)
+        .map(|suffix| format!("{base} {suffix}"))
+        .find(|candidate| free(candidate))
+        .expect("an unused workspace name always exists")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::WorkspaceSummary;
+
+    fn named(names: &[&str]) -> Vec<WorkspaceSummary> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| WorkspaceSummary {
+                id: format!("workspace-{}", i + 1),
+                name: (*name).to_owned(),
+            })
+            .collect()
+    }
+
+    /// Two rows ("Default" open, "Main"), 28 points tall from the panel's
+    /// top-left corner at (8, 8), with egui's 3-point spacing.
+    const ROW_LEFT: f32 = 8.0;
+    const ROW_RIGHT: f32 = 392.0;
+    fn row_center_y(row: usize) -> f32 {
+        8.0 + row as f32 * (WORKSPACE_ROW_HEIGHT + 3.0) + WORKSPACE_ROW_HEIGHT / 2.0
+    }
+
+    /// The center of a row's tool button while the row is hovered.
+    fn tool_center(row: usize, tool: usize, tools: usize) -> egui::Pos2 {
+        let left = ROW_RIGHT - 2.0 - WORKSPACE_TOOL_WIDTH * tools as f32;
+        egui::pos2(
+            left + WORKSPACE_TOOL_WIDTH * (tool as f32 + 0.5),
+            row_center_y(row),
+        )
+    }
+
+    /// The pointer glides in over a few frames: egui only treats it as
+    /// moving once it can measure its velocity.
+    fn click_at(at: egui::Pos2) -> Vec<Vec<egui::Event>> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let mut frames: Vec<_> = (0..4)
+            .rev()
+            .map(|step| {
+                vec![egui::Event::PointerMoved(
+                    at - egui::vec2(3.0 * step as f32, 0.0),
+                )]
+            })
+            .collect();
+        frames.push(vec![button(true)]);
+        frames.push(vec![button(false)]);
+        frames
+    }
+
+    /// Run the rows through real frames; returns each row's actions and the
+    /// icons painted in the last frame.
+    fn run_rows(
+        frames: Vec<Vec<egui::Event>>,
+        can_delete: bool,
+    ) -> (Vec<(usize, WorkspaceRowAction)>, Vec<String>) {
+        let ctx = egui::Context::default();
+        let mut actions = Vec::new();
+        let mut painted = Vec::new();
+        for (frame, events) in frames.into_iter().enumerate() {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 300.0),
+                )),
+                time: Some(frame as f64 / 60.0),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    for (row, name) in ["Default", "Main"].into_iter().enumerate() {
+                        let id = format!("workspace-{row}");
+                        if let Some(action) = workspace_row(ui, &id, name, row == 0, can_delete) {
+                            actions.push((row, action));
+                        }
+                    }
+                });
+            });
+            painted = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect();
+        }
+        (actions, painted)
+    }
+
+    #[test]
+    fn workspace_rows_fit_the_panel_this_test_assumes() {
+        let ctx = egui::Context::default();
+        let mut rects = Vec::new();
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    for _ in 0..2 {
+                        let top = ui.cursor().min;
+                        workspace_row(ui, "id", "Name", false, true);
+                        rects.push((top, ui.min_rect().right()));
+                    }
+                });
+            },
+        );
+        for (row, (top, right)) in rects.into_iter().enumerate() {
+            assert_eq!(top.x, ROW_LEFT);
+            assert_eq!(top.y + WORKSPACE_ROW_HEIGHT / 2.0, row_center_y(row));
+            assert_eq!(right, ROW_RIGHT);
+        }
+    }
+
+    #[test]
+    fn only_the_hovered_workspace_shows_its_tools() {
+        use egui_phosphor::regular as icons;
+        let (_, painted) = run_rows(
+            click_at(egui::pos2(100.0, row_center_y(1)))[..4].to_vec(),
+            true,
+        );
+        for icon in [icons::COPY, icons::PENCIL_SIMPLE, icons::TRASH] {
+            assert_eq!(
+                painted.iter().filter(|text| *text == icon).count(),
+                1,
+                "{icon}"
+            );
+        }
+        let (_, painted) = run_rows(vec![vec![]], true);
+        assert!(!painted.iter().any(|text| text == icons::TRASH));
+    }
+
+    #[test]
+    fn a_workspace_tool_acts_on_its_own_row() {
+        let (actions, _) = run_rows(click_at(tool_center(1, 1, 3)), true);
+        assert_eq!(actions, vec![(1, WorkspaceRowAction::Rename)]);
+        let (actions, _) = run_rows(click_at(tool_center(0, 2, 3)), true);
+        assert_eq!(actions, vec![(0, WorkspaceRowAction::Delete)]);
+        let (actions, _) = run_rows(click_at(tool_center(1, 0, 3)), true);
+        assert_eq!(actions, vec![(1, WorkspaceRowAction::Duplicate)]);
+    }
+
+    #[test]
+    fn clicking_a_workspace_name_opens_it() {
+        let (actions, _) = run_rows(click_at(egui::pos2(60.0, row_center_y(1))), true);
+        assert_eq!(actions, vec![(1, WorkspaceRowAction::Open)]);
+    }
+
+    #[test]
+    fn the_last_workspace_has_no_delete_button() {
+        use egui_phosphor::regular as icons;
+        let (_, painted) = run_rows(
+            click_at(egui::pos2(100.0, row_center_y(0)))[..4].to_vec(),
+            false,
+        );
+        assert!(painted.iter().any(|text| text == icons::PENCIL_SIMPLE));
+        assert!(!painted.iter().any(|text| text == icons::TRASH));
+    }
+
+    #[test]
+    fn copies_get_the_next_free_number() {
+        let list = named(&["Main"]);
+        assert_eq!(unique_workspace_name(&list, "Main", "Copy"), "Main Copy");
+        let list = named(&["Main", "main copy", "Main Copy 2"]);
+        assert_eq!(unique_workspace_name(&list, "Main", "Copy"), "Main Copy 3");
+    }
+
+    #[test]
+    fn long_names_leave_room_for_the_label() {
+        let long = "x".repeat(60);
+        let name = unique_workspace_name(&named(&[&long]), &long, "Recovered");
+        assert!(name.chars().count() <= 60);
+        assert!(name.ends_with(" Recovered"));
     }
 }

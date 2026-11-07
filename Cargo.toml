@@ -1,18 +1,23 @@
 [package]
 name = "pluriview"
-version = "0.7.5"
+version = "0.7.6"
 edition = "2021"
 description = "Live window preview application with infinite canvas"
 authors = ["Spatpit"]
 build = "build.rs"
 
+[features]
+# Tools → Phone Viewer, for the Android companion app. Left out of releases
+# until nearby pairing can't be relayed by another device on the network.
+phone-viewer = []
+
 [dependencies]
 # UI Framework
-eframe = { version = "0.29", default-features = false, features = [
+eframe = { version = "0.35", default-features = false, features = [
     "default_fonts",
     "glow"
 ] }
-egui-phosphor = "0.7"
+egui-phosphor = "0.13"
 
 # Window Capture
 windows-capture = "2.0.1"
@@ -80,6 +85,7 @@ windows = { version = "0.58", features = [
     "Win32_Media_MediaFoundation",
     "Win32_NetworkManagement_Dns",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

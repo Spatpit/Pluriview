@@ -8,6 +8,7 @@ import java.util.function.LongSupplier;
 
 /** Dedicated LAN socket: timeout polling never discards a partially read record. */
 final class VideoConnection implements AutoCloseable {
+    static final String RESPONSE_TIMEOUT = "Video response timeout";
     private final Socket socket = new Socket(Proxy.NO_PROXY);
     private final ResumableInput reader;
     private final DataInputStream input;
@@ -76,7 +77,7 @@ final class VideoConnection implements AutoCloseable {
             // Bound both silence and slow-drip records. No unbounded retry loop.
             if (now - started >= (header ? responseTimeout : 8_000_000_000L)
                 || now - progress >= 5_000_000_000L)
-                throw new SocketTimeoutException(header ? "Video response timeout" : "Video data timeout");
+                throw new SocketTimeoutException(header ? RESPONSE_TIMEOUT : "Video data timeout");
         }
         @Override public int read() throws IOException {
             byte[] one = new byte[1]; int n = read(one, 0, 1); return n < 0 ? -1 : one[0] & 255;

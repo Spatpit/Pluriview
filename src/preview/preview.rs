@@ -23,11 +23,59 @@ fn ease_out_cubic(t: f32) -> f32 {
 pub struct PreviewId(pub u64);
 
 /// Workspace group identity travels with each member, including deletion undo.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Every member carries the same name, arrangement and gap.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TileGroup {
     pub id: u64,
     pub name: String,
     pub order: u32,
+    #[serde(default)]
+    pub arrangement: GroupArrangement,
+    #[serde(default)]
+    pub gap: GroupGap,
+    /// The group's box as `[x, y, width, height]` in units of this member's
+    /// own tile size, measured from its top-left corner. Moving, scaling or
+    /// pinning the whole group keeps it valid for every member, and any
+    /// remaining member still knows the box after another one leaves.
+    #[serde(default)]
+    pub frame: Option<[f32; 4]>,
+}
+
+impl TileGroup {
+    /// A freely arranged group.
+    pub fn new(id: u64, name: impl Into<String>, order: u32) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            order,
+            arrangement: GroupArrangement::Free,
+            gap: GroupGap::Small,
+            frame: None,
+        }
+    }
+}
+
+/// How a group lays out its members inside its box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupArrangement {
+    /// Members stay wherever they were put.
+    #[default]
+    Free,
+    /// One to three large tiles, with the others beside or below them.
+    Main(u8),
+    /// Every member gets the same visible area.
+    Equal,
+}
+
+/// Space between the tiles of an arranged group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupGap {
+    None,
+    #[default]
+    Small,
+    Large,
 }
 
 /// Browser-specific startup state shown inside a tile before capture begins.
@@ -130,6 +178,17 @@ impl FpsPreset {
             FpsPreset::Low => "15 FPS (Low)",
             FpsPreset::Medium => "30 FPS (Medium)",
             FpsPreset::High => "60 FPS (High)",
+        }
+    }
+
+    /// The next rate up, wrapping from 60 back to 15, as clicking a tile's
+    /// frame-rate badge steps through them. Starting anywhere, three steps
+    /// visit every rate once.
+    pub fn next(self) -> Self {
+        match self {
+            FpsPreset::Low => FpsPreset::Medium,
+            FpsPreset::Medium => FpsPreset::High,
+            FpsPreset::High => FpsPreset::Low,
         }
     }
 }
@@ -283,6 +342,11 @@ pub struct Preview {
 
     /// Source aspect ratio from the captured window (width/height)
     pub source_aspect_ratio: f32,
+
+    /// Size a newly added window tile was given before its source was seen.
+    /// The first captured frame reshapes the tile to the source's proportions
+    /// (same area and top-left) unless the user has changed it by then.
+    pub shape_from_first_frame: Option<Vec2>,
 
     /// Z-order (higher = on top)
     pub z_order: u32,
@@ -460,6 +524,7 @@ impl Preview {
             list_order: 0,
             lock_aspect_ratio: true,
             source_aspect_ratio: aspect_ratio,
+            shape_from_first_frame: None,
             z_order: 0,
             target_fps: FpsPreset::default().as_u32(),
             fps_preset: FpsPreset::default(),
@@ -741,6 +806,16 @@ impl Preview {
             if self.crop_uv.is_none() {
                 self.source_aspect_ratio = source_width as f32 / source_height as f32;
             }
+            // Geometry edited before the source appeared belongs to the user.
+            if let Some(added_size) = self.shape_from_first_frame.take() {
+                if self.size == added_size
+                    && self.viewport_pin.is_none()
+                    && self.crop_uv.is_none()
+                    && self.tile_group.is_none()
+                {
+                    self.size = size_with_aspect(added_size, self.source_aspect_ratio);
+                }
+            }
         }
         if width > 0 && height > 0 {
             self.frame_size = Some((width, height));
@@ -825,16 +900,14 @@ impl Preview {
     pub fn get_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         self.advance_media_animation(ctx);
 
-        // Media frames already own their RGBA bytes, so build the upload
-        // image directly from that slice instead of cloning a second buffer.
+        // Media frames are stored ready to upload; the texture shares them.
         let media_image = if self.media_frame_dirty {
             self.media_frame_dirty = false;
-            let image = self.media_frames.get(self.media_frame_index).map(|frame| {
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                )
-            });
+            let max_side = ctx.input(|input| input.max_texture_side);
+            let image = self
+                .media_frames
+                .get(self.media_frame_index)
+                .map(|frame| crate::media::frame_upload(frame, max_side));
             // A still image never uploads again, so its decoded copy would
             // only double its memory. GIF frames stay for animation.
             if image.is_some() && self.media_frames.len() == 1 {
@@ -1107,7 +1180,8 @@ fn is_sensitive_stream_parameter(name: &str) -> bool {
             | "sig"
             | "signature"
             | "token"
-    ) || name.ends_with("_token")
+    ) || crate::browser::PRIVATE_QUERY_KEYS.contains(&name.as_str())
+        || name.ends_with("_token")
         || name.ends_with("_key")
         || name.ends_with("_password")
         || name.ends_with("_signature")
@@ -1246,6 +1320,12 @@ fn twitch_label(parsed: &url::Url) -> Option<String> {
     }
 }
 
+/// `size` reshaped to `aspect` (width / height), keeping its area.
+fn size_with_aspect(size: Vec2, aspect: f32) -> Vec2 {
+    let area = size.x * size.y;
+    Vec2::new((area * aspect).sqrt(), (area / aspect).sqrt()).round()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1256,6 +1336,64 @@ mod tests {
     use eframe::egui::{Context, Pos2, Rect, Vec2};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn added_window_tile() -> Preview {
+        let mut preview = Preview::for_window(
+            PreviewId(1),
+            1,
+            42,
+            "game".to_owned(),
+            Pos2::new(10.0, 20.0),
+            Vec2::new(320.0, 240.0),
+        );
+        preview.shape_from_first_frame = Some(preview.size);
+        preview
+    }
+
+    fn frame(preview: &mut Preview, width: u32, height: u32) {
+        let image = eframe::egui::ColorImage::filled([16, 16], eframe::egui::Color32::WHITE);
+        preview.update_capture_frame(width, height, image);
+    }
+
+    #[test]
+    fn a_new_window_tile_takes_the_shape_of_its_first_frame() {
+        let mut preview = added_window_tile();
+        frame(&mut preview, 1920, 1080);
+        let size = preview.size;
+        assert!((size.x / size.y - 16.0 / 9.0).abs() < 0.01, "{size:?}");
+        assert!(
+            (size.x * size.y / (320.0 * 240.0) - 1.0).abs() < 0.01,
+            "{size:?}"
+        );
+        assert_eq!(preview.position, Pos2::new(10.0, 20.0));
+
+        // Later source changes leave the tile to the user.
+        frame(&mut preview, 1080, 1920);
+        assert_eq!(preview.size, size);
+
+        let mut portrait = added_window_tile();
+        frame(&mut portrait, 1080, 2340);
+        assert!((portrait.size.x / portrait.size.y - 1080.0 / 2340.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_window_tile_changed_before_its_first_frame_keeps_the_users_shape() {
+        let mut resized = added_window_tile();
+        resized.size = Vec2::new(500.0, 200.0);
+        frame(&mut resized, 1920, 1080);
+        assert_eq!(resized.size, Vec2::new(500.0, 200.0));
+
+        let mut grouped = added_window_tile();
+        grouped.tile_group = Some(super::TileGroup::new(1, "Group", 0));
+        frame(&mut grouped, 1920, 1080);
+        assert_eq!(grouped.size, Vec2::new(320.0, 240.0));
+
+        // Restored and duplicated tiles keep their saved shape.
+        let mut restored = added_window_tile();
+        restored.shape_from_first_frame = None;
+        frame(&mut restored, 1920, 1080);
+        assert_eq!(restored.size, Vec2::new(320.0, 240.0));
+    }
 
     #[test]
     fn video_preferences_round_trip_without_runtime_state() {
@@ -1394,12 +1532,12 @@ mod tests {
         );
         preview.set_media(
             PathBuf::from("test.gif"),
-            vec![MediaFrame {
-                width: 1,
-                height: 1,
-                rgba: vec![255, 0, 0, 255],
-                duration: Duration::from_millis(100),
-            }],
+            vec![MediaFrame::from_rgba(
+                1,
+                1,
+                &[255, 0, 0, 255],
+                Duration::from_millis(100),
+            )],
         );
 
         assert!(preview.frame_buffer.is_none());
@@ -1412,11 +1550,13 @@ mod tests {
     #[test]
     fn still_images_release_decoded_pixels_after_upload_but_gifs_keep_them() {
         let ctx = eframe::egui::Context::default();
-        let frame = |duration_ms| MediaFrame {
-            width: 2,
-            height: 1,
-            rgba: vec![255; 8],
-            duration: std::time::Duration::from_millis(duration_ms),
+        let frame = |duration_ms| {
+            MediaFrame::from_rgba(
+                2,
+                1,
+                &[255; 8],
+                std::time::Duration::from_millis(duration_ms),
+            )
         };
         let mut still = Preview::new(
             PreviewId(1),
@@ -1462,18 +1602,8 @@ mod tests {
         preview.set_media(
             PathBuf::from("test.gif"),
             vec![
-                MediaFrame {
-                    width: 1,
-                    height: 1,
-                    rgba: vec![255, 0, 0, 255],
-                    duration: Duration::from_millis(10),
-                },
-                MediaFrame {
-                    width: 1,
-                    height: 1,
-                    rgba: vec![0, 255, 0, 255],
-                    duration: Duration::from_millis(10),
-                },
+                MediaFrame::from_rgba(1, 1, &[255, 0, 0, 255], Duration::from_millis(10)),
+                MediaFrame::from_rgba(1, 1, &[0, 255, 0, 255], Duration::from_millis(10)),
             ],
         );
         preview.manually_frozen = true;
@@ -1915,7 +2045,7 @@ mod tests {
             Vec2::splat(1.0),
         );
         preview.video_source = Some(VideoSource::Stream {
-            url: "https://user:password@youtube.com/watch?v=abc123&token=secret&sig=private&api_key=hidden&password=hidden&expire=1&X-Amz-Credential=hidden&X-Amz-Signature=hidden#chat".to_owned(),
+            url: "https://user:password@youtube.com/watch?v=abc123&token=secret&sig=private&api_key=hidden&password=hidden&expire=1&X-Amz-Credential=hidden&X-Amz-Signature=hidden&pwd=hidden&otp=123456&ticket=hidden#chat".to_owned(),
             quality: "best".to_owned(),
         });
 

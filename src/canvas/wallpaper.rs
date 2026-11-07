@@ -101,8 +101,9 @@ impl CanvasWallpaper {
                 }
             } else {
                 self.paint_video_status(painter, canvas_rect);
+                // The status is still text; check back for the player soon.
                 if !self.video_sleeping && self.error.is_none() {
-                    ctx.request_repaint();
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 }
             }
             return;
@@ -146,10 +147,8 @@ impl CanvasWallpaper {
         if self.frame_dirty {
             self.frame_dirty = false;
             if let Some(frame) = self.frames.get(self.frame_index) {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                );
+                let max_side = ctx.input(|input| input.max_texture_side);
+                let image = crate::media::frame_upload(frame, max_side);
                 if let Some(texture) = self.texture.as_mut() {
                     texture.set(image, egui::TextureOptions::LINEAR);
                 } else {
@@ -295,11 +294,12 @@ mod tests {
         wallpaper.error = Some("Video unavailable".into());
         let ctx = eframe::egui::Context::default();
         for _ in 0..3 {
-            let _ = ctx.run(Default::default(), |_| {});
+            let _ = ctx.run_ui(Default::default(), |_| {});
         }
-        let output = ctx.run(Default::default(), |ctx| {
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             eframe::egui::CentralPanel::default()
-                .show(ctx, |ui| wallpaper.paint(ui.painter(), ui.max_rect(), ctx));
+                .show(ui, |ui| wallpaper.paint(ui.painter(), ui.max_rect(), ctx));
         });
         assert!(
             output.viewport_output[&eframe::egui::ViewportId::ROOT].repaint_delay

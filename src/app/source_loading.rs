@@ -275,12 +275,12 @@ mod tests {
         media::MediaAsset {
             width: 2,
             height: 1,
-            frames: vec![media::MediaFrame {
-                width: 2,
-                height: 1,
-                rgba: vec![255; 8],
-                duration: Duration::ZERO,
-            }],
+            frames: vec![media::MediaFrame::from_rgba(
+                2,
+                1,
+                &[255; 8],
+                Duration::ZERO,
+            )],
         }
     }
 

@@ -219,7 +219,7 @@ impl CanvasState {
         let corner = (8.0 * s).min(8.0);
         painter.rect_filled(
             layout.toolbar,
-            egui::Rounding {
+            egui::epaint::CornerRadiusF32 {
                 nw: corner,
                 ne: corner,
                 sw: 0.0,
@@ -229,7 +229,7 @@ impl CanvasState {
         );
         painter.rect_filled(
             layout.tabs,
-            egui::Rounding {
+            egui::epaint::CornerRadiusF32 {
                 nw: 0.0,
                 ne: 0.0,
                 sw: corner,
@@ -246,7 +246,9 @@ impl CanvasState {
 
         if preview.browser_loading && enabled {
             paint_loading_bar(painter, layout.toolbar, time);
-            ui.ctx().request_repaint();
+            // A thin sweeping bar needs no more than 30 frames a second.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(33));
         }
         self.paint_toolbar(ui, painter, preview, layout, enabled, &mut output);
         self.paint_tab_strip(ui, painter, preview, layout, enabled, &mut output);
@@ -401,6 +403,7 @@ impl CanvasState {
                     ui_theme::BORDER
                 },
             ),
+            egui::StrokeKind::Middle,
         );
         let font = egui::FontId::proportional(12.0 * s);
         let url = preview.browser_url.as_deref().unwrap_or_default();
@@ -426,7 +429,7 @@ impl CanvasState {
 
         if editing {
             self.browser_chrome_holds_interaction |= self.interactive_browser == Some(id);
-            let row_height = ui.fonts(|fonts| fonts.row_height(&font));
+            let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font));
             let edit_rect = Rect::from_center_size(
                 text_rect.center(),
                 Vec2::new(text_rect.width(), row_height),
@@ -438,7 +441,7 @@ impl CanvasState {
             let response = ui.put(
                 edit_rect,
                 egui::TextEdit::singleline(&mut edit.text)
-                    .frame(false)
+                    .frame(egui::Frame::NONE)
                     .font(font)
                     .text_color(ui_theme::TEXT)
                     .margin(egui::Margin::ZERO)
@@ -461,7 +464,7 @@ impl CanvasState {
                     state.store(ui.ctx(), response.id);
                 } else if response.has_focus() {
                     if let Some(range) = state.cursor.char_range() {
-                        edit.selection = (range.secondary.index, range.primary.index);
+                        edit.selection = (range.secondary.index.0, range.primary.index.0);
                     }
                 }
             }
@@ -500,7 +503,7 @@ impl CanvasState {
 
             let has_selection = edit.selection.0 != edit.selection.1;
             let mut command = None;
-            response.context_menu(|ui| {
+            crate::ui_theme::context_menu(&response, |ui| {
                 crate::ui_theme::menu(ui);
                 let items = [
                     ("Cut", EditCommand::Cut, has_selection),
@@ -514,13 +517,13 @@ impl CanvasState {
                         .clicked()
                     {
                         command = Some(item);
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                 }
                 ui.separator();
                 if ui.button("Select All").clicked() {
                     command = Some(EditCommand::SelectAll);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             });
             if let Some(command) = command {
@@ -545,12 +548,12 @@ impl CanvasState {
             self.browser_address_edit = Some(AddressEdit::new(id, url.to_owned(), false));
         }
         let interactive = self.interactive_browser == Some(id);
-        response.context_menu(|ui| {
+        crate::ui_theme::context_menu(&response, |ui| {
             crate::ui_theme::menu(ui);
             self.browser_chrome_holds_interaction |= interactive;
             if ui.button("Copy Address").clicked() {
                 ui.ctx().copy_text(url.to_owned());
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if ui.button("Paste").clicked() {
                 let text = pasted_address();
@@ -558,11 +561,11 @@ impl CanvasState {
                 let mut edit = AddressEdit::new(id, text, false);
                 edit.focus_selection = Some((end, end));
                 self.browser_address_edit = Some(edit);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if ui.button("Paste and Go").clicked() {
                 self.navigate_to_clipboard(id, false);
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
         });
         let job = address_job(url, &font, text_rect.width());
@@ -737,23 +740,23 @@ impl CanvasState {
                 response
             };
             let interactive = self.interactive_browser == Some(id);
-            response.context_menu(|ui| {
+            crate::ui_theme::context_menu(&response, |ui| {
                 crate::ui_theme::menu(ui);
                 self.browser_chrome_holds_interaction |= interactive;
                 if ui.button("Copy Address").clicked() {
                     ui.ctx().copy_text(tab.url.clone());
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui.button("New Tab").clicked() {
                     self.browser_address_edit = Some(AddressEdit::new(id, String::new(), true));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 if ui
                     .add_enabled(can_close, egui::Button::new("Move to New Tile"))
                     .clicked()
                 {
                     self.detach_tab(id, index, None);
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
                 ui.separator();
                 if ui
@@ -762,7 +765,7 @@ impl CanvasState {
                 {
                     self.pending_browser_actions
                         .push((id, BrowserAction::CloseTab(index)));
-                    ui.close_menu();
+                    ui.close_kind(egui::UiKind::Menu);
                 }
             });
             if closed || (can_close && enabled && response.middle_clicked()) {
@@ -1051,7 +1054,12 @@ impl CanvasState {
             egui::Id::new("browser_tab_drag_ghost"),
         ));
         if let Some(target) = &target {
-            ghost_painter.rect_stroke(target.tile, 6.0, Stroke::new(2.0, ui_theme::GOLD));
+            ghost_painter.rect_stroke(
+                target.tile,
+                6.0,
+                Stroke::new(2.0, ui_theme::GOLD),
+                egui::StrokeKind::Middle,
+            );
             if let Some((x, y, s)) = target.line {
                 ghost_painter.hline(x, y, Stroke::new(2.0 * s.max(0.5), ui_theme::GOLD));
             }
@@ -1063,7 +1071,12 @@ impl CanvasState {
         };
         let ghost = Rect::from_min_size(pointer + Vec2::new(14.0, 10.0), Vec2::new(200.0, 52.0));
         ghost_painter.rect_filled(ghost, 8.0, ui_theme::SURFACE);
-        ghost_painter.rect_stroke(ghost, 8.0, Stroke::new(1.5, ui_theme::GOLD));
+        ghost_painter.rect_stroke(
+            ghost,
+            8.0,
+            Stroke::new(1.5, ui_theme::GOLD),
+            egui::StrokeKind::Middle,
+        );
         let badge = Rect::from_center_size(
             Pos2::new(ghost.left() + 20.0, ghost.top() + 18.0),
             Vec2::splat(BADGE),
@@ -1281,7 +1294,7 @@ fn icon_button(
     ui: &egui::Ui,
     painter: &egui::Painter,
     rect: Rect,
-    id_salt: impl std::hash::Hash,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
     icon: &str,
     tip: &str,
     enabled: bool,
@@ -1576,7 +1589,10 @@ mod tests {
         let job = address_job("https://twitch.tv/somechannel?x=1", &font, 200.0);
         assert_eq!(job.text, "twitch.tv/somechannel?x=1");
         assert_eq!(job.sections.len(), 2);
-        assert_eq!(job.sections[0].byte_range, 0.."twitch.tv".len());
+        assert_eq!(
+            job.sections[0].byte_range,
+            egui::text::ByteIndex(0)..egui::text::ByteIndex("twitch.tv".len())
+        );
         let bare = address_job("https://example.com/", &font, 200.0);
         assert_eq!(bare.text, "example.com");
     }

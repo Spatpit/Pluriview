@@ -1,7 +1,7 @@
 use super::*;
 use crate::screenshot_library::{self, ScreenshotFolder};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::SystemTime;
 
 /// Folder contents can change in Explorer; refresh while the panel is open.
@@ -25,7 +25,9 @@ pub(super) struct ShotDrag {
 
 #[derive(Default)]
 pub(super) struct PanelState {
-    folders: Vec<ScreenshotFolder>,
+    /// Shared so drawing the panel can hold the listing while it changes the
+    /// rest of the state, without copying every folder each frame.
+    folders: Arc<Vec<ScreenshotFolder>>,
     scan: Option<mpsc::Receiver<Vec<ScreenshotFolder>>>,
     scan_queued: bool,
     last_scan: Option<Instant>,
@@ -196,6 +198,19 @@ enum EditOutcome {
     Cancel,
 }
 
+/// Screenshots in panel order, skipping collapsed folders so a Shift range
+/// never selects hidden shots.
+fn shot_order<'a>(
+    folders: &'a [ScreenshotFolder],
+    collapsed: &HashSet<Option<String>>,
+) -> Vec<&'a Path> {
+    folders
+        .iter()
+        .filter(|folder| !collapsed.contains(&folder.name))
+        .flat_map(|folder| folder.shots.iter().map(|shot| shot.path.as_path()))
+        .collect()
+}
+
 fn folder_label(name: Option<&str>) -> &str {
     name.unwrap_or("Unsorted")
 }
@@ -232,22 +247,12 @@ impl PanelState {
         self.scan_queued = true;
     }
 
-    /// Screenshots in panel order, skipping collapsed folders so a Shift
-    /// range never selects hidden shots.
-    fn order(&self) -> Vec<&Path> {
-        self.folders
-            .iter()
-            .filter(|folder| !self.collapsed.contains(&folder.name))
-            .flat_map(|folder| folder.shots.iter().map(|shot| shot.path.as_path()))
-            .collect()
-    }
-
     fn upkeep(&mut self, root: &Path, ctx: &egui::Context) {
         self.frame += 1;
         if let Some(receiver) = &self.scan {
             match receiver.try_recv() {
                 Ok(folders) => {
-                    self.folders = folders;
+                    self.folders = Arc::new(folders);
                     self.scan = None;
                     let existing: HashSet<&Path> = self
                         .folders
@@ -472,6 +477,20 @@ fn shell_open(file: &std::ffi::OsStr, parameters: Option<&std::ffi::OsStr>) {
     }
 }
 
+/// Explorer's full path in the Windows folder. Starting it by bare name could
+/// run a stray `explorer.exe` from the current folder instead.
+#[cfg(windows)]
+fn explorer_path() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+
+    let mut buffer = [0u16; 260];
+    let length = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
+    (length > 0 && length < buffer.len()).then(|| {
+        PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])).join("explorer.exe")
+    })
+}
+
 impl PluriviewApp {
     pub(super) fn set_screenshots_panel_open(&mut self, open: bool) {
         if self.app_config.screenshots_panel_open == open {
@@ -498,7 +517,8 @@ impl PluriviewApp {
         Some(directory)
     }
 
-    pub(super) fn screenshots_panel_ui(&mut self, ctx: &egui::Context) {
+    pub(super) fn screenshots_panel_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         self.screenshots.panel.landing_rect = None;
         if !self.app_config.screenshots_panel_open || self.canvas_only {
             self.screenshots.panel.release();
@@ -522,16 +542,16 @@ impl PluriviewApp {
         let mut close = false;
         let mut edit_outcome = EditOutcome::Editing;
 
-        egui::SidePanel::right("screenshots_panel")
-            .default_width(292.0)
-            .min_width(240.0)
-            .max_width(420.0)
+        egui::Panel::right("screenshots_panel")
+            .default_size(292.0)
+            .min_size(240.0)
+            .max_size(420.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(crate::ui_theme::PANEL)
-                    .inner_margin(egui::Margin::same(12.0)),
+                    .inner_margin(egui::Margin::same(12)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let state = &mut self.screenshots.panel;
                 ui.add_space(4.0);
                 let title = ui
@@ -594,7 +614,7 @@ impl PluriviewApp {
                         .selected_text(folder_label(save_folder.as_deref()))
                         .width(ui.available_width())
                         .show_ui(ui, |ui| {
-                            for folder in &state.folders {
+                            for folder in state.folders.iter() {
                                 let selected = folder.name == save_folder;
                                 if ui
                                     .selectable_label(
@@ -611,9 +631,8 @@ impl PluriviewApp {
                 });
                 ui.add_space(8.0);
 
-                let order: Vec<PathBuf> =
-                    state.order().into_iter().map(Path::to_path_buf).collect();
-                let order_refs: Vec<&Path> = order.iter().map(PathBuf::as_path).collect();
+                let folders = Arc::clone(&state.folders);
+                let order_refs = shot_order(&folders, &state.collapsed);
                 let selected = state.selection.ordered(&order_refs);
                 if !selected.is_empty() {
                     selection_bar(
@@ -629,7 +648,7 @@ impl PluriviewApp {
                 let dragging = egui::DragAndDrop::payload::<ShotDrag>(ui.ctx());
                 let released = ui.input(|input| input.pointer.any_released());
                 let mut landing = None;
-                let total = order.len();
+                let total = order_refs.len();
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -658,8 +677,7 @@ impl PluriviewApp {
                         if total == 0 && state.folders.len() <= 1 && state.edit.is_none() {
                             empty_state(ui, shot_shortcut);
                         }
-                        let folders = state.folders.clone();
-                        for folder in &folders {
+                        for folder in folders.iter() {
                             let section_top = ui.cursor().top();
                             let renaming = folder.name.is_some()
                                 && state
@@ -701,18 +719,18 @@ impl PluriviewApp {
                                         state.selection.paths.remove(&shot.path);
                                     }
                                 }
-                                header.context_menu(|ui| {
+                                crate::ui_theme::context_menu(&header, |ui| {
                                     crate::ui_theme::menu(ui);
                                     if folder.name != save_folder
                                         && ui.button("Save New Screenshots Here").clicked()
                                     {
                                         actions.push(PanelAction::SaveTo(folder.name.clone()));
-                                        ui.close_menu();
+                                        ui.close_kind(egui::UiKind::Menu);
                                     }
                                     if let Some(name) = &folder.name {
                                         if ui.button("Rename").clicked() {
                                             actions.push(PanelAction::RenameFolder(name.clone()));
-                                            ui.close_menu();
+                                            ui.close_kind(egui::UiKind::Menu);
                                         }
                                     }
                                     if !folder.shots.is_empty()
@@ -727,7 +745,7 @@ impl PluriviewApp {
                                             paths,
                                             vec![header.rect],
                                         ));
-                                        ui.close_menu();
+                                        ui.close_kind(egui::UiKind::Menu);
                                     }
                                     if ui.button("Select All in Folder").clicked() {
                                         state.collapsed.remove(&folder.name);
@@ -735,11 +753,11 @@ impl PluriviewApp {
                                         state.selection.paths.extend(
                                             folder.shots.iter().map(|shot| shot.path.clone()),
                                         );
-                                        ui.close_menu();
+                                        ui.close_kind(egui::UiKind::Menu);
                                     }
                                     if ui.button("Open in Explorer").clicked() {
                                         actions.push(PanelAction::OpenFolder(folder.name.clone()));
-                                        ui.close_menu();
+                                        ui.close_kind(egui::UiKind::Menu);
                                     }
                                 });
                             }
@@ -762,6 +780,7 @@ impl PluriviewApp {
                                         section.shrink(1.0),
                                         8.0,
                                         egui::Stroke::new(1.5, crate::ui_theme::GOLD),
+                                        egui::StrokeKind::Middle,
                                     );
                                     if released {
                                         actions.push(PanelAction::Move(
@@ -864,7 +883,9 @@ impl PluriviewApp {
                     let mut select = std::ffi::OsString::from("/select,\"");
                     select.push(path.as_os_str());
                     select.push("\"");
-                    shell_open(std::ffi::OsStr::new("explorer.exe"), Some(&select));
+                    if let Some(explorer) = explorer_path() {
+                        shell_open(explorer.as_os_str(), Some(&select));
+                    }
                 }
             }
             PanelAction::OpenFolder(folder) => {
@@ -993,11 +1014,11 @@ fn selection_bar(
     actions: &mut Vec<PanelAction>,
     selection: &mut Selection,
 ) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(crate::ui_theme::GOLD_DARK)
         .stroke(egui::Stroke::new(1.0, crate::ui_theme::GOLD))
-        .rounding(7.0)
-        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .corner_radius(7.0)
+        .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1037,7 +1058,8 @@ fn selection_bar(
                     {
                         actions.push(PanelAction::AddToCanvas(selected.to_vec(), Vec::new()));
                     }
-                    ui.menu_button(
+                    crate::ui_theme::menu_button(
+                        ui,
                         egui::RichText::new(egui_phosphor::regular::FOLDER_SIMPLE_PLUS).size(14.0),
                         |ui| {
                             crate::ui_theme::menu(ui);
@@ -1066,24 +1088,70 @@ fn move_menu(
         }
         if ui.button(folder_label(target.name.as_deref())).clicked() {
             actions.push(PanelAction::Move(paths.to_vec(), target.name.clone()));
-            ui.close_menu();
+            ui.close_kind(egui::UiKind::Menu);
         }
     }
     if crate::ui_theme::action(ui, egui_phosphor::regular::FOLDER_PLUS, "New Folder").clicked() {
         actions.push(PanelAction::NewFolder(paths.to_vec()));
-        ui.close_menu();
+        ui.close_kind(egui::UiKind::Menu);
     }
+}
+
+/// Whether the "Move to" flyout fits beside the open context menu. egui opens
+/// a submenu on the right, or on the left when the right has no room; when
+/// neither side fits it slides the flyout over the rows below it.
+fn move_flyout_fits(ui: &egui::Ui, current: &Option<String>, folders: &[ScreenshotFolder]) -> bool {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widest_label = ui.fonts_mut(|fonts| {
+        folders
+            .iter()
+            .filter(|target| &target.name != current)
+            .map(|target| {
+                let label = folder_label(target.name.as_deref()).to_owned();
+                fonts
+                    .layout_no_wrap(label, font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .fold(0.0, f32::max)
+    });
+    let spacing = ui.spacing();
+    let screen = ui.ctx().content_rect();
+    flyout_fits(
+        ui.max_rect().left() - f32::from(spacing.menu_margin.left),
+        widest_label + 2.0 * spacing.button_padding.x,
+        spacing.menu_margin.sum().x,
+        spacing.menu_spacing,
+        (screen.left(), screen.right()),
+    )
+}
+
+/// Whether a flyout whose widest row is `widest_row` fits on either side of a
+/// menu that starts at `menu_left`, within the screen's `(left, right)` edges.
+/// The menu's own rows all fit the minimum width, which keeps the answer
+/// independent of the flyout's choice.
+fn flyout_fits(
+    menu_left: f32,
+    widest_row: f32,
+    frame_margin: f32,
+    gap: f32,
+    (screen_left, screen_right): (f32, f32),
+) -> bool {
+    use crate::ui_theme::{MENU_MAX_WIDTH, MENU_MIN_WIDTH};
+    let menu = MENU_MIN_WIDTH + frame_margin;
+    let flyout = widest_row.clamp(MENU_MIN_WIDTH, MENU_MAX_WIDTH) + frame_margin;
+    menu_left + menu + gap + flyout <= screen_right || menu_left - gap - flyout >= screen_left
 }
 
 /// Folder name field drawn in place of a folder row: Enter or the check
 /// saves, Escape or the cross cancels.
 fn folder_name_row(ui: &mut egui::Ui, edit: &mut FolderEdit) -> EditOutcome {
     let mut outcome = EditOutcome::Editing;
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(crate::ui_theme::SURFACE)
         .stroke(egui::Stroke::new(1.0, crate::ui_theme::GOLD))
-        .rounding(7.0)
-        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .corner_radius(7.0)
+        .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_min_height(ROW_HEIGHT - 6.0);
@@ -1102,7 +1170,7 @@ fn folder_name_row(ui: &mut egui::Ui, edit: &mut FolderEdit) -> EditOutcome {
                             "New folder name"
                         })
                         .desired_width(field_width)
-                        .frame(false),
+                        .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 2))),
                 );
                 if edit.focus {
                     response.request_focus();
@@ -1181,6 +1249,7 @@ fn folder_header(
             rect,
             7.0,
             egui::Stroke::new(1.0, crate::ui_theme::GOLD_DARK),
+            egui::StrokeKind::Middle,
         );
     }
     let caret = if expanded {
@@ -1330,6 +1399,7 @@ fn shot_grid(
                         image_rect.expand(1.5),
                         7.5,
                         egui::Stroke::new(2.5, crate::ui_theme::GOLD),
+                        egui::StrokeKind::Middle,
                     );
                     let badge = image_rect.right_top() + egui::vec2(-12.0, 12.0);
                     painter.circle_filled(badge, 9.0, crate::ui_theme::GOLD);
@@ -1345,12 +1415,14 @@ fn shot_grid(
                         image_rect.expand(1.0),
                         7.0,
                         egui::Stroke::new(2.0, crate::ui_theme::GOLD.gamma_multiply(alpha)),
+                        egui::StrokeKind::Middle,
                     );
                 } else if response.hovered() {
                     painter.rect_stroke(
                         image_rect,
                         6.0,
                         egui::Stroke::new(1.0, crate::ui_theme::SECONDARY),
+                        egui::StrokeKind::Middle,
                     );
                 }
                 let label_rect = egui::Rect::from_min_max(
@@ -1399,7 +1471,7 @@ fn shot_grid(
                     vec![shot.path.clone()]
                 };
                 let response = response.on_hover_text(&shot.name);
-                response.context_menu(|ui| {
+                crate::ui_theme::context_menu(&response, |ui| {
                     crate::ui_theme::menu(ui);
                     if crate::ui_theme::action(
                         ui,
@@ -1409,7 +1481,7 @@ fn shot_grid(
                     .clicked()
                     {
                         actions.push(PanelAction::AddToCanvas(targets.clone(), Vec::new()));
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                     ui.separator();
                     if targets.len() > 1 {
@@ -1417,21 +1489,30 @@ fn shot_grid(
                     } else {
                         if ui.button("Open").clicked() {
                             actions.push(PanelAction::OpenShot(shot.path.clone()));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                         if ui.button("Show in Explorer").clicked() {
                             actions.push(PanelAction::ShowShot(shot.path.clone()));
-                            ui.close_menu();
+                            ui.close_kind(egui::UiKind::Menu);
                         }
                     }
-                    ui.menu_button("Move to", |ui| {
-                        crate::ui_theme::menu(ui);
+                    if move_flyout_fits(ui, &folder.name, folders) {
+                        crate::ui_theme::menu_button(ui, "Move to", |ui| {
+                            crate::ui_theme::menu(ui);
+                            move_menu(ui, &targets, Some(&folder.name), folders, actions);
+                        });
+                    } else {
+                        // No room beside this menu: list the folders in it
+                        // rather than let the flyout cover the rows below.
+                        if targets.len() == 1 {
+                            ui.separator();
+                        }
                         move_menu(ui, &targets, Some(&folder.name), folders, actions);
-                    });
+                    }
                     ui.separator();
                     if crate::ui_theme::destructive(ui, "Move to Recycle Bin").clicked() {
                         actions.push(PanelAction::Delete(targets.clone()));
-                        ui.close_menu();
+                        ui.close_kind(egui::UiKind::Menu);
                     }
                 });
             }
@@ -1510,7 +1591,12 @@ fn drag_ghost(ctx: &egui::Context, panel: &PanelState, payload: &ShotDrag) {
                 egui::Color32::WHITE.gamma_multiply(0.9),
             );
         }
-        painter.rect_stroke(card, 6.0, egui::Stroke::new(1.5, crate::ui_theme::GOLD));
+        painter.rect_stroke(
+            card,
+            6.0,
+            egui::Stroke::new(1.5, crate::ui_theme::GOLD),
+            egui::StrokeKind::Middle,
+        );
     }
     if payload.paths.len() > 1 {
         let badge = rect.right_top() + egui::vec2(0.0, 0.0);
@@ -1529,10 +1615,33 @@ fn drag_ghost(ctx: &egui::Context, panel: &PanelState, payload: &ShotDrag) {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn show_in_folder_starts_explorer_by_its_full_path() {
+        let explorer = super::explorer_path().expect("Windows folder");
+        assert!(explorer.is_absolute(), "{}", explorer.display());
+        assert!(explorer.is_file(), "{}", explorer.display());
+    }
+
+    #[test]
+    fn move_flyout_goes_inline_only_when_neither_side_fits() {
+        // Menu 200 wide plus a 200-wide flyout and a 2 px gap: 402 px.
+        assert!(flyout_fits(0.0, 50.0, 16.0, 2.0, (0.0, 402.0)));
+        assert!(!flyout_fits(0.0, 50.0, 16.0, 2.0, (0.0, 401.0)));
+        // No room on the right, but 202 px on the left: egui flips it there.
+        assert!(flyout_fits(202.0, 50.0, 16.0, 2.0, (0.0, 500.0)));
+        assert!(!flyout_fits(200.0, 50.0, 16.0, 2.0, (0.0, 500.0)));
+        // Long folder names widen the flyout, up to the menu's cap.
+        assert!(!flyout_fits(0.0, 250.0, 16.0, 2.0, (0.0, 450.0)));
+        assert!(flyout_fits(0.0, 900.0, 16.0, 2.0, (0.0, 498.0)));
+        assert!(!flyout_fits(250.0, 250.0, 16.0, 2.0, (0.0, 450.0)));
+        assert!(flyout_fits(298.0, 900.0, 16.0, 2.0, (0.0, 498.0)));
+    }
+
     #[test]
     fn hiding_the_panel_releases_its_caches_but_keeps_collapsed_folders() {
         let mut panel = PanelState::default();
-        panel.folders.push(ScreenshotFolder {
+        Arc::make_mut(&mut panel.folders).push(ScreenshotFolder {
             name: None,
             shots: Vec::new(),
         });
