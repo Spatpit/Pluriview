@@ -66,116 +66,91 @@ time you start Pluriview; reopen it from **Help → Getting Started**.
 ### Use an app from its tile
 
 Double-click a window tile (or right-click → **Interact**) to use the app right
-on the canvas. Pluriview zooms to the window's real size and moves the app's
-own window over the tile, so you can click, type, and pick songs as usual. The
-window is never resized, and a big one is kept on your screen.
-
-Drag the gold bar above it, or the app's own title bar, to move the tile. Click
-outside the app or **Done** to finish, and the window goes back where it was.
-While you use it, the tile shows your mouse pointer, so people watching through
-Discord or OBS see where you point.
+on the canvas. Pluriview moves the app's own window over the tile, so your
+clicks and typing go to the app. Drag the gold bar above it to move the tile,
+and click outside the app or **Done** when you're finished; the window goes back
+where it was. People watching through Discord or OBS see your mouse pointer
+meanwhile.
 
 This doesn't work for apps running as administrator or windows on another
 virtual desktop.
 
 ### Web pages
 
-Double-click a browser tile or press `Ctrl+B` to use the page. Press `Esc` or
-click outside to go back to arranging.
+Double-click a browser tile or press `Ctrl+B` to use the page, and `Esc` to go
+back to arranging.
 
-- **Toolbar and tabs:** an address bar (type an address or a search), back,
-  forward, reload, and vertical tabs. Drag a tab to reorder it, drop it on
-  another browser tile to move it there, or drop it on the canvas to give it
-  its own tile. Moved tabs keep playing without reloading. Turn the frame off
-  under right-click → **Page → Show Toolbar and Tabs**.
-- **Your own browser profile:** all browser tiles share their sign-ins, kept
-  separate from your regular browser. **Tools → Clear Browser Data...** signs
-  you out everywhere.
-- **Ad blocking:** uBlock Origin Lite is built in and on by default. Toggle it
-  under **Tools → Block Ads & Trackers (uBOL)**.
-- **Handy extras:** `Shift`+scroll scrolls a page without clicking into it,
-  **Page Zoom** makes text bigger or smaller, **Page → Fit to Video** crops the
-  tile to the page's video player, and pages with transparent backgrounds stay
-  transparent, which is great for overlay widgets.
-
-Unused background tabs sleep after 10 minutes to save memory and wake when you
-open them. A crashed page reloads on its own, and when the browser engine
-updates, **Tools → Restart Browser Tiles** switches to the new version.
+- **Toolbar and tabs:** address bar, back, forward, reload, and tabs down the
+  side. Drag a tab to another browser tile, or onto the canvas to give it its
+  own tile.
+- **Sign-ins:** browser tiles share one profile, separate from your regular
+  browser. **Tools → Clear Browser Data...** signs you out everywhere.
+- **Ad blocking:** uBlock Origin Lite is built in and on by default
+  (**Tools → Block Ads & Trackers (uBOL)**).
+- **Extras:** `Shift`+scroll scrolls a page without clicking into it,
+  **Page Zoom** resizes its text, and **Page → Fit to Video** crops the tile to
+  the page's video. Transparent pages stay transparent, great for overlay
+  widgets.
 
 ### Videos, playlists, and streams
 
-Video tiles have play/pause, seeking with a preview, volume, speed, looping,
-and audio and subtitle track choices. Each tile remembers its settings. A
-folder playlist adds previous/next, shuffle, and repeat.
+Video tiles have play/pause, seeking, volume, speed, looping, and audio and
+subtitle tracks, and each tile remembers its settings. A folder playlist adds
+previous/next, shuffle, and repeat. For stream links, install
+[Streamlink](https://streamlink.github.io/), or open the stream site in a web
+page tile.
 
-For streams, open the stream site in a web page tile, or install
-[Streamlink](https://streamlink.github.io/) to play stream links in a video
-tile and pick their quality.
-
-Images, GIFs, and videos are used from where they are, not copied, so keep
-them in place. If you move an image, right-click its tile → **Locate Image…**.
+Images, GIFs, and videos are used from where they are, not copied, so keep them
+in place. If you move an image, right-click its tile → **Locate Image…**.
 
 ### Control Tile Center
 
-Press `C` to open a separate window that lists every tile.
-
-- **Grid** shows each tile as a card with a live thumbnail, grouped tiles under
-  their group's name. Drag cards into your own order, or switch to **A–Z**.
-- **Click** a card to focus that tile on the canvas, the **eye** to hide or
-  show it, and the **speaker** to mute it. Window tiles get a **Stream Audio**
-  button instead. Hidden tiles keep playing in the background; right-click
-  empty canvas to show them again without opening this window.
-- **Map** shows the whole canvas in miniature. Drag tiles to new places
-  (**Move tiles**, the default), or switch to **Move camera** to look around.
-  Pinned tiles can also be moved and resized there.
+Press `C` to see every tile in a separate window. Click a card to focus that
+tile, the **eye** to hide or show it, or the **speaker** to mute it. **Map**
+shows the whole canvas in miniature, where you can drag tiles to new places.
+Hidden tiles keep playing; right-click empty canvas to show them again.
 
 ### Groups
 
 Select tiles (`Ctrl`+click or drag a box) and press `Ctrl+G` to group them, so
-they move and resize together. `Alt+1`–`Alt+4` arrange a group with one, two,
-or three large tiles, or all equal; the bar above a selected group does the
-same. An arranged group keeps its layout: tiles that join, leave or change
-shape fit back into the group's box, and dragging the box's edges re-flows it.
-
-`Shift`+drag a tile onto another to swap them. `Shift+F` makes the selected
-tile the large one, and `Shift+←`/`Shift+→` step through the group.
+they move and resize together. `Alt+1`–`Alt+4` lay a group out with one, two,
+or three large tiles, or all equal, and it keeps that layout as tiles come and
+go. `Shift`+drag a tile onto another to swap them, and `Shift+F` makes the
+selected tile the large one.
 
 ### Tile tools
 
 | Tool | What it does |
 |---|---|
-| **Crop** | Shows only the part you need. Right-click → **Tile Settings → Edit Crop**, or hold `Alt` and drag an edge. |
+| **Crop** | Shows only the part you need. Hold `Alt` and drag an edge, or right-click → **Tile Settings → Edit Crop**. |
 | **Focus** | `F` fills the view with the selected tile; `Esc` goes back. |
 | **Pin to Viewport** | Keeps a tile in place on screen while you pan and zoom. |
-| **Picture in Picture** | `Shift+P` pops tiles out into a small window that stays on top of other apps, including borderless or windowed games. |
+| **Picture in Picture** | `Shift+P` pops tiles into a small window that stays above other apps, including borderless or windowed games. |
 | **Freeze** | Holds a tile's current frame until you resume it. |
-| **Frame rate** | Click the FPS number on a live tile to step through 15, 30, and 60 FPS, or pick one under right-click → **Tile Settings → Frame Rate**. |
+| **Frame rate** | Click the FPS number on a live tile to switch between 15, 30, and 60 FPS. |
 
 ### Screenshots and recording
 
-- `Shift+S` saves a screenshot of the selected tiles. Several tiles become one
-  image laid out as on the canvas, or choose **Capture → Screenshot Each Tile
-  Separately**.
-- `Shift+R` records the selected tiles to an MP4 with sound; `P` pauses.
-- `S` opens the **Screenshots panel**: sort shots into folders, open them, or
-  drag them back onto the canvas.
+- `Shift+S` saves a screenshot of the selected tiles, laid out as on the canvas.
+- `Shift+R` records them to an MP4 with sound (`P` pauses), and `Shift+G`
+  records a GIF of up to 10 seconds.
+- `S` opens the **Screenshots panel**, where you sort shots into folders or drag
+  them back onto the canvas.
 
 ### Workspaces, viewpoints, and wallpapers
 
-- The **Workspace** menu creates and switches between separate canvases. They
-  save automatically. Hover a workspace to duplicate, rename, or delete it;
-  renaming happens right in the menu.
+- The **Workspace** menu switches between separate canvases, which save
+  automatically.
 - **View → Saved Viewpoints** bookmarks spots on the canvas; jump to them with
   `Ctrl+1`–`Ctrl+9`.
 - **View → Set Wallpaper...** puts an image, GIF, or looping video behind the
-  canvas, per workspace.
+  canvas.
 
 ### Overlay mode
 
 Turn on **Always on Top** (right-click empty canvas), then **Click Through**
 from the tray icon so your clicks reach the apps underneath. Turn Click Through
-off from the tray to use Pluriview again. `H` hides the interface for a clean
-canvas.
+off from the tray to use Pluriview again. `H` hides the interface.
 
 ## Sharing audio with Discord or OBS
 
@@ -191,10 +166,8 @@ Audio** button.
 
 ## Shortcuts
 
-All keyboard shortcuts can be changed in **Tools → Settings → Keyboard
-Shortcuts**, grouped by area with a search box. Click a key, press the new one,
-and use **Swap** if another action already has it. Press `F1` in the app for the
-full list, with a **Change Shortcuts...** button.
+Change any shortcut in **Tools → Settings → Keyboard Shortcuts**. Press `F1` in
+the app for the full list.
 
 | Action | Shortcut |
 |---|---|
@@ -213,7 +186,7 @@ full list, with a **Change Shortcuts...** button.
 | Group layouts | `Alt+1`–`Alt+4` |
 | Make main tile / next / previous | `Shift+F` / `Shift+→` / `Shift+←` |
 | Screenshot / Screenshots panel | `Shift+S` / `S` |
-| Record / pause | `Shift+R` / `P` |
+| Record / pause / record a GIF | `Shift+R` / `P` / `Shift+G` |
 | Hide interface | `H` |
 | Saved viewpoints | `Ctrl+1`–`Ctrl+9` |
 
@@ -260,17 +233,6 @@ cd Pluriview
 The package lands in `dist`. Don't share `pluriview.pdb`, which can contain
 local paths. After editing `src/capture/shaders/area_average.hlsl`, run
 `.\scripts\compile-capture-shader.ps1` (needs the Windows SDK).
-
-| Location | Purpose |
-|---|---|
-| `src/app.rs` | Application state, menus, and sources |
-| `src/canvas/` | Canvas rendering and interaction |
-| `src/preview/` | Tile models |
-| `src/capture/` | Window and Spout2 capture |
-| `src/browser.rs` | Browser tiles |
-| `src/libmpv.rs` | Video playback |
-| `src/persistence/` | Workspaces and settings |
-| `scripts/` | Runtime preparation and packaging |
 
 </details>
 
